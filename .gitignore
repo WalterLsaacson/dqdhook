@@ -1,0 +1,21 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+**/.DS_Store
+
+# Runtime state for skills / frontend
+data/*
+!data/.gitkeep
+!data/polymarket/
+!data/polymarket/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/

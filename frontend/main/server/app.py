@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""System Main — boot quote skill cascade + all frontend boards."""
+
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+MODULE_DIR = Path(__file__).resolve().parents[1]
+FRONTEND = MODULE_DIR.parent
+ROOT = FRONTEND.parent
+PUBLIC = MODULE_DIR / "public"
+SRC = MODULE_DIR / "src"
+
+HOST = "127.0.0.1"
+PORT = 8790
+
+BOARDS = (
+    {
+        "id": "match-board",
+        "name": "Dongqiudi",
+        "script": FRONTEND / "run.py",
+        "port": 8787,
+        "skill": "dongqiudi-match",
+    },
+    {
+        "id": "polymarket-board",
+        "name": "Polymarket",
+        "script": FRONTEND / "run_polymarket.py",
+        "port": 8788,
+        "skill": "polymarket-soccer",
+    },
+    {
+        "id": "bridge-board",
+        "name": "Match Bridge",
+        "script": FRONTEND / "run_bridge.py",
+        "port": 8789,
+        "skill": "match-bridge",
+    },
+)
+
+QUOTE_SCRIPT = (
+    ROOT / ".cursor" / "skills" / "polymarket-quote" / "scripts" / "pm_quote.py"
+)
+
+_children: list[subprocess.Popen[Any]] = []
+_lock = threading.RLock()
+_started_at: str | None = None
+_quote_proc: subprocess.Popen[Any] | None = None
+_quote_trade: dict[str, Any]
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_quote_trade_config(
+    *,
+    live: bool | None = None,
+    no_trade: bool | None = None,
+    take_depth: str | None = None,
+    max_levels: int | None = None,
+    max_usdc: float | None = None,
+    max_shares: float | None = None,
+    max_slippage: float | None = None,
+    allow_extreme_prices: bool | None = None,
+    interval: int | None = None,
+    trade_env_file: str | None = None,
+) -> dict[str, Any]:
+    """Merge CLI overrides with QUOTE_* env (defaults = dry-run trade on)."""
+    depth = (take_depth or os.getenv("QUOTE_TAKE_DEPTH") or "top").strip().lower()
+    if depth not in ("top", "walk"):
+        depth = "top"
+
+    enabled = _env_bool("QUOTE_TRADE", True)
+    if no_trade is True:
+        enabled = False
+    elif no_trade is False:
+        enabled = True
+
+    env_file = trade_env_file or os.getenv("QUOTE_TRADE_ENV_FILE") or None
+    if not env_file and (ROOT / ".env").is_file():
+        env_file = str(ROOT / ".env")
+
+    return {
+        "enabled": enabled,
+        "live": bool(live) if live is not None else _env_bool("QUOTE_LIVE", False),
+        "take_depth": depth,
+        "max_levels": int(
+            max_levels if max_levels is not None else os.getenv("QUOTE_MAX_LEVELS", "5")
+        ),
+        "max_usdc": float(
+            max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "5")
+        ),
+        "max_shares": float(
+            max_shares if max_shares is not None else os.getenv("QUOTE_MAX_SHARES", "25")
+        ),
+        "max_slippage": float(
+            max_slippage
+            if max_slippage is not None
+            else os.getenv("QUOTE_MAX_SLIPPAGE", "0.03")
+        ),
+        "allow_extreme_prices": (
+            bool(allow_extreme_prices)
+            if allow_extreme_prices is not None
+            else _env_bool("QUOTE_ALLOW_EXTREME_PRICES", False)
+        ),
+        "interval": max(
+            1,
+            int(interval if interval is not None else os.getenv("QUOTE_INTERVAL", "2")),
+        ),
+        "trade_env_file": env_file,
+    }
+
+
+def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
+    """Build pm_quote.py watch argv including in-process trade flags."""
+    c = cfg or _quote_trade
+    args: list[str] = ["watch", "--interval", str(int(c["interval"]))]
+    if not c.get("enabled", True):
+        args.append("--no-trade")
+        return args
+    if c.get("live"):
+        args.append("--live")
+    args.extend(["--take-depth", str(c.get("take_depth") or "top")])
+    args.extend(["--max-levels", str(int(c.get("max_levels") or 5))])
+    args.extend(["--max-usdc", str(float(c.get("max_usdc") or 5))])
+    args.extend(["--max-shares", str(float(c.get("max_shares") or 25))])
+    args.extend(["--max-slippage", str(float(c.get("max_slippage") or 0.03))])
+    if c.get("allow_extreme_prices"):
+        args.append("--allow-extreme-prices")
+    env_file = c.get("trade_env_file")
+    if env_file:
+        args.extend(["--trade-env-file", str(env_file)])
+    return args
+
+
+# Default trade config (env + .env path); main() may override via CLI.
+_quote_trade = load_quote_trade_config()
+
+
+def _now() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+def _port_open(port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.25)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _http_json(url: str, *, timeout: float = 1.5) -> dict[str, Any] | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "main-module/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess.Popen[Any]:
+    stdout: Any = subprocess.DEVNULL
+    stderr: Any = subprocess.DEVNULL
+    log_fh = None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+        stdout = log_fh
+        stderr = subprocess.STDOUT
+    proc = subprocess.Popen(
+        [sys.executable, str(script), *args],
+        cwd=str(ROOT),
+        env=os.environ.copy(),
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
+    )
+    # Keep file handle alive on the process object so it is not GC'd closed.
+    if log_fh is not None:
+        proc._quote_log_fh = log_fh  # type: ignore[attr-defined]
+    return proc
+
+
+def start_stack(*, open_browser: bool = True) -> dict[str, Any]:
+    """Start three boards, then quote watch (+ in-process trade) cascade."""
+    global _started_at, _quote_proc
+    with _lock:
+        if _started_at and _quote_proc and _quote_proc.poll() is None:
+            return status()
+
+        launched: list[dict[str, Any]] = []
+        for board in BOARDS:
+            port = int(board["port"])
+            url = f"http://{HOST}:{port}/"
+            if _port_open(port):
+                launched.append(
+                    {"id": board["id"], "port": port, "url": url, "already": True}
+                )
+                continue
+            print(f"main → starting {board['id']} @ {url}", flush=True)
+            proc = _spawn(Path(board["script"]))
+            _children.append(proc)
+            launched.append(
+                {
+                    "id": board["id"],
+                    "port": port,
+                    "url": url,
+                    "already": False,
+                    "pid": proc.pid,
+                }
+            )
+
+        # Wait for bridge-board so quote can attach via HTTP.
+        deadline = time.time() + 20
+        while time.time() < deadline and not _port_open(8789):
+            time.sleep(0.15)
+
+        watch_args = quote_watch_argv(_quote_trade)
+        trade = _quote_trade
+        mode = (
+            "off"
+            if not trade.get("enabled")
+            else ("live" if trade.get("live") else "dry-run")
+        )
+        print(
+            "main → starting polymarket-quote watch "
+            f"(trade={mode} depth={trade.get('take_depth')} "
+            f"max_usdc={trade.get('max_usdc')}) "
+            "(→ match-bridge → dongqiudi-match + polymarket-soccer)",
+            flush=True,
+        )
+        quote_log = ROOT / "data" / "pm-quote" / "watch.log"
+        _quote_proc = _spawn(QUOTE_SCRIPT, *watch_args, log_path=quote_log)
+        _children.append(_quote_proc)
+        _started_at = _now()
+
+        if open_browser:
+            threading.Thread(
+                target=_open_uis, args=(launched,), name="open-uis", daemon=True
+            ).start()
+
+        return {
+            "ok": True,
+            "started_at": _started_at,
+            "boards": launched,
+            "quote_pid": _quote_proc.pid,
+            "quote_trade": dict(trade),
+            "quote_argv": watch_args,
+            "hub": f"http://{HOST}:{PORT}/",
+        }
+
+
+def _open_uis(launched: list[dict[str, Any]]) -> None:
+    time.sleep(0.8)
+    urls = [f"http://{HOST}:{PORT}/"] + [b["url"] for b in launched]
+    for url in urls:
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif sys.platform.startswith("linux"):
+                subprocess.Popen(
+                    ["xdg-open", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.25)
+
+
+def stop_stack() -> dict[str, Any]:
+    global _quote_proc, _started_at
+    with _lock:
+        procs = list(_children)
+        _children.clear()
+        _quote_proc = None
+        _started_at = None
+    for p in procs:
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except Exception:  # noqa: BLE001
+                try:
+                    p.send_signal(signal.SIGTERM)
+                except Exception:  # noqa: BLE001
+                    pass
+    for p in procs:
+        try:
+            p.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    return {"ok": True, "stopped": True}
+
+
+def status() -> dict[str, Any]:
+    boards_st: list[dict[str, Any]] = []
+    for board in BOARDS:
+        port = int(board["port"])
+        up = _port_open(port)
+        extra: dict[str, Any] = {}
+        if up and board["id"] == "bridge-board":
+            st = _http_json(f"http://{HOST}:{port}/api/status")
+            if st:
+                extra = {
+                    "skill_running": st.get("running"),
+                    "dqd_ticks": st.get("dqd_ticks"),
+                    "pm_ticks": st.get("pm_ticks"),
+                }
+        boards_st.append(
+            {
+                "id": board["id"],
+                "name": board["name"],
+                "skill": board["skill"],
+                "port": port,
+                "url": f"http://{HOST}:{port}/",
+                "up": up,
+                **extra,
+            }
+        )
+    with _lock:
+        q = _quote_proc
+        quote_alive = bool(q and q.poll() is None)
+        started = _started_at
+        trade = dict(_quote_trade)
+    mode = (
+        "off"
+        if not trade.get("enabled")
+        else ("live" if trade.get("live") else "dry-run")
+    )
+    return {
+        "module": "main",
+        "hub": f"http://{HOST}:{PORT}/",
+        "started_at": started,
+        "quote": {
+            "skill": "polymarket-quote",
+            "running": quote_alive,
+            "pid": q.pid if quote_alive and q else None,
+            "cascade": ["match-bridge", "dongqiudi-match", "polymarket-soccer"],
+            "trade": {
+                **trade,
+                "mode": mode,
+                "trades_path": str(ROOT / "data" / "pm-quote" / "trades.jsonl"),
+                "watch_log": str(ROOT / "data" / "pm-quote" / "watch.log"),
+            },
+        },
+        "boards": boards_st,
+        "ok": True,
+    }
+
+
+def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def read_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    n = int(handler.headers.get("Content-Length") or 0)
+    if n <= 0:
+        return {}
+    try:
+        return json.loads(handler.rfile.read(n).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/health":
+            json_response(self, 200, {"ok": True, "module": "main", "port": PORT})
+            return
+        if path == "/api/status":
+            json_response(self, 200, status())
+            return
+
+        if path == "/" or path == "/index.html":
+            return self._file(PUBLIC / "index.html", "text/html; charset=utf-8")
+        if path.startswith("/src/"):
+            rel = path[len("/src/") :]
+            fp = SRC / rel
+            if fp.is_file() and SRC in fp.resolve().parents:
+                ctype = mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
+                return self._file(fp, ctype)
+        self.send_error(404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        body = read_body(self)
+        if path == "/api/start":
+            try:
+                json_response(
+                    self,
+                    200,
+                    start_stack(open_browser=bool(body.get("open_browser", False))),
+                )
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                json_response(self, 502, {"error": str(e)})
+            return
+        if path == "/api/stop":
+            json_response(self, 200, stop_stack())
+            return
+        self.send_error(404)
+
+    def _file(self, path: Path, content_type: str) -> None:
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    global _quote_trade
+
+    parser = argparse.ArgumentParser(
+        description="System Main — boards + quote watch with in-process trading"
+    )
+    parser.add_argument("--no-trade", action="store_true", help="Quote only (no executor)")
+    parser.add_argument("--live", action="store_true", help="Post real CLOB orders")
+    parser.add_argument(
+        "--take-depth",
+        choices=("top", "walk"),
+        default=None,
+        help="Fill depth (default top / QUOTE_TAKE_DEPTH)",
+    )
+    parser.add_argument("--max-levels", type=int, default=None)
+    parser.add_argument("--max-usdc", type=float, default=None)
+    parser.add_argument("--max-shares", type=float, default=None)
+    parser.add_argument("--max-slippage", type=float, default=None)
+    parser.add_argument("--allow-extreme-prices", action="store_true")
+    parser.add_argument("--interval", type=int, default=None, help="Quote poll seconds")
+    parser.add_argument(
+        "--trade-env-file",
+        default=None,
+        help="Env file for PRIVATE_KEY/FUNDER (default repo .env)",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not auto-open browser tabs on boot",
+    )
+    args = parser.parse_args(argv)
+
+    _quote_trade = load_quote_trade_config(
+        live=True if args.live else None,
+        no_trade=True if args.no_trade else None,
+        take_depth=args.take_depth,
+        max_levels=args.max_levels,
+        max_usdc=args.max_usdc,
+        max_shares=args.max_shares,
+        max_slippage=args.max_slippage,
+        allow_extreme_prices=True if args.allow_extreme_prices else None,
+        interval=args.interval,
+        trade_env_file=args.trade_env_file,
+    )
+
+    PUBLIC.mkdir(parents=True, exist_ok=True)
+    SRC.mkdir(parents=True, exist_ok=True)
+    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"System Main → http://{HOST}:{PORT}/", flush=True)
+    t = _quote_trade
+    print(
+        f"Quote trade → "
+        f"{'off' if not t['enabled'] else ('live' if t['live'] else 'dry-run')} "
+        f"depth={t['take_depth']} max_usdc={t['max_usdc']}",
+        flush=True,
+    )
+    print("Booting skills + boards…", flush=True)
+
+    open_browser = not args.no_browser
+
+    def _boot() -> None:
+        try:
+            start_stack(open_browser=open_browser)
+            st = status()
+            qt = (st.get("quote") or {}).get("trade") or {}
+            print(
+                f"Stack ready · quote={'up' if st['quote']['running'] else 'down'} "
+                f"· trade={qt.get('mode')} · "
+                + " · ".join(
+                    f"{b['id']}={'up' if b['up'] else 'down'}" for b in st["boards"]
+                ),
+                flush=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            print(f"Boot failed: {e}", flush=True)
+
+    threading.Thread(target=_boot, name="main-boot", daemon=True).start()
+
+    def _shutdown(_sig: int, _frame: object) -> None:
+        print("\nshutting down stack…", flush=True)
+        stop_stack()
+        httpd.shutdown()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        _shutdown(signal.SIGINT, None)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
