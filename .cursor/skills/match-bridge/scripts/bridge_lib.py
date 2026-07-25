@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import re
 import sys
@@ -254,12 +255,19 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def append_events(path: Path, events: list[dict[str, Any]]) -> None:
+    """Append events under exclusive flock so quote prune cannot race replace."""
     if not events:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        for ev in events:
-            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    lock_path = Path(str(path) + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                for ev in events:
+                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def status_bucket(dqd: dict[str, Any] | None) -> str:

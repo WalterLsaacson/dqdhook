@@ -2,12 +2,31 @@
 
 ## Pipeline
 
-1. Trigger: `match_finished` from match-bridge (or CLI synthetic FT).
+1. Trigger: `score_change` / `match_finished` from match-bridge (or CLI synthetic FT).
 2. Join bridged row → `event_id` / `slug` / `market_refs`.
-3. Gamma: refresh main event markets (with `outcomes`); optionally fetch More Markets / Exact Score siblings.
+3. Gamma catalog: prefer `data/pm-quote/market_cache/{match_id}.json` (warmed after bridge match from `matches.json`). Complete only when `related_complete` and `main_event` are set (partial sibling warms are retried). Miss → fetch main + More Markets / Exact Score once and write cache. Cache holds **token definitions**, not CLOB prices. Dropped on FT.
 4. Settle each token from `home_score` / `away_score` → `WIN` | `LOSE` | `PENDING`.
-5. CLOB: `POST /books` (batch ≤50) with `GET /book` fallback.
-6. Persist bundle + opportunities.
+5. CLOB: urllib `POST /books` (batch ≤50) with `GET /book` fallback (same proxy as Gamma; no subprocess curl).
+6. **Live phases**: (A) totals + BTTS books → misprice → `maybe_trade`; (B) exact score (+ remainder) books → trade. One merged bundle for analytics/UI.
+7. Persist bundle + opportunities.
+
+## Watch wake
+
+`pm_quote watch` polls `data/bridge/events.jsonl` mtime/size (~50ms). `--interval` (default **0.25**) is the **max idle** between ticks; new events wake early. Each tick still runs `retry_pending_flattens` and drains unprocessed cursor keys. System Main: `QUOTE_INTERVAL` default `0.25`.
+
+Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
+
+## Retention (rolling 24h)
+
+`data_prune.py` (started with `pm_quote watch`; also `pm_quote prune`):
+
+| Target | Rule |
+|---|---|
+| `market_cache/*.json` | Keep only **open** paired matches still in `matches.json`; drop finished / orphan. **Skip** if matches file missing / bad / empty. |
+| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` | Keep rows with `quoted_at` ≥ now − retain_hours |
+| `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
+
+Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
 
 ## Moneyline six tokens
 
@@ -89,7 +108,22 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 | POST | `https://clob.polymarket.com/books` body `[{"token_id":"..."}]` |
 | GET | `https://clob.polymarket.com/book?token_id=` |
 
+Fetched via `_http_clob` / `urllib` (HTTP proxy handler or SOCKS socket patch from `pm_lib.configure_proxy`).  
 Normalized fields per token: `best_bid`, `best_bid_size`, `best_ask`, `best_ask_size`, `spread`, `midpoint`, `last_trade_price`, `bids_top`, `asks_top`, `tick_size`, `neg_risk`, `book_ts`.
+
+## Market cache file
+
+```json
+{
+  "match_id": "…",
+  "event_id": "…",
+  "slug": "…",
+  "main_event": { "…Gamma event…" },
+  "more_markets": { "…or null…" },
+  "exact_score": { "…or null…" },
+  "warmed_at": "…+08:00"
+}
+```
 
 ## Prop settlement (when listed)
 

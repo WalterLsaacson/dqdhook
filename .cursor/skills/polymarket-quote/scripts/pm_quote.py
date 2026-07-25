@@ -5,7 +5,7 @@ Examples:
   python3 pm_quote.py once --from-bridge --json
   python3 pm_quote.py once --match-id 54363289 --home-score 2 --away-score 1 --json
   python3 pm_quote.py once --event-id 674336 --home-score 1 --away-score 0 --json
-  python3 pm_quote.py watch --interval 2
+  python3 pm_quote.py watch --interval 0.25
   python3 pm_quote.py watch --take-depth walk --max-usdc 10   # dry-run trade plans
   python3 pm_quote.py watch --live --take-depth top --max-usdc 2
 """
@@ -15,13 +15,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
+import threading
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import data_prune  # noqa: E402
+import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import load_trade_settings  # noqa: E402
@@ -92,6 +94,7 @@ def cmd_once(args: argparse.Namespace) -> int:
 
     try:
         if args.from_bridge:
+            cache = mcache.MarketCatalogCache(rt)
             bundles = lib.process_bridge_events(
                 rt,
                 proxy=proxy,
@@ -102,6 +105,7 @@ def cmd_once(args: argparse.Namespace) -> int:
                 min_net=float(args.min_net),
                 force=bool(args.force),
                 trade_executor=executor,
+                market_cache=cache,
             )
             payload = {
                 "quoted_at": lib.now_cn_iso(),
@@ -133,6 +137,7 @@ def cmd_once(args: argparse.Namespace) -> int:
             else:
                 hs, aws = int(args.home_score), int(args.away_score)
             ev = lib.synthetic_ft_from_row(row, home_score=int(hs), away_score=int(aws))
+            cache = mcache.MarketCatalogCache(rt)
             payload = lib.quote_finished_event(
                 rt,
                 ev,
@@ -144,6 +149,7 @@ def cmd_once(args: argparse.Namespace) -> int:
                 min_net=float(args.min_net),
                 persist=not args.no_persist,
                 trade_executor=executor,
+                market_cache=cache,
             )
     except Exception as e:  # noqa: BLE001
         print(f"quote failed: {e}", file=sys.stderr)
@@ -173,7 +179,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
     proxy = None if args.no_proxy else (args.proxy if args.proxy else ...)
     include_props = not args.moneyline_only
     include_exact = not args.moneyline_only and not args.no_exact
-    interval = max(1, int(args.interval))
+    interval = max(0.05, float(args.interval))
+    events_path = lib.bridge_dir(rt) / "events.jsonl"
+    cache = mcache.MarketCatalogCache(rt)
+    stop_warm = threading.Event()
 
     if not args.no_upstream:
         print(
@@ -211,11 +220,34 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"trade setup failed: {e}", file=sys.stderr)
         return 1
 
+    # Configure process proxy once before warmer + quote share SOCKS socket patch.
+    try:
+        if proxy is None:
+            lib.pm.configure_proxy(None)  # honor --no-proxy → direct
+        elif proxy is ...:
+            lib.pm.configure_proxy(None)  # default PM_PROXY
+        else:
+            lib.pm.configure_proxy(str(proxy))
+    except Exception as e:  # noqa: BLE001
+        print(f"proxy setup warning: {e}", file=sys.stderr, flush=True)
+
+    mcache.start_warmer(cache, proxy=proxy, interval_s=5.0, stop_event=stop_warm)
+    retain_h = float(getattr(args, "retain_hours", data_prune.DEFAULT_RETAIN_HOURS))
+    data_prune.start_pruner(
+        rt,
+        market_cache=cache,
+        retain_hours=retain_h,
+        interval_s=600.0,
+        stop_event=stop_warm,
+        run_immediately=True,
+    )
     print(
-        f"polymarket-quote watch (interval={interval}s) → {lib.data_dir(rt)}",
+        f"polymarket-quote watch (wake≤{interval}s · market_cache · "
+        f"retain={retain_h}h) → {lib.data_dir(rt)}",
         file=sys.stderr,
         flush=True,
     )
+    sig = mcache.file_signature(events_path)
     try:
         while True:
             bundles = lib.process_bridge_events(
@@ -228,6 +260,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 min_net=float(args.min_net),
                 force=False,
                 trade_executor=executor,
+                market_cache=cache,
             )
             for b in bundles:
                 if b.get("error"):
@@ -251,19 +284,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     )
                     flat = int(b.get("flatten_count") or 0)
                     flat_s = f" flatten={flat}" if flat else ""
+                    cache_s = ""
+                    disc = b.get("discovery") or {}
+                    if disc.get("catalog_cache"):
+                        cache_s = f" cache={disc.get('catalog_cache')}"
                     print(
                         f"[{b.get('quoted_at')}] {b.get('trigger')}/{b.get('mode')} "
                         f"{b.get('home')} {prev_s}{b.get('home_score')}-{b.get('away_score')} "
                         f"{b.get('away')} quotes={b.get('count')} "
-                        f"opps={b.get('opportunity_count')} trades={trades}{flat_s}",
+                        f"opps={b.get('opportunity_count')} trades={trades}{flat_s}{cache_s}",
                         flush=True,
                     )
                     if args.json:
                         json.dump(b, sys.stdout, ensure_ascii=False)
                         print(flush=True)
-            time.sleep(interval)
+            # Event-driven wake on events.jsonl; interval is max idle sleep.
+            sig = mcache.wait_for_file_change(
+                events_path, sig, timeout_s=interval, poll_s=0.05
+            )
     except KeyboardInterrupt:
         print("\nbye", file=sys.stderr)
+        stop_warm.set()
         if not args.no_upstream:
             lib.stop_owned_bridge()
         return 0
@@ -360,16 +401,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Poll bridge events and quote; autostarts match-bridge (+ DQD + PM)",
     )
     _add_common_flags(watch)
-    watch.add_argument("--interval", type=int, default=2, help="Poll seconds (default 2)")
+    watch.add_argument(
+        "--interval",
+        type=float,
+        default=0.25,
+        help="Max idle seconds between ticks; wakes early on events.jsonl (default 0.25)",
+    )
     watch.add_argument("--json", action="store_true", help="Emit each bundle as JSON line")
     watch.add_argument(
         "--no-upstream",
         action="store_true",
         help="Do not autostart match-bridge / dongqiudi-match / polymarket-soccer",
     )
+    watch.add_argument(
+        "--retain-hours",
+        type=float,
+        default=data_prune.DEFAULT_RETAIN_HOURS,
+        help="Rolling retention hours for jsonl + stale market_cache (default 24)",
+    )
     watch.set_defaults(func=cmd_watch)
 
+    prune = sub.add_parser(
+        "prune",
+        help="Prune market_cache + jsonl older than rolling retain window",
+    )
+    prune.add_argument(
+        "--retain-hours",
+        type=float,
+        default=data_prune.DEFAULT_RETAIN_HOURS,
+        help="Rolling hours to keep (default 24; not calendar-day)",
+    )
+    prune.add_argument("--json", action="store_true", help="Print prune report as JSON")
+    prune.set_defaults(func=cmd_prune)
+
     return p
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    rt = root()
+    report = data_prune.prune_runtime_data(
+        rt, retain_hours=float(args.retain_hours)
+    )
+    if args.json:
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+    else:
+        mc = report.get("market_cache") or {}
+        print(
+            f"prune cutoff={report.get('cutoff')} "
+            f"cache_dropped={mc.get('dropped')}/{mc.get('scanned')} "
+            f"active_open={mc.get('active_open')}",
+            flush=True,
+        )
+        for name, stats in (report.get("jsonl") or {}).items():
+            if not isinstance(stats, dict):
+                continue
+            if stats.get("error"):
+                print(f"  {name}: error {stats['error']}", flush=True)
+            else:
+                print(
+                    f"  {name}: kept={stats.get('kept')} removed={stats.get('removed')} "
+                    f"{stats.get('bytes_before')}→{stats.get('bytes_after')} bytes",
+                    flush=True,
+                )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

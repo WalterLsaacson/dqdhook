@@ -59,12 +59,13 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
    - `score_change` — mid-match after a goal; quote **locked** outcomes only.
    - `match_finished` — full moneyline + props + exact settlement.
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
-4. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
-5. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
-6. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` posts market **FAK** via `py-clob-client-v2`.
-7. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal (entry score strictly higher than after). Live sells full balance and retries failures with `ALERT` logs. `max_usdc` default **5**.
-8. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
-9. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
+4. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
+5. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
+6. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
+7. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` posts market **FAK** via `py-clob-client-v2`.
+8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal (entry score strictly higher than after). Live sells full balance and retries failures with `ALERT` logs. `max_usdc` default **5**.
+9. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
+10. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
 
 ## Trading flags
 
@@ -83,9 +84,10 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 | Channel | Path | Purpose |
 |---|---|---|
-| Trigger | `data/bridge/events.jsonl` | `match_finished` / `score_change` |
-| Join | `data/bridge/matches.json` | Full Polymarket handles |
-| Quotes | `data/pm-quote/quotes.jsonl` | Full bundles (append) |
+| Trigger | `data/bridge/events.jsonl` | `match_finished` / `score_change` (watch wake) |
+| Join | `data/bridge/matches.json` | Full Polymarket handles + warmer input |
+| Market cache | `data/pm-quote/market_cache/{match_id}.json` | Pre-warmed Gamma main / more / exact |
+| Quotes | `data/pm-quote/quotes.jsonl` | Full bundles (append; rolling prune) |
 | Latest | `data/pm-quote/latest.json` | Last bundle |
 | Opportunities | `data/pm-quote/opportunities.jsonl` | `misprice=true` rows |
 | Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts + flatten_reversal |
@@ -99,6 +101,18 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | Moneyline ×6 | Main event | Always attempted |
 | Spreads / Totals / BTTS | `{slug}-more-markets` | Skipped if not listed |
 | Exact score | Exact Score sibling event | Skipped if not listed |
+
+## Retention / prune
+
+Rolling **24h** window (not calendar midnight): `watch` prunes on start and every ~10m.
+
+- Drop `market_cache/{match_id}.json` when match is finished or no longer an open paired row in `matches.json` (skip if matches snapshot empty/missing)
+- Truncate `quotes` / `opportunities` / `trades` / `bridge/events` by timestamp; **unprocessed** bridge events are always kept
+- Append/prune use `{path}.lock` so rewrite cannot race bridge/quote writers
+
+```bash
+python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py prune --retain-hours 24
+```
 
 ## Related skills
 

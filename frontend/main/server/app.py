@@ -79,7 +79,7 @@ def load_quote_trade_config(
     max_shares: float | None = None,
     max_slippage: float | None = None,
     allow_extreme_prices: bool | None = None,
-    interval: int | None = None,
+    interval: float | None = None,
     trade_env_file: str | None = None,
 ) -> dict[str, Any]:
     """Merge CLI overrides with QUOTE_* env (defaults = dry-run trade on)."""
@@ -121,8 +121,10 @@ def load_quote_trade_config(
             else _env_bool("QUOTE_ALLOW_EXTREME_PRICES", False)
         ),
         "interval": max(
-            1,
-            int(interval if interval is not None else os.getenv("QUOTE_INTERVAL", "2")),
+            0.05,
+            float(
+                interval if interval is not None else os.getenv("QUOTE_INTERVAL", "0.25")
+            ),
         ),
         "trade_env_file": env_file,
     }
@@ -131,7 +133,7 @@ def load_quote_trade_config(
 def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
     """Build pm_quote.py watch argv including in-process trade flags."""
     c = cfg or _quote_trade
-    args: list[str] = ["watch", "--interval", str(int(c["interval"]))]
+    args: list[str] = ["watch", "--interval", str(float(c["interval"]))]
     if not c.get("enabled", True):
         args.append("--no-trade")
         return args
@@ -529,7 +531,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-shares", type=float, default=None)
     parser.add_argument("--max-slippage", type=float, default=None)
     parser.add_argument("--allow-extreme-prices", action="store_true")
-    parser.add_argument("--interval", type=int, default=None, help="Quote poll seconds")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="Quote max idle seconds / events.jsonl wake (default 0.25)",
+    )
     parser.add_argument(
         "--trade-env-file",
         default=None,

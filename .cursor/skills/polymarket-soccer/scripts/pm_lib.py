@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +37,7 @@ _GAMMA_IPS_CACHE: list[str] | None = None
 TZ_CN = timezone(timedelta(hours=8))
 
 _PROXY_APPLIED: str | None = None
+_PROXY_LOCK = threading.RLock()
 _ORIG_SOCKET = socket.socket
 
 # Gamma /sports tag for football matchups (polymarket.com/.../sports/soccer/games).
@@ -161,24 +163,39 @@ def _apply_http_proxy(proxy_url: str) -> urllib.request.OpenerDirector:
 
 
 def configure_proxy(explicit: str | None = None) -> str | None:
-    """Configure process-wide proxy. Returns the proxy URL used, or None if direct."""
+    """Configure process-wide proxy. Returns the proxy URL used, or None if direct.
+
+    Idempotent under a lock: same target skips socket reset so concurrent warmer
+    + CLOB/Gamma threads do not tear down an in-flight SOCKS patch.
+    """
     global _PROXY_APPLIED
-    # Reset socket if previously patched
-    socket.socket = _ORIG_SOCKET  # type: ignore[misc, assignment]
-    _PROXY_APPLIED = None
+    with _PROXY_LOCK:
+        proxy = resolve_proxy(explicit)
+        if proxy == _PROXY_APPLIED:
+            if not proxy:
+                return None
+            scheme = (urlparse(proxy).scheme or "").lower()
+            if scheme.startswith("socks"):
+                if socket.socket is not _ORIG_SOCKET:
+                    return proxy
+            elif scheme in ("http", "https"):
+                return proxy
 
-    proxy = resolve_proxy(explicit)
-    if not proxy:
-        return None
+        # Reset socket if previously patched
+        socket.socket = _ORIG_SOCKET  # type: ignore[misc, assignment]
+        _PROXY_APPLIED = None
 
-    scheme = (urlparse(proxy).scheme or "").lower()
-    if scheme.startswith("socks"):
-        _apply_socks_proxy(proxy)
-        return proxy
-    if scheme in ("http", "https"):
-        _PROXY_APPLIED = proxy
-        return proxy
-    raise FetchError(f"Unsupported proxy URL: {proxy}")
+        if not proxy:
+            return None
+
+        scheme = (urlparse(proxy).scheme or "").lower()
+        if scheme.startswith("socks"):
+            _apply_socks_proxy(proxy)
+            return proxy
+        if scheme in ("http", "https"):
+            _PROXY_APPLIED = proxy
+            return proxy
+        raise FetchError(f"Unsupported proxy URL: {proxy}")
 
 
 def resolve_gamma_ips(proxy: str | None = None) -> list[str]:

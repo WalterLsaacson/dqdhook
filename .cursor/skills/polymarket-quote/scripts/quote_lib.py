@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import re
-import subprocess
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 TZ_CN = timezone(timedelta(hours=8))
 CLOB_HOST = "clob.polymarket.com"
@@ -86,12 +89,19 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Append JSONL under exclusive flock (pairs with data_prune.prune_jsonl)."""
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    lock_path = Path(str(path) + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def _parse_list_field(raw: Any) -> list[Any]:
@@ -743,7 +753,7 @@ def exact_score_tokens(
 # --- CLOB -------------------------------------------------------------------
 
 
-def _curl_clob(
+def _http_clob(
     url: str,
     proxy: str | None,
     timeout: float,
@@ -751,29 +761,35 @@ def _curl_clob(
     method: str = "GET",
     body: str | None = None,
 ) -> str:
-    cmd = [
-        "curl",
-        "-sS",
-        "-L",
-        "--max-time",
-        str(int(timeout)),
-        "-A",
-        UA,
-        "-H",
-        "Accept: application/json",
-    ]
-    if proxy:
-        cmd.extend(["-x", proxy])
+    """GET/POST CLOB JSON via urllib (SOCKS via pm.configure_proxy socket patch)."""
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+    }
+    data: bytes | None = None
     if method.upper() == "POST":
-        cmd.extend(["-X", "POST", "-H", "Content-Type: application/json"])
-        if body is not None:
-            cmd.extend(["-d", body])
-    cmd.append(url)
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise QuoteError(f"curl CLOB failed ({proc.returncode}): {err}")
-    return proc.stdout
+        headers["Content-Type"] = "application/json"
+        data = (body or "").encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    scheme = (urlparse(proxy).scheme or "").lower() if proxy else ""
+    try:
+        if proxy and scheme in ("http", "https"):
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8")
+        if proxy and scheme.startswith("socks"):
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body_txt = e.read().decode("utf-8", errors="replace")[:300]
+        raise QuoteError(f"CLOB HTTP {e.code}: {body_txt}") from e
+    except urllib.error.URLError as e:
+        raise QuoteError(f"CLOB network error: {e.reason}") from e
 
 
 def fetch_books(
@@ -793,13 +809,12 @@ def fetch_books(
         proxy_url = pm.configure_proxy(None if proxy is None else str(proxy))
 
     books: dict[str, dict[str, Any]] = {}
-    # Batch POST /books in chunks of 50
     for i in range(0, len(ids), 50):
         chunk = ids[i : i + 50]
         payload = json.dumps([{"token_id": t} for t in chunk])
         url = f"{CLOB_BASE}/books"
         try:
-            raw = _curl_clob(url, proxy_url, timeout, method="POST", body=payload)
+            raw = _http_clob(url, proxy_url, timeout, method="POST", body=payload)
             data = json.loads(raw)
             if not isinstance(data, list):
                 raise QuoteError("POST /books did not return a list")
@@ -809,12 +824,11 @@ def fetch_books(
                     if tid:
                         books[tid] = normalize_book(book, top_n=top_n)
         except (QuoteError, json.JSONDecodeError, pm.FetchError):
-            # Per-token fallback
             for tid in chunk:
                 if tid in books:
                     continue
                 try:
-                    one = _curl_clob(
+                    one = _http_clob(
                         f"{CLOB_BASE}/book?token_id={urllib.parse.quote(tid)}",
                         proxy_url,
                         timeout,
@@ -830,7 +844,6 @@ def fetch_books(
                         "best_ask": None,
                         "error": "book_fetch_failed",
                     }
-    # Mark missing ids
     for tid in ids:
         if tid not in books:
             books[tid] = {
@@ -1086,34 +1099,67 @@ def collect_target_tokens(
     include_props: bool = True,
     include_exact: bool = True,
     mode: str = "ft",
+    market_cache: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build settled token rows + discovery meta.
 
     mode=ft: full moneyline + props + exact (final settlement).
     mode=live: only outcomes already locked by current score (no moneyline/spreads).
+
+    When ``market_cache`` is set, prefer warmed Gamma catalog (main / more / exact)
+    so the hot path skips Gamma HTTP; misses fetch once and write back.
     """
     pm_h = ctx["polymarket"]
     home, away = ctx["home"], ctx["away"]
     hs, aws = ctx["home_score"], ctx["away_score"]
+    match_id = str(
+        (ctx.get("event") or {}).get("match_id")
+        or (ctx.get("dongqiudi") or {}).get("id")
+        or ""
+    )
     meta: dict[str, Any] = {
         "mode": mode,
         "main_event": None,
         "more_markets": None,
         "exact_score": None,
         "skipped": [],
+        "catalog_cache": "none",
     }
 
+    cached: dict[str, Any] | None = None
+    if market_cache is not None and match_id:
+        try:
+            hit = market_cache.get(match_id)
+            if isinstance(hit, dict):
+                cached = hit
+        except Exception:  # noqa: BLE001
+            cached = None
+
+    main_from_cache = bool(cached and isinstance(cached.get("main_event"), dict))
+    related_from_cache = bool(cached and cached.get("related_complete"))
+    if main_from_cache and related_from_cache:
+        meta["catalog_cache"] = "hit"
+    elif cached and (main_from_cache or related_from_cache or cached.get("more_markets") or cached.get("exact_score")):
+        meta["catalog_cache"] = "partial"
+
     main_markets: list[dict[str, Any]] = []
-    # Prefer live Gamma event for outcomes
-    try:
-        ev = fetch_gamma_event(
-            event_id=str(pm_h.get("event_id") or "") or None,
-            slug=str(pm_h.get("slug") or "") or None,
-            proxy=proxy,
-        )
-    except pm.FetchError as e:
-        ev = None
-        meta["main_fetch_error"] = str(e)
+    ev: dict[str, Any] | None = None
+    if main_from_cache:
+        ev = cached["main_event"]  # type: ignore[index]
+    else:
+        try:
+            ev = fetch_gamma_event(
+                event_id=str(pm_h.get("event_id") or "") or None,
+                slug=str(pm_h.get("slug") or "") or None,
+                proxy=proxy,
+            )
+            if meta["catalog_cache"] not in ("hit", "partial"):
+                meta["catalog_cache"] = "miss"
+        except pm.FetchError as e:
+            ev = None
+            meta["main_fetch_error"] = str(e)
+            if meta["catalog_cache"] not in ("hit", "partial"):
+                meta["catalog_cache"] = "miss"
     if ev:
         meta["main_event"] = {
             "id": str(ev.get("id") or ""),
@@ -1135,14 +1181,71 @@ def collect_target_tokens(
         meta["skipped"].append({"family": "moneyline", "reason": "live_not_locked_until_ft"})
         meta["skipped"].append({"family": "spreads", "reason": "live_not_locked"})
 
-    related = {"more_markets": None, "exact_score": None}
-    if include_props or include_exact:
+    related: dict[str, Any] = {"more_markets": None, "exact_score": None}
+    related_complete = False
+    if related_from_cache:
+        related = {
+            "more_markets": cached.get("more_markets"),  # type: ignore[union-attr]
+            "exact_score": cached.get("exact_score"),  # type: ignore[union-attr]
+        }
+        related_complete = True
+    elif include_props or include_exact:
         slug = str(pm_h.get("slug") or "")
         if slug:
             try:
                 related = discover_related_events(slug=slug, home=home, away=away, proxy=proxy)
+                related_complete = True
+                if meta["catalog_cache"] == "hit":
+                    meta["catalog_cache"] = "partial"
+                elif meta["catalog_cache"] not in ("miss", "partial"):
+                    meta["catalog_cache"] = "miss"
             except pm.FetchError as e:
                 meta["related_fetch_error"] = str(e)
+                # Keep any partial siblings from an incomplete warm; do not mark complete.
+                if cached:
+                    related = {
+                        "more_markets": cached.get("more_markets"),
+                        "exact_score": cached.get("exact_score"),
+                    }
+                related_complete = False
+        else:
+            related_complete = True
+
+    # Persist when we newly completed related discovery and/or filled main.
+    if market_cache is not None and match_id and (ev or related_complete):
+        already = bool(
+            cached
+            and cached.get("related_complete")
+            and isinstance(cached.get("main_event"), dict)
+        )
+        improved = (related_complete and not (cached and cached.get("related_complete"))) or (
+            isinstance(ev, dict) and not (cached and isinstance(cached.get("main_event"), dict))
+        )
+        if improved or (related_complete and isinstance(ev, dict) and not already):
+            try:
+                market_cache.put(
+                    match_id,
+                    {
+                        "event_id": str(pm_h.get("event_id") or ""),
+                        "slug": str(pm_h.get("slug") or ""),
+                        "home": home,
+                        "away": away,
+                        "main_event": ev
+                        if isinstance(ev, dict)
+                        else (cached or {}).get("main_event"),
+                        "more_markets": related.get("more_markets"),
+                        "exact_score": related.get("exact_score"),
+                        "related_complete": bool(
+                            related_complete
+                            and isinstance(
+                                ev if isinstance(ev, dict) else (cached or {}).get("main_event"),
+                                dict,
+                            )
+                        ),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     if include_props:
         more = related.get("more_markets")
@@ -1172,14 +1275,16 @@ def collect_target_tokens(
                     mode=mode,
                 )
             )
-            tokens.extend(btts_tokens(
-                prop_markets,
-                home_score=hs,
-                away_score=aws,
-                home_half=dqd.get("home_half"),
-                away_half=dqd.get("away_half"),
-                mode=mode,
-            ))
+            tokens.extend(
+                btts_tokens(
+                    prop_markets,
+                    home_score=hs,
+                    away_score=aws,
+                    home_half=dqd.get("home_half"),
+                    away_half=dqd.get("away_half"),
+                    mode=mode,
+                )
+            )
         else:
             meta["skipped"].append({"family": "props", "reason": "not_listed"})
 
@@ -1376,6 +1481,7 @@ def quote_bridge_event(
     min_net: float = DEFAULT_MIN_NET,
     persist: bool = True,
     trade_executor: Any | None = None,
+    market_cache: Any | None = None,
 ) -> dict[str, Any]:
     ctx = join_ft_context(root, ev)
     if ctx["home_score"] is None or ctx["away_score"] is None:
@@ -1391,6 +1497,7 @@ def quote_bridge_event(
         include_props=include_props,
         include_exact=include_exact,
         mode=mode,
+        market_cache=market_cache,
     )
     ek = event_key(ev)
     match_meta = {
@@ -1400,8 +1507,7 @@ def quote_bridge_event(
         "home_score": ctx.get("home_score"),
         "away_score": ctx.get("away_score"),
     }
-    quotes = quote_tokens(
-        tokens,
+    quote_kw = dict(
         proxy=proxy,
         eps=eps,
         fee_rate=fee_rate,
@@ -1410,6 +1516,19 @@ def quote_bridge_event(
         event_key_str=ek,
         match_meta=match_meta,
     )
+    # Live: books+trade totals/BTTS first, then exact (and any remainder).
+    if mode == "live":
+        phase_a = [t for t in tokens if t.get("family") in ("totals", "btts")]
+        phase_a_ids = {id(t) for t in phase_a}
+        phase_b = [t for t in tokens if id(t) not in phase_a_ids]
+        quotes: list[dict[str, Any]] = []
+        if phase_a:
+            quotes.extend(quote_tokens(phase_a, **quote_kw))
+        if phase_b:
+            quotes.extend(quote_tokens(phase_b, **quote_kw))
+        discovery["quote_phases"] = ["totals_btts", "exact_rest"]
+    else:
+        quotes = quote_tokens(tokens, **quote_kw)
     bundle = build_bundle(ctx, quotes, discovery)
     if persist:
         persist_bundle(root, bundle)
@@ -1428,6 +1547,7 @@ def quote_finished_event(
     min_net: float = DEFAULT_MIN_NET,
     persist: bool = True,
     trade_executor: Any | None = None,
+    market_cache: Any | None = None,
 ) -> dict[str, Any]:
     """Alias for FT / manual quoting."""
     if not ev.get("type"):
@@ -1444,6 +1564,7 @@ def quote_finished_event(
         min_net=min_net,
         persist=persist,
         trade_executor=trade_executor,
+        market_cache=market_cache,
     )
 
 
@@ -1458,6 +1579,7 @@ def process_bridge_events(
     min_net: float = DEFAULT_MIN_NET,
     force: bool = False,
     trade_executor: Any | None = None,
+    market_cache: Any | None = None,
 ) -> list[dict[str, Any]]:
     cursor = load_cursor(root)
     seen = set(cursor.get("processed_keys") or [])
@@ -1510,12 +1632,20 @@ def process_bridge_events(
                 min_net=min_net,
                 persist=True,
                 trade_executor=trade_executor,
+                market_cache=market_cache,
             )
             if flatten_rows:
                 bundle["flatten_attempts"] = flatten_rows
                 bundle["flatten_count"] = len(flatten_rows)
             bundles.append(bundle)
             seen.add(key)
+            if market_cache is not None and ev.get("type") == "match_finished":
+                mid = str(ev.get("match_id") or bundle.get("match_id") or "")
+                if mid:
+                    try:
+                        market_cache.drop(mid)
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as e:  # noqa: BLE001
             err_row: dict[str, Any] = {
                 "quoted_at": now_cn_iso(),
@@ -1527,9 +1657,11 @@ def process_bridge_events(
             if flatten_rows:
                 err_row["flatten_attempts"] = flatten_rows
             bundles.append(err_row)
-            # Still mark processed to avoid tight error loops unless force
-            if not force:
-                seen.add(key)
+            # Do not mark processed / drop cache on failure — retry next tick.
+            print(
+                f"ALERT quote failed (will retry) key={key}: {e}",
+                flush=True,
+            )
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["updated_at"] = now_cn_iso()
     save_cursor(root, cursor)
