@@ -55,20 +55,30 @@ After `flag_misprice` returns true inside `quote_tokens`, `TradeExecutor` runs *
 | Mode | Behavior |
 |---|---|
 | dry-run (default) | Plan fill → append `data/pm-quote/trades.jsonl`; no chain order |
-| `--live` | Same plan, then `create_and_post_market_order` (FOK top buy / FAK walk buy; FAK sells) |
+| `--live` | Same plan, then `create_and_post_market_order` (**FAK** buys and sells) |
 
 **Take depth**
 
 | `--take-depth` | Buy WIN | Sell LOSE |
 |---|---|---|
-| `top` (default) | Only best ask size / price; FOK | Only best bid; needs position |
+| `top` (default) | Only best ask size / price; FAK | Only best bid; needs position |
 | `walk` | Accumulate `asks_top` until max_levels / max_usdc / max_shares / slippage; FAK | Walk `bids_top` downward; FAK |
 
 Price guard: skip when best ≤0.01 or ≥0.99 unless `--allow-extreme-prices`.  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  
 SDK: `py-clob-client-v2` (see `requirements-trade.txt`). Env: `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAIN_ID`, `CLOB_HOST`.
 
-Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`.
+Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`, `score_reversal.py`.
+
+**Score reversal / disallowed goal**
+
+- Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
+- **One event, two phases**: (1) FAK-flatten affected open `buy_win` lots whose **entry_score** is strictly higher than post-reversal / FT score; (2) **quote once** on the corrected `curr` score (may open newly locked markets). Unaffected lots stay open.
+- Live flatten sells the **full token balance**; incomplete / failed exits set `pending_flatten` and are retried each watch tick with `ALERT` logs.
+- CLOB `status=delayed` (+ `success`/`orderID`) counts as an accepted fill: register the open lot (brief balance poll) so a later reversal can flatten.
+- Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
+- Dry-run logs `flatten_dry_run`. Default size cap remains **`max_usdc=5`**.
+- Open lots: `data/pm-quote/open_positions.json`.
 
 **System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with these flags automatically (default dry-run + repo `.env`). Same flags on the hub CLI / `QUOTE_*` env. Logs: `data/pm-quote/watch.log`.
 

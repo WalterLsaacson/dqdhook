@@ -249,11 +249,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         if (q.get("trade_attempt") or {}).get("status")
                         in ("dry_run", "posted")
                     )
+                    flat = int(b.get("flatten_count") or 0)
+                    flat_s = f" flatten={flat}" if flat else ""
                     print(
                         f"[{b.get('quoted_at')}] {b.get('trigger')}/{b.get('mode')} "
                         f"{b.get('home')} {prev_s}{b.get('home_score')}-{b.get('away_score')} "
                         f"{b.get('away')} quotes={b.get('count')} "
-                        f"opps={b.get('opportunity_count')} trades={trades}",
+                        f"opps={b.get('opportunity_count')} trades={trades}{flat_s}",
                         flush=True,
                     )
                     if args.json:

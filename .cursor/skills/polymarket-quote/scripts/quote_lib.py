@@ -1462,10 +1462,42 @@ def process_bridge_events(
     cursor = load_cursor(root)
     seen = set(cursor.get("processed_keys") or [])
     bundles: list[dict[str, Any]] = []
+
+    # Retry any live flatten that failed / partial-filled on a prior tick.
+    if trade_executor is not None:
+        try:
+            retried = list(trade_executor.retry_pending_flattens() or [])
+            if retried:
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "flatten_retry",
+                        "flatten_attempts": retried,
+                        "flatten_count": len(retried),
+                    }
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT flatten retry sweep failed: {e}", flush=True)
+
     for ev in load_bridge_quote_events(root):
         key = event_key(ev)
         if not force and key in seen:
             continue
+        # Score disallow / correction: flatten open buy_win lots BEFORE quoting.
+        flatten_rows: list[dict[str, Any]] = []
+        if trade_executor is not None:
+            try:
+                flatten_rows = list(trade_executor.maybe_flatten_for_event(ev) or [])
+            except Exception as e:  # noqa: BLE001
+                flatten_rows = [
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "status": "flatten_error",
+                        "error": str(e),
+                        "match_id": ev.get("match_id"),
+                        "event_key": key,
+                    }
+                ]
         try:
             bundle = quote_bridge_event(
                 root,
@@ -1479,18 +1511,22 @@ def process_bridge_events(
                 persist=True,
                 trade_executor=trade_executor,
             )
+            if flatten_rows:
+                bundle["flatten_attempts"] = flatten_rows
+                bundle["flatten_count"] = len(flatten_rows)
             bundles.append(bundle)
             seen.add(key)
         except Exception as e:  # noqa: BLE001
-            bundles.append(
-                {
-                    "quoted_at": now_cn_iso(),
-                    "error": str(e),
-                    "event_key": key,
-                    "match_id": ev.get("match_id"),
-                    "trigger": ev.get("type"),
-                }
-            )
+            err_row: dict[str, Any] = {
+                "quoted_at": now_cn_iso(),
+                "error": str(e),
+                "event_key": key,
+                "match_id": ev.get("match_id"),
+                "trigger": ev.get("type"),
+            }
+            if flatten_rows:
+                err_row["flatten_attempts"] = flatten_rows
+            bundles.append(err_row)
             # Still mark processed to avoid tight error loops unless force
             if not force:
                 seen.add(key)

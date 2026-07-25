@@ -12,9 +12,6 @@ from trade_settings import TradeSettings
 
 logger = logging.getLogger("pm_quote.clob")
 
-MIN_ORDER_SIZE = Decimal("5")
-
-
 class ClobTrader:
     """Auth once, reuse for market FOK/FAK orders."""
 
@@ -48,6 +45,16 @@ class ClobTrader:
         client.set_api_creds(creds)
         self._client = client
         self._wallet_address = self._resolve_wallet_address()
+        # Ensure USDC (collateral) allowance is set before market buys.
+        try:
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+            client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            logger.info("CLOB collateral allowance updated")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("CLOB collateral allowance update failed: %s", e)
         logger.info("CLOB ready wallet=%s…", self._wallet_address[:10])
 
     def _resolve_wallet_address(self) -> str:
@@ -81,18 +88,58 @@ class ClobTrader:
         return Decimal(str(result.get("balance", "0"))) / Decimal("1000000")
 
     @staticmethod
-    def is_order_success(result: dict | None) -> bool:
+    def is_order_success(result: dict | None, *, market: bool = True) -> bool:
+        """Whether a market order was accepted / filled.
+
+        MATCHED/FILLED = done. DELAYED = CLOB accepted (async settle) — treat as
+        success so buy_win lots enter the open ledger for score-reversal flatten.
+        Do not treat resting LIVE/OPEN limit orders as fills.
+        """
         if not result:
             return False
         status = str(result.get("status", "")).upper()
-        if status in ("MATCHED", "FILLED", "LIVE", "OPEN", "SUCCESS"):
+        has_id = bool(result.get("orderID") or result.get("id"))
+        if market:
+            if status in ("MATCHED", "FILLED", "SUCCESS"):
+                return True
+            # Polymarket often returns delayed + success=true before shares show up.
+            if status == "DELAYED" and (result.get("success") is True or has_id):
+                return True
+            if result.get("success") is True and status not in ("LIVE", "OPEN"):
+                return True
+            return False
+        if status in ("MATCHED", "FILLED", "LIVE", "OPEN", "SUCCESS", "DELAYED"):
             return True
         if result.get("success") is True:
             return True
-        if result.get("orderID") or result.get("id"):
+        if has_id:
             err = result.get("errorMsg") or result.get("error")
             return not err
         return False
+
+    def wait_conditional_balance(
+        self,
+        token_id: str,
+        *,
+        min_shares: float = 0.01,
+        timeout_s: float = 3.0,
+        interval_s: float = 0.35,
+    ) -> float:
+        """Poll conditional token balance until visible or timeout (delayed fills)."""
+        import time
+
+        deadline = time.time() + max(0.0, float(timeout_s))
+        last = 0.0
+        while True:
+            try:
+                last = float(self.get_conditional_balance(token_id))
+            except Exception:  # noqa: BLE001
+                last = 0.0
+            if last + 1e-12 >= float(min_shares):
+                return last
+            if time.time() >= deadline:
+                return last
+            time.sleep(max(0.05, float(interval_s)))
 
     def post_market_buy(
         self,
@@ -101,7 +148,7 @@ class ClobTrader:
         tick_size: str,
         max_price: Decimal,
         *,
-        order_type: str = "FOK",
+        order_type: str = "FAK",
         neg_risk: bool | None = None,
     ) -> dict:
         from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
@@ -110,6 +157,8 @@ class ClobTrader:
         if max_price is None or max_price <= 0:
             raise ValueError("BUY requires max_price")
         ot = OrderType.FOK if str(order_type).upper() == "FOK" else OrderType.FAK
+        # py-clob-client-v2: OrderType members are plain strings (no .name).
+        ot_label = getattr(ot, "name", None) or str(ot)
         options = PartialCreateOrderOptions(tick_size=tick_size)
         if neg_risk is not None:
             options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
@@ -126,7 +175,7 @@ class ClobTrader:
         out = result if isinstance(result, dict) else {"result": result}
         logger.info(
             "market BUY %s token=%s usdc=%s max_price=%s ok=%s",
-            ot.name,
+            ot_label,
             token_id[:12],
             amount_usdc,
             max_price,
@@ -148,6 +197,7 @@ class ClobTrader:
         from py_clob_client_v2.clob_types import PartialCreateOrderOptions
 
         ot = OrderType.FOK if str(order_type).upper() == "FOK" else OrderType.FAK
+        ot_label = getattr(ot, "name", None) or str(ot)
         options = PartialCreateOrderOptions(tick_size=tick_size)
         if neg_risk is not None:
             options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
@@ -166,7 +216,7 @@ class ClobTrader:
         out = result if isinstance(result, dict) else {"result": result}
         logger.info(
             "market SELL %s token=%s shares=%s min_price=%s ok=%s",
-            ot.name,
+            ot_label,
             token_id[:12],
             shares,
             min_price,

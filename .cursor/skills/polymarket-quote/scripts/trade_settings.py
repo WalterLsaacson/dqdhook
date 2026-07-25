@@ -82,6 +82,7 @@ def load_trade_settings(
         max_shares=float(max_shares),
         max_slippage=float(max_slippage),
         allow_extreme_prices=bool(allow_extreme_prices),
-        min_order_shares=float(os.getenv("MIN_ORDER_SHARES", "5")),
+        # Polymarket market buys are USDC-notional; do not impose a 5-share floor.
+        min_order_shares=float(os.getenv("MIN_ORDER_SHARES", "0")),
         enabled=bool(enabled),
     )

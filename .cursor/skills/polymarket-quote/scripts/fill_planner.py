@@ -60,7 +60,7 @@ def plan_buy_win(
     max_usdc: float = 5.0,
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
-    min_order_shares: float = 5.0,
+    min_order_shares: float = 0.0,
 ) -> FillPlan:
     """Buy WIN token into asks."""
     asks = _levels_from_top(
@@ -75,7 +75,7 @@ def plan_buy_win(
         trade="buy_win",
         side="BUY",
         take_depth=take_depth,
-        order_type="FOK" if take_depth == "top" else "FAK",
+        order_type="FAK",
         shares=0.0,
         usdc=0.0,
         worst_price=0.0,
@@ -117,7 +117,10 @@ def plan_buy_win(
         usdc += cost
         worst = price
 
-    if shares + 1e-12 < float(min_order_shares):
+    if shares <= 1e-12 or usdc <= 1e-12:
+        empty.skip_reason = "zero_fill"
+        return empty
+    if float(min_order_shares) > 0 and shares + 1e-12 < float(min_order_shares):
         empty.skip_reason = f"shares={shares:.4f} < min_order={min_order_shares}"
         empty.levels = taken
         empty.levels_used = len(taken)
@@ -130,7 +133,7 @@ def plan_buy_win(
         trade="buy_win",
         side="BUY",
         take_depth=take_depth,
-        order_type="FOK" if take_depth == "top" else "FAK",
+        order_type="FAK",
         shares=round(shares, 6),
         usdc=round(usdc, 6),
         worst_price=worst,
@@ -148,7 +151,7 @@ def plan_sell_lose(
     max_levels: int = 5,
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
-    min_order_shares: float = 5.0,
+    min_order_shares: float = 0.0,
 ) -> FillPlan:
     """Sell LOSE token into bids."""
     bids = _levels_from_top(
@@ -163,7 +166,7 @@ def plan_sell_lose(
         trade="sell_lose",
         side="SELL",
         take_depth=take_depth,
-        # Plan + simple_str: sells are FAK (partial OK); only buy_win top is FOK.
+        # Sells and buys both use FAK (partial fill OK).
         order_type="FAK",
         shares=0.0,
         usdc=0.0,
@@ -207,7 +210,10 @@ def plan_sell_lose(
         usdc += room * price
         worst = price
 
-    if shares + 1e-12 < float(min_order_shares):
+    if shares <= 1e-12:
+        empty.skip_reason = "zero_fill"
+        return empty
+    if float(min_order_shares) > 0 and shares + 1e-12 < float(min_order_shares):
         empty.skip_reason = f"shares={shares:.4f} < min_order={min_order_shares}"
         empty.levels = taken
         empty.levels_used = len(taken)
@@ -238,7 +244,7 @@ def plan_fill(
     max_usdc: float = 5.0,
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
-    min_order_shares: float = 5.0,
+    min_order_shares: float = 0.0,
     available_shares: float | None = None,
 ) -> FillPlan:
     trade = str(quote.get("trade") or "")

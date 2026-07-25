@@ -54,14 +54,17 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 ## Agent workflow
 
-1. Prefer `watch` (or `frontend/run_stack.py`) so upstream skills are running.
+1. Prefer System Main (`frontend/run_main.py` / `run_stack.py`): one entry boots all boards + `pm_quote watch`, which cascades match-bridge → DQD + PM. Do not start boards separately.
 2. Prefer bridge events in `data/bridge/events.jsonl`:
    - `score_change` — mid-match after a goal; quote **locked** outcomes only.
    - `match_finished` — full moneyline + props + exact settlement.
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
 5. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
-6. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` posts FOK/FAK via `py-clob-client-v2`.
+6. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` posts market **FAK** via `py-clob-client-v2`.
+7. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal (entry score strictly higher than after). Live sells full balance and retries failures with `ALERT` logs. `max_usdc` default **5**.
+8. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
+9. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
 
 ## Trading flags
 
@@ -85,7 +88,8 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | Quotes | `data/pm-quote/quotes.jsonl` | Full bundles (append) |
 | Latest | `data/pm-quote/latest.json` | Last bundle |
 | Opportunities | `data/pm-quote/opportunities.jsonl` | `misprice=true` rows |
-| Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts (plan + response) |
+| Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts + flatten_reversal |
+| Open lots | `data/pm-quote/open_positions.json` | buy_win lots awaiting flatten |
 | Cursor | `data/pm-quote/cursor.json` | Processed event keys |
 
 ## Coverage
@@ -100,6 +104,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 - [`match-bridge`](../match-bridge/SKILL.md) — FT / score_change trigger
 - [`polymarket-soccer`](../polymarket-soccer/SKILL.md) — Gamma proxy helpers / fixture list
+- [`trade-analytics`](../trade-analytics/SKILL.md) — historical trades / overnight PnL from `trades.jsonl`
 
 ## Details
 

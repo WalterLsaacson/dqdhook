@@ -11,6 +11,14 @@ from typing import Any
 import quote_lib as lib
 from clob_trader import ClobTrader
 from fill_planner import FillPlan, plan_fill
+from score_reversal import (
+    OpenPositionLedger,
+    entry_tuple,
+    event_signals_reversal,
+    ft_reversal_vs_entry,
+    lot_depends_on_disallowed_goal,
+    score_pair,
+)
 from trade_settings import TradeSettings
 
 logger = logging.getLogger("pm_quote.trade")
@@ -34,7 +42,151 @@ class TradeExecutor:
         self.settings = settings
         self.trader = trader
         self._done: set[str] = set()
+        self._flatten_done: set[str] = set()
+        self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
+        self._load_recent_flattens()
+        if self.settings.live:
+            purged = self.ledger.purge_dry_run_opens(reason="pre_live_purge")
+            if purged:
+                logger.warning(
+                    "purged %d dry-run open lots before live trading", purged
+                )
+        self._rebuild_open_from_trades()
+
+    def _rebuild_open_from_trades(self, limit: int = 800) -> None:
+        """Re-open buy_win lots from trades.jsonl that were never flattened (restart-safe)."""
+        path = self.trades_path
+        if not path.is_file():
+            return
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        except OSError:
+            return
+        flattened: set[tuple[str, str]] = set()
+        buys: list[dict[str, Any]] = []
+        live_mode = bool(self.settings.live)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            mid = str(row.get("match_id") or "")
+            tid = str(row.get("token_id") or "")
+            if row.get("trade") == "flatten_reversal" and row.get("success"):
+                if mid and tid:
+                    flattened.add((mid, tid))
+                continue
+            if row.get("trade") != "buy_win":
+                continue
+            # Live session: only real posted fills. Dry-run: keep simulated opens.
+            if live_mode:
+                if row.get("status") != "posted" or not row.get("success") or not row.get(
+                    "live"
+                ):
+                    continue
+            elif row.get("status") not in ("dry_run", "posted") or not row.get("success"):
+                continue
+            if "verify" in str(row.get("idempotency_key") or ""):
+                continue
+            buys.append(row)
+        # Last buy per match+token wins
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in buys:
+            mid = str(row.get("match_id") or "")
+            tid = str(row.get("token_id") or "")
+            if mid and tid:
+                latest[(mid, tid)] = row
+        for (mid, tid), row in latest.items():
+            if (mid, tid) in flattened:
+                continue
+            if any(
+                str(x.get("token_id")) == tid
+                for x in self.ledger.open_for_match(mid)
+            ):
+                continue
+            plan = row.get("plan") or {}
+            shares = float(plan.get("shares") or 0)
+            if shares <= 0:
+                continue
+            self.ledger.register_buy(
+                match_id=mid,
+                token_id=tid,
+                market_key=str(row.get("market_key") or ""),
+                shares=shares,
+                usdc=float(plan.get("usdc") or 0),
+                home_score=row.get("home_score"),
+                away_score=row.get("away_score"),
+                live=bool(row.get("live")),
+                event_key=str(row.get("event_key") or ""),
+                home=str(row.get("home") or ""),
+                away=str(row.get("away") or ""),
+                family=str(row.get("family") or ""),
+                tick_size="0.01",
+                neg_risk=None,
+            )
+        self._close_stale_ft_reversed_lots()
+
+    def _close_stale_ft_reversed_lots(self) -> None:
+        """Drop zombie opens whose entry score was already undone by known FT."""
+        latest_ft: dict[str, tuple[int, int]] = {}
+        try:
+            for m in lib.load_bridge_matches(self.root):
+                dqd = m.get("dongqiudi") or {}
+                mid = str(dqd.get("id") or "")
+                sc = score_pair(dqd.get("home_score"), dqd.get("away_score"))
+                st = str(dqd.get("status") or "").lower()
+                finished = bool(dqd.get("is_finished")) or st in (
+                    "played",
+                    "finished",
+                    "ft",
+                ) or "play" == st
+                # Dongqiudi often uses status display "Played"
+                if "played" in st or finished:
+                    if mid and sc:
+                        latest_ft[mid] = sc
+        except Exception as e:  # noqa: BLE001
+            logger.warning("stale FT scan matches.json failed: %s", e)
+
+        # Also peek last scores from events.jsonl for finished matches not in matches.json
+        try:
+            for line in (lib.bridge_dir(self.root) / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()[-2000:]:
+                if not line.strip():
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if (ev.get("type") or "") != "match_finished":
+                    continue
+                mid = str(ev.get("match_id") or "")
+                sc = score_pair(ev.get("home_score"), ev.get("away_score"))
+                if mid and sc:
+                    latest_ft[mid] = sc
+        except OSError:
+            pass
+
+        closed = 0
+        for lot in list(self.ledger.all_open()):
+            mid = str(lot.get("match_id") or "")
+            ft = latest_ft.get(mid)
+            if ft_reversal_vs_entry(entry=entry_tuple(lot), ft=ft):
+                self.ledger.mark_closed(
+                    str(lot.get("token_id")),
+                    mid,
+                    reason=f"stale_ft_reversal ft={ft[0]}-{ft[1]}",
+                )
+                closed += 1
+        if closed:
+            logger.info("closed %d stale FT-reversed open lots on rebuild", closed)
+
 
     @property
     def trades_path(self) -> Path:
@@ -65,6 +217,33 @@ class TradeExecutor:
                 and row.get("idempotency_key")
             ):
                 self._done.add(str(row["idempotency_key"]))
+
+    def _load_recent_flattens(self, limit: int = 500) -> None:
+        path = self.trades_path
+        if not path.is_file():
+            return
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("trade") != "flatten_reversal":
+                continue
+            key = row.get("idempotency_key")
+            if key and row.get("status") in ("flatten_dry_run", "flatten_posted") and row.get(
+                "success"
+            ):
+                self._flatten_done.add(str(key))
+            # Rebuild open ledger from successful live buys if ledger empty? skip — ledger file is source
 
     def ensure_trader(self) -> ClobTrader | None:
         """Initialize once and reuse (plan: watch 启动时 initialize)."""
@@ -210,6 +389,10 @@ class TradeExecutor:
                 plan.worst_price,
                 plan.take_depth,
             )
+            if trade == "buy_win":
+                self._register_open_buy(
+                    quote, plan=plan, event_key=event_key, match_meta=match_meta, live=False
+                )
             return row
 
         # Live post
@@ -238,19 +421,68 @@ class TradeExecutor:
                     neg_risk=neg_risk,
                 )
             ok = trader.is_order_success(response)
+            resp_status = (
+                str((response or {}).get("status") or "").upper()
+                if isinstance(response, dict)
+                else ""
+            )
+            # DELAYED: CLOB accepted — wait briefly for shares so ledger size is real.
+            ledger_plan = plan
+            if ok and trade == "buy_win" and resp_status == "DELAYED":
+                bal = trader.wait_conditional_balance(
+                    token_id, min_shares=0.01, timeout_s=3.0
+                )
+                if bal > 0:
+                    ledger_plan = FillPlan(
+                        trade=plan.trade,
+                        side=plan.side,
+                        take_depth=plan.take_depth,
+                        order_type=plan.order_type,
+                        shares=round(bal, 6),
+                        usdc=plan.usdc,
+                        worst_price=plan.worst_price,
+                        levels_used=plan.levels_used,
+                        levels=list(plan.levels),
+                        skip_reason=plan.skip_reason,
+                    )
+                    logger.info(
+                        "delayed buy confirmed token=%s… shares=%.4f (plan=%.4f)",
+                        token_id[:12],
+                        bal,
+                        plan.shares,
+                    )
+                else:
+                    logger.warning(
+                        "delayed buy accepted but balance still 0 token=%s… "
+                        "registering plan shares=%.4f for flatten safety",
+                        token_id[:12],
+                        plan.shares,
+                    )
             row = self._record(
                 quote,
                 event_key=event_key,
                 match_meta=match_meta,
-                plan=plan,
+                plan=ledger_plan,
                 status="posted",
-                skip_reason=None,
+                skip_reason=(
+                    f"delayed|{resp_status.lower()}" if resp_status == "DELAYED" else None
+                ),
                 response=response,
                 success=ok,
                 idempotency_key=key,
             )
             if ok:
                 self._done.add(key)
+                if trade == "buy_win":
+                    # Must register even when delayed — otherwise score-reversal
+                    # flatten never sees the lot (Alianza Over 4.5 bug).
+                    self._register_open_buy(
+                        quote,
+                        plan=ledger_plan,
+                        event_key=event_key,
+                        match_meta=match_meta,
+                        live=True,
+                    )
             return row
         except Exception as e:  # noqa: BLE001
             logger.exception("live order failed: %s", e)
@@ -266,6 +498,301 @@ class TradeExecutor:
                 idempotency_key=key,
             )
             return row
+
+    def _register_open_buy(
+        self,
+        quote: dict[str, Any],
+        *,
+        plan: FillPlan,
+        event_key: str,
+        match_meta: dict[str, Any] | None,
+        live: bool,
+    ) -> None:
+        meta = match_meta or {}
+        mid = str(meta.get("match_id") or quote.get("match_id") or "")
+        if not mid:
+            return
+        neg = quote.get("neg_risk")
+        self.ledger.register_buy(
+            match_id=mid,
+            token_id=str(quote.get("token_id") or ""),
+            market_key=str(quote.get("market_key") or ""),
+            shares=float(plan.shares),
+            usdc=float(plan.usdc),
+            home_score=meta.get("home_score"),
+            away_score=meta.get("away_score"),
+            live=live,
+            event_key=event_key,
+            home=str(meta.get("home") or ""),
+            away=str(meta.get("away") or ""),
+            family=str(quote.get("family") or ""),
+            tick_size=str(quote.get("tick_size") or "0.01"),
+            neg_risk=bool(neg) if neg is not None else None,
+        )
+
+    def maybe_flatten_for_event(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
+        """Flatten only lots that depended on a disallowed goal (entry > after score)."""
+        if not self.settings.enabled:
+            return []
+        mid = str(ev.get("match_id") or "")
+        if not mid:
+            return []
+
+        open_lots = self.ledger.open_for_match(mid)
+        if not open_lots:
+            return []
+
+        typ = ev.get("type") or ""
+        after: tuple[int, int] | None = None
+        reason = ""
+
+        if typ == "score_change" and event_signals_reversal(ev):
+            after = score_pair(ev.get("home_score"), ev.get("away_score"))
+            prev = ev.get("prev") or {}
+            reason = (
+                f"score_reversal "
+                f"{prev.get('home')}-{prev.get('away')}→"
+                f"{ev.get('home_score')}-{ev.get('away_score')}"
+            )
+        elif typ == "match_finished":
+            after = score_pair(ev.get("home_score"), ev.get("away_score"))
+            reason = (
+                f"ft_reversal_vs_entry ft={ev.get('home_score')}-{ev.get('away_score')}"
+            )
+        else:
+            return []
+
+        affected = [
+            lot
+            for lot in open_lots
+            if lot_depends_on_disallowed_goal(lot, after_score=after)
+        ]
+        if not affected:
+            return []
+
+        logger.warning(
+            "reversal flatten match=%s lots=%d/%d reason=%s",
+            mid,
+            len(affected),
+            len(open_lots),
+            reason,
+        )
+        out: list[dict[str, Any]] = []
+        ek = f"flatten|{mid}|{ev.get('ts') or lib.now_cn_iso()}|{reason}"
+        for lot in affected:
+            out.append(self._flatten_lot(lot, event_key=ek, reason=reason, match_ev=ev))
+        return out
+
+    def retry_pending_flattens(self) -> list[dict[str, Any]]:
+        """Retry live FAK exits that failed earlier (lot still open + pending_flatten)."""
+        if not self.settings.enabled:
+            return []
+        pending = self.ledger.pending_flatten_lots()
+        if not pending:
+            return []
+        out: list[dict[str, Any]] = []
+        for lot in pending:
+            mid = str(lot.get("match_id") or "")
+            reason = str(lot.get("pending_reason") or "retry_pending_flatten")
+            ek = f"flatten_retry|{mid}|{lib.now_cn_iso()}|{reason}"
+            logger.error(
+                "ALERT flatten_retry match=%s token=%s… attempt=%s reason=%s",
+                mid,
+                str(lot.get("token_id") or "")[:12],
+                lot.get("flatten_attempts"),
+                reason,
+            )
+            out.append(
+                self._flatten_lot(
+                    lot,
+                    event_key=ek,
+                    reason=reason,
+                    match_ev={
+                        "match_id": mid,
+                        "home": lot.get("home"),
+                        "away": lot.get("away"),
+                        "home_score": (lot.get("entry_score") or [None, None])[0]
+                        if isinstance(lot.get("entry_score"), list)
+                        else None,
+                        "away_score": (lot.get("entry_score") or [None, None])[1]
+                        if isinstance(lot.get("entry_score"), list)
+                        else None,
+                    },
+                )
+            )
+        return out
+
+    def _flatten_lot(
+        self,
+        lot: dict[str, Any],
+        *,
+        event_key: str,
+        reason: str,
+        match_ev: dict[str, Any],
+    ) -> dict[str, Any]:
+        token_id = str(lot.get("token_id") or "")
+        mid = str(lot.get("match_id") or "")
+        # Success-only idempotency: failures stay retryable (new retry keys / pending).
+        key = f"{event_key}|{token_id}|flatten_reversal"
+        if key in self._flatten_done:
+            return {
+                "idempotency_key": key,
+                "status": "skipped",
+                "skip_reason": "already_flattened",
+                "trade": "flatten_reversal",
+            }
+
+        planned_shares = float(lot.get("shares") or 0)
+        meta = {
+            "match_id": mid,
+            "home": lot.get("home") or match_ev.get("home") or "",
+            "away": lot.get("away") or match_ev.get("away") or "",
+            "home_score": match_ev.get("home_score"),
+            "away_score": match_ev.get("away_score"),
+        }
+        quote_stub = {
+            "market_key": lot.get("market_key"),
+            "family": lot.get("family"),
+            "token_id": token_id,
+            "trade": "flatten_reversal",
+            "settlement": "REVERSAL",
+            "tick_size": lot.get("tick_size") or "0.01",
+            "neg_risk": lot.get("neg_risk"),
+        }
+
+        # Dry-run: log intent and close ledger lot (so we don't re-fire)
+        if not self.settings.live:
+            plan = FillPlan(
+                trade="flatten_reversal",
+                side="SELL",
+                take_depth="emergency",
+                order_type="FAK",
+                shares=planned_shares,
+                usdc=0.0,
+                worst_price=0.0,
+                levels_used=0,
+                levels=[],
+                skip_reason=None,
+            )
+            row = self._record(
+                quote_stub,
+                event_key=event_key,
+                match_meta=meta,
+                plan=plan,
+                status="flatten_dry_run",
+                skip_reason=reason,
+                response=None,
+                success=True,
+                idempotency_key=key,
+            )
+            self._flatten_done.add(key)
+            self.ledger.mark_closed(token_id, mid, reason=reason)
+            logger.info(
+                "flatten dry-run match=%s token=%s… shares=%.4f (%s)",
+                mid,
+                token_id[:12],
+                planned_shares,
+                reason,
+            )
+            return row
+
+        # Live FAK sell full wallet balance for this token (ignore extreme-price guard).
+        try:
+            trader = self.ensure_trader()
+            if trader is None:
+                raise RuntimeError("no trader for flatten")
+            bal = float(trader.get_conditional_balance(token_id))
+            shares = bal if bal > 0 else 0.0
+            if shares <= 0:
+                row = self._record(
+                    quote_stub,
+                    event_key=event_key,
+                    match_meta=meta,
+                    plan=None,
+                    status="flatten_skipped",
+                    skip_reason="no_position_on_flatten",
+                    response=None,
+                    success=False,
+                    idempotency_key=key,
+                )
+                self.ledger.mark_closed(token_id, mid, reason=reason + "|empty")
+                return row
+            tick = str(lot.get("tick_size") or "0.01") or "0.01"
+            neg = lot.get("neg_risk")
+            neg_risk = bool(neg) if neg is not None else None
+            response = trader.post_market_sell(
+                token_id,
+                Decimal(str(shares)),
+                tick,
+                min_price=None,
+                order_type="FAK",
+                neg_risk=neg_risk,
+            )
+            ok = trader.is_order_success(response)
+            # Confirm residual — FAK may partial-fill; leftover stays pending.
+            residual = 0.0
+            try:
+                residual = float(trader.get_conditional_balance(token_id))
+            except Exception:  # noqa: BLE001
+                residual = -1.0
+            fully_flat = ok and residual >= 0 and residual < 0.01
+
+            plan = FillPlan(
+                trade="flatten_reversal",
+                side="SELL",
+                take_depth="emergency",
+                order_type="FAK",
+                shares=shares,
+                usdc=0.0,
+                worst_price=0.0,
+                levels_used=0,
+                levels=[],
+                skip_reason=None,
+            )
+            row = self._record(
+                quote_stub,
+                event_key=event_key,
+                match_meta=meta,
+                plan=plan,
+                status="flatten_posted",
+                skip_reason=reason
+                + (f"|residual={residual:.4f}" if residual > 0.01 else ""),
+                response=response,
+                success=fully_flat,
+                idempotency_key=key,
+            )
+            if fully_flat:
+                self._flatten_done.add(key)
+                self.ledger.mark_closed(token_id, mid, reason=reason)
+            else:
+                alert = (
+                    f"ALERT flatten_incomplete match={mid} token={token_id[:12]}… "
+                    f"sold≈{shares:.4f} residual={residual:.4f} ok={ok} — will retry"
+                )
+                logger.error(alert)
+                print(alert, flush=True)
+                self.ledger.mark_pending_flatten(token_id, mid, reason=reason)
+                # Do NOT add to _flatten_done — allow retry with new event_key
+            return row
+        except Exception as e:  # noqa: BLE001
+            alert = (
+                f"ALERT flatten_failed match={mid} token={token_id[:12]}… "
+                f"err={e} — will retry"
+            )
+            logger.exception(alert)
+            print(alert, flush=True)
+            self.ledger.mark_pending_flatten(token_id, mid, reason=f"{reason}|err={e}")
+            return self._record(
+                quote_stub,
+                event_key=event_key,
+                match_meta=meta,
+                plan=None,
+                status="flatten_error",
+                skip_reason=str(e),
+                response=None,
+                success=False,
+                idempotency_key=key,
+            )
 
     def _position_shares(self, token_id: str) -> float | None:
         """Available conditional balance.

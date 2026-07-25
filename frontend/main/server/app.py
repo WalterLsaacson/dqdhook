@@ -201,73 +201,136 @@ def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess
     return proc
 
 
-def start_stack(*, open_browser: bool = True) -> dict[str, Any]:
-    """Start three boards, then quote watch (+ in-process trade) cascade."""
-    global _started_at, _quote_proc
+_supervisor_stop = threading.Event()
+_supervisor_thread: threading.Thread | None = None
+
+
+def _boards_all_up() -> bool:
+    return all(_port_open(int(b["port"])) for b in BOARDS)
+
+
+def _ensure_boards() -> list[dict[str, Any]]:
+    """Start any board whose port is down. Returns launch records."""
+    launched: list[dict[str, Any]] = []
+    for board in BOARDS:
+        port = int(board["port"])
+        url = f"http://{HOST}:{port}/"
+        if _port_open(port):
+            launched.append(
+                {"id": board["id"], "port": port, "url": url, "already": True}
+            )
+            continue
+        print(f"main → starting {board['id']} @ {url}", flush=True)
+        proc = _spawn(Path(board["script"]))
+        _children.append(proc)
+        launched.append(
+            {
+                "id": board["id"],
+                "port": port,
+                "url": url,
+                "already": False,
+                "pid": proc.pid,
+            }
+        )
+    return launched
+
+
+def _ensure_quote() -> bool:
+    """Start quote watch if missing. Returns True if (re)started."""
+    global _quote_proc
+    if _quote_proc is not None and _quote_proc.poll() is None:
+        return False
+    watch_args = quote_watch_argv(_quote_trade)
+    trade = _quote_trade
+    mode = (
+        "off"
+        if not trade.get("enabled")
+        else ("live" if trade.get("live") else "dry-run")
+    )
+    print(
+        "main → starting polymarket-quote watch "
+        f"(trade={mode} depth={trade.get('take_depth')} "
+        f"max_usdc={trade.get('max_usdc')}) "
+        "(→ match-bridge → dongqiudi-match + polymarket-soccer)",
+        flush=True,
+    )
+    quote_log = ROOT / "data" / "pm-quote" / "watch.log"
+    _quote_proc = _spawn(QUOTE_SCRIPT, *watch_args, log_path=quote_log)
+    _children.append(_quote_proc)
+    return True
+
+
+def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
+    """One-shot: boards + quote cascade. Heals missing children if already started."""
+    global _started_at
     with _lock:
-        if _started_at and _quote_proc and _quote_proc.poll() is None:
+        quote_alive = bool(_quote_proc and _quote_proc.poll() is None)
+        if _started_at and quote_alive and _boards_all_up():
             return status()
 
-        launched: list[dict[str, Any]] = []
-        for board in BOARDS:
-            port = int(board["port"])
-            url = f"http://{HOST}:{port}/"
-            if _port_open(port):
-                launched.append(
-                    {"id": board["id"], "port": port, "url": url, "already": True}
-                )
-                continue
-            print(f"main → starting {board['id']} @ {url}", flush=True)
-            proc = _spawn(Path(board["script"]))
-            _children.append(proc)
-            launched.append(
-                {
-                    "id": board["id"],
-                    "port": port,
-                    "url": url,
-                    "already": False,
-                    "pid": proc.pid,
-                }
-            )
+        launched = _ensure_boards()
 
         # Wait for bridge-board so quote can attach via HTTP.
         deadline = time.time() + 20
         while time.time() < deadline and not _port_open(8789):
             time.sleep(0.15)
 
-        watch_args = quote_watch_argv(_quote_trade)
-        trade = _quote_trade
-        mode = (
-            "off"
-            if not trade.get("enabled")
-            else ("live" if trade.get("live") else "dry-run")
-        )
-        print(
-            "main → starting polymarket-quote watch "
-            f"(trade={mode} depth={trade.get('take_depth')} "
-            f"max_usdc={trade.get('max_usdc')}) "
-            "(→ match-bridge → dongqiudi-match + polymarket-soccer)",
-            flush=True,
-        )
-        quote_log = ROOT / "data" / "pm-quote" / "watch.log"
-        _quote_proc = _spawn(QUOTE_SCRIPT, *watch_args, log_path=quote_log)
-        _children.append(_quote_proc)
-        _started_at = _now()
+        _ensure_quote()
+        if _started_at is None:
+            _started_at = _now()
+        _start_supervisor()
 
         if open_browser:
             threading.Thread(
                 target=_open_uis, args=(launched,), name="open-uis", daemon=True
             ).start()
 
+        trade = _quote_trade
         return {
             "ok": True,
             "started_at": _started_at,
             "boards": launched,
-            "quote_pid": _quote_proc.pid,
+            "quote_pid": _quote_proc.pid if _quote_proc else None,
             "quote_trade": dict(trade),
-            "quote_argv": watch_args,
+            "quote_argv": quote_watch_argv(trade),
             "hub": f"http://{HOST}:{PORT}/",
         }
+
+
+def start_stack(*, open_browser: bool = True) -> dict[str, Any]:
+    """Start three boards, then quote watch (+ in-process trade) cascade."""
+    return ensure_stack(open_browser=open_browser)
+
+
+def _supervisor_loop() -> None:
+    """Keep boards + quote up while the stack is marked started."""
+    while not _supervisor_stop.wait(5.0):
+        with _lock:
+            if _started_at is None:
+                continue
+            try:
+                healed_boards = not _boards_all_up()
+                if healed_boards:
+                    print("main → supervisor: board(s) down, restarting…", flush=True)
+                    _ensure_boards()
+                    deadline = time.time() + 15
+                    while time.time() < deadline and not _port_open(8789):
+                        time.sleep(0.15)
+                if _ensure_quote():
+                    print("main → supervisor: quote watch restarted", flush=True)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+
+def _start_supervisor() -> None:
+    global _supervisor_thread
+    if _supervisor_thread is not None and _supervisor_thread.is_alive():
+        return
+    _supervisor_stop.clear()
+    _supervisor_thread = threading.Thread(
+        target=_supervisor_loop, name="main-supervisor", daemon=True
+    )
+    _supervisor_thread.start()
 
 
 def _open_uis(launched: list[dict[str, Any]]) -> None:
@@ -290,6 +353,7 @@ def _open_uis(launched: list[dict[str, Any]]) -> None:
 
 def stop_stack() -> dict[str, Any]:
     global _quote_proc, _started_at
+    _supervisor_stop.set()
     with _lock:
         procs = list(_children)
         _children.clear()

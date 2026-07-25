@@ -296,10 +296,10 @@ def detect_score_changes(
     paired: list[dict[str, Any]],
     prev_scores: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Emit score_change when a matched live fixture's score ticks (goal).
+    """Emit score_change on goals and on score reversals (disallowed / corrections).
 
-    First sighting only seeds prev_scores. Used by polymarket-quote for
-    mid-match locked-outcome scans (e.g. 1-0 kills 0-0 exact score).
+    First sighting only seeds prev_scores. Goals: is_goal=True.
+    Score drop on either side: is_reversal=True (polymarket-quote flattens).
     """
     events: list[dict[str, Any]] = []
     ts = datetime.now(TZ_CN).isoformat(timespec="seconds")
@@ -331,7 +331,7 @@ def detect_score_changes(
         if ph == hs_i and pa == aws_i:
             continue
 
-        # Soccer scores only rise; ignore non-monotonic glitches for emission.
+        # Goal: scores only rise.
         if hs_i >= ph and aws_i >= pa and (hs_i > ph or aws_i > pa):
             events.append(
                 {
@@ -351,6 +351,36 @@ def detect_score_changes(
                         else ("home" if hs_i > ph else "away")
                     ),
                     "is_goal": True,
+                    "is_reversal": False,
+                    "status": dqd.get("status") or "",
+                    "status_raw": dqd.get("status_raw") or "",
+                    "official_clock": dqd.get("official_clock") or "",
+                    "kickoff_beijing": row.get("kickoff_beijing") or "",
+                    "polymarket": _pm_event_handle(pm),
+                }
+            )
+        # Disallowed / correction: either side's score drops.
+        elif hs_i < ph or aws_i < pa:
+            side = (
+                "both"
+                if hs_i < ph and aws_i < pa
+                else ("home" if hs_i < ph else "away")
+            )
+            events.append(
+                {
+                    "type": "score_change",
+                    "ts": ts,
+                    "match_id": mid,
+                    "league": pm.get("league") or dqd.get("league") or "",
+                    "home": pm.get("home") or dqd.get("home") or "",
+                    "away": pm.get("away") or dqd.get("away") or "",
+                    "prev": {"home": ph, "away": pa},
+                    "curr": {"home": hs_i, "away": aws_i},
+                    "home_score": hs_i,
+                    "away_score": aws_i,
+                    "side": side,
+                    "is_goal": False,
+                    "is_reversal": True,
                     "status": dqd.get("status") or "",
                     "status_raw": dqd.get("status_raw") or "",
                     "official_clock": dqd.get("official_clock") or "",
