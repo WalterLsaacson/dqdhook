@@ -9,11 +9,14 @@ Inputs:
 
 Algorithm (greedy 1:1):
 
-1. Kickoff within **45 minutes** (Beijing `local_date` + `time`)
-2. Fuzzy team similarity on `home`/`away` (and swapped), after stripping FC/IF/… noise and diacritics
-3. Keep pairs with `match_score ≥ 0.62` (override `--min-score`)
+1. **Drop stale PM** — kickoff more than **6h** in the past (override `--pm-stale-hours`)
+2. **Kickoff skew** — absolute `|t_dqd − t_pm| ≤ 90` minutes (override `--max-skew-min`). Prefer DQD `match_timestamp` (UTC epoch → Beijing) and PM `kickoff_beijing`; fall back to `local_date` + `time`
+3. **Bilateral team floor** — home **and** away similarity each ≥ **0.75** on the chosen orientation (direct or swapped); override `--min-side`. Digit tokens like `2028` / `04` are **kept**; digits inside a token are never stripped
+4. **League gate** — when both sides have league fields, alias to canonical codes ([`league_aliases.py`](scripts/league_aliases.py)); known codes must match exactly; otherwise fuzzy ratio must be ≥ **0.40**. Missing league on either side skips this gate
+5. Keep pairs with composite `match_score ≥ 0.70` (override `--min-score`)
 
-League IDs are **not** used (DQD numeric vs PM sport codes).
+Smoke: `python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py`  
+FT period: `python3 .cursor/skills/match-bridge/scripts/smoke_ft_period.py`
 
 ## Output shape
 
@@ -74,8 +77,10 @@ Prefer these fields (most → least specific):
 
 ## End-of-match (`match_finished`)
 
-Dongqiudi skill only exposes `status` / `status_raw` (`Fixture` / `Playing` / `Played`).  
-**Bridge** detects transitions into `played` on matched rows and emits:
+Dongqiudi exposes `status` (`Fixture` / `Playing` / `Played`) and **`period`** (`1H` / `2H` / `FT`).  
+Stoppage time stays `Playing` + `1H`/`2H`. Full time is **`period=FT`** (status may briefly still be Playing).
+
+**Bridge** emits when `period` transitions into `FT` on matched rows:
 
 ```json
 {
@@ -83,7 +88,9 @@ Dongqiudi skill only exposes `status` / `status_raw` (`Fixture` / `Playing` / `P
   "ts": "2026-07-19T20:05:00+08:00",
   "match_id": "54363289",
   "prev_status": "playing",
+  "prev_period": "2H",
   "status": "played",
+  "period": "FT",
   "home": "FC Anyang",
   "away": "Gwangju FC",
   "home_score": 1,
@@ -102,11 +109,13 @@ Downstream `polymarket-quote` joins this event (or `matches.json`) for CLOB quot
 
 Rules:
 
-- First sighting of a match only seeds `prev_status.json` (no event)
-- Fire when previous status ≠ `played` and current = `played`
+- First sighting only seeds `prev_status.json` + `prev_period.json` (no event)
+- Fire when previous `period` ≠ `FT` and current `period` = `FT` (does **not** require `Played`)
+- `1H` / `2H` never emit full-time (covers half-time and injury time)
 - Appended to `data/bridge/events.jsonl`; also in that rematch tick’s `matches.json` → `events`
+- Poll cadence: default live **15s**; if any DQD row is `Played` but `period` ≠ `FT`, next sleep is **5s** until FT
 
-Matched rows get `finished: true` / `dongqiudi.is_finished: true` while status is played.
+Matched rows get `finished: true` / `dongqiudi.is_finished: true` while `period` is `FT`.
 
 ## State files
 
@@ -114,7 +123,8 @@ Matched rows get `finished: true` / `dongqiudi.is_finished: true` while status i
 |---|---|
 | `data/bridge/matches.json` | Last match result (+ `events` for that tick) |
 | `data/bridge/latest.json` | Same payload (alias) |
-| `data/bridge/prev_status.json` | Per-match status baseline for FT detection |
+| `data/bridge/prev_status.json` | Per-match status baseline |
+| `data/bridge/prev_period.json` | Per-match period baseline for FT detection |
 | `data/bridge/events.jsonl` | Append-only `match_finished` log |
 | `data/snapshot.json` | DQD upstream |
 | `data/polymarket/snapshot.json` | PM upstream |

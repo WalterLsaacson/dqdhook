@@ -16,9 +16,18 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from league_aliases import LEAGUE_ALIASES
 from team_aliases import TEAM_ALIASES
 
 TZ_CN = timezone(timedelta(hours=8))
+
+DEFAULT_MIN_SCORE = 0.70
+DEFAULT_MIN_SIDE = 0.75
+DEFAULT_MAX_SKEW_MIN = 90
+DEFAULT_PM_STALE_HOURS = 6
+DEFAULT_LEAGUE_FLOOR = 0.40
+# After status=Played but period not yet FT, poll faster (default live stays 15s).
+PENDING_FT_POLL_SEC = 5
 
 # Noise words stripped before fuzzy compare.
 _TEAM_STOP = frozenset(
@@ -60,8 +69,10 @@ _TEAM_STOP = frozenset(
     }
 )
 
-# Canonical alias table — extend in team_aliases.py
+# Canonical alias tables — extend in team_aliases.py / league_aliases.py
 _TEAM_ALIASES = TEAM_ALIASES
+_LEAGUE_ALIASES = LEAGUE_ALIASES
+_KNOWN_LEAGUE_CODES = frozenset(_LEAGUE_ALIASES.values())
 
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
@@ -73,6 +84,11 @@ def repo_root_from(scripts_file: Path) -> Path:
 
 
 def normalize_team(name: str) -> str:
+    """Normalize team names for fuzzy compare.
+
+    Keeps standalone digit tokens (e.g. ``2028``, ``04``). Never strips digits
+    from inside a token (``shenzhen2028``, ``u23`` stay intact).
+    """
     s = unicodedata.normalize("NFKD", str(name or ""))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower().strip()
@@ -86,7 +102,7 @@ def normalize_team(name: str) -> str:
     s = _WS_RE.sub(" ", s).strip()
     if s in _TEAM_ALIASES:
         s = _TEAM_ALIASES[s]
-    tokens = [t for t in s.split(" ") if t and t not in _TEAM_STOP and not t.isdigit()]
+    tokens = [t for t in s.split(" ") if t and t not in _TEAM_STOP]
     out = " ".join(tokens)
     return _TEAM_ALIASES.get(out, out)
 
@@ -105,6 +121,43 @@ def team_similarity(a: str, b: str) -> float:
     return max(jacc, seq)
 
 
+def normalize_league(name: str = "", league_id: str = "") -> str:
+    """Map DQD/PM league labels to a comparable string (prefer alias codes)."""
+    for raw in (league_id, name):
+        key = str(raw or "").strip()
+        if not key:
+            continue
+        low = key.lower()
+        if low in _LEAGUE_ALIASES:
+            return _LEAGUE_ALIASES[low]
+        if key in _LEAGUE_ALIASES:
+            return _LEAGUE_ALIASES[key]
+        # light cleanup then alias again
+        cleaned = _WS_RE.sub(" ", _PUNCT_RE.sub(" ", low)).strip()
+        if cleaned in _LEAGUE_ALIASES:
+            return _LEAGUE_ALIASES[cleaned]
+    # Fallback: cleaned display name (or id) for fuzzy compare
+    for raw in (name, league_id):
+        key = str(raw or "").strip()
+        if key:
+            return _WS_RE.sub(" ", _PUNCT_RE.sub(" ", key.lower())).strip()
+    return ""
+
+
+def league_similarity(dqd: dict[str, Any], pm: dict[str, Any]) -> float | None:
+    """Return league similarity, or None when either side lacks league fields."""
+    a = normalize_league(str(dqd.get("league") or ""), str(dqd.get("league_id") or ""))
+    b = normalize_league(str(pm.get("league") or ""), str(pm.get("league_id") or ""))
+    if not a or not b:
+        return None
+    if a == b:
+        return 1.0
+    # Known canonical codes must match exactly (中甲 vs 中乙 etc.).
+    if a in _KNOWN_LEAGUE_CODES and b in _KNOWN_LEAGUE_CODES:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def _parse_hhmm(value: str) -> int | None:
     try:
         hh, mm = str(value).strip().split(":")[:2]
@@ -113,34 +166,95 @@ def _parse_hhmm(value: str) -> int | None:
         return None
 
 
+def _kickoff_dt(row: dict[str, Any]) -> datetime | None:
+    """Absolute Beijing kickoff: match_timestamp → kickoff_beijing → local_date+time."""
+    ts = row.get("match_timestamp")
+    if ts is not None and str(ts).strip() != "":
+        try:
+            epoch = float(ts)
+            if epoch > 1e12:  # ms
+                epoch /= 1000.0
+            return datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(TZ_CN)
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+
+    kb = str(row.get("kickoff_beijing") or "").strip()
+    if kb:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(kb, fmt).replace(tzinfo=TZ_CN)
+            except ValueError:
+                continue
+
+    da = str(row.get("local_date") or "").strip()
+    tm = str(row.get("time") or "").strip()
+    if da and tm and _parse_hhmm(tm) is not None:
+        try:
+            return datetime.strptime(f"{da} {tm}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_CN)
+        except ValueError:
+            return None
+    return None
+
+
 def kickoff_minutes_apart(a: dict[str, Any], b: dict[str, Any]) -> int | None:
-    """Absolute minute distance using local_date + time (Beijing)."""
-    da = str(a.get("local_date") or "")
-    db = str(b.get("local_date") or "")
-    ta = _parse_hhmm(str(a.get("time") or ""))
-    tb = _parse_hhmm(str(b.get("time") or ""))
-    if not da or not db or ta is None or tb is None:
+    """Absolute minute distance between kickoffs (prefer epoch / kickoff_beijing)."""
+    dta = _kickoff_dt(a)
+    dtb = _kickoff_dt(b)
+    if dta is None or dtb is None:
         return None
-    try:
-        dta = datetime.strptime(f"{da} {a.get('time')}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_CN)
-        dtb = datetime.strptime(f"{db} {b.get('time')}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_CN)
-    except ValueError:
-        return abs(ta - tb) if da == db else None
     return int(abs((dta - dtb).total_seconds()) // 60)
 
 
-def score_pair(dqd: dict[str, Any], pm: dict[str, Any], *, max_skew_min: int = 45) -> float:
+def filter_fresh_pm_matches(
+    pm_matches: list[dict[str, Any]],
+    *,
+    stale_hours: float = DEFAULT_PM_STALE_HOURS,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Drop PM events whose kickoff is more than ``stale_hours`` in the past."""
+    if stale_hours is None or stale_hours < 0:
+        return list(pm_matches)
+    now_cn = now or datetime.now(TZ_CN)
+    cutoff = now_cn - timedelta(hours=float(stale_hours))
+    out: list[dict[str, Any]] = []
+    for p in pm_matches:
+        dt = _kickoff_dt(p)
+        if dt is None or dt >= cutoff:
+            out.append(p)
+    return out
+
+
+def _side_pair_ok(home_s: float, away_s: float, min_side: float) -> bool:
+    return home_s >= min_side and away_s >= min_side
+
+
+def score_pair(
+    dqd: dict[str, Any],
+    pm: dict[str, Any],
+    *,
+    max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
+    min_side: float = DEFAULT_MIN_SIDE,
+    league_floor: float = DEFAULT_LEAGUE_FLOOR,
+) -> float:
     skew = kickoff_minutes_apart(dqd, pm)
     if skew is None or skew > max_skew_min:
         return 0.0
+
+    league_s = league_similarity(dqd, pm)
+    if league_s is not None and league_s < league_floor:
+        return 0.0
+
     home_s = team_similarity(dqd.get("home") or "", pm.get("home") or "")
     away_s = team_similarity(dqd.get("away") or "", pm.get("away") or "")
-    direct = (home_s + away_s) / 2
-    swap = (
-        team_similarity(dqd.get("home") or "", pm.get("away") or "")
-        + team_similarity(dqd.get("away") or "", pm.get("home") or "")
-    ) / 2
+    direct = (home_s + away_s) / 2 if _side_pair_ok(home_s, away_s, min_side) else 0.0
+
+    swap_h = team_similarity(dqd.get("home") or "", pm.get("away") or "")
+    swap_a = team_similarity(dqd.get("away") or "", pm.get("home") or "")
+    swap = (swap_h + swap_a) / 2 if _side_pair_ok(swap_h, swap_a, min_side) else 0.0
+
     best = max(direct, swap)
+    if best <= 0.0:
+        return 0.0
     # Soft time bonus
     time_factor = 1.0 - min(skew, max_skew_min) / (max_skew_min * 2)
     return best * (0.85 + 0.15 * time_factor)
@@ -172,14 +286,24 @@ def match_fixtures(
     dqd_matches: list[dict[str, Any]],
     pm_matches: list[dict[str, Any]],
     *,
-    min_score: float = 0.62,
-    max_skew_min: int = 45,
+    min_score: float = DEFAULT_MIN_SCORE,
+    max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
+    min_side: float = DEFAULT_MIN_SIDE,
+    league_floor: float = DEFAULT_LEAGUE_FLOOR,
+    pm_stale_hours: float = DEFAULT_PM_STALE_HOURS,
 ) -> list[dict[str, Any]]:
     """Greedy 1:1 matching by similarity score."""
+    pm_fresh = filter_fresh_pm_matches(pm_matches, stale_hours=pm_stale_hours)
     candidates: list[tuple[float, int, int]] = []
     for i, d in enumerate(dqd_matches):
-        for j, p in enumerate(pm_matches):
-            s = score_pair(d, p, max_skew_min=max_skew_min)
+        for j, p in enumerate(pm_fresh):
+            s = score_pair(
+                d,
+                p,
+                max_skew_min=max_skew_min,
+                min_side=min_side,
+                league_floor=league_floor,
+            )
             if s >= min_score:
                 candidates.append((s, i, j))
     candidates.sort(reverse=True, key=lambda x: x[0])
@@ -193,7 +317,7 @@ def match_fixtures(
         used_d.add(i)
         used_p.add(j)
         d = dict(dqd_matches[i])
-        p = pm_matches[j]
+        p = pm_fresh[j]
         # Refresh clocks at match time (wall clock drifts between DQD polls).
         try:
             import dqd_lib as dqd  # type: ignore
@@ -288,6 +412,27 @@ def status_bucket(dqd: dict[str, Any] | None) -> str:
     if "play" in raw and "ed" in raw:
         return "played"
     return raw or ""
+
+
+def period_bucket(dqd: dict[str, Any] | None) -> str:
+    """Normalize Dongqiudi period into 1H|2H|FT|'' (uppercase)."""
+    if not dqd:
+        return ""
+    return str(dqd.get("period") or "").strip().upper()
+
+
+def is_full_time(dqd: dict[str, Any] | None) -> bool:
+    """True when Dongqiudi marks the match period as full time."""
+    return period_bucket(dqd) == "FT"
+
+
+def is_pending_ft_poll(dqd: dict[str, Any] | None) -> bool:
+    """Played status but period not FT yet — accelerate DQD polling."""
+    return status_bucket(dqd) == "played" and not is_full_time(dqd)
+
+
+def has_pending_ft_poll(matches: list[dict[str, Any]] | None) -> bool:
+    return any(is_pending_ft_poll(m) for m in (matches or []))
 
 
 def _pm_event_handle(pm: dict[str, Any]) -> dict[str, Any]:
@@ -403,11 +548,12 @@ def detect_score_changes(
 def detect_match_finished(
     paired: list[dict[str, Any]],
     prev_status: dict[str, str],
+    prev_period: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Emit match_finished when DQD status transitions into played.
+    """Emit match_finished when DQD period transitions into FT.
 
-    First sighting only seeds prev_status (no event). Dongqiudi skill exposes
-    status/status_raw; bridge owns the终局 trigger.
+    Dongqiudi keeps period=1H/2H through stoppage; full time is period=FT
+    (status may still be Playing briefly). First sighting only seeds baselines.
     """
     events: list[dict[str, Any]] = []
     ts = datetime.now(TZ_CN).isoformat(timespec="seconds")
@@ -417,25 +563,35 @@ def detect_match_finished(
         mid = str(dqd.get("id") or "")
         if not mid:
             continue
-        curr = status_bucket(dqd)
-        finished = curr == "played"
+        curr_status = status_bucket(dqd)
+        curr_period = period_bucket(dqd)
+        finished = is_full_time(dqd)
         dqd["is_finished"] = finished
         row["finished"] = finished
         row["dongqiudi"] = dqd
 
-        prev = prev_status.get(mid)
-        if prev is None:
-            prev_status[mid] = curr
-            continue
+        if mid not in prev_period:
+            # Upgrade / cold bootstrap: status was already tracked, period file is new.
+            # Do not seed current FT as the baseline (that would swallow the edge).
+            if mid in prev_status:
+                prev_period[mid] = ""
+            else:
+                prev_period[mid] = curr_period
+                prev_status[mid] = curr_status
+                continue
 
-        if prev != "played" and curr == "played":
+        prev_p = str(prev_period.get(mid) or "")
+        prev_s = str(prev_status.get(mid) or "")
+        if prev_p != "FT" and curr_period == "FT":
             events.append(
                 {
                     "type": "match_finished",
                     "ts": ts,
                     "match_id": mid,
-                    "prev_status": prev,
-                    "status": curr,
+                    "prev_status": prev_s,
+                    "prev_period": prev_p,
+                    "status": curr_status or "played",
+                    "period": curr_period,
                     "status_display": dqd.get("status") or "Played",
                     "league": pm.get("league") or dqd.get("league") or "",
                     "home": pm.get("home") or dqd.get("home") or "",
@@ -449,10 +605,11 @@ def detect_match_finished(
             )
             row["finished_at"] = ts
         elif finished and row.get("finished_at") is None:
-            # Already finished before we started watching — no toast, keep flag.
+            # Already FT before we started watching — no toast, keep flag.
             pass
 
-        prev_status[mid] = curr
+        prev_period[mid] = curr_period
+        prev_status[mid] = curr_status
     return events
 
 
@@ -468,7 +625,10 @@ class BridgeRuntime:
         dqd_idle_interval: int = 60,
         pm_interval: int = 600,
         pm_within_hours: int = 48,
-        min_score: float = 0.62,
+        min_score: float = DEFAULT_MIN_SCORE,
+        max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
+        min_side: float = DEFAULT_MIN_SIDE,
+        pm_stale_hours: float = DEFAULT_PM_STALE_HOURS,
     ) -> None:
         self.root = root
         # full tab overlaps Polymarket's multi-league 48h window better than hot-only
@@ -478,6 +638,9 @@ class BridgeRuntime:
         self.pm_interval = max(120, pm_interval)
         self.pm_within_hours = pm_within_hours
         self.min_score = min_score
+        self.max_skew_min = max_skew_min
+        self.min_side = min_side
+        self.pm_stale_hours = pm_stale_hours
 
         self.dqd_scripts = root / ".cursor" / "skills" / "dongqiudi-match" / "scripts"
         self.pm_scripts = root / ".cursor" / "skills" / "polymarket-soccer" / "scripts"
@@ -513,6 +676,9 @@ class BridgeRuntime:
                 "pm_interval": self.pm_interval,
                 "pm_within_hours": self.pm_within_hours,
                 "min_score": self.min_score,
+                "max_skew_min": self.max_skew_min,
+                "min_side": self.min_side,
+                "pm_stale_hours": self.pm_stale_hours,
                 "dqd_ticks": self.dqd_ticks,
                 "pm_ticks": self.pm_ticks,
                 "match_ticks": self.match_ticks,
@@ -554,9 +720,17 @@ class BridgeRuntime:
         pm_snap = load_json(self.pm_data / "snapshot.json", {}) or {}
         dqd_matches = list(dqd_snap.get("matches") or [])
         pm_matches = list(pm_snap.get("matches") or [])
-        paired = match_fixtures(dqd_matches, pm_matches, min_score=self.min_score)
+        paired = match_fixtures(
+            dqd_matches,
+            pm_matches,
+            min_score=self.min_score,
+            max_skew_min=self.max_skew_min,
+            min_side=self.min_side,
+            pm_stale_hours=self.pm_stale_hours,
+        )
 
         prev_path = self.bridge_data / "prev_status.json"
+        prev_period_path = self.bridge_data / "prev_period.json"
         prev_scores_path = self.bridge_data / "prev_scores.json"
         events_path = self.bridge_data / "events.jsonl"
         prev_status = load_json(prev_path, {}) or {}
@@ -564,15 +738,21 @@ class BridgeRuntime:
             prev_status = {}
         prev_status = {str(k): str(v) for k, v in prev_status.items()}
 
+        prev_period = load_json(prev_period_path, {}) or {}
+        if not isinstance(prev_period, dict):
+            prev_period = {}
+        prev_period = {str(k): str(v) for k, v in prev_period.items()}
+
         prev_scores = load_json(prev_scores_path, {}) or {}
         if not isinstance(prev_scores, dict):
             prev_scores = {}
         prev_scores = {str(k): v for k, v in prev_scores.items() if isinstance(v, dict)}
 
         score_events = detect_score_changes(paired, prev_scores)
-        ft_events = detect_match_finished(paired, prev_status)
+        ft_events = detect_match_finished(paired, prev_status, prev_period)
         events = score_events + ft_events
         write_json(prev_path, prev_status)
+        write_json(prev_period_path, prev_period)
         write_json(prev_scores_path, prev_scores)
         append_events(events_path, events)
 
@@ -586,6 +766,9 @@ class BridgeRuntime:
             "count": len(paired),
             "finished_count": finished_n,
             "min_score": self.min_score,
+            "max_skew_min": self.max_skew_min,
+            "min_side": self.min_side,
+            "pm_stale_hours": self.pm_stale_hours,
             "events": events,
             "matches": paired,
         }
@@ -648,8 +831,16 @@ class BridgeRuntime:
             sleep_s = self.dqd_idle_interval
             try:
                 result = self.refresh_dqd_once()
-                sleep_s = self.dqd_interval if result.get("has_live") else self.dqd_idle_interval
                 self.rematch()
+                dqd_snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
+                dqd_matches = list(dqd_snap.get("matches") or [])
+                if has_pending_ft_poll(dqd_matches):
+                    # Played but period not FT yet — catch period→FT sooner.
+                    sleep_s = PENDING_FT_POLL_SEC
+                elif result.get("has_live"):
+                    sleep_s = self.dqd_interval
+                else:
+                    sleep_s = self.dqd_idle_interval
             except Exception as e:  # noqa: BLE001
                 with self.lock:
                     self.last_error = f"dqd: {e}"

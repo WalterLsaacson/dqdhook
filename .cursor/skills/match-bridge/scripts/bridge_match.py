@@ -41,7 +41,14 @@ def get_runtime(args: argparse.Namespace) -> lib.BridgeRuntime:
             dqd_idle_interval=int(getattr(args, "dqd_idle_interval", 60) or 60),
             pm_interval=int(getattr(args, "pm_interval", 600) or 600),
             pm_within_hours=int(getattr(args, "within_hours", 48) or 48),
-            min_score=float(getattr(args, "min_score", 0.62) or 0.62),
+            min_score=float(getattr(args, "min_score", lib.DEFAULT_MIN_SCORE) or lib.DEFAULT_MIN_SCORE),
+            max_skew_min=int(getattr(args, "max_skew_min", lib.DEFAULT_MAX_SKEW_MIN) or lib.DEFAULT_MAX_SKEW_MIN),
+            min_side=float(getattr(args, "min_side", lib.DEFAULT_MIN_SIDE) or lib.DEFAULT_MIN_SIDE),
+            pm_stale_hours=float(
+                getattr(args, "pm_stale_hours", lib.DEFAULT_PM_STALE_HOURS)
+                if getattr(args, "pm_stale_hours", None) is not None
+                else lib.DEFAULT_PM_STALE_HOURS
+            ),
         )
     return _RUNTIME
 
@@ -125,7 +132,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dqd-idle-interval", type=int, default=60, help="DQD idle poll seconds")
     p.add_argument("--pm-interval", type=int, default=600, help="Polymarket refresh seconds (default 10m)")
     p.add_argument("--within-hours", type=int, default=48, help="PM upcoming window hours")
-    p.add_argument("--min-score", type=float, default=0.62, help="Fuzzy match threshold 0-1")
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=lib.DEFAULT_MIN_SCORE,
+        help=f"Fuzzy match threshold 0-1 (default {lib.DEFAULT_MIN_SCORE})",
+    )
+    p.add_argument(
+        "--min-side",
+        type=float,
+        default=lib.DEFAULT_MIN_SIDE,
+        help=f"Min home AND away team similarity (default {lib.DEFAULT_MIN_SIDE})",
+    )
+    p.add_argument(
+        "--max-skew-min",
+        type=int,
+        default=lib.DEFAULT_MAX_SKEW_MIN,
+        help=f"Max absolute kickoff skew minutes (default {lib.DEFAULT_MAX_SKEW_MIN})",
+    )
+    p.add_argument(
+        "--pm-stale-hours",
+        type=float,
+        default=lib.DEFAULT_PM_STALE_HOURS,
+        help=f"Drop PM events with kickoff older than this many hours (default {lib.DEFAULT_PM_STALE_HOURS})",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     once = sub.add_parser("once", help="Refresh both skills once and emit matches JSON")

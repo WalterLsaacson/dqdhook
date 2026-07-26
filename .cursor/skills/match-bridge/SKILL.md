@@ -35,8 +35,11 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py status --json
 
 | Source | Skill | Default refresh |
 |---|---|---|
-| Dongqiudi | `dongqiudi-match` watch (`full` tab) | **15s** live / **60s** idle |
+| Dongqiudi | `dongqiudi-match` watch (`full` tab) | **15s** live / **60s** idle; **5s** while any match is `Played` but `period` ≠ `FT` |
 | Polymarket | `polymarket-soccer` list | **600s** (10 min), `within_hours=48` |
+
+Matching defaults: `min_score=0.70`, `min_side=0.75`, `max_skew_min=90`, `pm_stale_hours=6` (see [reference.md](reference.md)).  
+Full-time: `period=FT` edge (not mere `Played`); see [reference.md](reference.md).
 
 ## Agent workflow
 
@@ -52,8 +55,8 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py status --json
 |---|---|---|
 | CLI JSON | `once` / `list` stdout | Matched pairs (+ `events` that tick) |
 | Snapshot | `data/bridge/matches.json` | Last successful match run |
-| FT events | `data/bridge/events.jsonl` | `match_finished` when status → played |
-| Status baseline | `data/bridge/prev_status.json` | For FT transition detection |
+| FT events | `data/bridge/events.jsonl` | `match_finished` when `period` → `FT` |
+| Status baseline | `data/bridge/prev_status.json` / `prev_period.json` | For FT transition detection |
 | Upstream DQD | `data/snapshot.json` | Written by embedded DQD watch |
 | Upstream PM | `data/polymarket/snapshot.json` | Written by embedded PM list |
 
@@ -77,5 +80,5 @@ Module: [`frontend/bridge-board/`](../../../frontend/bridge-board/).
 
 ## Files
 
-- Scripts: [scripts/bridge_match.py](scripts/bridge_match.py), [scripts/bridge_lib.py](scripts/bridge_lib.py), [scripts/team_aliases.py](scripts/team_aliases.py) (CN / abbr → EN)
-- Details: [reference.md](reference.md)
+- Scripts: [scripts/bridge_match.py](scripts/bridge_match.py), [scripts/bridge_lib.py](scripts/bridge_lib.py), [scripts/team_aliases.py](scripts/team_aliases.py) (CN / abbr → EN), [scripts/league_aliases.py](scripts/league_aliases.py) (league short names → codes), [scripts/smoke_match_hardening.py](scripts/smoke_match_hardening.py), [scripts/smoke_ft_period.py](scripts/smoke_ft_period.py)
+- Docs: this file, [reference.md](reference.md) (matching thresholds, output shape, FT events)
