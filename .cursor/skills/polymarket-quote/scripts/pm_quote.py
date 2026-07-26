@@ -27,6 +27,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
+from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import load_trade_settings, resolve_live_modes  # noqa: E402
 
@@ -245,6 +246,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         stop_event=stop_warm,
         run_immediately=True,
     )
+    sampler = PostGoalSampler(rt)
+    sampler.start()
+    print(
+        f"post-goal sampler → {lib.data_dir(rt) / 'post_goal_samples.jsonl'} "
+        f"(buy tokens · 10s × 6 · jsonl only)",
+        file=sys.stderr,
+        flush=True,
+    )
     print(
         f"polymarket-quote watch (wake≤{interval}s · market_cache · "
         f"retain={retain_h}h) → {lib.data_dir(rt)}",
@@ -309,6 +318,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nbye", file=sys.stderr)
         stop_warm.set()
+        sampler.stop()
         if not args.no_upstream:
             lib.stop_owned_bridge()
         return 0

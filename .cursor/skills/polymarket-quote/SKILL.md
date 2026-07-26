@@ -68,6 +68,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal. Flatten follows **`lot.live`** (dry lots → `flatten_dry_run`; live lots → CLOB). Live FAK sell floors shares to **2dp**, `min_price=0.2`; dust &lt; 0.01 closes the lot; `invalid maker amount` stops retry. `max_usdc` default **5**.
 9. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
 10. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
+11. **Post-goal samples (data only)**: when `score_change` produces a successful `buy_win` (dry or live), write that quote as sample 0 and background-requote the same tokens at +10s…+50s (6 total) into `post_goal_samples.jsonl` — no extra `maybe_trade`. Jobs run in **parallel**; follow-ups re-read score and recompute settlement; `reversal_seen` only if an event undoes the t0 score.
 
 ## Trading flags
 
@@ -97,6 +98,7 @@ Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while post
 | Latest | `data/pm-quote/latest.json` | Last bundle |
 | Opportunities | `data/pm-quote/opportunities.jsonl` | `misprice=true` rows |
 | Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts + flatten_reversal |
+| Post-goal samples | `data/pm-quote/post_goal_samples.jsonl` | After buy_win on score_change: books at 0/10/20/30/40/50s (no trade) |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots awaiting flatten |
 | Cursor | `data/pm-quote/cursor.json` | Processed event keys |
 

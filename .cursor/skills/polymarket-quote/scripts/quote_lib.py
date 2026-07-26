@@ -1640,6 +1640,21 @@ def process_bridge_events(
                 bundle["flatten_attempts"] = flatten_rows
                 bundle["flatten_count"] = len(flatten_rows)
             bundles.append(bundle)
+            # Data-only: after score_change buy_win, schedule 10s×6 book samples.
+            try:
+                from post_goal_sampler import get_active_sampler
+
+                sampler = get_active_sampler()
+                if sampler is not None:
+                    sampler.enqueue_from_bundle(
+                        bundle,
+                        eps=eps,
+                        fee_rate=fee_rate,
+                        min_net=min_net,
+                        proxy=proxy,
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(f"post-goal sampler enqueue failed: {e}", flush=True)
             seen.add(key)
             if market_cache is not None and ev.get("type") == "match_finished":
                 mid = str(ev.get("match_id") or bundle.get("match_id") or "")

@@ -23,7 +23,7 @@ Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
 | Target | Rule |
 |---|---|
 | `market_cache/*.json` | Keep only **open** paired matches still in `matches.json`; drop finished / orphan. **Skip** if matches file missing / bad / empty. |
-| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` | Keep rows with `quoted_at` ≥ now − retain_hours |
+| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` | Keep rows with `quoted_at`/`sampled_at` ≥ now − retain_hours |
 | `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
 
 Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
@@ -103,6 +103,10 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
 - Dry-run logs `flatten_dry_run`. Default size cap remains **`max_usdc=5`**.
 - Open lots: `data/pm-quote/open_positions.json`.
+
+**Post-goal price samples (research)**
+
+After a `score_change` that successfully `buy_win`s (dry_run or posted), watch writes sample 0 from that quote and background-requotes **only those tokens** at +10s…+50s (6 total) into `data/pm-quote/post_goal_samples.jsonl`. Follow-up jobs run **in parallel** (wall-clock `elapsed_s`). Each follow-up re-reads the match score, recomputes settlement/lock, and sets `reversal_seen` only when a later `score_change` has `prev == score_at_t0` and a lower total. No `maybe_trade` on follow-ups.
 
 **System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with these flags automatically (default dry-run + repo `.env`). Same flags on the hub CLI / `QUOTE_*` env. Logs: `data/pm-quote/watch.log`.
 
