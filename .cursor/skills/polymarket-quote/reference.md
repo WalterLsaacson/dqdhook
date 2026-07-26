@@ -93,7 +93,7 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
 - **One event, two phases**: (1) FAK-flatten affected open `buy_win` lots whose **entry_score** is strictly higher than post-reversal / FT score; (2) **quote once** on the corrected `curr` score (may open newly locked markets). Unaffected lots stay open.
-- Live flatten sells the **full token balance**; incomplete / failed exits set `pending_flatten` and are retried each watch tick with `ALERT` logs.
+- Live flatten sells floored shares (**2 decimal** maker precision), `min_price=0.2`. Dust below `0.01` closes the ledger lot. `invalid maker amount` / `invalid amounts` are terminal (no infinite retry). Incomplete non-terminal exits stay `pending_flatten`.
 - CLOB `status=delayed` (+ `success`/`orderID`) counts as an accepted fill: register the open lot (brief balance poll) so a later reversal can flatten.
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
 - Dry-run logs `flatten_dry_run`. Default size cap remains **`max_usdc=5`**.

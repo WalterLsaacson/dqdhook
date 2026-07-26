@@ -63,7 +63,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 5. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
 6. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
 7. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` posts market **FAK** via `py-clob-client-v2`.
-8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal (entry score strictly higher than after). Live sells full balance and retries failures with `ALERT` logs. `max_usdc` default **5**.
+8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal. Live FAK sell floors shares to **2dp**, `min_price=0.2`; dust &lt; 0.01 closes the lot; `invalid maker amount` stops retry. `max_usdc` default **5**.
 9. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
 10. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
 

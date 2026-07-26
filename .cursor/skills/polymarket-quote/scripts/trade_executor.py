@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from decimal import Decimal
+import re
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +24,35 @@ from trade_settings import TradeSettings
 
 logger = logging.getLogger("pm_quote.trade")
 
+# CLOB FAK/FOK sell: maker (shares) max 2 decimals; floor to avoid invalid maker amount.
+FLATTEN_SHARE_DECIMALS = 2
+FLATTEN_MIN_SHARES = Decimal("0.01")
+# Emergency flatten floor price (do not dump into sub-0.2 bids forever).
+FLATTEN_MIN_PRICE = Decimal("0.2")
+_TERMINAL_FLATTEN_ERR_RE = re.compile(
+    r"invalid\s+maker\s+amount|invalid\s+amounts",
+    re.IGNORECASE,
+)
+
 
 def trade_idempotency_key(event_key: str, token_id: str, trade: str) -> str:
     return f"{event_key}|{token_id}|{trade}"
+
+
+def floor_shares(shares: Decimal | float | str, *, decimals: int = FLATTEN_SHARE_DECIMALS) -> Decimal:
+    """Round shares down to ``decimals`` (CLOB sell maker precision)."""
+    q = Decimal(10) ** -int(decimals)
+    d = Decimal(str(shares))
+    if d <= 0:
+        return Decimal("0")
+    return (d / q).to_integral_value(rounding=ROUND_DOWN) * q
+
+
+def is_terminal_flatten_error(err: str | Exception | None) -> bool:
+    """Errors that will not succeed on blind retry (stop pending_flatten loop)."""
+    if err is None:
+        return False
+    return bool(_TERMINAL_FLATTEN_ERR_RE.search(str(err)))
 
 
 class TradeExecutor:
@@ -593,12 +620,35 @@ class TradeExecutor:
         out: list[dict[str, Any]] = []
         for lot in pending:
             mid = str(lot.get("match_id") or "")
+            tid = str(lot.get("token_id") or "")
             reason = str(lot.get("pending_reason") or "retry_pending_flatten")
+            # Stop looping terminal CLOB amount errors left in the ledger.
+            if is_terminal_flatten_error(reason):
+                self.ledger.mark_closed(
+                    tid, mid, reason="terminal_flatten_error|" + reason[:180]
+                )
+                alert = (
+                    f"ALERT flatten_give_up match={mid} token={tid[:12]}… "
+                    f"terminal prior error — stopped retry"
+                )
+                logger.error(alert)
+                print(alert, flush=True)
+                out.append(
+                    {
+                        "quoted_at": lib.now_cn_iso(),
+                        "status": "flatten_abandoned",
+                        "skip_reason": reason[:300],
+                        "trade": "flatten_reversal",
+                        "match_id": mid,
+                        "token_id": tid,
+                    }
+                )
+                continue
             ek = f"flatten_retry|{mid}|{lib.now_cn_iso()}|{reason}"
             logger.error(
                 "ALERT flatten_retry match=%s token=%s… attempt=%s reason=%s",
                 mid,
-                str(lot.get("token_id") or "")[:12],
+                tid[:12],
                 lot.get("flatten_attempts"),
                 reason,
             )
@@ -696,55 +746,74 @@ class TradeExecutor:
             )
             return row
 
-        # Live FAK sell full wallet balance for this token (ignore extreme-price guard).
+        # Live FAK sell: floor shares to 2dp (CLOB maker precision), min_price=0.2.
         try:
             trader = self.ensure_trader()
             if trader is None:
                 raise RuntimeError("no trader for flatten")
-            bal = float(trader.get_conditional_balance(token_id))
-            shares = bal if bal > 0 else 0.0
-            if shares <= 0:
+            bal = Decimal(str(trader.get_conditional_balance(token_id)))
+            shares = floor_shares(bal)
+            if bal <= 0 or shares < FLATTEN_MIN_SHARES:
+                # Dust / empty: close ledger and stop retrying.
+                dust_reason = (
+                    f"{reason}|dust_bal={bal:.6f}|floor={shares}"
+                    if bal > 0
+                    else reason + "|empty"
+                )
                 row = self._record(
                     quote_stub,
                     event_key=event_key,
                     match_meta=meta,
                     plan=None,
                     status="flatten_skipped",
-                    skip_reason="no_position_on_flatten",
+                    skip_reason=(
+                        "flatten_dust" if bal > 0 else "no_position_on_flatten"
+                    ),
                     response=None,
-                    success=False,
+                    success=True if bal > 0 else False,
                     idempotency_key=key,
                 )
-                self.ledger.mark_closed(token_id, mid, reason=reason + "|empty")
+                self._flatten_done.add(key)
+                self.ledger.mark_closed(token_id, mid, reason=dust_reason)
+                if bal > 0:
+                    alert = (
+                        f"ALERT flatten_dust match={mid} token={token_id[:12]}… "
+                        f"bal={bal} floor={shares} < {FLATTEN_MIN_SHARES} — closed"
+                    )
+                    logger.warning(alert)
+                    print(alert, flush=True)
                 return row
             tick = str(lot.get("tick_size") or "0.01") or "0.01"
             neg = lot.get("neg_risk")
             neg_risk = bool(neg) if neg is not None else None
             response = trader.post_market_sell(
                 token_id,
-                Decimal(str(shares)),
+                shares,
                 tick,
-                min_price=None,
+                min_price=FLATTEN_MIN_PRICE,
                 order_type="FAK",
                 neg_risk=neg_risk,
             )
             ok = trader.is_order_success(response)
-            # Confirm residual — FAK may partial-fill; leftover stays pending.
-            residual = 0.0
+            # Confirm residual — FAK may partial-fill; dust residual closes.
+            residual = Decimal("-1")
             try:
-                residual = float(trader.get_conditional_balance(token_id))
+                residual = Decimal(str(trader.get_conditional_balance(token_id)))
             except Exception:  # noqa: BLE001
-                residual = -1.0
-            fully_flat = ok and residual >= 0 and residual < 0.01
+                residual = Decimal("-1")
+            residual_floor = (
+                floor_shares(residual) if residual >= 0 else Decimal("-1")
+            )
+            fully_flat = ok and residual >= 0 and residual_floor < FLATTEN_MIN_SHARES
 
             plan = FillPlan(
                 trade="flatten_reversal",
                 side="SELL",
                 take_depth="emergency",
                 order_type="FAK",
-                shares=shares,
+                shares=float(shares),
                 usdc=0.0,
-                worst_price=0.0,
+                worst_price=float(FLATTEN_MIN_PRICE),
                 levels_used=0,
                 levels=[],
                 skip_reason=None,
@@ -756,38 +825,54 @@ class TradeExecutor:
                 plan=plan,
                 status="flatten_posted",
                 skip_reason=reason
-                + (f"|residual={residual:.4f}" if residual > 0.01 else ""),
+                + (
+                    f"|residual={float(residual):.4f}"
+                    if residual > FLATTEN_MIN_SHARES
+                    else ""
+                ),
                 response=response,
                 success=fully_flat,
                 idempotency_key=key,
             )
             if fully_flat:
                 self._flatten_done.add(key)
-                self.ledger.mark_closed(token_id, mid, reason=reason)
+                close_r = reason
+                if residual > 0:
+                    close_r += f"|dust_residual={residual}"
+                self.ledger.mark_closed(token_id, mid, reason=close_r)
             else:
                 alert = (
                     f"ALERT flatten_incomplete match={mid} token={token_id[:12]}… "
-                    f"sold≈{shares:.4f} residual={residual:.4f} ok={ok} — will retry"
+                    f"sold≈{shares} residual={residual} ok={ok} — will retry"
                 )
                 logger.error(alert)
                 print(alert, flush=True)
                 self.ledger.mark_pending_flatten(token_id, mid, reason=reason)
-                # Do NOT add to _flatten_done — allow retry with new event_key
             return row
         except Exception as e:  # noqa: BLE001
+            terminal = is_terminal_flatten_error(e)
             alert = (
                 f"ALERT flatten_failed match={mid} token={token_id[:12]}… "
-                f"err={e} — will retry"
+                f"err={e} — "
+                + ("stopped retry (terminal)" if terminal else "will retry")
             )
             logger.exception(alert)
             print(alert, flush=True)
-            self.ledger.mark_pending_flatten(token_id, mid, reason=f"{reason}|err={e}")
+            if terminal:
+                self._flatten_done.add(key)
+                self.ledger.mark_closed(
+                    token_id, mid, reason=f"{reason}|terminal|{e}"[:240]
+                )
+            else:
+                self.ledger.mark_pending_flatten(
+                    token_id, mid, reason=f"{reason}|err={e}"
+                )
             return self._record(
                 quote_stub,
                 event_key=event_key,
                 match_meta=meta,
                 plan=None,
-                status="flatten_error",
+                status="flatten_error" if not terminal else "flatten_abandoned",
                 skip_reason=str(e),
                 response=None,
                 success=False,

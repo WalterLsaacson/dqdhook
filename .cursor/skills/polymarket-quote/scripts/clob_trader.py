@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from eth_account import Account
@@ -201,14 +201,19 @@ class ClobTrader:
         options = PartialCreateOrderOptions(tick_size=tick_size)
         if neg_risk is not None:
             options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
+        sell_shares = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if sell_shares <= 0:
+            raise ValueError(f"sell shares floor to 0 from {shares}")
         kwargs: dict[str, Any] = {
             "token_id": token_id,
-            "amount": float(shares),
+            "amount": float(sell_shares),
             "side": Side.SELL,
             "order_type": ot,
         }
         if min_price is not None and min_price > 0:
             kwargs["price"] = float(min_price)
+        else:
+            kwargs["price"] = 0.01
         args = MarketOrderArgs(**kwargs)
         result = self.client.create_and_post_market_order(
             args, options=options, order_type=ot
@@ -218,7 +223,7 @@ class ClobTrader:
             "market SELL %s token=%s shares=%s min_price=%s ok=%s",
             ot_label,
             token_id[:12],
-            shares,
+            sell_shares,
             min_price,
             self.is_order_success(out),
         )
