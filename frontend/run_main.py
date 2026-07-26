@@ -5,6 +5,8 @@ Examples:
   python3 frontend/run_main.py
   python3 frontend/run_main.py --take-depth walk --max-usdc 5
   python3 frontend/run_main.py --live --max-usdc 2
+  python3 frontend/run_main.py --goals-mode dry --ft-mode live --max-usdc 1
+  python3 frontend/run_main.py --goals-mode live --ft-mode dry --max-usdc 1
   python3 frontend/run_main.py --no-trade
 """
 

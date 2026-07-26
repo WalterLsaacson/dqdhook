@@ -225,9 +225,33 @@ class OpenPositionLedger:
 
     def purge_dry_run_opens(self, *, reason: str = "pre_live_purge") -> int:
         """Close simulated (live=False) open lots before enabling live trading."""
+        return self.purge_dry_run_opens_for_signals(
+            {"score_change", "match_finished"},
+            reason=reason,
+            purge_unknown=True,
+        )
+
+    def purge_dry_run_opens_for_signals(
+        self,
+        signals: set[str],
+        *,
+        reason: str = "pre_live_purge",
+        purge_unknown: bool = False,
+    ) -> int:
+        """Close dry open lots whose event_key signal is in ``signals``.
+
+        When both score_change and match_finished are live, pass both and
+        ``purge_unknown=True`` to match the old full purge.
+        """
+        if not signals:
+            return 0
         n = 0
         for r in self._rows:
-            if r.get("status") == "open" and not r.get("live"):
+            if r.get("status") != "open" or r.get("live"):
+                continue
+            ek = str(r.get("event_key") or "")
+            sig = ek.split("|", 1)[0] if ek else ""
+            if sig in signals or (purge_unknown and not sig):
                 r["status"] = "closed"
                 r["close_reason"] = reason
                 r.pop("pending_flatten", None)

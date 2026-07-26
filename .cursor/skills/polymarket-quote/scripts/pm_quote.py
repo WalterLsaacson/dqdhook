@@ -8,6 +8,8 @@ Examples:
   python3 pm_quote.py watch --interval 0.25
   python3 pm_quote.py watch --take-depth walk --max-usdc 10   # dry-run trade plans
   python3 pm_quote.py watch --live --take-depth top --max-usdc 2
+  python3 pm_quote.py watch --goals-mode dry --ft-mode live --max-usdc 1
+  python3 pm_quote.py watch --goals-mode live --ft-mode dry --max-usdc 1
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
-from trade_settings import load_trade_settings  # noqa: E402
+from trade_settings import load_trade_settings, resolve_live_modes  # noqa: E402
 
 
 def root() -> Path:
@@ -38,8 +40,16 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     if getattr(args, "no_trade", False):
         return None
     live = bool(getattr(args, "live", False))
+    goals_mode = getattr(args, "goals_mode", None)
+    ft_mode = getattr(args, "ft_mode", None)
+    # Peek modes so require_key matches either live channel.
+    live_goals, live_ft = resolve_live_modes(
+        live=live, goals_mode=goals_mode, ft_mode=ft_mode
+    )
     settings = load_trade_settings(
         live=live,
+        goals_mode=goals_mode,
+        ft_mode=ft_mode,
         take_depth=str(getattr(args, "take_depth", "top") or "top"),
         max_levels=int(getattr(args, "max_levels", 5)),
         max_usdc=float(getattr(args, "max_usdc", 5.0)),
@@ -48,7 +58,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         allow_extreme_prices=bool(getattr(args, "allow_extreme_prices", False)),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
-        require_key=live,
+        require_key=bool(live_goals or live_ft),
     )
     executor = TradeExecutor(rt, settings)
     # Plan: initialize ClobClient once at watch/start when trading is on (reuse).
@@ -57,27 +67,21 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         try:
             executor.ensure_trader()
         except Exception as e:  # noqa: BLE001
-            if live:
+            if settings.live:
                 raise
             print(
                 f"trade → CLOB init failed (sell position checks disabled): {e}",
                 file=sys.stderr,
                 flush=True,
             )
-    if settings.live:
-        print(
-            f"trade → LIVE take_depth={settings.take_depth} "
-            f"max_usdc={settings.max_usdc} max_shares={settings.max_shares}",
-            file=sys.stderr,
-            flush=True,
-        )
-    else:
-        print(
-            f"trade → dry-run take_depth={settings.take_depth} "
-            f"max_usdc={settings.max_usdc} (pass --live to post)",
-            file=sys.stderr,
-            flush=True,
-        )
+    g = "live" if settings.live_goals else "dry"
+    f = "live" if settings.live_ft else "dry"
+    print(
+        f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
+        f"max_usdc={settings.max_usdc} max_shares={settings.max_shares}",
+        file=sys.stderr,
+        flush=True,
+    )
     return executor
 
 
@@ -341,7 +345,19 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--live",
         action="store_true",
-        help="Post real CLOB market orders (default is dry-run)",
+        help="Post real CLOB orders for both goals and FT (override with --goals-mode/--ft-mode)",
+    )
+    sp.add_argument(
+        "--goals-mode",
+        choices=("dry", "live"),
+        default=None,
+        help="score_change dry|live (default dry; --live sets live unless overridden)",
+    )
+    sp.add_argument(
+        "--ft-mode",
+        choices=("dry", "live"),
+        default=None,
+        help="match_finished dry|live (default dry; --live sets live unless overridden)",
     )
     sp.add_argument(
         "--take-depth",

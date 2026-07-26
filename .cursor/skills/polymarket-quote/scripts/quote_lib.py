@@ -1368,6 +1368,7 @@ def quote_tokens(
                     item,
                     event_key=event_key_str,
                     match_meta=match_meta,
+                    event_type=str((match_meta or {}).get("event_type") or ""),
                 )
                 if trade_row is not None:
                     item["trade_attempt"] = {
@@ -1506,6 +1507,7 @@ def quote_bridge_event(
         "away": ctx.get("away") or "",
         "home_score": ctx.get("home_score"),
         "away_score": ctx.get("away_score"),
+        "event_type": str(ev.get("type") or ""),
     }
     quote_kw = dict(
         proxy=proxy,

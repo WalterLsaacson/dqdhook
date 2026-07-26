@@ -69,9 +69,25 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_mode(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    m = raw.strip().lower()
+    if m in ("dry", "live"):
+        return m
+    if m in ("1", "true", "yes", "on"):
+        return "live"
+    if m in ("0", "false", "no", "off"):
+        return "dry"
+    return None
+
+
 def load_quote_trade_config(
     *,
     live: bool | None = None,
+    goals_mode: str | None = None,
+    ft_mode: str | None = None,
     no_trade: bool | None = None,
     take_depth: str | None = None,
     max_levels: int | None = None,
@@ -97,9 +113,20 @@ def load_quote_trade_config(
     if not env_file and (ROOT / ".env").is_file():
         env_file = str(ROOT / ".env")
 
+    # --live / QUOTE_LIVE sets both channels live; per-channel modes override.
+    base_live = bool(live) if live is not None else _env_bool("QUOTE_LIVE", False)
+    g_mode = goals_mode if goals_mode is not None else _env_mode("QUOTE_GOALS_MODE")
+    f_mode = ft_mode if ft_mode is not None else _env_mode("QUOTE_FT_MODE")
+    if g_mode is None:
+        g_mode = "live" if base_live else "dry"
+    if f_mode is None:
+        f_mode = "live" if base_live else "dry"
+
     return {
         "enabled": enabled,
-        "live": bool(live) if live is not None else _env_bool("QUOTE_LIVE", False),
+        "live": g_mode == "live" or f_mode == "live",
+        "goals_mode": g_mode,
+        "ft_mode": f_mode,
         "take_depth": depth,
         "max_levels": int(
             max_levels if max_levels is not None else os.getenv("QUOTE_MAX_LEVELS", "5")
@@ -137,8 +164,13 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
     if not c.get("enabled", True):
         args.append("--no-trade")
         return args
-    if c.get("live"):
+    g = str(c.get("goals_mode") or "dry")
+    f = str(c.get("ft_mode") or "dry")
+    if g == "live" and f == "live":
         args.append("--live")
+    else:
+        args.extend(["--goals-mode", g])
+        args.extend(["--ft-mode", f])
     args.extend(["--take-depth", str(c.get("take_depth") or "top")])
     args.extend(["--max-levels", str(int(c.get("max_levels") or 5))])
     args.extend(["--max-usdc", str(float(c.get("max_usdc") or 5))])
@@ -237,6 +269,15 @@ def _ensure_boards() -> list[dict[str, Any]]:
     return launched
 
 
+def _trade_mode_label(trade: dict[str, Any]) -> str:
+    if not trade.get("enabled"):
+        return "off"
+    return (
+        f"goals:{trade.get('goals_mode', 'dry')} "
+        f"ft:{trade.get('ft_mode', 'dry')}"
+    )
+
+
 def _ensure_quote() -> bool:
     """Start quote watch if missing. Returns True if (re)started."""
     global _quote_proc
@@ -244,11 +285,7 @@ def _ensure_quote() -> bool:
         return False
     watch_args = quote_watch_argv(_quote_trade)
     trade = _quote_trade
-    mode = (
-        "off"
-        if not trade.get("enabled")
-        else ("live" if trade.get("live") else "dry-run")
-    )
+    mode = _trade_mode_label(trade)
     print(
         "main → starting polymarket-quote watch "
         f"(trade={mode} depth={trade.get('take_depth')} "
@@ -411,11 +448,7 @@ def status() -> dict[str, Any]:
         quote_alive = bool(q and q.poll() is None)
         started = _started_at
         trade = dict(_quote_trade)
-    mode = (
-        "off"
-        if not trade.get("enabled")
-        else ("live" if trade.get("live") else "dry-run")
-    )
+    mode = _trade_mode_label(trade)
     return {
         "module": "main",
         "hub": f"http://{HOST}:{PORT}/",
@@ -519,7 +552,23 @@ def main(argv: list[str] | None = None) -> int:
         description="System Main — boards + quote watch with in-process trading"
     )
     parser.add_argument("--no-trade", action="store_true", help="Quote only (no executor)")
-    parser.add_argument("--live", action="store_true", help="Post real CLOB orders")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Post real CLOB orders for both goals and FT",
+    )
+    parser.add_argument(
+        "--goals-mode",
+        choices=("dry", "live"),
+        default=None,
+        help="score_change dry|live (default dry; --live sets live unless overridden)",
+    )
+    parser.add_argument(
+        "--ft-mode",
+        choices=("dry", "live"),
+        default=None,
+        help="match_finished dry|live (default dry; --live sets live unless overridden)",
+    )
     parser.add_argument(
         "--take-depth",
         choices=("top", "walk"),
@@ -551,6 +600,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _quote_trade = load_quote_trade_config(
         live=True if args.live else None,
+        goals_mode=args.goals_mode,
+        ft_mode=args.ft_mode,
         no_trade=True if args.no_trade else None,
         take_depth=args.take_depth,
         max_levels=args.max_levels,
@@ -567,9 +618,12 @@ def main(argv: list[str] | None = None) -> int:
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"System Main → http://{HOST}:{PORT}/", flush=True)
     t = _quote_trade
+    if not t["enabled"]:
+        trade_label = "off"
+    else:
+        trade_label = f"goals:{t.get('goals_mode', 'dry')} ft:{t.get('ft_mode', 'dry')}"
     print(
-        f"Quote trade → "
-        f"{'off' if not t['enabled'] else ('live' if t['live'] else 'dry-run')} "
+        f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']}",
         flush=True,
     )

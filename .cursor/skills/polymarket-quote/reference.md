@@ -74,7 +74,12 @@ After `flag_misprice` returns true inside `quote_tokens`, `TradeExecutor` runs *
 | Mode | Behavior |
 |---|---|
 | dry-run (default) | Plan fill → append `data/pm-quote/trades.jsonl`; no chain order |
-| `--live` | Same plan, then `create_and_post_market_order` (**FAK** buys and sells) |
+| `--live` | Both signal channels post `create_and_post_market_order` (**FAK**) |
+| `--goals-mode` / `--ft-mode` | Independent `dry\|live` for `score_change` vs `match_finished` (modes override `--live` per channel) |
+
+Env (System Main): `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE` (`dry`/`live`).
+
+Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sessions never CLOB-sell a dry-run open lot.
 
 **Take depth**
 

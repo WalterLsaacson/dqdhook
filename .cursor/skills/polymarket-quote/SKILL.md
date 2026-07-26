@@ -13,7 +13,7 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-默认 **dry-run**（只写 `trades.jsonl`）；加 `--live` 才真正 post。
+默认 **dry-run**（只写 `trades.jsonl`）；加 `--live` 两者真下单，或用 `--goals-mode` / `--ft-mode` 分开。
 
 ## Quick start
 
@@ -22,13 +22,15 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 ```bash
 python3 frontend/run_main.py
 python3 frontend/run_main.py --take-depth walk --max-usdc 5
-python3 frontend/run_main.py --live --max-usdc 2          # 真下单
+python3 frontend/run_main.py --live --max-usdc 2          # 进球+终场真下单
+python3 frontend/run_main.py --goals-mode dry --ft-mode live --max-usdc 1   # 进球模拟 / 终场真买
+python3 frontend/run_main.py --goals-mode live --ft-mode dry --max-usdc 1   # 反过来
 python3 frontend/run_main.py --no-trade                   # 仅询价
 ```
 
 Hub：http://127.0.0.1:8790/ · quote 日志：`data/pm-quote/watch.log` · 成交尝试：`data/pm-quote/trades.jsonl`
 
-也可用环境变量：`QUOTE_LIVE`、`QUOTE_TAKE_DEPTH`、`QUOTE_MAX_USDC`、`QUOTE_TRADE=0` 等（见 System Main）。
+也可用环境变量：`QUOTE_LIVE`、`QUOTE_GOALS_MODE`、`QUOTE_FT_MODE`、`QUOTE_TAKE_DEPTH`、`QUOTE_MAX_USDC`、`QUOTE_TRADE=0` 等（见 System Main）。
 
 Skill 单跑（调试用）：
 
@@ -62,8 +64,8 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 4. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
 5. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
 6. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
-7. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` posts market **FAK** via `py-clob-client-v2`.
-8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal. Live FAK sell floors shares to **2dp**, `min_price=0.2`; dust &lt; 0.01 closes the lot; `invalid maker amount` stops retry. `max_usdc` default **5**.
+7. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` or per-signal `--goals-mode`/`--ft-mode` posts market **FAK** via `py-clob-client-v2`.
+8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal. Flatten follows **`lot.live`** (dry lots → `flatten_dry_run`; live lots → CLOB). Live FAK sell floors shares to **2dp**, `min_price=0.2`; dust &lt; 0.01 closes the lot; `invalid maker amount` stops retry. `max_usdc` default **5**.
 9. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
 10. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
 
@@ -71,14 +73,18 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 | Flag | Default | Meaning |
 |---|---|---|
-| (default) | dry-run | Plan + log only |
-| `--live` | off | Real `create_and_post_market_order` |
+| (default) | both dry | Plan + log only |
+| `--live` | off | Both `score_change` and `match_finished` post real orders |
+| `--goals-mode dry\|live` | dry | Per-signal mode for进球 (`score_change`); overrides `--live` for that channel |
+| `--ft-mode dry\|live` | dry | Per-signal mode for终场 (`match_finished`); overrides `--live` for that channel |
 | `--no-trade` | off | Quote only |
 | `--take-depth top\|walk` | `top` | Best level vs walk book |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 5 / 25 | Size caps |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
 | `--allow-extreme-prices` | off | Allow ≤0.01 / ≥0.99 |
+
+Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while posting FT fills. Flatten always uses the lot’s own `live` flag so a dry goal lot is never live-sold.
 
 ## Cooperation
 

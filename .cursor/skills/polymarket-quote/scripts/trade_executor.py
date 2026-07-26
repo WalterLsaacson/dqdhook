@@ -55,6 +55,14 @@ def is_terminal_flatten_error(err: str | Exception | None) -> bool:
     return bool(_TERMINAL_FLATTEN_ERR_RE.search(str(err)))
 
 
+def signal_from_event_key(event_key: str) -> str:
+    """First segment of event_key (score_change|… / match_finished|…)."""
+    ek = (event_key or "").strip()
+    if not ek:
+        return ""
+    return ek.split("|", 1)[0]
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -73,13 +81,61 @@ class TradeExecutor:
         self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
         self._load_recent_flattens()
-        if self.settings.live:
-            purged = self.ledger.purge_dry_run_opens(reason="pre_live_purge")
+        live_signals: set[str] = set()
+        if self.settings.live_goals:
+            live_signals.add("score_change")
+        if self.settings.live_ft:
+            live_signals.add("match_finished")
+        if live_signals:
+            both = live_signals >= {"score_change", "match_finished"}
+            purged = self.ledger.purge_dry_run_opens_for_signals(
+                live_signals,
+                reason="pre_live_purge",
+                purge_unknown=both,
+            )
             if purged:
                 logger.warning(
-                    "purged %d dry-run open lots before live trading", purged
+                    "purged %d dry-run open lots before live trading (%s)",
+                    purged,
+                    ",".join(sorted(live_signals)),
                 )
         self._rebuild_open_from_trades()
+
+    def _live_for_signal(self, event_type: str) -> bool:
+        """Whether this bridge signal posts real CLOB orders."""
+        typ = (event_type or "").strip()
+        if typ == "score_change":
+            return bool(self.settings.live_goals)
+        if typ == "match_finished":
+            return bool(self.settings.live_ft)
+        return bool(self.settings.live)
+
+    def _resolve_event_type(
+        self,
+        *,
+        event_type: str = "",
+        event_key: str = "",
+        match_meta: dict[str, Any] | None = None,
+    ) -> str:
+        typ = (event_type or "").strip()
+        if not typ and match_meta:
+            typ = str(match_meta.get("event_type") or "").strip()
+        if not typ:
+            typ = signal_from_event_key(event_key)
+        return typ
+
+    def _keep_buy_for_rebuild(self, row: dict[str, Any]) -> bool:
+        """Keep buy_win row as open lot for the channel's current dry/live mode."""
+        if not row.get("success"):
+            return False
+        sig = signal_from_event_key(str(row.get("event_key") or ""))
+        channel_live = self._live_for_signal(sig)
+        if channel_live:
+            return (
+                row.get("status") == "posted"
+                and bool(row.get("live"))
+            )
+        return row.get("status") in ("dry_run", "posted")
 
     def _rebuild_open_from_trades(self, limit: int = 800) -> None:
         """Re-open buy_win lots from trades.jsonl that were never flattened (restart-safe)."""
@@ -92,7 +148,6 @@ class TradeExecutor:
             return
         flattened: set[tuple[str, str]] = set()
         buys: list[dict[str, Any]] = []
-        live_mode = bool(self.settings.live)
         for line in lines:
             line = line.strip()
             if not line:
@@ -111,13 +166,7 @@ class TradeExecutor:
                 continue
             if row.get("trade") != "buy_win":
                 continue
-            # Live session: only real posted fills. Dry-run: keep simulated opens.
-            if live_mode:
-                if row.get("status") != "posted" or not row.get("success") or not row.get(
-                    "live"
-                ):
-                    continue
-            elif row.get("status") not in ("dry_run", "posted") or not row.get("success"):
+            if not self._keep_buy_for_rebuild(row):
                 continue
             if "verify" in str(row.get("idempotency_key") or ""):
                 continue
@@ -297,6 +346,7 @@ class TradeExecutor:
         *,
         event_key: str = "",
         match_meta: dict[str, Any] | None = None,
+        event_type: str = "",
     ) -> dict[str, Any] | None:
         """If quote is a misprice opportunity, plan and optionally post."""
         if not self.settings.enabled:
@@ -308,6 +358,13 @@ class TradeExecutor:
         token_id = str(quote.get("token_id") or "")
         if not trade or not token_id:
             return None
+
+        typ = self._resolve_event_type(
+            event_type=event_type,
+            event_key=event_key,
+            match_meta=match_meta,
+        )
+        channel_live = self._live_for_signal(typ)
 
         key = trade_idempotency_key(event_key or "", token_id, trade)
         if key in self._done:
@@ -336,6 +393,7 @@ class TradeExecutor:
                 response=None,
                 success=False,
                 idempotency_key=key,
+                live=channel_live,
             )
             return row
 
@@ -353,6 +411,7 @@ class TradeExecutor:
                     response=None,
                     success=False,
                     idempotency_key=key,
+                    live=channel_live,
                 )
                 return row
             if available <= 0:
@@ -366,6 +425,7 @@ class TradeExecutor:
                     response=None,
                     success=False,
                     idempotency_key=key,
+                    live=channel_live,
                 )
                 return row
 
@@ -391,10 +451,11 @@ class TradeExecutor:
                 response=None,
                 success=False,
                 idempotency_key=key,
+                live=channel_live,
             )
             return row
 
-        if not self.settings.live:
+        if not channel_live:
             row = self._record(
                 quote,
                 event_key=event_key,
@@ -405,16 +466,18 @@ class TradeExecutor:
                 response=None,
                 success=True,
                 idempotency_key=key,
+                live=False,
             )
             self._done.add(key)
             logger.info(
-                "dry-run %s %s shares=%.4f usdc=%.4f worst=%.4f depth=%s",
+                "dry-run %s %s shares=%.4f usdc=%.4f worst=%.4f depth=%s signal=%s",
                 trade,
                 token_id[:12],
                 plan.shares,
                 plan.usdc,
                 plan.worst_price,
                 plan.take_depth,
+                typ or "?",
             )
             if trade == "buy_win":
                 self._register_open_buy(
@@ -497,6 +560,7 @@ class TradeExecutor:
                 response=response,
                 success=ok,
                 idempotency_key=key,
+                live=True,
             )
             if ok:
                 self._done.add(key)
@@ -523,6 +587,7 @@ class TradeExecutor:
                 response=None,
                 success=False,
                 idempotency_key=key,
+                live=True,
             )
             return row
 
@@ -710,8 +775,9 @@ class TradeExecutor:
             "neg_risk": lot.get("neg_risk"),
         }
 
-        # Dry-run: log intent and close ledger lot (so we don't re-fire)
-        if not self.settings.live:
+        # Dry-run lots: log intent and close ledger (never post CLOB for simulated buys).
+        lot_live = bool(lot.get("live"))
+        if not lot_live:
             plan = FillPlan(
                 trade="flatten_reversal",
                 side="SELL",
@@ -734,6 +800,7 @@ class TradeExecutor:
                 response=None,
                 success=True,
                 idempotency_key=key,
+                live=False,
             )
             self._flatten_done.add(key)
             self.ledger.mark_closed(token_id, mid, reason=reason)
@@ -772,6 +839,7 @@ class TradeExecutor:
                     response=None,
                     success=True if bal > 0 else False,
                     idempotency_key=key,
+                    live=True,
                 )
                 self._flatten_done.add(key)
                 self.ledger.mark_closed(token_id, mid, reason=dust_reason)
@@ -833,6 +901,7 @@ class TradeExecutor:
                 response=response,
                 success=fully_flat,
                 idempotency_key=key,
+                live=True,
             )
             if fully_flat:
                 self._flatten_done.add(key)
@@ -877,6 +946,7 @@ class TradeExecutor:
                 response=None,
                 success=False,
                 idempotency_key=key,
+                live=True,
             )
 
     def _position_shares(self, token_id: str) -> float | None:
@@ -907,13 +977,14 @@ class TradeExecutor:
         response: dict | None,
         success: bool,
         idempotency_key: str,
+        live: bool | None = None,
     ) -> dict[str, Any]:
         meta = match_meta or {}
         row: dict[str, Any] = {
             "quoted_at": lib.now_cn_iso(),
             "status": status,
             "success": success,
-            "live": self.settings.live,
+            "live": bool(live) if live is not None else bool(self.settings.live),
             "idempotency_key": idempotency_key,
             "event_key": event_key,
             "match_id": meta.get("match_id") or quote.get("match_id") or "",
@@ -921,6 +992,9 @@ class TradeExecutor:
             "away": meta.get("away") or "",
             "home_score": meta.get("home_score"),
             "away_score": meta.get("away_score"),
+            "event_type": meta.get("event_type")
+            or signal_from_event_key(event_key)
+            or "",
             "market_key": quote.get("market_key"),
             "family": quote.get("family"),
             "outcome": quote.get("outcome"),
