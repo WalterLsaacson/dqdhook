@@ -60,6 +60,10 @@ _lock = threading.RLock()
 _started_at: str | None = None
 _quote_proc: subprocess.Popen[Any] | None = None
 _quote_trade: dict[str, Any]
+_shutting_down = threading.Event()
+_httpd: ThreadingHTTPServer | None = None
+_supervisor_stop = threading.Event()
+_supervisor_thread: threading.Thread | None = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -235,16 +239,27 @@ def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess
     return proc
 
 
-_supervisor_stop = threading.Event()
-_supervisor_thread: threading.Thread | None = None
-
-
 def _boards_all_up() -> bool:
     return all(_port_open(int(b["port"])) for b in BOARDS)
 
 
+def _wait_port(port: int, *, timeout_s: float, poll_s: float = 0.15) -> bool:
+    """Wait for a port without holding ``_lock``."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _shutting_down.is_set() or _supervisor_stop.is_set():
+            return False
+        if _port_open(port):
+            return True
+        time.sleep(poll_s)
+    return _port_open(port)
+
+
 def _ensure_boards() -> list[dict[str, Any]]:
-    """Start any board whose port is down. Returns launch records."""
+    """Start any board whose port is down. Returns launch records.
+
+    Caller must hold ``_lock`` (or be single-threaded boot).
+    """
     launched: list[dict[str, Any]] = []
     for board in BOARDS:
         port = int(board["port"])
@@ -279,7 +294,10 @@ def _trade_mode_label(trade: dict[str, Any]) -> str:
 
 
 def _ensure_quote() -> bool:
-    """Start quote watch if missing. Returns True if (re)started."""
+    """Start quote watch if missing. Returns True if (re)started.
+
+    Caller must hold ``_lock``.
+    """
     global _quote_proc
     if _quote_proc is not None and _quote_proc.poll() is None:
         return False
@@ -302,18 +320,21 @@ def _ensure_quote() -> bool:
 def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
     """One-shot: boards + quote cascade. Heals missing children if already started."""
     global _started_at
+    if _shutting_down.is_set():
+        return {"ok": False, "error": "hub_shutting_down"}
+
     with _lock:
         quote_alive = bool(_quote_proc and _quote_proc.poll() is None)
         if _started_at and quote_alive and _boards_all_up():
             return status()
-
         launched = _ensure_boards()
 
-        # Wait for bridge-board so quote can attach via HTTP.
-        deadline = time.time() + 20
-        while time.time() < deadline and not _port_open(8789):
-            time.sleep(0.15)
+    # Wait for bridge-board outside the lock so /api/status is not blocked.
+    _wait_port(8789, timeout_s=20)
 
+    with _lock:
+        if _shutting_down.is_set():
+            return {"ok": False, "error": "hub_shutting_down"}
         _ensure_quote()
         if _started_at is None:
             _started_at = _now()
@@ -344,17 +365,27 @@ def start_stack(*, open_browser: bool = True) -> dict[str, Any]:
 def _supervisor_loop() -> None:
     """Keep boards + quote up while the stack is marked started."""
     while not _supervisor_stop.wait(5.0):
+        if _shutting_down.is_set():
+            return
+        healed_boards = False
         with _lock:
-            if _started_at is None:
+            if _started_at is None or _shutting_down.is_set():
                 continue
             try:
                 healed_boards = not _boards_all_up()
                 if healed_boards:
                     print("main → supervisor: board(s) down, restarting…", flush=True)
                     _ensure_boards()
-                    deadline = time.time() + 15
-                    while time.time() < deadline and not _port_open(8789):
-                        time.sleep(0.15)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                continue
+        # Port wait must not hold _lock (status / start would stall).
+        if healed_boards:
+            _wait_port(8789, timeout_s=15)
+        with _lock:
+            if _started_at is None or _shutting_down.is_set():
+                continue
+            try:
                 if _ensure_quote():
                     print("main → supervisor: quote watch restarted", flush=True)
             except Exception:  # noqa: BLE001
@@ -391,6 +422,7 @@ def _open_uis(launched: list[dict[str, Any]]) -> None:
 
 
 def stop_stack() -> dict[str, Any]:
+    """Stop boards + quote children; disable supervisor heal."""
     global _quote_proc, _started_at
     _supervisor_stop.set()
     with _lock:
@@ -416,6 +448,20 @@ def stop_stack() -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 pass
     return {"ok": True, "stopped": True}
+
+
+def request_hub_shutdown() -> None:
+    """Stop children and ask the HTTP server to exit (safe from signal / request threads)."""
+    if _shutting_down.is_set():
+        return
+    _shutting_down.set()
+    print("\nshutting down stack…", flush=True)
+    stop_stack()
+    server = _httpd
+    if server is not None:
+        threading.Thread(
+            target=server.shutdown, name="httpd-shutdown", daemon=True
+        ).start()
 
 
 def status() -> dict[str, Any]:
@@ -530,7 +576,13 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 502, {"error": str(e)})
             return
         if path == "/api/stop":
-            json_response(self, 200, stop_stack())
+            # Respond first, then exit hub (do not leave empty shell on :8790).
+            json_response(
+                self,
+                200,
+                {"ok": True, "stopped": True, "hub_exiting": True},
+            )
+            request_hub_shutdown()
             return
         self.send_error(404)
 
@@ -546,10 +598,13 @@ class Handler(BaseHTTPRequestHandler):
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    global _quote_trade
+    global _quote_trade, _httpd
 
     parser = argparse.ArgumentParser(
-        description="System Main — boards + quote watch with in-process trading"
+        description=(
+            "System Main — single entrypoint: hub + boards + quote watch "
+            "(do not start pm_quote / boards separately)"
+        )
     )
     parser.add_argument("--no-trade", action="store_true", help="Quote only (no executor)")
     parser.add_argument(
@@ -615,7 +670,19 @@ def main(argv: list[str] | None = None) -> int:
 
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
+
+    if _port_open(PORT):
+        print(
+            f"error: System Main already running on http://{HOST}:{PORT}/ — "
+            "do not start a second hub; stop the existing one first "
+            f"(POST /api/stop or kill the run_main process).",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    _httpd = httpd
     print(f"System Main → http://{HOST}:{PORT}/", flush=True)
     t = _quote_trade
     if not t["enabled"]:
@@ -650,17 +717,23 @@ def main(argv: list[str] | None = None) -> int:
 
     threading.Thread(target=_boot, name="main-boot", daemon=True).start()
 
-    def _shutdown(_sig: int, _frame: object) -> None:
-        print("\nshutting down stack…", flush=True)
-        stop_stack()
-        httpd.shutdown()
+    def _on_signal(_sig: int, _frame: object) -> None:
+        request_hub_shutdown()
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        _shutdown(signal.SIGINT, None)
+        request_hub_shutdown()
+    finally:
+        if not _shutting_down.is_set():
+            stop_stack()
+        try:
+            httpd.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+        _httpd = None
     return 0
 
 

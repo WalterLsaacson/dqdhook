@@ -17,7 +17,7 @@ polymarket-soccer ┘
 | `match-bridge` | Align DQD ↔ PM; emit `score_change` / `match_finished` |
 | `polymarket-quote` | Settle markets from score, quote CLOB, dry-run or live FAK |
 
-**System Main** (`frontend/run_main.py`) boots the hub boards + `pm_quote watch`, which cascades bridge → DQD + Polymarket.
+**System Main** (`frontend/run_main.py`) is the **only** process you start. It boots the hub (:8790), three boards, and `pm_quote watch`, which cascades bridge → DQD + Polymarket. Do **not** start `pm_quote`, boards, or a second `run_main` yourself (a second hub exits immediately if :8790 is taken).
 
 ## Quick start
 
@@ -28,12 +28,14 @@ pip install -r .cursor/skills/polymarket-quote/requirements-trade.txt
 # Secrets in repo-root .env (never commit). Required for live:
 #   PRIVATE_KEY, FUNDER, SIGNATURE_TYPE, CHAIN_ID, CLOB_HOST
 
-# Default: dry-run trading (plans written to trades.jsonl, no CLOB post)
+# Only entrypoint — pulls up boards + quote (+ bridge cascade)
 python3 frontend/run_main.py --no-browser
 
 # Hub
 open http://127.0.0.1:8790/
 ```
+
+Stop: `Ctrl-C` / `kill` the `run_main` process, or `POST http://127.0.0.1:8790/api/stop` (exits hub + children; no empty shell on :8790).
 
 Logs / data (gitignored under `data/` except a few keepers):
 
@@ -74,7 +76,9 @@ Flatten on score reversal follows each lot’s own `live` flag, so a dry goal fi
 
 CLOB auth (repo `.env` or `--trade-env-file`): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAIN_ID`, `CLOB_HOST`.
 
-## Skill entrypoints (debug)
+## Skill entrypoints (debug only)
+
+Prefer System Main above. Direct skill CLIs are for one-off debugging — do not run them alongside a live hub.
 
 ```bash
 # Bridge + quote once from backlog

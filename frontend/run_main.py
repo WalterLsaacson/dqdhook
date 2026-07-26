@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Launch System Main (boards + quote watch with in-process trading).
+"""Launch System Main — the only process you should start.
+
+Boots hub (:8790) + boards + pm_quote watch (which cascades match-bridge →
+dongqiudi-match + polymarket-soccer). Do not start boards or pm_quote separately;
+a second run_main fails if :8790 is already taken.
 
 Examples:
   python3 frontend/run_main.py
@@ -13,6 +17,7 @@ Examples:
 from __future__ import annotations
 
 import runpy
+import sys
 from pathlib import Path
 
 APP = Path(__file__).resolve().parent / "main" / "server" / "app.py"
@@ -20,7 +25,15 @@ APP = Path(__file__).resolve().parent / "main" / "server" / "app.py"
 
 def main() -> int:
     # Preserve CLI flags for app.main() argparse (runpy keeps sys.argv).
-    runpy.run_path(str(APP), run_name="__main__")
+    try:
+        runpy.run_path(str(APP), run_name="__main__")
+    except SystemExit as e:
+        code = e.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        return 1
     return 0
 
 
