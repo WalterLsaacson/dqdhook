@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -102,6 +106,51 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+_PERSIST_EXEC: ThreadPoolExecutor | None = None
+_PERSIST_LOCK = threading.Lock()
+
+
+def _persist_executor() -> ThreadPoolExecutor:
+    global _PERSIST_EXEC
+    with _PERSIST_LOCK:
+        if _PERSIST_EXEC is None:
+            _PERSIST_EXEC = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="quote-persist"
+            )
+        return _PERSIST_EXEC
+
+
+def append_jsonl_async(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Fire-and-forget JSONL append (does not block the trade hot path)."""
+    if not rows:
+        return
+    _persist_executor().submit(append_jsonl, path, list(rows))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Limited concurrency for independent FAK posts within one quote phase.
+TRADE_POOL_WORKERS = max(1, int(os.getenv("QUOTE_TRADE_WORKERS", "2") or 2))
+_TRADE_EXEC: ThreadPoolExecutor | None = None
+_TRADE_EXEC_LOCK = threading.Lock()
+
+
+def _trade_executor_pool() -> ThreadPoolExecutor:
+    global _TRADE_EXEC
+    with _TRADE_EXEC_LOCK:
+        if _TRADE_EXEC is None:
+            _TRADE_EXEC = ThreadPoolExecutor(
+                max_workers=TRADE_POOL_WORKERS,
+                thread_name_prefix="quote-trade",
+            )
+        return _TRADE_EXEC
 
 
 def _parse_list_field(raw: Any) -> list[Any]:
@@ -1325,13 +1374,17 @@ def quote_tokens(
     trade_executor: Any | None = None,
     event_key_str: str = "",
     match_meta: dict[str, Any] | None = None,
+    books: dict[str, dict[str, Any]] | None = None,
+    trade_workers: int | None = None,
 ) -> list[dict[str, Any]]:
     ids = [r["token_id"] for r in token_rows if r.get("token_id")]
-    books = fetch_books(ids, proxy=proxy)
-    out: list[dict[str, Any]] = []
+    book_map = books if books is not None else fetch_books(ids, proxy=proxy)
+    t0 = time.monotonic()
+    priced: list[dict[str, Any]] = []
+    trade_jobs: list[tuple[int, dict[str, Any]]] = []
     for row in token_rows:
         tid = row["token_id"]
-        book = books.get(tid) or {"book_missing": True, "best_bid": None, "best_ask": None}
+        book = book_map.get(tid) or {"book_missing": True, "best_bid": None, "best_ask": None}
         mis, reason, econ = flag_misprice(
             str(row.get("settlement") or ""),
             book,
@@ -1361,27 +1414,49 @@ def quote_tokens(
             "net_edge": econ.get("net_edge"),
             "trade": econ.get("trade"),
         }
-        # Lowest latency: trade in-process right after misprice (do not read JSONL).
         if mis and trade_executor is not None:
-            try:
-                trade_row = trade_executor.maybe_trade(
-                    item,
-                    event_key=event_key_str,
-                    match_meta=match_meta,
-                    event_type=str((match_meta or {}).get("event_type") or ""),
-                )
-                if trade_row is not None:
-                    item["trade_attempt"] = {
-                        "status": trade_row.get("status"),
-                        "success": trade_row.get("success"),
-                        "skip_reason": trade_row.get("skip_reason"),
-                        "plan": trade_row.get("plan"),
-                        "live": trade_row.get("live"),
-                    }
-            except Exception as e:  # noqa: BLE001
-                item["trade_attempt"] = {"status": "error", "skip_reason": str(e)}
-        out.append(item)
-    return out
+            trade_jobs.append((len(priced), item))
+        priced.append(item)
+
+    def _one_trade(item: dict[str, Any]) -> dict[str, Any]:
+        try:
+            trade_row = trade_executor.maybe_trade(
+                item,
+                event_key=event_key_str,
+                match_meta=match_meta,
+                event_type=str((match_meta or {}).get("event_type") or ""),
+            )
+            if trade_row is not None:
+                return {
+                    "status": trade_row.get("status"),
+                    "success": trade_row.get("success"),
+                    "skip_reason": trade_row.get("skip_reason"),
+                    "plan": trade_row.get("plan"),
+                    "live": trade_row.get("live"),
+                }
+            return {"status": "skipped", "skip_reason": "no_row"}
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "skip_reason": str(e)}
+
+    workers = TRADE_POOL_WORKERS if trade_workers is None else max(1, int(trade_workers))
+    if trade_jobs:
+        if workers <= 1 or len(trade_jobs) == 1:
+            for idx, item in trade_jobs:
+                priced[idx]["trade_attempt"] = _one_trade(item)
+        else:
+            pool = _trade_executor_pool()
+            futs = {
+                pool.submit(_one_trade, item): idx for idx, item in trade_jobs
+            }
+            for fut in as_completed(futs):
+                priced[futs[fut]]["trade_attempt"] = fut.result()
+
+    books_ms = int((time.monotonic() - t0) * 1000) if books is not None else None
+    if books_ms is not None:
+        for item in priced:
+            item.setdefault("latency_ms", {})
+            # books RTT attributed outside when prefetched
+    return priced
 
 
 def build_bundle(
@@ -1518,20 +1593,32 @@ def quote_bridge_event(
         event_key_str=ek,
         match_meta=match_meta,
     )
-    # Live: books+trade totals/BTTS first, then exact (and any remainder).
+    latency_ms: dict[str, int] = {}
+    # Live: one books POST for all tokens, trade totals/BTTS first then exact.
     if mode == "live":
         phase_a = [t for t in tokens if t.get("family") in ("totals", "btts")]
         phase_a_ids = {id(t) for t in phase_a}
         phase_b = [t for t in tokens if id(t) not in phase_a_ids]
+        all_ids = [t["token_id"] for t in tokens if t.get("token_id")]
+        t_books = time.monotonic()
+        book_map = fetch_books(all_ids, proxy=proxy) if all_ids else {}
+        latency_ms["books"] = int((time.monotonic() - t_books) * 1000)
         quotes: list[dict[str, Any]] = []
+        t_trade = time.monotonic()
         if phase_a:
-            quotes.extend(quote_tokens(phase_a, **quote_kw))
+            quotes.extend(quote_tokens(phase_a, books=book_map, **quote_kw))
         if phase_b:
-            quotes.extend(quote_tokens(phase_b, **quote_kw))
+            quotes.extend(quote_tokens(phase_b, books=book_map, **quote_kw))
+        latency_ms["trade_phases"] = int((time.monotonic() - t_trade) * 1000)
         discovery["quote_phases"] = ["totals_btts", "exact_rest"]
+        discovery["books_once"] = True
     else:
+        t_books = time.monotonic()
         quotes = quote_tokens(tokens, **quote_kw)
+        latency_ms["books_and_trade"] = int((time.monotonic() - t_books) * 1000)
+    discovery["latency_ms"] = latency_ms
     bundle = build_bundle(ctx, quotes, discovery)
+    bundle["latency_ms"] = dict(latency_ms)
     if persist:
         persist_bundle(root, bundle)
     return bundle
@@ -1582,10 +1669,13 @@ def process_bridge_events(
     force: bool = False,
     trade_executor: Any | None = None,
     market_cache: Any | None = None,
+    af_referee: Any | None = None,
+    events_override: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     cursor = load_cursor(root)
     seen = set(cursor.get("processed_keys") or [])
     bundles: list[dict[str, Any]] = []
+    tick_t0 = time.monotonic()
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
@@ -1603,29 +1693,37 @@ def process_bridge_events(
         except Exception as e:  # noqa: BLE001
             print(f"ALERT flatten retry sweep failed: {e}", flush=True)
 
-    for ev in load_bridge_quote_events(root):
-        key = event_key(ev)
-        if not force and key in seen:
-            continue
-        # Score disallow / correction: flatten open buy_win lots BEFORE quoting.
+    def _quote_one(
+        work_ev: dict[str, Any],
+        key: str,
+        *,
+        af_gate: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal bundles, seen
+        typ_local = str(work_ev.get("type") or "")
         flatten_rows: list[dict[str, Any]] = []
         if trade_executor is not None:
             try:
-                flatten_rows = list(trade_executor.maybe_flatten_for_event(ev) or [])
+                if af_referee is not None and typ_local == "score_change":
+                    flatten_rows = []
+                else:
+                    flatten_rows = list(
+                        trade_executor.maybe_flatten_for_event(work_ev) or []
+                    )
             except Exception as e:  # noqa: BLE001
                 flatten_rows = [
                     {
                         "quoted_at": now_cn_iso(),
                         "status": "flatten_error",
                         "error": str(e),
-                        "match_id": ev.get("match_id"),
+                        "match_id": work_ev.get("match_id"),
                         "event_key": key,
                     }
                 ]
         try:
             bundle = quote_bridge_event(
                 root,
-                ev,
+                work_ev,
                 proxy=proxy,
                 include_props=include_props,
                 include_exact=include_exact,
@@ -1639,8 +1737,9 @@ def process_bridge_events(
             if flatten_rows:
                 bundle["flatten_attempts"] = flatten_rows
                 bundle["flatten_count"] = len(flatten_rows)
+            if af_gate is not None:
+                bundle["af_referee"] = af_gate
             bundles.append(bundle)
-            # Data-only: after score_change buy_win, schedule 10s×6 book samples.
             try:
                 from post_goal_sampler import get_active_sampler
 
@@ -1656,8 +1755,8 @@ def process_bridge_events(
             except Exception as e:  # noqa: BLE001
                 print(f"post-goal sampler enqueue failed: {e}", flush=True)
             seen.add(key)
-            if market_cache is not None and ev.get("type") == "match_finished":
-                mid = str(ev.get("match_id") or bundle.get("match_id") or "")
+            if market_cache is not None and work_ev.get("type") == "match_finished":
+                mid = str(work_ev.get("match_id") or bundle.get("match_id") or "")
                 if mid:
                     try:
                         market_cache.drop(mid)
@@ -1668,20 +1767,211 @@ def process_bridge_events(
                 "quoted_at": now_cn_iso(),
                 "error": str(e),
                 "event_key": key,
-                "match_id": ev.get("match_id"),
-                "trigger": ev.get("type"),
+                "match_id": work_ev.get("match_id"),
+                "trigger": work_ev.get("type"),
             }
             if flatten_rows:
                 err_row["flatten_attempts"] = flatten_rows
+            if af_gate is not None:
+                err_row["af_referee"] = af_gate
             bundles.append(err_row)
-            # Do not mark processed / drop cache on failure — retry next tick.
             print(
                 f"ALERT quote failed (will retry) key={key}: {e}",
                 flush=True,
             )
+
+    def _finish_af_job(job: dict[str, Any]) -> None:
+        from af_referee import apply_af_score_to_event
+
+        key = str(job.get("event_key") or "")
+        ev = job.get("ev") or {}
+        gate = job.get("gate") or {}
+        mid = str(job.get("match_id") or ev.get("match_id") or "")
+        target = job.get("target") or (None, None)
+        if key in seen and not force:
+            return
+        if not gate.get("confirmed"):
+            skip = {
+                "quoted_at": now_cn_iso(),
+                "trigger": "score_change",
+                "mode": "af_unconfirmed",
+                "event_key": key,
+                "match_id": mid,
+                "home": ev.get("home"),
+                "away": ev.get("away"),
+                "home_score": target[0] if target else ev.get("home_score"),
+                "away_score": target[1] if target else ev.get("away_score"),
+                "count": 0,
+                "opportunity_count": 0,
+                "af_referee": gate,
+            }
+            bundles.append(skip)
+            seen.add(key)
+            print(
+                f"af-referee → IGNORE goal match_id={mid} "
+                f"target={target[0] if target else '?'}-"
+                f"{target[1] if target else '?'} "
+                f"polls={gate.get('polls')} err={gate.get('error')}",
+                flush=True,
+            )
+            return
+        work_ev = apply_af_score_to_event(
+            ev,
+            home=int(gate["goals"]["home"]),
+            away=int(gate["goals"]["away"]),
+        )
+        print(
+            f"af-referee → CONFIRMED {mid} "
+            f"{gate['goals']['home']}-{gate['goals']['away']} "
+            f"in {gate.get('elapsed_ms')}ms polls={gate.get('polls')} "
+            f"burst={gate.get('burst_dir')}",
+            flush=True,
+        )
+        _quote_one(
+            work_ev,
+            key,
+            af_gate={
+                "confirmed": True,
+                "score_source": "api_football",
+                "home_score": work_ev.get("home_score"),
+                "away_score": work_ev.get("away_score"),
+                "burst_dir": gate.get("burst_dir"),
+                "polls": gate.get("polls"),
+                "elapsed_ms": gate.get("elapsed_ms"),
+                "via": gate.get("via"),
+            },
+        )
+
+    # Drain async AF confirms from prior ticks (keeps watch non-blocking).
+    if af_referee is not None:
+        try:
+            for job in af_referee.drain_done():
+                _finish_af_job(job)
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT af-referee drain failed: {e}", flush=True)
+
+    pending_keys = (
+        af_referee.pending_event_keys() if af_referee is not None else set()
+    )
+
+    # Memory events (in-process bridge) first; file scan for restart / board path.
+    events_iter: list[dict[str, Any]] = []
+    override_keys: set[str] = set()
+    if events_override:
+        for ev in events_override:
+            if not isinstance(ev, dict):
+                continue
+            events_iter.append(ev)
+            override_keys.add(event_key(ev))
+    for ev in load_bridge_quote_events(root):
+        key = event_key(ev)
+        if key in override_keys:
+            continue
+        events_iter.append(ev)
+
+    for ev in events_iter:
+        key = event_key(ev)
+        if not force and key in seen:
+            continue
+        if key in pending_keys:
+            continue
+
+        typ = str(ev.get("type") or "")
+
+        if typ == "score_change" and af_referee is not None:
+            from af_referee import (
+                event_is_goal_up,
+                event_is_reversal,
+                target_score_from_event,
+            )
+
+            if event_is_reversal(ev):
+                skip = {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "score_change",
+                    "mode": "af_skip_reversal",
+                    "event_key": key,
+                    "match_id": ev.get("match_id"),
+                    "home": ev.get("home"),
+                    "away": ev.get("away"),
+                    "home_score": ev.get("home_score"),
+                    "away_score": ev.get("away_score"),
+                    "count": 0,
+                    "opportunity_count": 0,
+                    "af_referee": {
+                        "skipped": True,
+                        "reason": "dqd_reversal_ignored",
+                    },
+                    "via": "memory" if key in override_keys else "file",
+                }
+                bundles.append(skip)
+                seen.add(key)
+                print(
+                    f"af-referee → skip reversal match_id={ev.get('match_id')} key={key}",
+                    flush=True,
+                )
+                continue
+
+            if event_is_goal_up(ev):
+                target = target_score_from_event(ev)
+                mid = str(ev.get("match_id") or "")
+                if not mid or target is None:
+                    skip = {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "af_skip_bad_event",
+                        "event_key": key,
+                        "match_id": mid,
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "af_referee": {
+                            "skipped": True,
+                            "reason": "missing_match_id_or_score",
+                        },
+                    }
+                    bundles.append(skip)
+                    seen.add(key)
+                    continue
+
+                af_referee.submit(key, ev, target)
+                pending_keys.add(key)
+                continue
+
+            skip = {
+                "quoted_at": now_cn_iso(),
+                "trigger": "score_change",
+                "mode": "af_skip_non_goal",
+                "event_key": key,
+                "match_id": ev.get("match_id"),
+                "count": 0,
+                "opportunity_count": 0,
+                "af_referee": {"skipped": True, "reason": "not_goal_up"},
+            }
+            bundles.append(skip)
+            seen.add(key)
+            continue
+
+        _quote_one(ev, key)
+
+    if af_referee is not None:
+        try:
+            for job in af_referee.drain_done():
+                _finish_af_job(job)
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT af-referee drain failed: {e}", flush=True)
+
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["updated_at"] = now_cn_iso()
     save_cursor(root, cursor)
+    tick_ms = int((time.monotonic() - tick_t0) * 1000)
+    if bundles:
+        for b in bundles:
+            if isinstance(b, dict):
+                lat = dict(b.get("latency_ms") or {})
+                lat["process_tick"] = tick_ms
+                if events_override is not None:
+                    lat["events_via"] = "memory+file"
+                b["latency_ms"] = lat
     return bundles
 
 
@@ -1737,6 +2027,10 @@ BRIDGE_BOARD_URL = "http://127.0.0.1:8789"
 _OWNED_BRIDGE: Any = None
 
 
+def get_owned_bridge() -> Any | None:
+    return _OWNED_BRIDGE
+
+
 def _http_json(method: str, url: str, *, timeout: float = 2.0) -> dict[str, Any] | None:
     import urllib.request
 
@@ -1757,14 +2051,21 @@ def _http_json(method: str, url: str, *, timeout: float = 2.0) -> dict[str, Any]
 def ensure_upstream_bridge(
     root: Path,
     *,
-    prefer_board: bool = True,
+    prefer_board: bool | None = None,
 ) -> dict[str, Any]:
-    """Start match-bridge (which starts dongqiudi-match + polymarket-soccer).
+    """Start match-bridge (dongqiudi-match + polymarket-soccer).
 
-    Prefer Bridge Board on :8789 if it is already up; otherwise start an
-    in-process BridgeRuntime owned by this quote process.
+    Default: **in-process** BridgeRuntime owned by quote (memory event queue).
+    Set ``MAIN_BRIDGE_INPROC=0`` (or ``prefer_board=True``) to use bridge-board
+    on :8789 instead (file-wake path).
+
+    In-process mode refuses to co-exist with a running board skill (dual writers).
+    If the board is running, it is stopped via ``POST /api/bridge/stop`` first.
     """
     global _OWNED_BRIDGE
+
+    if prefer_board is None:
+        prefer_board = not _env_bool("MAIN_BRIDGE_INPROC", True)
 
     if prefer_board:
         st = _http_json("GET", f"{BRIDGE_BOARD_URL}/api/status", timeout=1.5)
@@ -1789,14 +2090,49 @@ def ensure_upstream_bridge(
                     "pm_ticks": started.get("pm_ticks"),
                 }
 
+    # In-process owner: stop board skill if it is already emitting events.
+    st = _http_json("GET", f"{BRIDGE_BOARD_URL}/api/status", timeout=1.5)
+    if st is not None and st.get("running"):
+        print(
+            "upstream → bridge-board skill is running; stopping it so "
+            "quote can own in-process match-bridge (avoid dual emitters)",
+            flush=True,
+        )
+        stopped = _http_json("POST", f"{BRIDGE_BOARD_URL}/api/bridge/stop", timeout=30)
+        if stopped is None or (
+            stopped.get("running") is True and not stopped.get("ok", True)
+        ):
+            # Still running — refuse rather than double-write.
+            if stopped and stopped.get("running"):
+                raise RuntimeError(
+                    "bridge-board skill still running; stop it before "
+                    "MAIN_BRIDGE_INPROC=1 / in-process bridge"
+                )
+        # Re-check
+        st2 = _http_json("GET", f"{BRIDGE_BOARD_URL}/api/status", timeout=1.5)
+        if st2 is not None and st2.get("running"):
+            raise RuntimeError(
+                "bridge-board skill still running after stop; "
+                "refuse in-process bridge to avoid dual score_change emitters"
+            )
+
     bridge_scripts = root / ".cursor" / "skills" / "match-bridge" / "scripts"
     if str(bridge_scripts) not in sys.path:
         sys.path.insert(0, str(bridge_scripts))
     import bridge_lib as bridge  # type: ignore
 
     if _OWNED_BRIDGE is None:
-        _OWNED_BRIDGE = bridge.BridgeRuntime(root)
+        _OWNED_BRIDGE = bridge.BridgeRuntime(root, async_persist=True)
     result = _OWNED_BRIDGE.start()
+    # Mutual exclusion marker so bridge-board Start refuses dual emit.
+    try:
+        marker = root / "data" / "bridge" / ".inproc_owner"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            f"pid={os.getpid()}\nmode=in_process\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
     return {
         "ok": True,
         "mode": "in_process",
@@ -1805,6 +2141,7 @@ def ensure_upstream_bridge(
         "dqd_idle_interval": _OWNED_BRIDGE.dqd_idle_interval,
         "pm_interval": _OWNED_BRIDGE.pm_interval,
         "owned": True,
+        "event_queue": True,
     }
 
 
@@ -1813,8 +2150,16 @@ def stop_owned_bridge() -> None:
     global _OWNED_BRIDGE
     if _OWNED_BRIDGE is None:
         return
+    owned = _OWNED_BRIDGE
+    root = Path(owned.root)
     try:
-        _OWNED_BRIDGE.stop()
+        owned.stop()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        marker = root / "data" / "bridge" / ".inproc_owner"
+        if marker.is_file():
+            marker.unlink()
     except Exception:  # noqa: BLE001
         pass
     _OWNED_BRIDGE = None

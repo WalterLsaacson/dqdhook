@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import queue
 import re
 import sys
 import threading
@@ -26,7 +27,7 @@ DEFAULT_MIN_SIDE = 0.75
 DEFAULT_MAX_SKEW_MIN = 90
 DEFAULT_PM_STALE_HOURS = 6
 DEFAULT_LEAGUE_FLOOR = 0.40
-# After status=Played but period not yet FT, poll faster (default live stays 15s).
+# After status=Played but period not yet FT, poll at this cadence (same as live default).
 PENDING_FT_POLL_SEC = 5
 
 # Noise words stripped before fuzzy compare.
@@ -614,14 +615,19 @@ def detect_match_finished(
 
 
 class BridgeRuntime:
-    """Runs DQD watch + PM list at defaults and rematches into data/bridge/."""
+    """Runs DQD watch + PM list at defaults and rematches into data/bridge/.
+
+    Hot path: score/FT events go to ``event_queue`` (in-memory) for quote.
+    Cold path: JSONL/JSON snapshots are written by a background persist worker
+    so disk I/O does not block event delivery.
+    """
 
     def __init__(
         self,
         root: Path,
         *,
         dqd_tab: str = "full",
-        dqd_interval: int = 15,
+        dqd_interval: int = 5,
         dqd_idle_interval: int = 60,
         pm_interval: int = 600,
         pm_within_hours: int = 48,
@@ -629,11 +635,12 @@ class BridgeRuntime:
         max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
         min_side: float = DEFAULT_MIN_SIDE,
         pm_stale_hours: float = DEFAULT_PM_STALE_HOURS,
+        async_persist: bool = True,
     ) -> None:
         self.root = root
         # full tab overlaps Polymarket's multi-league 48h window better than hot-only
         self.dqd_tab = dqd_tab
-        self.dqd_interval = max(10, dqd_interval)
+        self.dqd_interval = max(5, dqd_interval)
         self.dqd_idle_interval = max(max(30, self.dqd_interval), dqd_idle_interval)
         self.pm_interval = max(120, pm_interval)
         self.pm_within_hours = pm_within_hours
@@ -641,6 +648,7 @@ class BridgeRuntime:
         self.max_skew_min = max_skew_min
         self.min_side = min_side
         self.pm_stale_hours = pm_stale_hours
+        self.async_persist = bool(async_persist)
 
         self.dqd_scripts = root / ".cursor" / "skills" / "dongqiudi-match" / "scripts"
         self.pm_scripts = root / ".cursor" / "skills" / "polymarket-soccer" / "scripts"
@@ -649,8 +657,10 @@ class BridgeRuntime:
         self.bridge_data = root / "data" / "bridge"
 
         self.lock = threading.RLock()
+        self._rematch_lock = threading.Lock()
         self.running = False
         self._stop = threading.Event()
+        self._shutting_down = False
         self._threads: list[threading.Thread] = []
         self.last_error: str | None = None
         self.dqd_ticks = 0
@@ -660,9 +670,100 @@ class BridgeRuntime:
         self.last_result: dict[str, Any] | None = None
         self.last_events: list[dict[str, Any]] = []
 
+        # In-memory hot path for quote (and optional external consumers).
+        self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        # In-memory prev_* so async disk lag cannot double-emit events.
+        self._prev_loaded = False
+        self._prev_status: dict[str, str] = {}
+        self._prev_period: dict[str, str] = {}
+        self._prev_scores: dict[str, dict[str, Any]] = {}
+
+        self._persist_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._persist_thread: threading.Thread | None = None
+        self._persist_lock = threading.Lock()
+
         for p in (self.dqd_scripts, self.pm_scripts):
             if str(p) not in sys.path:
                 sys.path.insert(0, str(p))
+
+    def _ensure_persist_worker(self) -> None:
+        if not self.async_persist or self._shutting_down:
+            return
+        with self._persist_lock:
+            t = self._persist_thread
+            if t is not None and t.is_alive():
+                return
+            self._persist_thread = threading.Thread(
+                target=self._persist_loop, name="bridge-persist", daemon=True
+            )
+            self._persist_thread.start()
+
+    def _persist_loop(self) -> None:
+        while True:
+            job = self._persist_q.get()
+            if job is None:
+                return
+            try:
+                self._persist_rematch_job(job)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+    def _persist_rematch_job(self, job: dict[str, Any]) -> None:
+        # Durable event log first so a crash after prev_* advance cannot drop goals:
+        # append events → matches snapshots → prev_* last.
+        append_events(self.bridge_data / "events.jsonl", job.get("events") or [])
+        payload = job.get("payload") or {}
+        write_json(self.bridge_data / "matches.json", payload)
+        write_json(self.bridge_data / "latest.json", payload)
+        write_json(self.bridge_data / "prev_status.json", job["prev_status"])
+        write_json(self.bridge_data / "prev_period.json", job["prev_period"])
+        write_json(self.bridge_data / "prev_scores.json", job["prev_scores"])
+
+    def _load_prev_state(self) -> None:
+        if self._prev_loaded:
+            return
+        prev_status = load_json(self.bridge_data / "prev_status.json", {}) or {}
+        if not isinstance(prev_status, dict):
+            prev_status = {}
+        prev_period = load_json(self.bridge_data / "prev_period.json", {}) or {}
+        if not isinstance(prev_period, dict):
+            prev_period = {}
+        prev_scores = load_json(self.bridge_data / "prev_scores.json", {}) or {}
+        if not isinstance(prev_scores, dict):
+            prev_scores = {}
+        self._prev_status = {str(k): str(v) for k, v in prev_status.items()}
+        self._prev_period = {str(k): str(v) for k, v in prev_period.items()}
+        self._prev_scores = {
+            str(k): v for k, v in prev_scores.items() if isinstance(v, dict)
+        }
+        self._prev_loaded = True
+
+    def drain_event_queue(self, *, max_items: int = 256) -> list[dict[str, Any]]:
+        """Non-blocking drain of in-memory bridge events."""
+        out: list[dict[str, Any]] = []
+        while len(out) < max_items:
+            try:
+                out.append(self.event_queue.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def wait_events(
+        self, timeout_s: float, *, max_items: int = 256
+    ) -> list[dict[str, Any]]:
+        """Block up to timeout for the first event, then drain the rest."""
+        out: list[dict[str, Any]] = []
+        try:
+            out.append(self.event_queue.get(timeout=max(0.0, float(timeout_s))))
+        except queue.Empty:
+            return []
+        while len(out) < max_items:
+            try:
+                out.append(self.event_queue.get_nowait())
+            except queue.Empty:
+                break
+        return out
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -729,57 +830,58 @@ class BridgeRuntime:
             pm_stale_hours=self.pm_stale_hours,
         )
 
-        prev_path = self.bridge_data / "prev_status.json"
-        prev_period_path = self.bridge_data / "prev_period.json"
-        prev_scores_path = self.bridge_data / "prev_scores.json"
-        events_path = self.bridge_data / "events.jsonl"
-        prev_status = load_json(prev_path, {}) or {}
-        if not isinstance(prev_status, dict):
-            prev_status = {}
-        prev_status = {str(k): str(v) for k, v in prev_status.items()}
+        with self._rematch_lock:
+            self._load_prev_state()
+            prev_status = self._prev_status
+            prev_period = self._prev_period
+            prev_scores = self._prev_scores
 
-        prev_period = load_json(prev_period_path, {}) or {}
-        if not isinstance(prev_period, dict):
-            prev_period = {}
-        prev_period = {str(k): str(v) for k, v in prev_period.items()}
+            score_events = detect_score_changes(paired, prev_scores)
+            ft_events = detect_match_finished(paired, prev_status, prev_period)
+            events = score_events + ft_events
 
-        prev_scores = load_json(prev_scores_path, {}) or {}
-        if not isinstance(prev_scores, dict):
-            prev_scores = {}
-        prev_scores = {str(k): v for k, v in prev_scores.items() if isinstance(v, dict)}
+            finished_n = sum(1 for r in paired if r.get("finished"))
+            payload = {
+                "matched_at": datetime.now(TZ_CN).isoformat(timespec="seconds"),
+                "source": "match-bridge",
+                "dqd_tab": dqd_snap.get("tab") or self.dqd_tab,
+                "dqd_count": len(dqd_matches),
+                "pm_count": len(pm_matches),
+                "count": len(paired),
+                "finished_count": finished_n,
+                "min_score": self.min_score,
+                "max_skew_min": self.max_skew_min,
+                "min_side": self.min_side,
+                "pm_stale_hours": self.pm_stale_hours,
+                "events": events,
+                "matches": paired,
+            }
 
-        score_events = detect_score_changes(paired, prev_scores)
-        ft_events = detect_match_finished(paired, prev_status, prev_period)
-        events = score_events + ft_events
-        write_json(prev_path, prev_status)
-        write_json(prev_period_path, prev_period)
-        write_json(prev_scores_path, prev_scores)
-        append_events(events_path, events)
+            # Hot path: memory queue first (quote wakes here, not on file mtime).
+            for ev in events:
+                self.event_queue.put(dict(ev))
 
-        finished_n = sum(1 for r in paired if r.get("finished"))
-        payload = {
-            "matched_at": datetime.now(TZ_CN).isoformat(timespec="seconds"),
-            "source": "match-bridge",
-            "dqd_tab": dqd_snap.get("tab") or self.dqd_tab,
-            "dqd_count": len(dqd_matches),
-            "pm_count": len(pm_matches),
-            "count": len(paired),
-            "finished_count": finished_n,
-            "min_score": self.min_score,
-            "max_skew_min": self.max_skew_min,
-            "min_side": self.min_side,
-            "pm_stale_hours": self.pm_stale_hours,
-            "events": events,
-            "matches": paired,
-        }
-        write_json(self.bridge_data / "matches.json", payload)
-        write_json(self.bridge_data / "latest.json", payload)
-        with self.lock:
-            self.last_result = payload
-            self.match_ticks += 1
-            self.last_error = None
-            if events:
-                self.last_events = list(events)
+            with self.lock:
+                self.last_result = payload
+                self.match_ticks += 1
+                self.last_error = None
+                if events:
+                    self.last_events = list(events)
+
+            job = {
+                "prev_status": dict(prev_status),
+                "prev_period": dict(prev_period),
+                "prev_scores": {k: dict(v) for k, v in prev_scores.items()},
+                "events": [dict(ev) for ev in events],
+                "payload": payload,
+            }
+
+        if self.async_persist and not self._shutting_down:
+            self._ensure_persist_worker()
+            self._persist_q.put(job)
+        else:
+            # Sync when shutting down or async disabled — never spawn a second worker.
+            self._persist_rematch_job(job)
         return payload
 
     def run_once(self, *, refresh: bool = True) -> dict[str, Any]:
@@ -803,6 +905,7 @@ class BridgeRuntime:
             if self.running:
                 return {"ok": True, "already": True, **self.status()}
             self.running = True
+            self._shutting_down = False
             self._stop.clear()
             self.started_at = datetime.now(TZ_CN).isoformat(timespec="seconds")
             self.last_error = None
@@ -817,11 +920,21 @@ class BridgeRuntime:
 
     def stop(self) -> dict[str, Any]:
         with self.lock:
+            self._shutting_down = True
             self._stop.set()
             self.running = False
             threads = list(self._threads)
         for t in threads:
-            t.join(timeout=2)
+            t.join(timeout=5)
+        # Flush persist worker; never null a still-alive thread (avoids dual writers).
+        with self._persist_lock:
+            t = self._persist_thread
+        if t is not None and t.is_alive():
+            self._persist_q.put(None)
+            t.join(timeout=5)
+        with self._persist_lock:
+            if self._persist_thread is not None and not self._persist_thread.is_alive():
+                self._persist_thread = None
         with self.lock:
             self._threads = []
             return {"ok": True, **self.status()}
@@ -851,11 +964,18 @@ class BridgeRuntime:
             self.running = self.running and any(t.is_alive() for t in self._threads)
 
     def _pm_loop(self) -> None:
-        # First tick runs immediately (seed may also refresh; rematch is cheap).
+        # First tick runs immediately; rematch only after DQD has seeded once so
+        # a fast PM pull does not publish dqd_count=0 while EN-name cache warms.
         while not self._stop.is_set():
             try:
                 self.refresh_pm_once()
-                self.rematch()
+                with self.lock:
+                    dqd_ready = self.dqd_ticks > 0
+                if not dqd_ready:
+                    snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
+                    dqd_ready = bool(snap.get("matches"))
+                if dqd_ready:
+                    self.rematch()
             except Exception as e:  # noqa: BLE001
                 with self.lock:
                     self.last_error = f"pm: {e}"

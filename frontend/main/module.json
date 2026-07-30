@@ -5,7 +5,7 @@
   "kind": "orchestrator",
   "status": "stable",
   "skill": "polymarket-quote",
-  "description": "Master entry: quote watch (+ in-process CLOB trade) cascade → bridge → DQD + PM, and all frontend boards.",
+  "description": "Master entry: quote watch (+ AF referee + in-process CLOB trade) → match-bridge → DQD + PM, plus apifootball-bridge watch and all frontend boards.",
   "entry": {
     "html": "public/index.html",
     "js": "src/main.js",
@@ -16,6 +16,7 @@
     { "id": "match-board", "port": 8787, "skill": "dongqiudi-match" },
     { "id": "polymarket-board", "port": 8788, "skill": "polymarket-soccer" },
     { "id": "bridge-board", "port": 8789, "skill": "match-bridge" },
+    { "id": "af-bridge-board", "port": 8791, "skill": "apifootball-bridge" },
     {
       "id": "polymarket-quote",
       "kind": "skill",

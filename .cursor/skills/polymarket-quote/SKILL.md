@@ -13,11 +13,25 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-默认 **dry-run**（只写 `trades.jsonl`）；加 `--live` 两者真下单，或用 `--goals-mode` / `--ft-mode` 分开。
+**进球门控（默认开）**：`score_change` 进球后，quote **异步**调用 apifootball-bridge **库入口**（与 `events` CLI 同一路径：AF HTTP + 确认时落 burst），不阻塞 watch。轮询间隔默认 **500ms**，最长 **120s**。
+
+- AF 比分 == 目标，或 AF 已覆盖该次上涨（例如 DQD 报 1-0 而 AF 已是 2-0）→ 以 **AF 比分** 为真值下单，写入 `af_confirmed_scores.json`
+- 超时 → 忽略该进球（写入 cursor，不再重试）
+- 中间 poll **不**写 burst；确认时写一次
+- 429 自动退避
+- 懂球帝 **回撤** 直接忽略
+
+人工/其它 skill 仍可：
+
+```bash
+python3 .cursor/skills/apifootball-bridge/scripts/af_bridge.py events --match-id <DQD_ID> --json
+```
+
+`--no-af-referee` 可退回旧行为。默认 **dry-run**；`--live` / `--goals-mode` / `--ft-mode` 控制真下单。
 
 ## Quick start
 
-**主入口（推荐）** — System Main 会拉起 boards + `pm_quote watch`，并把交易参数一并传入（默认 dry-run，写 `trades.jsonl`）：
+**主入口（推荐）** — System Main 会拉起全部 boards（含 AF 验证板 :8791）、启动 apifootball-bridge watch，并跑 `pm_quote watch`（默认 AF referee + dry-run 交易）：
 
 ```bash
 python3 frontend/run_main.py
@@ -56,19 +70,18 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 ## Agent workflow
 
-1. Prefer System Main (`frontend/run_main.py` / `run_stack.py`): one entry boots all boards + `pm_quote watch`, which cascades match-bridge → DQD + PM. Do not start boards separately.
+1. Prefer System Main (`frontend/run_main.py`): boots boards (UI) + AF watch + `pm_quote watch`, which owns **in-process** match-bridge (memory `event_queue` → AF referee → quote/trade). File writes are async. `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake. Do not start boards as skill hosts separately.
 2. Prefer bridge events in `data/bridge/events.jsonl`:
-   - `score_change` — mid-match after a goal; quote **locked** outcomes only.
-   - `match_finished` — full moneyline + props + exact settlement.
+   - `score_change` — mid-match after a goal; **AF-confirmed** then quote **locked** outcomes only.
+   - `match_finished` — full moneyline + props + exact settlement (no AF goal gate).
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
-4. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
-5. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
-6. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
-7. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` or per-signal `--goals-mode`/`--ft-mode` posts market **FAK** via `py-clob-client-v2`.
-8. **Score reversal**: if bridge reports a score drop (`is_reversal`) or FT undoes the entry score, flatten **only** `buy_win` lots that depended on that goal. Flatten follows **`lot.live`** (dry lots → `flatten_dry_run`; live lots → CLOB). Live FAK sell floors shares to **2dp**, `min_price=0.2`; dust &lt; 0.01 closes the lot; `invalid maker amount` stops retry. `max_usdc` default **5**.
-9. **Reversal processing (one event)**: on that same `score_change`, first flatten affected lots, then **quote once** against the corrected `curr` score (and may trade newly locked markets). Not a separate second event.
-10. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so reversal flatten can fire.
-11. **Post-goal samples (data only)**: when `score_change` produces a successful `buy_win` (dry or live), write that quote as sample 0 and background-requote the same tokens at +10s…+50s (6 total) into `post_goal_samples.jsonl` — no extra `maybe_trade`. Jobs run in **parallel**; follow-ups re-read score and recompute settlement; `reversal_seen` only if an event undoes the t0 score.
+4. **AF referee**: on goal-up, **async** poll apifootball-bridge lib; confirm returns immediately (memory score); burst/disk async — no second AF fetch on the hot path. Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
+5. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
+6. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
+7. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
+8. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` or per-signal `--goals-mode`/`--ft-mode` posts market **FAK** via `py-clob-client-v2`.
+9. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so later FT flatten can fire.
+10. **Post-goal samples (data only)**: when `score_change` produces a successful `buy_win` (dry or live), write that quote as sample 0 and background-requote the same tokens at +10s…+50s (6 total) into `post_goal_samples.jsonl` — no extra `maybe_trade`. Jobs run in **parallel**; follow-ups re-read score and recompute settlement.
 
 ## Trading flags
 
@@ -79,6 +92,9 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--goals-mode dry\|live` | dry | Per-signal mode for进球 (`score_change`); overrides `--live` for that channel |
 | `--ft-mode dry\|live` | dry | Per-signal mode for终场 (`match_finished`); overrides `--live` for that channel |
 | `--no-trade` | off | Quote only |
+| `--no-af-referee` | off | Skip AF confirmation (trade on raw DQD goals; also re-enable DQD reversal flatten) |
+| `--af-poll` | 0.5 | Seconds between in-process apifootball-bridge events polls |
+| `--af-timeout` | 120 | Give up confirming a goal after this many seconds (then ignore + mark processed) |
 | `--take-depth top\|walk` | `top` | Best level vs walk book |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 5 / 25 | Size caps |
@@ -97,7 +113,8 @@ Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while post
 | Quotes | `data/pm-quote/quotes.jsonl` | Full bundles (append; rolling prune) |
 | Latest | `data/pm-quote/latest.json` | Last bundle |
 | Opportunities | `data/pm-quote/opportunities.jsonl` | `misprice=true` rows |
-| Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts + flatten_reversal |
+| Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts + flatten |
+| AF confirmed scores | `data/pm-quote/af_confirmed_scores.json` | Last AF-confirmed score per DQD match_id |
 | Post-goal samples | `data/pm-quote/post_goal_samples.jsonl` | After buy_win on score_change: books at 0/10/20/30/40/50s (no trade) |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots awaiting flatten |
 | Cursor | `data/pm-quote/cursor.json` | Processed event keys |
@@ -125,6 +142,7 @@ python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py prune --retain-hours
 ## Related skills
 
 - [`match-bridge`](../match-bridge/SKILL.md) — FT / score_change trigger
+- [`apifootball-bridge`](../apifootball-bridge/SKILL.md) — AF fixture cache + events for goal referee
 - [`polymarket-soccer`](../polymarket-soccer/SKILL.md) — Gamma proxy helpers / fixture list
 - [`trade-analytics`](../trade-analytics/SKILL.md) — historical trades / overnight PnL from `trades.jsonl`
 

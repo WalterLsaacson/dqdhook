@@ -147,16 +147,41 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 404, {"error": "module.json missing"})
             return
         if path == "/api/status":
-            json_response(self, 200, RUNTIME.status())
+            st = RUNTIME.status()
+            owner = ROOT / "data" / "bridge" / ".inproc_owner"
+            owned = owner.is_file()
+            st["inproc_owner"] = owned
+            st["viewer_mode"] = (
+                "quote_owned"
+                if owned
+                else ("board_skill" if st.get("running") else "idle")
+            )
+            if owned:
+                try:
+                    st["inproc_owner_text"] = owner.read_text(encoding="utf-8").strip()
+                except OSError:
+                    st["inproc_owner_text"] = ""
+            json_response(self, 200, st)
             return
         if path == "/api/matches":
             snap = bridge.load_json(ROOT / "data" / "bridge" / "matches.json", None)
             if not snap:
-                # Seed once if empty.
-                try:
-                    snap = RUNTIME.run_once(refresh=True)
-                except Exception as e:  # noqa: BLE001
-                    json_response(self, 502, {"error": str(e)})
+                # Prefer in-memory payload when this process owns the skill;
+                # otherwise empty until quote/System Main writes files.
+                if RUNTIME.last_result:
+                    snap = RUNTIME.last_result
+                else:
+                    json_response(
+                        self,
+                        200,
+                        {
+                            "matched_at": None,
+                            "count": 0,
+                            "matches": [],
+                            "events": [],
+                            "note": "read-only until match-bridge writes data/bridge",
+                        },
+                    )
                     return
             out = refresh_clocks(snap)
             # Surface in-memory events from the latest rematch tick (file may be stale mid-tick).
@@ -190,6 +215,20 @@ class Handler(BaseHTTPRequestHandler):
         body = read_body(self)
 
         if path == "/api/bridge/once":
+            owner = ROOT / "data" / "bridge" / ".inproc_owner"
+            if owner.is_file():
+                # Read-only: quote owns the skill; just re-serve file snapshot.
+                snap = bridge.load_json(ROOT / "data" / "bridge" / "matches.json", {}) or {}
+                out = refresh_clocks(snap) if snap else {
+                    "matched_at": None,
+                    "count": 0,
+                    "matches": [],
+                    "note": "quote owns match-bridge; showing file snapshot",
+                }
+                out["ok"] = True
+                out["viewer_mode"] = "quote_owned"
+                json_response(self, 200, out)
+                return
             offline = bool(body.get("offline"))
             try:
                 payload = RUNTIME.run_once(refresh=not offline)
@@ -199,6 +238,25 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 502, {"error": str(e)})
             return
         if path == "/api/bridge/start":
+            owner = ROOT / "data" / "bridge" / ".inproc_owner"
+            if owner.is_file():
+                snap = bridge.load_json(ROOT / "data" / "bridge" / "matches.json", {}) or {}
+                json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "already": True,
+                        "running": False,
+                        "viewer_mode": "quote_owned",
+                        "note": (
+                            "match-bridge is owned by polymarket-quote (in-process). "
+                            "Board is read-only; Start is a no-op."
+                        ),
+                        "last_result": refresh_clocks(snap) if snap else None,
+                    },
+                )
+                return
             if body.get("tab"):
                 RUNTIME.dqd_tab = str(body.get("tab"))
             try:
@@ -208,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                     ROOT / "data" / "bridge" / "matches.json", {}
                 )
                 result["last_result"] = refresh_clocks(snap) if snap else result.get("last_result")
+                result["viewer_mode"] = "board_skill"
                 json_response(self, 200, result)
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
@@ -220,34 +279,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def _autostart_bridge() -> None:
-    """Master switch: launching the board starts match-bridge (DQD + PM loops)."""
-    try:
-        result = RUNTIME.start()
-        already = result.get("already")
-        print(
-            f"Skill autostart → {'already running' if already else 'started'} "
-            f"(DQD {RUNTIME.dqd_interval}s/{RUNTIME.dqd_idle_interval}s · "
-            f"PM {RUNTIME.pm_interval}s)",
-            flush=True,
-        )
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        print(f"Skill autostart failed: {e}", flush=True)
-
-
 def main() -> int:
-    import threading
-
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
     (ROOT / "data" / "bridge").mkdir(parents=True, exist_ok=True)
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Bridge Board → http://{HOST}:{PORT}/", flush=True)
     print(f"Module path  → {MODULE_DIR}", flush=True)
-    print(f"Skill        → match-bridge (autostart)", flush=True)
-    # Do not block bind/serve on the first DQD+PM fetch.
-    threading.Thread(target=_autostart_bridge, name="bridge-autostart", daemon=True).start()
+    print(
+        "Skill        → match-bridge (read-only UI; Start watch / Sync once, "
+        "or let polymarket-quote own in-process bridge)",
+        flush=True,
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

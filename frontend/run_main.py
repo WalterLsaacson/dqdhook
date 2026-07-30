@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Launch System Main — the only process you should start.
 
-Boots hub (:8790) + boards + pm_quote watch (which cascades match-bridge →
-dongqiudi-match + polymarket-soccer). Do not start boards or pm_quote separately;
-a second run_main fails if :8790 is already taken.
+Boots hub (:8790) + all boards (UI; AF watch via board API) + pm_quote watch,
+which owns in-process match-bridge (memory event queue → AF referee → quote).
+Do not start boards or pm_quote separately; a second run_main fails if :8790 is
+already taken. Set MAIN_BRIDGE_INPROC=0 to use bridge-board as skill host.
 
 Examples:
   python3 frontend/run_main.py

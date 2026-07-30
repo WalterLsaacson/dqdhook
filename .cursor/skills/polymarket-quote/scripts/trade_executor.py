@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,7 @@ class TradeExecutor:
         self.trader = trader
         self._done: set[str] = set()
         self._flatten_done: set[str] = set()
+        self._lock = threading.RLock()
         self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
         self._load_recent_flattens()
@@ -349,6 +351,23 @@ class TradeExecutor:
         event_type: str = "",
     ) -> dict[str, Any] | None:
         """If quote is a misprice opportunity, plan and optionally post."""
+        with self._lock:
+            return self._maybe_trade_locked(
+                quote,
+                event_key=event_key,
+                match_meta=match_meta,
+                event_type=event_type,
+            )
+
+    def _maybe_trade_locked(
+        self,
+        quote: dict[str, Any],
+        *,
+        event_key: str = "",
+        match_meta: dict[str, Any] | None = None,
+        event_type: str = "",
+    ) -> dict[str, Any] | None:
+        """Caller must hold ``self._lock`` (serializes ledger / _done / posts)."""
         if not self.settings.enabled:
             return None
         if not quote.get("misprice"):
@@ -516,11 +535,11 @@ class TradeExecutor:
                 if isinstance(response, dict)
                 else ""
             )
-            # DELAYED: CLOB accepted — wait briefly for shares so ledger size is real.
+            # DELAYED: CLOB accepted — one quick balance peek (no multi-second wait).
             ledger_plan = plan
             if ok and trade == "buy_win" and resp_status == "DELAYED":
                 bal = trader.wait_conditional_balance(
-                    token_id, min_shares=0.01, timeout_s=3.0
+                    token_id, min_shares=0.01, timeout_s=0.0, interval_s=0.05
                 )
                 if bal > 0:
                     ledger_plan = FillPlan(
@@ -624,6 +643,10 @@ class TradeExecutor:
 
     def maybe_flatten_for_event(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
         """Flatten only lots that depended on a disallowed goal (entry > after score)."""
+        with self._lock:
+            return self._maybe_flatten_for_event_locked(ev)
+
+    def _maybe_flatten_for_event_locked(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.settings.enabled:
             return []
         mid = str(ev.get("match_id") or "")
@@ -677,6 +700,10 @@ class TradeExecutor:
 
     def retry_pending_flattens(self) -> list[dict[str, Any]]:
         """Retry live FAK exits that failed earlier (lot still open + pending_flatten)."""
+        with self._lock:
+            return self._retry_pending_flattens_locked()
+
+    def _retry_pending_flattens_locked(self) -> list[dict[str, Any]]:
         if not self.settings.enabled:
             return []
         pending = self.ledger.pending_flatten_lots()
@@ -1011,5 +1038,5 @@ class TradeExecutor:
             "skip_reason": skip_reason,
             "response": response,
         }
-        lib.append_jsonl(self.trades_path, [row])
+        lib.append_jsonl_async(self.trades_path, [row])
         return row

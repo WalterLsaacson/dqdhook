@@ -30,10 +30,28 @@ import quote_lib as lib  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import load_trade_settings, resolve_live_modes  # noqa: E402
+from af_referee import AfReferee, DEFAULT_POLL_S, DEFAULT_TIMEOUT_S  # noqa: E402
 
 
 def root() -> Path:
     return lib.repo_root_from(Path(__file__))
+
+
+def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
+    """AF goal confirmation gate (default on). Disable with --no-af-referee."""
+    if getattr(args, "no_af_referee", False):
+        return None
+    poll = float(getattr(args, "af_poll", DEFAULT_POLL_S))
+    timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
+    # Always load apifootball_key from repo .env (not the CLOB trade env file).
+    ref = AfReferee(rt, poll_s=poll, timeout_s=timeout, env_path=None)
+    print(
+        f"af-referee → on (apifootball-bridge lib · async · poll={poll}s "
+        f"timeout={timeout}s · DQD reversals ignored)",
+        file=sys.stderr,
+        flush=True,
+    )
+    return ref
 
 
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
@@ -96,6 +114,7 @@ def cmd_once(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"trade setup failed: {e}", file=sys.stderr)
         return 1
+    referee = build_af_referee(args, rt)
 
     try:
         if args.from_bridge:
@@ -111,6 +130,7 @@ def cmd_once(args: argparse.Namespace) -> int:
                 force=bool(args.force),
                 trade_executor=executor,
                 market_cache=cache,
+                af_referee=referee,
             )
             payload = {
                 "quoted_at": lib.now_cn_iso(),
@@ -191,8 +211,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     if not args.no_upstream:
         print(
-            "upstream → starting match-bridge "
-            "(dongqiudi-match + polymarket-soccer)…",
+            "upstream → starting match-bridge in-process "
+            "(dongqiudi-match + polymarket-soccer · memory event queue)…",
             file=sys.stderr,
             flush=True,
         )
@@ -203,7 +223,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if mode == "bridge_board":
                 print(
                     f"upstream → bridge-board {already} @ {up.get('url')} "
-                    f"(DQD ticks={up.get('dqd_ticks')} · PM ticks={up.get('pm_ticks')})",
+                    f"(DQD ticks={up.get('dqd_ticks')} · PM ticks={up.get('pm_ticks')}) "
+                    f"[file wake]",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -211,7 +232,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 print(
                     f"upstream → match-bridge {already} in-process "
                     f"(DQD {up.get('dqd_interval')}/{up.get('dqd_idle_interval')}s · "
-                    f"PM {up.get('pm_interval')}s)",
+                    f"PM {up.get('pm_interval')}s · event_queue)",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -224,6 +245,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"trade setup failed: {e}", file=sys.stderr)
         return 1
+    referee = build_af_referee(args, rt)
 
     # Configure process proxy once before warmer + quote share SOCKS socket patch.
     try:
@@ -255,14 +277,26 @@ def cmd_watch(args: argparse.Namespace) -> int:
         flush=True,
     )
     print(
-        f"polymarket-quote watch (wake≤{interval}s · market_cache · "
-        f"retain={retain_h}h) → {lib.data_dir(rt)}",
+        f"polymarket-quote watch (wake≤{interval}s · memory queue|file · "
+        f"market_cache · retain={retain_h}h) → {lib.data_dir(rt)}",
         file=sys.stderr,
         flush=True,
     )
     sig = mcache.file_signature(events_path)
+    owned = lib.get_owned_bridge()
+    first_tick = True
     try:
         while True:
+            mem_events: list = []
+            if not first_tick:
+                if owned is not None:
+                    mem_events = owned.wait_events(interval)
+                else:
+                    sig = mcache.wait_for_file_change(
+                        events_path, sig, timeout_s=interval, poll_s=0.05
+                    )
+            first_tick = False
+
             bundles = lib.process_bridge_events(
                 rt,
                 proxy=proxy,
@@ -274,14 +308,37 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 force=False,
                 trade_executor=executor,
                 market_cache=cache,
+                af_referee=referee,
+                events_override=mem_events if mem_events else None,
             )
             for b in bundles:
+                lat = b.get("latency_ms") or {}
+                lat_s = ""
+                if lat:
+                    parts = [
+                        f"{k}={v}ms" if isinstance(v, int) else f"{k}={v}"
+                        for k, v in lat.items()
+                    ]
+                    lat_s = " · " + " ".join(parts)
                 if b.get("error"):
                     print(
                         f"error match_id={b.get('match_id')} "
-                        f"trigger={b.get('trigger')}: {b.get('error')}",
+                        f"trigger={b.get('trigger')}: {b.get('error')}{lat_s}",
                         flush=True,
                     )
+                elif str(b.get("mode") or "").startswith("af_"):
+                    gate = b.get("af_referee") or {}
+                    print(
+                        f"[{b.get('quoted_at')}] {b.get('mode')} "
+                        f"match_id={b.get('match_id')} "
+                        f"score={b.get('home_score')}-{b.get('away_score')} "
+                        f"af={gate.get('reason') or gate.get('error') or gate}"
+                        f"{lat_s}",
+                        flush=True,
+                    )
+                    if args.json:
+                        json.dump(b, sys.stdout, ensure_ascii=False)
+                        print(flush=True)
                 else:
                     prev = b.get("prev_score") or {}
                     prev_s = (
@@ -301,20 +358,19 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     disc = b.get("discovery") or {}
                     if disc.get("catalog_cache"):
                         cache_s = f" cache={disc.get('catalog_cache')}"
+                    if disc.get("books_once"):
+                        cache_s += " books=once"
                     print(
                         f"[{b.get('quoted_at')}] {b.get('trigger')}/{b.get('mode')} "
                         f"{b.get('home')} {prev_s}{b.get('home_score')}-{b.get('away_score')} "
                         f"{b.get('away')} quotes={b.get('count')} "
-                        f"opps={b.get('opportunity_count')} trades={trades}{flat_s}{cache_s}",
+                        f"opps={b.get('opportunity_count')} trades={trades}"
+                        f"{flat_s}{cache_s}{lat_s}",
                         flush=True,
                     )
                     if args.json:
                         json.dump(b, sys.stdout, ensure_ascii=False)
                         print(flush=True)
-            # Event-driven wake on events.jsonl; interval is max idle sleep.
-            sig = mcache.wait_for_file_change(
-                events_path, sig, timeout_s=interval, poll_s=0.05
-            )
     except KeyboardInterrupt:
         print("\nbye", file=sys.stderr)
         stop_warm.set()
@@ -403,6 +459,24 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         "--trade-env-file",
         default=None,
         help="Env file with PRIVATE_KEY/FUNDER/… (default repo .env)",
+    )
+    # --- AF referee gate (confirm DQD goals via API-Football events) ---
+    sp.add_argument(
+        "--no-af-referee",
+        action="store_true",
+        help="Disable AF confirmation gate (legacy: trade on DQD score_change immediately)",
+    )
+    sp.add_argument(
+        "--af-poll",
+        type=float,
+        default=DEFAULT_POLL_S,
+        help=f"AF events poll interval seconds while confirming a goal (default {DEFAULT_POLL_S})",
+    )
+    sp.add_argument(
+        "--af-timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help=f"Give up confirming a goal after this many seconds (default {DEFAULT_TIMEOUT_S})",
     )
 
 

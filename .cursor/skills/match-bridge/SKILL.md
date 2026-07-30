@@ -23,7 +23,7 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py once --json
 # Rematch from existing snapshots only
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py once --offline --json
 
-# Resident loops (DQD 15s/60s, Polymarket 10 min)
+# Resident loops (DQD 5s/60s, Polymarket 10 min)
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py start --foreground
 
 # Last result / status
@@ -35,7 +35,7 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py status --json
 
 | Source | Skill | Default refresh |
 |---|---|---|
-| Dongqiudi | `dongqiudi-match` watch (`full` tab) | **15s** live / **60s** idle; **5s** while any match is `Played` but `period` ≠ `FT` |
+| Dongqiudi | `dongqiudi-match` watch (`full` tab) | **5s** live / **60s** idle; **5s** while any match is `Played` but `period` ≠ `FT` |
 | Polymarket | `polymarket-soccer` list | **600s** (10 min), `within_hours=48` |
 
 Matching defaults: `min_score=0.70`, `min_side=0.75`, `max_skew_min=90`, `pm_stale_hours=6` (see [reference.md](reference.md)).  
@@ -67,7 +67,7 @@ Demo board (scores + 伤停补时 / 墙钟 + Polymarket links):
 ```bash
 python3 frontend/run_bridge.py
 # → http://127.0.0.1:8789/
-# Board boot autostarts match-bridge (DQD watch + PM poll + rematch).
+# Read-only UI by default; quote owns in-process bridge. Start watch / Sync once if standalone.
 ```
 
 Module: [`frontend/bridge-board/`](../../../frontend/bridge-board/).
@@ -76,7 +76,7 @@ Module: [`frontend/bridge-board/`](../../../frontend/bridge-board/).
 
 - [`dongqiudi-match`](../dongqiudi-match/SKILL.md)
 - [`polymarket-soccer`](../polymarket-soccer/SKILL.md)
-- [`polymarket-quote`](../polymarket-quote/SKILL.md) — `watch` autostarts this bridge (+ DQD + PM); full UI via `python3 frontend/run_stack.py`
+- [`polymarket-quote`](../polymarket-quote/SKILL.md) — `watch` owns in-process bridge (+ memory event queue); UI via `python3 frontend/run_main.py`
 
 ## Files
 

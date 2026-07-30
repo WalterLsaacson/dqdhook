@@ -25,6 +25,21 @@ function render(st) {
     $("pillTrade").className = "pill ok";
   }
 
+  const afBoard = (st.boards || []).find((b) => b.id === "af-bridge-board");
+  const afRef = st.quote?.af_referee !== false;
+  if (!afBoard?.up) {
+    $("pillAf").textContent = "AF board down";
+    $("pillAf").className = "pill bad";
+  } else if (afBoard.skill_running) {
+    $("pillAf").textContent = afRef
+      ? `AF watch · referee on · ${afBoard.entry_count ?? "?"} mapped`
+      : `AF watch · referee off · ${afBoard.entry_count ?? "?"} mapped`;
+    $("pillAf").className = "pill ok";
+  } else {
+    $("pillAf").textContent = "AF watch idle";
+    $("pillAf").className = "pill bad";
+  }
+
   const boards = st.boards || [];
   const upN = boards.filter((b) => b.up).length;
   $("pillBoards").textContent = `Boards ${upN}/${boards.length}`;
@@ -47,7 +62,11 @@ function render(st) {
           ? ` · bridge skill ${b.skill_running ? "running" : "idle"}` +
             (b.dqd_ticks != null ? ` · DQD ${b.dqd_ticks}` : "") +
             (b.pm_ticks != null ? ` · PM ${b.pm_ticks}` : "")
-          : "";
+          : b.id === "af-bridge-board" && b.skill_running != null
+            ? ` · af watch ${b.skill_running ? "running" : "idle"}` +
+              (b.entry_count != null ? ` · ${b.entry_count} mapped` : "") +
+              (b.unresolved_count != null ? ` · ${b.unresolved_count} unresolved` : "")
+            : "";
       return `
       <a class="card ${b.up ? "" : "is-down"}" href="${b.url}" target="_blank" rel="noreferrer">
         <div>

@@ -37,7 +37,7 @@ def get_runtime(args: argparse.Namespace) -> lib.BridgeRuntime:
         _RUNTIME = lib.BridgeRuntime(
             root(),
             dqd_tab=getattr(args, "tab", "full") or "full",
-            dqd_interval=int(getattr(args, "dqd_interval", 15) or 15),
+            dqd_interval=int(getattr(args, "dqd_interval", 5) or 5),
             dqd_idle_interval=int(getattr(args, "dqd_idle_interval", 60) or 60),
             pm_interval=int(getattr(args, "pm_interval", 600) or 600),
             pm_within_hours=int(getattr(args, "within_hours", 48) or 48),
@@ -128,7 +128,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Bridge Dongqiudi + Polymarket match lists")
     p.add_argument("--tab", default="full", help="Dongqiudi tab (default: full)")
-    p.add_argument("--dqd-interval", type=int, default=15, help="DQD live poll seconds")
+    p.add_argument("--dqd-interval", type=int, default=5, help="DQD live poll seconds")
     p.add_argument("--dqd-idle-interval", type=int, default=60, help="DQD idle poll seconds")
     p.add_argument("--pm-interval", type=int, default=600, help="Polymarket refresh seconds (default 10m)")
     p.add_argument("--within-hours", type=int, default=48, help="PM upcoming window hours")

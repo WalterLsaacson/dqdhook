@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import json
+import http.client
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -30,12 +32,23 @@ TZ_CN = timezone(timedelta(hours=8))
 TAB_FILTERS: dict[str, Callable[[dict[str, Any]], bool]] = {}
 
 
+class FetchError(RuntimeError):
+    """Raised when the upstream API cannot be reached or response is truncated."""
+
+
 def fetch_json(path: str, params: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
     qs = urllib.parse.urlencode(params)
     url = f"{BASE}{path}?{qs}"
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except http.client.IncompleteRead as e:
+        raise FetchError(f"IncompleteRead: {e}") from e
+    except http.client.HTTPException as e:
+        raise FetchError(f"HTTPException: {e}") from e
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        raise FetchError(str(e)) from e
 
 
 def fetch_soccer_match_list(language: str = "en") -> list[dict[str, Any]]:
@@ -51,6 +64,11 @@ def fetch_soccer_match_list(language: str = "en") -> list[dict[str, Any]]:
     )
     data = payload.get("data") or {}
     return list(data.get("matches") or [])
+
+
+def fetch_soccer_match_list_raw(language: str = "zh-cn") -> list[dict[str, Any]]:
+    """Alias for raw match_list rows (no map_match). Same as fetch_soccer_match_list."""
+    return fetch_soccer_match_list(language=language)
 
 
 def schedule_start_param(beijing_day: str) -> str:
@@ -408,7 +426,7 @@ def fetch_team_en_name(team_id: str) -> str | None:
             {"team_id": tid, "language": "en"},
             timeout=12.0,
         )
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+    except (FetchError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
     base = ((payload.get("data") or {}).get("base_info") or {}) if isinstance(payload, dict) else {}
     name = str(base.get("team_en_name") or "").strip()
@@ -419,8 +437,15 @@ def resolve_team_en_names(
     team_ids: Iterable[str],
     *,
     workers: int = 8,
+    max_fetch: int = 64,
+    fetch_timeout_s: float = 8.0,
 ) -> dict[str, str]:
-    """Return team_id → English name, fetching + caching misses."""
+    """Return team_id → English name, fetching + caching misses.
+
+    Cold cache (after wiping ``data/``) can mean thousands of misses. Cap
+    per-call fetches so match_list / bridge rematch stay responsive; remaining
+    ids keep Chinese names until later ticks warm the cache.
+    """
     cache = load_team_en_cache()
     missing = sorted(
         {
@@ -430,17 +455,27 @@ def resolve_team_en_names(
         }
     )
     if missing:
-        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-            futures = {pool.submit(fetch_team_en_name, tid): tid for tid in missing}
-            for fut in as_completed(futures):
-                tid = futures[fut]
+        batch = missing[: max(0, int(max_fetch))]
+        if batch:
+            deadline = time.monotonic() + max(0.5, float(fetch_timeout_s))
+            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+                futures = {pool.submit(fetch_team_en_name, tid): tid for tid in batch}
                 try:
-                    name = fut.result()
-                except Exception:  # noqa: BLE001
-                    name = None
-                if name:
-                    cache[tid] = name
-        save_team_en_cache(cache)
+                    for fut in as_completed(
+                        futures, timeout=max(0.1, deadline - time.monotonic())
+                    ):
+                        tid = futures[fut]
+                        try:
+                            name = fut.result(timeout=0)
+                        except Exception:  # noqa: BLE001
+                            name = None
+                        if name:
+                            cache[tid] = name
+                        if time.monotonic() >= deadline:
+                            break
+                except FuturesTimeout:
+                    pass
+            save_team_en_cache(cache)
     return cache
 
 
@@ -499,7 +534,15 @@ def load_matches(
             continue
         try:
             raw_rows = fetch_soccer_schedule_list(d, language="zh-CN", future=True)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        except (
+            FetchError,
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            OSError,
+            http.client.IncompleteRead,
+            http.client.HTTPException,
+        ):
             continue
         for raw in raw_rows:
             if (raw.get("cmp_type") or "soccer") != "soccer":
@@ -616,10 +659,6 @@ def detect_score_changes(
     return events
 
 
-class FetchError(RuntimeError):
-    """Raised when the upstream API cannot be reached."""
-
-
 def safe_load_matches(
     language: str = "en",
     day: str | None = None,
@@ -627,7 +666,7 @@ def safe_load_matches(
 ) -> list[dict[str, Any]]:
     try:
         return load_matches(language=language, day=day, days=days)
-    except urllib.error.URLError as e:
-        raise FetchError(str(e)) from e
-    except TimeoutError as e:
+    except FetchError:
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.IncompleteRead, http.client.HTTPException) as e:
         raise FetchError(str(e)) from e

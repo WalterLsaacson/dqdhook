@@ -221,10 +221,17 @@ export function renderMeta(snap) {
   $("pillFetched").textContent = snap?.matched_at
     ? `更新 ${formatBeijingDateTime(snap.matched_at)}`
     : "—";
-  $("pillStatus").textContent = state.running ? "Bridge running" : "Idle";
-  $("pillStatus").classList.toggle("is-live", state.running);
-  $("btnStart").disabled = state.running;
-  $("btnStop").disabled = !state.running;
+  if (state.quoteOwned) {
+    $("pillStatus").textContent = "Quote-owned (read-only)";
+    $("pillStatus").classList.toggle("is-live", true);
+    $("btnStart").disabled = true;
+    $("btnStop").disabled = true;
+  } else {
+    $("pillStatus").textContent = state.running ? "Bridge running" : "Idle";
+    $("pillStatus").classList.toggle("is-live", state.running);
+    $("btnStart").disabled = state.running;
+    $("btnStop").disabled = !state.running;
+  }
 }
 
 export function render(snap) {

@@ -113,7 +113,7 @@ Rules:
 - Fire when previous `period` ≠ `FT` and current `period` = `FT` (does **not** require `Played`)
 - `1H` / `2H` never emit full-time (covers half-time and injury time)
 - Appended to `data/bridge/events.jsonl`; also in that rematch tick’s `matches.json` → `events`
-- Poll cadence: default live **15s**; if any DQD row is `Played` but `period` ≠ `FT`, next sleep is **5s** until FT
+- Poll cadence: default live **5s**; if any DQD row is `Played` but `period` ≠ `FT`, next sleep is **5s** until FT
 
 Matched rows get `finished: true` / `dongqiudi.is_finished: true` while `period` is `FT`.
 

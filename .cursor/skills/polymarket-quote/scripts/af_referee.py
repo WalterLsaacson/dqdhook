@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""AF referee gate: confirm Dongqiudi goal-ups via apifootball-bridge skill lib.
+
+Quote does **not** reimplement AF HTTP. Each poll calls the same code path as:
+
+  python3 …/apifootball-bridge/scripts/af_bridge.py events --match-id <id>
+
+(in-process ``af_bridge_lib.fetch_events_for_match_id``), so the skill owns
+fixture-cache updates and burst persistence.
+
+Confirmations run on a thread pool so ``process_bridge_events`` / watch stay
+responsive. Intermediate polls skip burst dirs. On confirm the gate returns
+immediately; burst + ``af_confirmed_scores.json`` persist asynchronously
+(no second AF fetch on the hot path).
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+TZ_CN = timezone(timedelta(hours=8))
+
+DEFAULT_POLL_S = 0.5
+DEFAULT_TIMEOUT_S = 120.0
+DEFAULT_WORKERS = 4
+
+_AF_SCRIPTS = Path(__file__).resolve().parents[2] / "apifootball-bridge" / "scripts"
+_af_sp = str(_AF_SCRIPTS)
+if _af_sp not in sys.path:
+    sys.path.insert(0, _af_sp)
+
+import af_bridge_lib as aflib  # noqa: E402
+
+# Process-local confirmed scores (disk is async / best-effort).
+_MEMORY_SCORES: dict[str, tuple[int, int]] = {}
+_MEMORY_LOCK = threading.Lock()
+_DISK_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="af-ref-disk")
+
+
+def iso_now() -> str:
+    return datetime.now(TZ_CN).isoformat(timespec="seconds")
+
+
+def confirmed_scores_path(root: Path) -> Path:
+    return root / "data" / "pm-quote" / "af_confirmed_scores.json"
+
+
+def load_confirmed_scores(root: Path) -> dict[str, Any]:
+    path = confirmed_scores_path(root)
+    if not path.is_file():
+        return {"updated_at": None, "scores": {}}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"updated_at": None, "scores": {}}
+    if not isinstance(raw, dict):
+        return {"updated_at": None, "scores": {}}
+    scores = raw.get("scores") if isinstance(raw.get("scores"), dict) else {}
+    return {
+        "updated_at": raw.get("updated_at"),
+        "scores": {str(k): v for k, v in scores.items() if isinstance(v, dict)},
+    }
+
+
+def save_confirmed_scores(root: Path, store: dict[str, Any]) -> None:
+    path = confirmed_scores_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = dict(store)
+    out["updated_at"] = iso_now()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def get_confirmed_score(root: Path, match_id: str) -> tuple[int, int] | None:
+    mid = str(match_id)
+    with _MEMORY_LOCK:
+        mem = _MEMORY_SCORES.get(mid)
+    if mem is not None:
+        return mem
+    store = load_confirmed_scores(root)
+    row = (store.get("scores") or {}).get(mid)
+    if not isinstance(row, dict):
+        return None
+    try:
+        h, a = row.get("home"), row.get("away")
+        if h is None or a is None:
+            return None
+        out = (int(h), int(a))
+        with _MEMORY_LOCK:
+            _MEMORY_SCORES[mid] = out
+        return out
+    except (TypeError, ValueError):
+        return None
+
+
+def set_confirmed_score(
+    root: Path,
+    match_id: str,
+    home: int,
+    away: int,
+    *,
+    af_fixture_id: int | None = None,
+    source: str = "af_bridge_events",
+    burst_dir: str | None = None,
+    persist: bool = True,
+) -> None:
+    mid = str(match_id)
+    with _MEMORY_LOCK:
+        _MEMORY_SCORES[mid] = (int(home), int(away))
+    if not persist:
+        return
+    store = load_confirmed_scores(root)
+    scores = dict(store.get("scores") or {})
+    scores[mid] = {
+        "home": int(home),
+        "away": int(away),
+        "af_fixture_id": af_fixture_id,
+        "source": source,
+        "burst_dir": burst_dir,
+        "confirmed_at": iso_now(),
+    }
+    store["scores"] = scores
+    save_confirmed_scores(root, store)
+
+
+def set_confirmed_score_async(
+    root: Path,
+    match_id: str,
+    home: int,
+    away: int,
+    *,
+    af_fixture_id: int | None = None,
+    source: str = "af_bridge_events",
+    burst_dir: str | None = None,
+) -> None:
+    """Update memory immediately; disk write on background thread."""
+    mid = str(match_id)
+    with _MEMORY_LOCK:
+        _MEMORY_SCORES[mid] = (int(home), int(away))
+    _DISK_EXEC.submit(
+        set_confirmed_score,
+        root,
+        mid,
+        int(home),
+        int(away),
+        af_fixture_id=af_fixture_id,
+        source=source,
+        burst_dir=burst_dir,
+        persist=True,
+    )
+
+
+def event_is_goal_up(ev: dict[str, Any]) -> bool:
+    if str(ev.get("type") or "") != "score_change":
+        return False
+    if ev.get("is_reversal"):
+        return False
+    if ev.get("is_goal") is True:
+        return True
+    prev = ev.get("prev") or {}
+    curr = ev.get("curr") or {}
+    try:
+        ph = int(prev.get("home"))
+        pa = int(prev.get("away"))
+        ch = int(curr.get("home", ev.get("home_score")))
+        ca = int(curr.get("away", ev.get("away_score")))
+    except (TypeError, ValueError):
+        return False
+    return ch >= ph and ca >= pa and (ch > ph or ca > pa)
+
+
+def event_is_reversal(ev: dict[str, Any]) -> bool:
+    if str(ev.get("type") or "") != "score_change":
+        return False
+    if ev.get("is_reversal"):
+        return True
+    prev = ev.get("prev") or {}
+    curr = ev.get("curr") or {}
+    try:
+        ph = int(prev.get("home"))
+        pa = int(prev.get("away"))
+        ch = int(curr.get("home", ev.get("home_score")))
+        ca = int(curr.get("away", ev.get("away_score")))
+    except (TypeError, ValueError):
+        return False
+    return ch < ph or ca < pa
+
+
+def target_score_from_event(ev: dict[str, Any]) -> tuple[int, int] | None:
+    curr = ev.get("curr") or {}
+    try:
+        h = curr.get("home", ev.get("home_score"))
+        a = curr.get("away", ev.get("away_score"))
+        if h is None or a is None:
+            return None
+        return int(h), int(a)
+    except (TypeError, ValueError):
+        return None
+
+
+def baseline_score_from_event(ev: dict[str, Any]) -> tuple[int, int] | None:
+    prev = ev.get("prev") or {}
+    try:
+        if prev.get("home") is None or prev.get("away") is None:
+            return None
+        return int(prev["home"]), int(prev["away"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def apply_af_score_to_event(
+    ev: dict[str, Any],
+    *,
+    home: int,
+    away: int,
+) -> dict[str, Any]:
+    out = dict(ev)
+    out["home_score"] = int(home)
+    out["away_score"] = int(away)
+    out["curr"] = {"home": int(home), "away": int(away)}
+    out["score_source"] = "api_football"
+    return out
+
+
+def af_score_satisfies(
+    af: tuple[int, int],
+    target: tuple[int, int],
+    *,
+    baseline: tuple[int, int] | None = None,
+) -> tuple[bool, tuple[int, int]]:
+    """Whether AF score confirms the DQD goal-up.
+
+    Exact match always wins. If AF is already ahead of the DQD target (e.g. AF
+    2-0 while DQD just reported 1-0), accept and use AF as truth — as long as AF
+    did not drop below the pre-goal baseline.
+    """
+    ah, aa = int(af[0]), int(af[1])
+    th, ta = int(target[0]), int(target[1])
+    if ah == th and aa == ta:
+        return True, (ah, aa)
+    if ah >= th and aa >= ta:
+        if baseline is None:
+            return True, (ah, aa)
+        bh, ba = int(baseline[0]), int(baseline[1])
+        if ah >= bh and aa >= ba:
+            return True, (ah, aa)
+    return False, (ah, aa)
+
+
+def _is_rate_limited(payload: dict[str, Any]) -> bool:
+    if payload.get("http_status") == 429:
+        return True
+    blob = str(payload.get("error") or payload.get("errors") or "").lower()
+    return "rate" in blob or "limit" in blob and "request" in blob
+
+
+def call_af_bridge_events(
+    match_id: str,
+    *,
+    af: aflib.AFClient,
+    cache: dict[str, Any],
+    persist_burst: bool = False,
+    persist_cache: bool = False,
+) -> dict[str, Any]:
+    """In-process apifootball-bridge events path (same as CLI ``events``)."""
+    return aflib.fetch_events_for_match_id(
+        af,
+        str(match_id),
+        cache=cache,
+        persist_cache=persist_cache,
+        persist_burst=persist_burst,
+    )
+
+
+class AfReferee:
+    """Async AF confirmations via apifootball-bridge lib + thread pool."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        poll_s: float = DEFAULT_POLL_S,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+        env_path: Path | None = None,
+        max_workers: int = DEFAULT_WORKERS,
+        events_fn: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
+        self.root = Path(root)
+        self.poll_s = max(0.05, float(poll_s))
+        self.timeout_s = max(1.0, float(timeout_s))
+        self.env_path = env_path
+        self._events_fn = events_fn
+        self._af: aflib.AFClient | None = None
+        self._cache: dict[str, Any] | None = None
+        self._exec = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="af-ref",
+        )
+        self._lock = threading.Lock()
+        self._pending: dict[str, Future] = {}
+        self._meta: dict[str, dict[str, Any]] = {}
+
+    def _client(self) -> aflib.AFClient:
+        if self._af is None:
+            key = aflib.load_af_key(self.env_path)
+            # No Free-plan 6.5s spacing — referee needs ~500ms polls; backoff on 429.
+            self._af = aflib.AFClient(key, min_interval_s=0.0)
+        return self._af
+
+    def _fixture_cache(self) -> dict[str, Any]:
+        if self._cache is None:
+            self._cache = aflib.load_cache(aflib.DEFAULT_CACHE_PATH)
+        return self._cache
+
+    def pending_event_keys(self) -> set[str]:
+        with self._lock:
+            return set(self._pending.keys())
+
+    def poll_once(self, match_id: str, *, persist_burst: bool = False) -> dict[str, Any]:
+        if self._events_fn is not None:
+            try:
+                return self._events_fn(str(match_id), persist_burst=persist_burst)
+            except TypeError:
+                return self._events_fn(str(match_id))
+        out = call_af_bridge_events(
+            str(match_id),
+            af=self._client(),
+            cache=self._fixture_cache(),
+            persist_burst=persist_burst,
+            persist_cache=False,
+        )
+        return out
+
+    def _persist_confirm_side_effects(
+        self, match_id: str, last: dict[str, Any], truth: tuple[int, int]
+    ) -> None:
+        """Background burst artifact + fixture cache (off hot path).
+
+        Score disk write is handled by ``set_confirmed_score_async``. Burst may
+        trigger one AF HTTP here — never on the confirm return path.
+        """
+        mid = str(match_id)
+        burst = str(last.get("burst_dir") or "") or None
+        if burst is None:
+            try:
+                out = self.poll_once(mid, persist_burst=True)
+                burst = str(out.get("burst_dir") or "") or None
+                if burst:
+                    # Refresh disk row with burst_dir once available.
+                    fid = last.get("af_fixture_id") or out.get("af_fixture_id")
+                    set_confirmed_score(
+                        self.root,
+                        mid,
+                        truth[0],
+                        truth[1],
+                        af_fixture_id=int(fid) if fid is not None else None,
+                        burst_dir=burst,
+                        persist=True,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            aflib.save_cache(aflib.DEFAULT_CACHE_PATH, self._fixture_cache())
+        except OSError:
+            pass
+
+    def await_score(
+        self,
+        match_id: str,
+        target: tuple[int, int],
+        *,
+        baseline: tuple[int, int] | None = None,
+        poll_s: float | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Block until AF confirms target (or AF already covers it) / timeout.
+
+        Prefer calling via ``submit`` + ``drain_done`` so watch is not blocked.
+        On confirm: return immediately (memory score); disk/burst async.
+        """
+        poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
+        timeout = self.timeout_s if timeout_s is None else max(1.0, float(timeout_s))
+        th, ta = int(target[0]), int(target[1])
+        # Prefer persisted AF truth as baseline when present.
+        stored = get_confirmed_score(self.root, str(match_id))
+        base = stored if stored is not None else baseline
+
+        t0 = time.monotonic()
+        polls = 0
+        last: dict[str, Any] = {}
+        last_goals: dict[str, int | None] = {"home": None, "away": None}
+        last_error: Any = None
+        rate_hits = 0
+
+        while True:
+            polls += 1
+            iter_t0 = time.monotonic()
+            try:
+                last = self.poll_once(str(match_id), persist_burst=False)
+            except Exception as e:  # noqa: BLE001
+                last_error = str(e)
+                last = {"ok": False, "error": str(e), "goals": last_goals}
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+            if _is_rate_limited(last):
+                rate_hits += 1
+                last_error = last.get("error") or last.get("errors") or "rate_limited"
+                backoff = min(8.0, poll * (2 ** min(rate_hits, 4)))
+                if (time.monotonic() - t0) >= timeout:
+                    break
+                time.sleep(backoff)
+                continue
+
+            if last.get("ok"):
+                goals = last.get("goals") or {}
+                last_goals = {"home": goals.get("home"), "away": goals.get("away")}
+                try:
+                    gh, ga = goals.get("home"), goals.get("away")
+                    if gh is not None and ga is not None:
+                        ok, truth = af_score_satisfies(
+                            (int(gh), int(ga)), (th, ta), baseline=base
+                        )
+                        if ok:
+                            fid = last.get("af_fixture_id")
+                            # Hot path: memory only — no second AF fetch, no sync disk.
+                            set_confirmed_score_async(
+                                self.root,
+                                str(match_id),
+                                truth[0],
+                                truth[1],
+                                af_fixture_id=int(fid) if fid is not None else None,
+                                burst_dir=str(last.get("burst_dir") or "") or None,
+                            )
+                            _DISK_EXEC.submit(
+                                self._persist_confirm_side_effects,
+                                str(match_id),
+                                dict(last),
+                                truth,
+                            )
+                            return {
+                                "ok": True,
+                                "confirmed": True,
+                                "match_id": str(match_id),
+                                "target": {"home": th, "away": ta},
+                                "goals": {"home": truth[0], "away": truth[1]},
+                                "baseline": (
+                                    {"home": base[0], "away": base[1]} if base else None
+                                ),
+                                "af_fixture_id": fid,
+                                "burst_dir": last.get("burst_dir"),
+                                "polls": polls,
+                                "elapsed_ms": elapsed_ms,
+                                "poll_s": poll,
+                                "timeout_s": timeout,
+                                "via": "apifootball-bridge",
+                                "persist": "async",
+                            }
+                except (TypeError, ValueError):
+                    pass
+            else:
+                last_error = last.get("error") or last.get("errors") or last_error
+
+            if (time.monotonic() - t0) >= timeout:
+                break
+            remain = poll - (time.monotonic() - iter_t0)
+            if remain > 0:
+                time.sleep(remain)
+
+        return {
+            "ok": False,
+            "confirmed": False,
+            "match_id": str(match_id),
+            "target": {"home": th, "away": ta},
+            "goals": last_goals,
+            "baseline": {"home": base[0], "away": base[1]} if base else None,
+            "af_fixture_id": last.get("af_fixture_id"),
+            "burst_dir": last.get("burst_dir"),
+            "polls": polls,
+            "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            "poll_s": poll,
+            "timeout_s": timeout,
+            "error": last_error or "af_confirm_timeout",
+            "via": "apifootball-bridge",
+        }
+
+    def submit(
+        self,
+        event_key: str,
+        ev: dict[str, Any],
+        target: tuple[int, int],
+    ) -> bool:
+        """Enqueue non-blocking confirmation. Returns False if already pending."""
+        mid = str(ev.get("match_id") or "")
+        if not mid:
+            return False
+        with self._lock:
+            if event_key in self._pending:
+                return False
+            stored = get_confirmed_score(self.root, mid)
+            baseline = stored if stored is not None else baseline_score_from_event(ev)
+            fut = self._exec.submit(
+                self.await_score,
+                mid,
+                target,
+                baseline=baseline,
+            )
+            self._pending[event_key] = fut
+            self._meta[event_key] = {
+                "ev": dict(ev),
+                "target": (int(target[0]), int(target[1])),
+                "match_id": mid,
+                "submitted_at": iso_now(),
+            }
+        print(
+            f"af-referee → queued {mid} target={target[0]}-{target[1]} "
+            f"key={event_key} (async · poll {self.poll_s}s · timeout {self.timeout_s}s)",
+            flush=True,
+        )
+        return True
+
+    def drain_done(self) -> list[dict[str, Any]]:
+        """Return completed confirm jobs (confirmed or timed out)."""
+        with self._lock:
+            done_keys = [k for k, fut in self._pending.items() if fut.done()]
+        out: list[dict[str, Any]] = []
+        for key in done_keys:
+            with self._lock:
+                fut = self._pending.pop(key, None)
+                meta = self._meta.pop(key, None)
+            if fut is None or meta is None:
+                continue
+            try:
+                gate = fut.result()
+            except Exception as e:  # noqa: BLE001
+                gate = {
+                    "ok": False,
+                    "confirmed": False,
+                    "error": str(e),
+                    "match_id": meta.get("match_id"),
+                    "target": {
+                        "home": meta["target"][0],
+                        "away": meta["target"][1],
+                    },
+                }
+            out.append(
+                {
+                    "event_key": key,
+                    "ev": meta["ev"],
+                    "target": meta["target"],
+                    "match_id": meta["match_id"],
+                    "gate": gate,
+                }
+            )
+        return out
