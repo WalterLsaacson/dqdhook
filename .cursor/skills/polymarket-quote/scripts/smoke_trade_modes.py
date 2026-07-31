@@ -30,6 +30,7 @@ def _settings(*, goals: bool, ft: bool) -> TradeSettings:
         max_shares=25.0,
         max_slippage=0.03,
         allow_extreme_prices=False,
+        min_buy_price=0.8,
         min_order_shares=0.0,
         enabled=True,
     )
@@ -79,6 +80,7 @@ def main() -> int:
         env_file="/dev/null",
     )
     assert s.live_goals is False and s.live_ft is True and s.live is True
+    assert s.min_buy_price == 0.8
 
     s2 = load_trade_settings(
         live=False,
@@ -89,6 +91,14 @@ def main() -> int:
     )
     assert s2.live_goals is True and s2.live_ft is False
 
+    s3 = load_trade_settings(
+        live=False,
+        min_buy_price=0.9,
+        require_key=False,
+        env_file="/dev/null",
+    )
+    assert s3.min_buy_price == 0.9
+
     # argparse shape on pm_quote
     import pm_quote
 
@@ -97,8 +107,19 @@ def main() -> int:
         ["watch", "--goals-mode", "dry", "--ft-mode", "live", "--no-upstream"]
     )
     assert ns.goals_mode == "dry" and ns.ft_mode == "live" and not ns.live
+    assert ns.min_buy_price == 0.8
     ns2 = p.parse_args(["watch", "--live", "--no-upstream"])
     assert ns2.live and ns2.goals_mode is None and ns2.ft_mode is None
+    ns3 = p.parse_args(["watch", "--min-buy-price", "0.75", "--no-upstream"])
+    assert ns3.min_buy_price == 0.75
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(goals=False, ft=True))
+        assert ex._min_buy_price_blocked(0.79) is not None
+        assert ex._min_buy_price_blocked(0.8) is None
+        assert "buy_price_below_min" in (ex._min_buy_price_blocked(0.5) or "")
 
     print("ok: split goals/ft trade modes")
     return 0

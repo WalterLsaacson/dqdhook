@@ -119,7 +119,7 @@ def test_af_confirm_no_sync_second_fetch() -> None:
             }
 
         referee = ref.AfReferee(
-            root, poll_s=0.05, timeout_s=2.0, events_fn=fake_events
+            root, poll_s=0.05, timeout_s=2.0, events_fn=fake_events, poll_schedule=False
         )
         out = referee.await_score("m1", (1, 0), baseline=(0, 0))
         check("confirmed", out.get("confirmed") is True)

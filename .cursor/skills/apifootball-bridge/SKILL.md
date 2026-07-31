@@ -34,7 +34,8 @@ python3 .cursor/skills/apifootball-bridge/scripts/af_bridge.py status --json
 
 Defaults: Free-plan AF spacing **6.5s** (`--free-plan` on). Mapping cache: `data/apifootball/fixture_cache.json`. Events artifacts share the latency probe tree: `data/dqd-probe/af-latency/bursts/`.
 
-`events` path: **cache lookup → one** `GET /fixtures/events` (fixture id already cached by sync/watch).
+`events` path: **cache lookup → one** `GET /fixtures/events` (fixture id already cached by sync/watch).  
+Quote referee always uses **cache_only** (no on-demand resolve); mapping is owned by sync/watch only.
 ## Agent workflow
 
 1. Ensure match-bridge has written `data/bridge/matches.json` (or run bridge `once` / `start` first).
@@ -57,7 +58,7 @@ Consumer skills should:
 - Prefer cache hits (`list` / read `fixture_cache.json`) before requesting events.
 - Pass **Dongqiudi** `match_id` (not Polymarket event id) to `events`.
 - Treat missing AF coverage as inconclusive (Free plan / league without events).
-- **polymarket-quote referee**: calls this skill’s **lib** `fetch_events_for_match_id` asynchronously (same path as `events` CLI); burst persisted on confirm; Free-plan spacing bypassed during confirm with 429 backoff.
+- **polymarket-quote referee**: `fetch_events_for_match_id(..., cache_only=True)` asynchronously — **never** resolves fixtures on the hot path; cache miss / unresolved → skip goal immediately. Burst persisted on confirm; Free-plan spacing bypassed during confirm with 429 backoff.
 
 ### Example handoff
 

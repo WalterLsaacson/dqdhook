@@ -89,6 +89,7 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 | `walk` | Accumulate `asks_top` until max_levels / max_usdc / max_shares / slippage; FAK | Walk `bids_top` downward; FAK |
 
 Price guard: skip when best ≤0.01 or ≥0.99 unless `--allow-extreme-prices`.  
+`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.8**). Env: `QUOTE_MIN_BUY_PRICE`.  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  
 SDK: `py-clob-client-v2` (see `requirements-trade.txt`). Env: `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAIN_ID`, `CLOB_HOST`.
 
@@ -97,6 +98,7 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 **Score reversal / disallowed goal**
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
+- With AF referee on, goal-ups wait for AF confirm; **reversals still flatten immediately** (no AF gate).
 - **One event, two phases**: (1) FAK-flatten affected open `buy_win` lots whose **entry_score** is strictly higher than post-reversal / FT score; (2) **quote once** on the corrected `curr` score (may open newly locked markets). Unaffected lots stay open.
 - Live flatten sells floored shares (**2 decimal** maker precision), `min_price=0.2`. Dust below `0.01` closes the ledger lot. `invalid maker amount` / `invalid amounts` are terminal (no infinite retry). Incomplete non-terminal exits stay `pending_flatten`.
 - CLOB `status=delayed` (+ `success`/`orderID`) counts as an accepted fill: register the open lot (brief balance poll) so a later reversal can flatten.

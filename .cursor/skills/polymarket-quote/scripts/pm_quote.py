@@ -30,7 +30,7 @@ import quote_lib as lib  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import load_trade_settings, resolve_live_modes  # noqa: E402
-from af_referee import AfReferee, DEFAULT_POLL_S, DEFAULT_TIMEOUT_S  # noqa: E402
+from af_referee import AfReferee, DEFAULT_TIMEOUT_S  # noqa: E402
 
 
 def root() -> Path:
@@ -41,16 +41,33 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
     """AF goal confirmation gate (default on). Disable with --no-af-referee."""
     if getattr(args, "no_af_referee", False):
         return None
-    poll = float(getattr(args, "af_poll", DEFAULT_POLL_S))
     timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
-    # Always load apifootball_key from repo .env (not the CLOB trade env file).
-    ref = AfReferee(rt, poll_s=poll, timeout_s=timeout, env_path=None)
-    print(
-        f"af-referee → on (apifootball-bridge lib · async · poll={poll}s "
-        f"timeout={timeout}s · DQD reversals ignored)",
-        file=sys.stderr,
-        flush=True,
-    )
+    poll = getattr(args, "af_poll", None)
+    # Default: tiered schedule 5s → every 2s to 60s → every 5s.
+    # --af-poll N forces a fixed interval (disables the schedule).
+    if poll is None:
+        ref = AfReferee(rt, timeout_s=timeout, poll_schedule=True, env_path=None)
+        sched = ref._schedule_desc()
+        print(
+            f"af-referee → on (apifootball-bridge lib · async · schedule={sched} "
+            f"timeout={timeout}s · DQD reversals → flatten)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        ref = AfReferee(
+            rt,
+            poll_s=float(poll),
+            timeout_s=timeout,
+            poll_schedule=False,
+            env_path=None,
+        )
+        print(
+            f"af-referee → on (apifootball-bridge lib · async · fixed poll={poll}s "
+            f"timeout={timeout}s · DQD reversals → flatten)",
+            file=sys.stderr,
+            flush=True,
+        )
     return ref
 
 
@@ -75,6 +92,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         max_shares=float(getattr(args, "max_shares", 25.0)),
         max_slippage=float(getattr(args, "max_slippage", 0.03)),
         allow_extreme_prices=bool(getattr(args, "allow_extreme_prices", False)),
+        min_buy_price=float(getattr(args, "min_buy_price", 0.8)),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
         require_key=bool(live_goals or live_ft),
@@ -97,7 +115,8 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     f = "live" if settings.live_ft else "dry"
     print(
         f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
-        f"max_usdc={settings.max_usdc} max_shares={settings.max_shares}",
+        f"max_usdc={settings.max_usdc} max_shares={settings.max_shares} "
+        f"min_buy_price={settings.min_buy_price}",
         file=sys.stderr,
         flush=True,
     )
@@ -456,6 +475,12 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         help="Allow orders when best price <=0.01 or >=0.99 (default blocked)",
     )
     sp.add_argument(
+        "--min-buy-price",
+        type=float,
+        default=0.8,
+        help="buy_win: skip (still log trades.jsonl) when best_ask < this (default 0.8)",
+    )
+    sp.add_argument(
         "--trade-env-file",
         default=None,
         help="Env file with PRIVATE_KEY/FUNDER/… (default repo .env)",
@@ -469,8 +494,11 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--af-poll",
         type=float,
-        default=DEFAULT_POLL_S,
-        help=f"AF events poll interval seconds while confirming a goal (default {DEFAULT_POLL_S})",
+        default=None,
+        help=(
+            "Fixed AF events poll interval seconds (disables default tiered "
+            "schedule: 5s → every 2s to 60s → every 5s)"
+        ),
     )
     sp.add_argument(
         "--af-timeout",

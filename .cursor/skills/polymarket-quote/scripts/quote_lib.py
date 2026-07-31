@@ -1700,16 +1700,14 @@ def process_bridge_events(
         af_gate: dict[str, Any] | None = None,
     ) -> None:
         nonlocal bundles, seen
-        typ_local = str(work_ev.get("type") or "")
         flatten_rows: list[dict[str, Any]] = []
         if trade_executor is not None:
             try:
-                if af_referee is not None and typ_local == "score_change":
-                    flatten_rows = []
-                else:
-                    flatten_rows = list(
-                        trade_executor.maybe_flatten_for_event(work_ev) or []
-                    )
+                # DQD score drops (VAR / disallowed) always flatten — including
+                # when AF referee is on (AF may briefly confirm then retract).
+                flatten_rows = list(
+                    trade_executor.maybe_flatten_for_event(work_ev) or []
+                )
             except Exception as e:  # noqa: BLE001
                 flatten_rows = [
                     {
@@ -1886,28 +1884,11 @@ def process_bridge_events(
             )
 
             if event_is_reversal(ev):
-                skip = {
-                    "quoted_at": now_cn_iso(),
-                    "trigger": "score_change",
-                    "mode": "af_skip_reversal",
-                    "event_key": key,
-                    "match_id": ev.get("match_id"),
-                    "home": ev.get("home"),
-                    "away": ev.get("away"),
-                    "home_score": ev.get("home_score"),
-                    "away_score": ev.get("away_score"),
-                    "count": 0,
-                    "opportunity_count": 0,
-                    "af_referee": {
-                        "skipped": True,
-                        "reason": "dqd_reversal_ignored",
-                    },
-                    "via": "memory" if key in override_keys else "file",
-                }
-                bundles.append(skip)
-                seen.add(key)
+                # Flatten + requote on corrected score (even with AF referee on).
+                _quote_one(ev, key)
                 print(
-                    f"af-referee → skip reversal match_id={ev.get('match_id')} key={key}",
+                    f"af-referee → DQD reversal flatten+quote match_id={ev.get('match_id')} "
+                    f"key={key}",
                     flush=True,
                 )
                 continue

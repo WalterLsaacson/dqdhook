@@ -248,6 +248,68 @@ def test_events_resolve_on_miss() -> None:
         check("one events call after resolve", len(event_calls) == 1)
 
 
+def test_events_cache_only_no_resolve() -> None:
+    print("test_events_cache_only_no_resolve")
+    ko = datetime(2026, 7, 30, 20, 0, tzinfo=TZ_CN)
+    date = ko.date().isoformat()
+    fx = _make_fx(777, "Liverpool", "Everton", ko, (0, 0))
+    af = FakeAF(
+        {
+            date: [fx],
+            (ko.date() - timedelta(days=1)).isoformat(): [],
+            (ko.date() + timedelta(days=1)).isoformat(): [],
+        },
+        events_by_id={777: [{"type": "Goal", "team": {"name": "Liverpool"}, "detail": "Normal Goal"}]},
+    )
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        bridge_path = root / "matches.json"
+        lib.write_json(
+            bridge_path,
+            {
+                "matched_at": "2026-07-30T12:00:00+08:00",
+                "matches": [_bridge_match("111", "Liverpool", "Everton", ko)],
+            },
+        )
+        cache = lib.empty_cache()
+        miss = lib.fetch_events_for_match_id(
+            af,  # type: ignore[arg-type]
+            "111",
+            cache=cache,
+            bridge_path=bridge_path,
+            bursts_dir=root / "bursts",
+            burst_index=root / "index.jsonl",
+            persist_cache=False,
+            persist_burst=False,
+            cache_only=True,
+        )
+        check("cache_only miss ok=False", miss.get("ok") is False)
+        check("error not_cached", miss.get("error") == "af_fixture_not_cached", str(miss.get("error")))
+        check("no AF HTTP on miss", len(af.calls) == 0, str(af.calls))
+        check("cache still empty", "111" not in (cache.get("entries") or {}))
+
+        cache["entries"]["111"] = {
+            "dqd_match_id": "111",
+            "af_fixture_id": 777,
+            "af_home": "Liverpool",
+            "af_away": "Everton",
+        }
+        hit = lib.fetch_events_for_match_id(
+            af,  # type: ignore[arg-type]
+            "111",
+            cache=cache,
+            bridge_path=bridge_path,
+            bursts_dir=root / "bursts",
+            burst_index=root / "index.jsonl",
+            persist_cache=False,
+            persist_burst=False,
+            cache_only=True,
+        )
+        check("cache_only hit ok", hit.get("ok") is True)
+        check("only events call", len(af.calls) == 1 and af.calls[0][0] == "/fixtures/events", str(af.calls))
+        check("goals from events", (hit.get("goals") or {}).get("home") == 1)
+
+
 def test_load_cache_preserves_sync_meta() -> None:
     print("test_load_cache_preserves_sync_meta")
     with tempfile.TemporaryDirectory() as td:
@@ -268,6 +330,7 @@ def main() -> int:
     test_cache_hit_miss_and_ttl()
     test_events_burst_layout()
     test_events_resolve_on_miss()
+    test_events_cache_only_no_resolve()
     test_load_cache_preserves_sync_meta()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

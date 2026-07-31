@@ -487,6 +487,15 @@ def sync_fixture_cache(
     return cache
 
 
+def cached_fixture_entry(cache: dict[str, Any], dqd_id: str) -> dict[str, Any] | None:
+    """Return a mapped fixture entry from cache only (no AF HTTP)."""
+    mid = str(dqd_id)
+    ent = (cache.get("entries") or {}).get(mid)
+    if isinstance(ent, dict) and ent.get("af_fixture_id"):
+        return ent
+    return None
+
+
 def ensure_fixture_for_match_id(
     af: AFClient,
     dqd_id: str,
@@ -498,12 +507,20 @@ def ensure_fixture_for_match_id(
     max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
     unresolved_ttl_h: float = UNRESOLVED_TTL_H,
     force_resolve: bool = False,
+    cache_only: bool = False,
 ) -> dict[str, Any] | None:
-    """Return cache entry for dqd_id, resolving via bridge/snapshot if needed."""
+    """Return cache entry for dqd_id.
+
+    ``cache_only=True`` (quote referee): never call AF to resolve — sync/watch
+    owns mapping. Miss → None immediately.
+    """
     mid = str(dqd_id)
-    ent = (cache.get("entries") or {}).get(mid)
-    if isinstance(ent, dict) and ent.get("af_fixture_id"):
+    ent = cached_fixture_entry(cache, mid)
+    if ent is not None:
         return ent
+
+    if cache_only:
+        return None
 
     u = (cache.get("unresolved") or {}).get(mid)
     if (
@@ -684,6 +701,16 @@ def write_events_burst(
     }
 
 
+def fixture_miss_error(cache: dict[str, Any], dqd_match_id: str) -> str:
+    """Classify why a DQD id has no af_fixture_id in cache."""
+    u = (cache.get("unresolved") or {}).get(str(dqd_match_id))
+    if isinstance(u, dict) and unresolved_fresh(u):
+        return "af_fixture_unresolved_ttl"
+    if isinstance(u, dict):
+        return "af_fixture_unresolved"
+    return "af_fixture_not_cached"
+
+
 def fetch_events_for_match_id(
     af: AFClient,
     dqd_match_id: str,
@@ -697,8 +724,12 @@ def fetch_events_for_match_id(
     persist_cache: bool = True,
     force_resolve: bool = False,
     persist_burst: bool = True,
+    cache_only: bool = False,
 ) -> dict[str, Any]:
-    """Cache lookup → one AF /fixtures/events call. Resolves fixture only on cache miss.
+    """Cache lookup → one AF /fixtures/events call.
+
+    - ``cache_only=True`` (quote referee): never resolve fixtures; miss → skip.
+    - Default CLI path may still one-shot resolve on miss (manual debug).
 
     Set persist_burst=False for high-frequency referee polls (burst written on confirm).
     """
@@ -709,15 +740,16 @@ def fetch_events_for_match_id(
         bridge_path=bridge_path,
         snapshot_path=snapshot_path,
         force_resolve=force_resolve,
+        cache_only=cache_only,
     )
-    if persist_cache:
+    if persist_cache and not cache_only:
         save_cache(cache_path, cache)
 
     if not entry or not entry.get("af_fixture_id"):
-        u = (cache.get("unresolved") or {}).get(str(dqd_match_id))
-        err = "af_fixture_unresolved"
-        if isinstance(u, dict) and unresolved_fresh(u):
-            err = "af_fixture_unresolved_ttl"
+        err = fixture_miss_error(cache, dqd_match_id)
+        if cache_only and err == "af_fixture_not_cached":
+            # Still not mapped by sync/watch — do not invent unresolved TTL here.
+            err = "af_fixture_not_cached"
         return {
             "ok": False,
             "dqd_match_id": str(dqd_match_id),
@@ -727,6 +759,7 @@ def fetch_events_for_match_id(
             "events": [],
             "error": err,
             "burst_dir": None,
+            "cache_only": cache_only,
         }
 
     fid = int(entry["af_fixture_id"])

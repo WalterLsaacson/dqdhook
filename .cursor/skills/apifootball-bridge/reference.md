@@ -61,15 +61,17 @@ Prune: on sync/watch, drop `entries` whose DQD id has been absent from bridge fo
 python3 .cursor/skills/apifootball-bridge/scripts/af_bridge.py events --match-id <DQD_ID> --json
 ```
 
-1. Resolve `af_fixture_id` from **fixture cache** (warm via `sync`/`watch`). On miss only: one-shot match using bridge row or DQD snapshot (respects unresolved 6h TTL unless `--force-resolve`)
-2. **One** AF call: `GET /fixtures/events?fixture=` (no extra `/fixtures?id=`)
-3. Derive `goals` from standing Goal events vs cached `af_home`/`af_away`
-4. Write under `data/dqd-probe/af-latency/bursts/{dqd_id}_{YYYYMMDDTHHMMSSmmm}/`:
+1. Resolve `af_fixture_id` from **fixture cache** (warm via `sync`/`watch`).
+2. **CLI default**: on cache miss only, one-shot match using bridge row or DQD snapshot (respects unresolved 6h TTL unless `--force-resolve`).
+3. **Quote AF referee** always uses `cache_only=True`: never resolves on the hot path. Miss / unresolved → skip the goal immediately (no polling spin). Mapping is owned solely by `sync`/`watch` when bridge fixtures are new or on init.
+4. **One** AF call: `GET /fixtures/events?fixture=` (no extra `/fixtures?id=`)
+5. Derive `goals` from standing Goal events vs cached `af_home`/`af_away`
+6. Write under `data/dqd-probe/af-latency/bursts/{dqd_id}_{YYYYMMDDTHHMMSSmmm}/`:
    - `meta.json` — `source: events_request`
    - `af_events.json` — raw events API body
    - `result.json` — summary
-5. Append `burst_index.jsonl` with `kind: events_request`
-6. Print JSON to stdout (`ok`, ids, `goals`, `events`, `burst_dir`)
+7. Append `burst_index.jsonl` with `kind: events_request`
+8. Print JSON to stdout (`ok`, ids, `goals`, `events`, `burst_dir`)
 
 ## Free plan
 

@@ -96,7 +96,7 @@ def test_await_via_bridge_fn() -> None:
                 return {"ok": True, "goals": {"home": 0, "away": 0}}
             return seq.pop(0)
 
-        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=2.0, events_fn=events_fn)
+        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=2.0, events_fn=events_fn, poll_schedule=False)
         out = referee.await_score("m1", (1, 0), baseline=(0, 0))
         check("confirmed", out.get("confirmed") is True, str(out))
         check("via bridge", out.get("via") == "apifootball-bridge")
@@ -124,7 +124,7 @@ def test_await_af_ahead() -> None:
                 row["burst_dir"] = str(root / "b")
             return row
 
-        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=1.0, events_fn=events_fn)
+        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=1.0, events_fn=events_fn, poll_schedule=False)
         out = referee.await_score("m3", (1, 0), baseline=(0, 0))
         check("ahead confirmed", out.get("confirmed") is True, str(out))
         check("truth 2-0", out.get("goals") == {"home": 2, "away": 0}, str(out.get("goals")))
@@ -148,7 +148,7 @@ def test_async_submit_drain() -> None:
                 row["burst_dir"] = str(root / "x")
             return row
 
-        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=2.0, events_fn=events_fn)
+        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=2.0, events_fn=events_fn, poll_schedule=False)
         ev = {
             "type": "score_change",
             "match_id": "m9",
@@ -185,7 +185,7 @@ def test_await_timeout() -> None:
                 "events": [],
             }
 
-        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=0.05, events_fn=events_fn)
+        referee = ref.AfReferee(root, poll_s=0.01, timeout_s=0.05, events_fn=events_fn, poll_schedule=False)
         out = referee.await_score("m2", (1, 0), baseline=(0, 0))
         check("not confirmed", out.get("confirmed") is False)
         check(
@@ -195,6 +195,51 @@ def test_await_timeout() -> None:
             str(out.get("error")),
         )
         check("no store", ref.get_confirmed_score(root, "m2") is None)
+
+
+def test_cache_miss_no_spin() -> None:
+    print("test_cache_miss_no_spin")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        calls = {"n": 0}
+
+        def events_fn(_mid: str, persist_burst: bool = False) -> dict[str, Any]:
+            calls["n"] += 1
+            return {
+                "ok": False,
+                "error": "af_fixture_unresolved_ttl",
+                "goals": {"home": None, "away": None},
+            }
+
+        referee = ref.AfReferee(root, poll_s=0.5, timeout_s=30.0, events_fn=events_fn, poll_schedule=False)
+        t0 = time.monotonic()
+        out = referee.await_score("m_miss", (1, 0), baseline=(0, 0))
+        elapsed = time.monotonic() - t0
+        check("not confirmed", out.get("confirmed") is False)
+        check("error ttl", out.get("error") == "af_fixture_unresolved_ttl", str(out.get("error")))
+        check("single poll", int(out.get("polls") or 0) == 1, str(out.get("polls")))
+        check("one events call", calls["n"] == 1, str(calls))
+        check("no 30s spin", elapsed < 2.0, f"{elapsed:.2f}s")
+
+
+def test_confirm_check_times() -> None:
+    print("test_confirm_check_times")
+    checks = ref.confirm_check_times(120.0)
+    check("starts at 5", checks[0] == 5.0, str(checks[:3]))
+    check("has 7", 7.0 in checks)
+    check("has 60", 60.0 in checks)
+    check("has 65", 65.0 in checks)
+    check("has 120", 120.0 in checks)
+    # no 0.5s dense junk in middle
+    between = [c for c in checks if 20 < c < 40]
+    check("mid spacing ~2s", all(
+        abs(between[i+1] - between[i] - 2.0) < 0.01 for i in range(len(between)-1)
+    ), str(between[:5]))
+    late = [c for c in checks if c > 60]
+    check("late spacing ~5s", all(
+        abs(late[i+1] - late[i] - 5.0) < 0.01 for i in range(len(late)-1)
+    ), str(late[:4]))
+    check("count ~40", 35 <= len(checks) <= 45, str(len(checks)))
 
 
 def test_apply_score() -> None:
@@ -217,6 +262,8 @@ def main() -> int:
     test_await_af_ahead()
     test_async_submit_drain()
     test_await_timeout()
+    test_cache_miss_no_spin()
+    test_confirm_check_times()
     test_apply_score()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

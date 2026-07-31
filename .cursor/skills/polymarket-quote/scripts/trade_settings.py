@@ -52,6 +52,7 @@ class TradeSettings:
     max_shares: float
     max_slippage: float
     allow_extreme_prices: bool
+    min_buy_price: float  # buy_win only: skip (but record) when best_ask < this
     min_order_shares: float
     enabled: bool
 
@@ -79,6 +80,7 @@ def load_trade_settings(
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
     allow_extreme_prices: bool = False,
+    min_buy_price: float = 0.8,
     enabled: bool = True,
     env_file: str | Path | None = None,
     require_key: bool = False,
@@ -123,6 +125,7 @@ def load_trade_settings(
         max_shares=float(max_shares),
         max_slippage=float(max_slippage),
         allow_extreme_prices=bool(allow_extreme_prices),
+        min_buy_price=max(0.0, float(min_buy_price)),
         # Polymarket market buys are USDC-notional; do not impose a 5-share floor.
         min_order_shares=float(os.getenv("MIN_ORDER_SHARES", "0")),
         enabled=bool(enabled),

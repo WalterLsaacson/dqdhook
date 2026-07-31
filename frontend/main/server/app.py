@@ -106,6 +106,7 @@ def load_quote_trade_config(
     max_shares: float | None = None,
     max_slippage: float | None = None,
     allow_extreme_prices: bool | None = None,
+    min_buy_price: float | None = None,
     interval: float | None = None,
     trade_env_file: str | None = None,
 ) -> dict[str, Any]:
@@ -158,6 +159,11 @@ def load_quote_trade_config(
             if allow_extreme_prices is not None
             else _env_bool("QUOTE_ALLOW_EXTREME_PRICES", False)
         ),
+        "min_buy_price": float(
+            min_buy_price
+            if min_buy_price is not None
+            else os.getenv("QUOTE_MIN_BUY_PRICE", "0.8")
+        ),
         "interval": max(
             0.05,
             float(
@@ -187,6 +193,7 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
     args.extend(["--max-usdc", str(float(c.get("max_usdc") or 5))])
     args.extend(["--max-shares", str(float(c.get("max_shares") or 25))])
     args.extend(["--max-slippage", str(float(c.get("max_slippage") or 0.03))])
+    args.extend(["--min-buy-price", str(float(c.get("min_buy_price") or 0.8))])
     if c.get("allow_extreme_prices"):
         args.append("--allow-extreme-prices")
     env_file = c.get("trade_env_file")
@@ -762,6 +769,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-slippage", type=float, default=None)
     parser.add_argument("--allow-extreme-prices", action="store_true")
     parser.add_argument(
+        "--min-buy-price",
+        type=float,
+        default=None,
+        help="buy_win floor (default 0.8; env QUOTE_MIN_BUY_PRICE)",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=None,
@@ -790,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         max_shares=args.max_shares,
         max_slippage=args.max_slippage,
         allow_extreme_prices=True if args.allow_extreme_prices else None,
+        min_buy_price=args.min_buy_price,
         interval=args.interval,
         trade_env_file=args.trade_env_file,
     )
@@ -817,7 +831,8 @@ def main(argv: list[str] | None = None) -> int:
         trade_label = f"goals:{t.get('goals_mode', 'dry')} ft:{t.get('ft_mode', 'dry')}"
     print(
         f"Quote trade → {trade_label} "
-        f"depth={t['take_depth']} max_usdc={t['max_usdc']}",
+        f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
+        f"min_buy_price={t.get('min_buy_price', 0.8)}",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

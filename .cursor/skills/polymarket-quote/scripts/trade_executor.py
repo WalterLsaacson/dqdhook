@@ -342,6 +342,15 @@ class TradeExecutor:
             return f"extreme_price={price} (>=0.99)"
         return None
 
+    def _min_buy_price_blocked(self, price: float | None) -> str | None:
+        """buy_win: require best_ask >= min_buy_price (default 0.8)."""
+        floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
+        if floor <= 0 or price is None:
+            return None
+        if price < floor - 1e-12:
+            return f"buy_price_below_min={price}<{floor}"
+        return None
+
     def maybe_trade(
         self,
         quote: dict[str, Any],
@@ -415,6 +424,30 @@ class TradeExecutor:
                 live=channel_live,
             )
             return row
+
+        if trade == "buy_win":
+            below_min = self._min_buy_price_blocked(ref_f)
+            if below_min:
+                row = self._record(
+                    quote,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    plan=None,
+                    status="skipped",
+                    skip_reason=below_min,
+                    response=None,
+                    success=False,
+                    idempotency_key=key,
+                    live=channel_live,
+                )
+                self._done.add(key)
+                logger.info(
+                    "skip buy_win %s ask=%s (%s)",
+                    (quote.get("market_key") or "")[:40],
+                    ref_f,
+                    below_min,
+                )
+                return row
 
         available: float | None = None
         if trade == "sell_lose":

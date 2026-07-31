@@ -75,7 +75,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
    - `score_change` — mid-match after a goal; **AF-confirmed** then quote **locked** outcomes only.
    - `match_finished` — full moneyline + props + exact settlement (no AF goal gate).
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
-4. **AF referee**: on goal-up, **async** poll apifootball-bridge lib; confirm returns immediately (memory score); burst/disk async — no second AF fetch on the hot path. Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
+4. **AF referee**: on goal-up, reload `fixture_cache.json` (filled by AF sync/watch). Cache miss / unresolved → skip immediately. Cache hit → **async** poll events on a tiered schedule (**5s → every 2s until 60s → every 5s**, `cache_only`); confirm returns immediately (memory score); burst/disk async. DQD score reversals still flatten + requote immediately (AF does not gate them). Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
 5. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
 6. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
 7. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
@@ -92,13 +92,14 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--goals-mode dry\|live` | dry | Per-signal mode for进球 (`score_change`); overrides `--live` for that channel |
 | `--ft-mode dry\|live` | dry | Per-signal mode for终场 (`match_finished`); overrides `--live` for that channel |
 | `--no-trade` | off | Quote only |
-| `--no-af-referee` | off | Skip AF confirmation (trade on raw DQD goals; also re-enable DQD reversal flatten) |
-| `--af-poll` | 0.5 | Seconds between in-process apifootball-bridge events polls |
+| `--no-af-referee` | off | Skip AF confirmation (trade on raw DQD goals) |
+| `--af-poll` | (off) | If set, fixed poll interval; otherwise tiered **5s → every 2s to 60s → every 5s** |
 | `--af-timeout` | 120 | Give up confirming a goal after this many seconds (then ignore + mark processed) |
 | `--take-depth top\|walk` | `top` | Best level vs walk book |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 5 / 25 | Size caps |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
+| `--min-buy-price` | 0.8 | `buy_win` only when `best_ask ≥` this; below → skip + still write `trades.jsonl` |
 | `--allow-extreme-prices` | off | Allow ≤0.01 / ≥0.99 |
 
 Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while posting FT fills. Flatten always uses the lot’s own `live` flag so a dry goal lot is never live-sold.
