@@ -75,7 +75,7 @@ Copied from the official Nuxt `/match` page:
 
 ## `score_change` event
 
-Appended to `data/events.jsonl` and printed as:
+Appended to `data/events.jsonl`. **Sentinels / watch `events`** only for regulation + stoppage.
 
 ```text
 DQD_SCORE_CHANGE {"type":"score_change",...}
@@ -95,12 +95,22 @@ DQD_SCORE_CHANGE {"type":"score_change",...}
   "side": "home",
   "is_goal": true,
   "status": "Playing 50'",
-  "tab": "hot"
+  "tab": "hot",
+  "minute": "50",
+  "injury_time": 0,
+  "period": "2H",
+  "clock_phase": "regulation",
+  "extra_time": false,
+  "emit_downstream": true
 }
 ```
 
 - `side`: `home` | `away` | `both` | `other`
 - `is_goal`: true when soccer and either side's score increased
+- `clock_phase`: `regulation` | `stoppage` | `extra_time` | `idle`
+  - **stoppage**: `injury_time > 0` (伤停补时, e.g. `90'+6'`)
+  - **regulation**: playing with minute ≤ 90 and no injury_time (also finished/FT)
+  - **extra_time**: playing, no injury_time, and minute > 90 (or ET/PEN period) — logged only
 - First sighting of a match only seeds `prev_scores`; it does not emit an event
 
 ## State files (`data/`)

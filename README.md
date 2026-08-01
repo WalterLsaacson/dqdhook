@@ -101,7 +101,7 @@ python3 frontend/run_main.py --no-trade
 | `--max-usdc` / `--max-shares` | Size caps (defaults 5 / 25) |
 | `--no-af-referee` | Skip AF goal confirm (not for production goals) |
 
-Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, …
+Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, …
 
 ## Logs & data
 

@@ -602,12 +602,138 @@ def build_snapshot(
     }
 
 
+def parse_match_minute(m: dict[str, Any] | None) -> int | None:
+    """Best-effort integer minute from ``minute`` / ``minute_str`` / ``status``.
+
+    Prefers the raw ``minute`` field. Strings like ``90'+6'`` only use the
+    part before ``+`` so stoppage notation cannot become ``906``.
+    """
+    if not m:
+        return None
+
+    def _from_clock_token(raw: Any) -> int | None:
+        if raw is None or raw == "":
+            return None
+        s = str(raw).strip()
+        # "90'+6'" / "45+3" → take the regulation minute only.
+        if "+" in s:
+            s = s.split("+", 1)[0]
+        s = s.strip().rstrip("'′")
+        try:
+            return int(float(s))
+        except (TypeError, ValueError):
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if not digits:
+                return None
+            try:
+                return int(digits)
+            except ValueError:
+                return None
+
+    # Prefer dedicated minute field over composite minute_str / status.
+    parsed = _from_clock_token(m.get("minute"))
+    if parsed is not None:
+        return parsed
+    parsed = _from_clock_token(m.get("minute_str"))
+    if parsed is not None:
+        return parsed
+
+    status = str(m.get("status") or "")
+    # e.g. "Playing 92'" — take the last integer token, not all digits joined.
+    if "Playing" in status or "进行" in status:
+        for tok in reversed(status.replace("'", " ").replace("′", " ").split()):
+            got = _from_clock_token(tok)
+            if got is not None:
+                return got
+    return None
+
+
+def parse_injury_time(m: dict[str, Any] | None) -> int:
+    if not m:
+        return 0
+    try:
+        return max(0, int(m.get("injury_time") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+_ET_PERIODS = frozenset(
+    {
+        "ET",
+        "AET",
+        "ET1",
+        "ET2",
+        "1ET",
+        "2ET",
+        "PEN",
+        "PENS",
+        "PENALTY",
+        "PENALTIES",
+    }
+)
+
+
+def clock_phase(m: dict[str, Any] | None) -> str:
+    """Classify match clock: ``regulation`` | ``stoppage`` | ``extra_time`` | ``idle``.
+
+    - **stoppage** (伤停补时): DQD ``injury_time > 0`` (e.g. 90'+6').
+    - **regulation** (正赛): playing with minute ≤ 90 and no injury_time; also
+      finished / half-time / unknown-minute live (fail open so real goals emit).
+    - **extra_time** (加时): playing, no injury_time, and (minute > 90 or
+      period looks like ET/PEN). Used to suppress downstream goal fan-out.
+    """
+    if not m:
+        return "idle"
+    status_raw = str(m.get("status_raw") or "").strip().lower()
+    status_disp = str(m.get("status") or "").strip().lower()
+    if not status_raw:
+        if status_disp.startswith("playing") or "进行" in status_disp:
+            status_raw = "playing"
+        elif status_disp.startswith("played") or status_disp in ("ft", "完场"):
+            status_raw = "played"
+        elif status_disp.startswith("fixture") or status_disp in ("未开赛",):
+            status_raw = "fixture"
+
+    period = str(m.get("period") or "").strip().upper()
+    if status_raw in ("fixture",):
+        return "idle"
+    # Finished / FT corrections are not "live ET" — allow emit.
+    if status_raw in ("played",) or period == "FT":
+        return "regulation"
+
+    injury = parse_injury_time(m)
+    if injury > 0:
+        return "stoppage"
+
+    if period in _ET_PERIODS:
+        return "extra_time"
+
+    if status_raw != "playing":
+        # HT / break / unknown — treat as regulation (no ET suppress).
+        return "regulation"
+
+    minute = parse_match_minute(m)
+    if minute is not None and minute > 90:
+        return "extra_time"
+    return "regulation"
+
+
+def is_extra_time_clock(m: dict[str, Any] | None) -> bool:
+    """True when live clock looks like extra time (not regulation / stoppage)."""
+    return clock_phase(m) == "extra_time"
+
+
 def detect_score_changes(
     matches: Iterable[dict[str, Any]],
     prev_scores: dict[str, dict[str, Any]],
     tab: str,
 ) -> list[dict[str, Any]]:
-    """Compare current scores to prev_scores; return score_change events."""
+    """Compare current scores to prev_scores; return score_change events.
+
+    Extra-time score swings are still returned (and should be appended to
+    ``events.jsonl``) but marked ``extra_time`` / ``emit_downstream=false`` so
+    watchers do not print sentinels or fan out to cooperating skills.
+    """
     events: list[dict[str, Any]] = []
     ts = datetime.now(TZ_CN).isoformat(timespec="seconds")
     for m in matches:
@@ -638,6 +764,8 @@ def detect_score_changes(
 
         side = "both" if dh > 0 and da > 0 else ("home" if dh > 0 else ("away" if da > 0 else "other"))
         is_goal = m.get("cmp_type") == "soccer" and (dh > 0 or da > 0)
+        phase = clock_phase(m)
+        extra = phase == "extra_time"
         events.append(
             {
                 "type": "score_change",
@@ -653,10 +781,26 @@ def detect_score_changes(
                 "is_goal": bool(is_goal),
                 "status": m.get("status") or "",
                 "tab": tab,
+                "minute": m.get("minute") or "",
+                "injury_time": parse_injury_time(m),
+                "period": m.get("period") or "",
+                "clock_phase": phase,
+                "extra_time": extra,
+                "emit_downstream": not extra,
             }
         )
         prev_scores[mid] = {"home": curr_h, "away": curr_a}
     return events
+
+
+def events_for_downstream(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Score changes that cooperating skills / sentinels should see."""
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        if ev.get("emit_downstream") is False or ev.get("extra_time"):
+            continue
+        out.append(ev)
+    return out
 
 
 def safe_load_matches(

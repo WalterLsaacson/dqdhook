@@ -120,7 +120,8 @@ def run_watch_once(
         prev_scores = {}
 
     # Only diff within the watched tab set.
-    events = lib.detect_score_changes(selected, prev_scores, tab=tab)
+    all_events = lib.detect_score_changes(selected, prev_scores, tab=tab)
+    emit_events = lib.events_for_downstream(all_events)
 
     # Also seed baseline for other known ids so restarts don't explode.
     for m in selected:
@@ -130,15 +131,18 @@ def run_watch_once(
 
     write_json(prev_path, prev_scores)
     write_json(ddir / "snapshot.json", snapshot)
-    append_events(events_path, events)
+    # Record every score swing (incl. extra-time noise); only emit clean ones.
+    append_events(events_path, all_events)
 
     result = {
         "fetched_at": snapshot["fetched_at"],
         "tab": tab,
         "count": snapshot["count"],
         "has_live": snapshot["has_live"],
-        "changes": len(events),
-        "events": events,
+        "changes": len(emit_events),
+        "recorded_changes": len(all_events),
+        "suppressed_extra_time": len(all_events) - len(emit_events),
+        "events": emit_events,
         "matches": selected if not quiet else None,
     }
     if quiet:

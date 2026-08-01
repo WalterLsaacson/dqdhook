@@ -128,6 +128,51 @@ def main() -> int:
     ev6 = bl.detect_match_finished([r6], prev_status5, prev_period5)
     _assert(ev6 == [], f"cold already-FT must seed only, got {ev6}")
 
+    # Extra time score swings: update prev, do not emit to quote
+    prev_scores: dict = {"et1": {"home": 0, "away": 1}}
+    r_et = {
+        "dongqiudi": {
+            "id": "et1",
+            "home": "Home FC",
+            "away": "Away FC",
+            "home_score": 0,
+            "away_score": 3,
+            "status_raw": "Playing",
+            "status": "Playing 103'",
+            "period": "2H",
+            "minute": "103",
+            "injury_time": 0,
+            "official_clock": "103'",
+        },
+        "polymarket": {"league": "COL", "home": "Home FC", "away": "Away FC"},
+        "kickoff_beijing": "2026-07-31 00:30",
+    }
+    et_ev = bl.detect_score_changes([r_et], prev_scores)
+    _assert(et_ev == [], f"ET must not emit score_change, got {et_ev}")
+    _assert(prev_scores["et1"] == {"home": 0, "away": 3}, "ET still updates prev")
+
+    # Stoppage still emits
+    prev_st: dict = {"st1": {"home": 1, "away": 1}}
+    r_st = {
+        "dongqiudi": {
+            "id": "st1",
+            "home": "Home FC",
+            "away": "Away FC",
+            "home_score": 2,
+            "away_score": 1,
+            "status_raw": "Playing",
+            "status": "Playing 90'",
+            "period": "2H",
+            "minute": "90",
+            "injury_time": 5,
+            "official_clock": "90'+5'",
+        },
+        "polymarket": {"league": "EPL", "home": "Home FC", "away": "Away FC"},
+        "kickoff_beijing": "2026-07-31 00:30",
+    }
+    st_ev = bl.detect_score_changes([r_st], prev_st)
+    _assert(len(st_ev) == 1 and st_ev[0].get("is_goal") is True, f"stoppage emit: {st_ev}")
+
     print("smoke_ft_period: ok")
     return 0
 

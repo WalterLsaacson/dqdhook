@@ -222,24 +222,62 @@ def test_cache_miss_no_spin() -> None:
         check("no 30s spin", elapsed < 2.0, f"{elapsed:.2f}s")
 
 
+def test_cache_miss_wait_until_timeout() -> None:
+    print("test_cache_miss_wait_until_timeout")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        calls = {"n": 0}
+
+        def events_fn(_mid: str, persist_burst: bool = False) -> dict[str, Any]:
+            calls["n"] += 1
+            return {
+                "ok": False,
+                "error": "af_fixture_unresolved_ttl",
+                "goals": {"home": None, "away": None},
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.05, timeout_s=0.2, events_fn=events_fn, poll_schedule=False
+        )
+        t0 = time.monotonic()
+        out = referee.await_score(
+            "m_wait", (1, 0), baseline=(0, 0), wait_cache=True
+        )
+        elapsed = time.monotonic() - t0
+        check("not confirmed", out.get("confirmed") is False)
+        check("error still miss", "af_fixture" in str(out.get("error") or ""))
+        check("multiple polls", int(out.get("polls") or 0) >= 2, str(out.get("polls")))
+        check("waited near timeout", elapsed >= 0.15, f"{elapsed:.2f}s")
+        check("many events calls", calls["n"] >= 2, str(calls))
+
+
 def test_confirm_check_times() -> None:
     print("test_confirm_check_times")
-    checks = ref.confirm_check_times(120.0)
-    check("starts at 5", checks[0] == 5.0, str(checks[:3]))
-    check("has 7", 7.0 in checks)
+    checks = ref.confirm_check_times(90.0)
+    check("starts at 0", checks[0] == 0.0, str(checks[:3]))
+    check("has 1", 1.0 in checks)
     check("has 60", 60.0 in checks)
-    check("has 65", 65.0 in checks)
-    check("has 120", 120.0 in checks)
-    # no 0.5s dense junk in middle
+    check("has 90", 90.0 in checks)
+    check("no late 2s grid", 62.0 not in checks or abs(checks[checks.index(62.0) - 1] - 61.0) < 0.01)
+    # Flat 1s: no 2s jump after 60
+    after60 = [c for c in checks if 60 < c <= 66]
+    check(
+        "after 60 still 1s",
+        after60 == [61.0, 62.0, 63.0, 64.0, 65.0, 66.0],
+        str(after60),
+    )
     between = [c for c in checks if 20 < c < 40]
-    check("mid spacing ~2s", all(
-        abs(between[i+1] - between[i] - 2.0) < 0.01 for i in range(len(between)-1)
-    ), str(between[:5]))
-    late = [c for c in checks if c > 60]
-    check("late spacing ~5s", all(
-        abs(late[i+1] - late[i] - 5.0) < 0.01 for i in range(len(late)-1)
-    ), str(late[:4]))
-    check("count ~40", 35 <= len(checks) <= 45, str(len(checks)))
+    check(
+        "spacing ~1s",
+        all(abs(between[i + 1] - between[i] - 1.0) < 0.01 for i in range(len(between) - 1)),
+        str(between[:5]),
+    )
+    # 0..90 @1s → 91
+    check("count 91", len(checks) == 91, str(len(checks)))
+    check("last is timeout", checks[-1] == 90.0, str(checks[-1]))
+    short = ref.confirm_check_times(2.5, period_s=1.0)
+    check("short ends ≤timeout", short[-1] <= 2.5 + 1e-9, str(short))
+    check("short no past timeout", all(c <= 2.5 + 1e-9 for c in short), str(short))
 
 
 def test_apply_score() -> None:
@@ -263,6 +301,7 @@ def main() -> int:
     test_async_submit_drain()
     test_await_timeout()
     test_cache_miss_no_spin()
+    test_cache_miss_wait_until_timeout()
     test_confirm_check_times()
     test_apply_score()
     print(f"\n{PASS} passed, {FAIL} failed")

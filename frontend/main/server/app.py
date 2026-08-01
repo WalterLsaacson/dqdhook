@@ -144,7 +144,7 @@ def load_quote_trade_config(
             max_levels if max_levels is not None else os.getenv("QUOTE_MAX_LEVELS", "5")
         ),
         "max_usdc": float(
-            max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "5")
+            max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "20")
         ),
         "max_shares": float(
             max_shares if max_shares is not None else os.getenv("QUOTE_MAX_SHARES", "25")
@@ -190,7 +190,7 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
         args.extend(["--ft-mode", f])
     args.extend(["--take-depth", str(c.get("take_depth") or "top")])
     args.extend(["--max-levels", str(int(c.get("max_levels") or 5))])
-    args.extend(["--max-usdc", str(float(c.get("max_usdc") or 5))])
+    args.extend(["--max-usdc", str(float(c.get("max_usdc") or 20))])
     args.extend(["--max-shares", str(float(c.get("max_shares") or 25))])
     args.extend(["--max-slippage", str(float(c.get("max_slippage") or 0.03))])
     args.extend(["--min-buy-price", str(float(c.get("min_buy_price") or 0.8))])
@@ -209,6 +209,8 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
             args.extend(["--af-poll", str(poll)])
         if timeout:
             args.extend(["--af-timeout", str(timeout)])
+        if _env_bool("QUOTE_AF_GATE_BEFORE_TRADE", False):
+            args.append("--af-gate-before-trade")
     return args
 
 

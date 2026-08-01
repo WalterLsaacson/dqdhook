@@ -40,18 +40,19 @@ Defaults: soccer only, `language=en`, **`--days 3`**. Today from `match_list`; l
 1. **Tab data** — run `list --tab <full|hot|beidan|jingcai|all> --json`. Return the JSON (or a short league summary). Do not scrape the website DOM.
 2. **Watch scores** — prefer `watch --tab hot --once` on a loop (`/loop 15s` when live; 30–60s when idle). Resident `watch` without `--once` is fine for a dedicated terminal.
 3. **On score change** — text mode prints `DQD_SCORE_CHANGE {...}` on stdout; every mode appends the same object to `data/events.jsonl`. With `--json`, read the `events` array instead. Forward that JSON to any cooperating skill the user named (notify / announce / log). Do not invent events.
+4. **Extra time** — DQD `injury_time > 0` ⇒ 伤停补时 (still emit). Playing with `minute > 90` and no injury_time (or ET period) ⇒ 加时: **still append** `events.jsonl` with `extra_time=true`, but **do not** print sentinels / include in watch `events` for downstream.
 
 ## Cooperation contract (for other skills)
 
 | Channel | Path / signal | Purpose |
 |---|---|---|
 | CLI JSON | stdout from `list` / `watch --once --json` | Immediate tab snapshot |
-| Event log | `data/events.jsonl` (append-only) | Durable score_change history |
-| Sentinel | `DQD_SCORE_CHANGE <json>` on stdout | Wake loop / session notify |
+| Event log | `data/events.jsonl` (append-only) | Durable score_change history (incl. suppressed ET) |
+| Sentinel | `DQD_SCORE_CHANGE <json>` on stdout | Wake loop / session notify (regulation + stoppage only) |
 
 Consumer skills should:
 
-- Read the latest `score_change` lines from `data/events.jsonl`, **or** accept the JSON the agent forwards after a sentinel.
+- Prefer watch JSON `events` / sentinels (already filtered), **or** skip `events.jsonl` rows with `extra_time` / `emit_downstream=false`.
 - Treat `is_goal: true` as a soccer goal notification.
 - Not call Dongqiudi HTML/OCR themselves.
 

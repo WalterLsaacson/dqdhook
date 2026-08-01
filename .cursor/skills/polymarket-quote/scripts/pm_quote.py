@@ -29,7 +29,7 @@ import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
-from trade_settings import load_trade_settings, resolve_live_modes  # noqa: E402
+from trade_settings import load_trade_settings, resolve_live_modes, size_tiers_label  # noqa: E402
 from af_referee import AfReferee, DEFAULT_TIMEOUT_S  # noqa: E402
 
 
@@ -38,19 +38,21 @@ def root() -> Path:
 
 
 def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
-    """AF goal confirmation gate (default on). Disable with --no-af-referee."""
+    """AF goal confirmation (default on). Disable with --no-af-referee."""
     if getattr(args, "no_af_referee", False):
         return None
     timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
     poll = getattr(args, "af_poll", None)
-    # Default: tiered schedule 5s → every 2s to 60s → every 5s.
+    gate_before = bool(getattr(args, "af_gate_before_trade", False))
+    af_mode = "gate" if gate_before else "postcheck"
+    # Default: flat schedule 0s → every 1s → timeout.
     # --af-poll N forces a fixed interval (disables the schedule).
     if poll is None:
         ref = AfReferee(rt, timeout_s=timeout, poll_schedule=True, env_path=None)
         sched = ref._schedule_desc()
         print(
             f"af-referee → on (apifootball-bridge lib · async · schedule={sched} "
-            f"timeout={timeout}s · DQD reversals → flatten)",
+            f"timeout={timeout}s · af_mode={af_mode} · DQD reversals → flatten)",
             file=sys.stderr,
             flush=True,
         )
@@ -64,11 +66,19 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
         )
         print(
             f"af-referee → on (apifootball-bridge lib · async · fixed poll={poll}s "
-            f"timeout={timeout}s · DQD reversals → flatten)",
+            f"timeout={timeout}s · af_mode={af_mode} · DQD reversals → flatten)",
             file=sys.stderr,
             flush=True,
         )
     return ref
+
+
+def resolve_af_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "no_af_referee", False):
+        return "off"
+    if getattr(args, "af_gate_before_trade", False):
+        return "gate"
+    return "postcheck"
 
 
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
@@ -88,7 +98,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         ft_mode=ft_mode,
         take_depth=str(getattr(args, "take_depth", "top") or "top"),
         max_levels=int(getattr(args, "max_levels", 5)),
-        max_usdc=float(getattr(args, "max_usdc", 5.0)),
+        max_usdc=float(getattr(args, "max_usdc", 20.0)),
         max_shares=float(getattr(args, "max_shares", 25.0)),
         max_slippage=float(getattr(args, "max_slippage", 0.03)),
         allow_extreme_prices=bool(getattr(args, "allow_extreme_prices", False)),
@@ -97,7 +107,14 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         env_file=getattr(args, "trade_env_file", None),
         require_key=bool(live_goals or live_ft),
     )
-    executor = TradeExecutor(rt, settings)
+    af_mode = resolve_af_mode(args)
+    timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
+    executor = TradeExecutor(
+        rt,
+        settings,
+        af_mode=af_mode if af_mode != "off" else "off",
+        af_timeout_s=timeout,
+    )
     # Plan: initialize ClobClient once at watch/start when trading is on (reuse).
     # Also needed in dry-run so sell_lose can query position.
     if settings.private_key:
@@ -116,7 +133,9 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     print(
         f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
         f"max_usdc={settings.max_usdc} max_shares={settings.max_shares} "
-        f"min_buy_price={settings.min_buy_price}",
+        f"min_buy_price={settings.min_buy_price} "
+        f"max_open_usdc={settings.max_open_usdc} "
+        f"size_tiers={size_tiers_label(settings)}",
         file=sys.stderr,
         flush=True,
     )
@@ -150,6 +169,7 @@ def cmd_once(args: argparse.Namespace) -> int:
                 trade_executor=executor,
                 market_cache=cache,
                 af_referee=referee,
+                af_mode=resolve_af_mode(args) if referee is not None else "off",
             )
             payload = {
                 "quoted_at": lib.now_cn_iso(),
@@ -328,6 +348,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 trade_executor=executor,
                 market_cache=cache,
                 af_referee=referee,
+                af_mode=resolve_af_mode(args) if referee is not None else "off",
                 events_override=mem_events if mem_events else None,
             )
             for b in bundles:
@@ -456,12 +477,12 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         default=5,
         help="Walk max book levels (default 5, matches TOP_N)",
     )
-    sp.add_argument("--max-usdc", type=float, default=5.0, help="Max USDC per buy (default 5)")
+    sp.add_argument("--max-usdc", type=float, default=20.0, help="Hard max USDC per buy (default 20; .env QUOTE_MAX_USDC wins)")
     sp.add_argument(
         "--max-shares",
         type=float,
         default=25.0,
-        help="Max shares per order (default 25)",
+        help="Hard max shares per order (default 25; .env QUOTE_MAX_SHARES wins; scaled with usdc by ask)",
     )
     sp.add_argument(
         "--max-slippage",
@@ -485,19 +506,28 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         default=None,
         help="Env file with PRIVATE_KEY/FUNDER/… (default repo .env)",
     )
-    # --- AF referee gate (confirm DQD goals via API-Football events) ---
+    # --- AF referee (confirm DQD goals via API-Football events) ---
     sp.add_argument(
         "--no-af-referee",
         action="store_true",
-        help="Disable AF confirmation gate (legacy: trade on DQD score_change immediately)",
+        help="Disable AF confirmation (trade on DQD score_change only; reversals still flatten)",
+    )
+    sp.add_argument(
+        "--af-gate-before-trade",
+        action="store_true",
+        help=(
+            "Legacy: wait for AF confirm before trading (preconfirm quote only). "
+            "Default is postcheck: trade on DQD goal, hold if AF confirms, "
+            "flatten on AF timeout/reversal"
+        ),
     )
     sp.add_argument(
         "--af-poll",
         type=float,
         default=None,
         help=(
-            "Fixed AF events poll interval seconds (disables default tiered "
-            "schedule: 5s → every 2s to 60s → every 5s)"
+            "Fixed AF events poll interval seconds (disables default schedule: "
+            "0s → every 1s → timeout)"
         ),
     )
     sp.add_argument(

@@ -87,6 +87,60 @@ class ClobTrader:
         )
         return Decimal(str(result.get("balance", "0"))) / Decimal("1000000")
 
+    def refresh_conditional_allowance(self, token_id: str) -> None:
+        """Best-effort refresh of conditional-token allowance before sells."""
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+        try:
+            self.client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL, token_id=str(token_id)
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "conditional allowance update failed token=%s…: %s",
+                str(token_id)[:12],
+                e,
+            )
+
+    def cancel_orders_for_asset(self, token_id: str) -> Any:
+        """Cancel open orders for one outcome token (frees locked shares)."""
+        from py_clob_client_v2.clob_types import OrderMarketCancelParams
+
+        tid = str(token_id)
+        try:
+            out = self.client.cancel_market_orders(
+                OrderMarketCancelParams(asset_id=tid)
+            )
+            logger.info("canceled market orders asset=%s… result=%s", tid[:12], out)
+            return out
+        except Exception as e:  # noqa: BLE001
+            # Fallback: cancel individually from open-order list.
+            logger.warning(
+                "cancel_market_orders failed token=%s… (%s); trying get_open_orders",
+                tid[:12],
+                e,
+            )
+        try:
+            from py_clob_client_v2.clob_types import OpenOrderParams, OrderPayload
+
+            opens = self.client.get_open_orders(OpenOrderParams(asset_id=tid)) or []
+            ids = [
+                str(o.get("id") or o.get("orderID") or o.get("order_id") or "")
+                for o in opens
+                if isinstance(o, dict)
+            ]
+            ids = [i for i in ids if i]
+            if not ids:
+                return {"canceled": 0}
+            if len(ids) == 1:
+                return self.client.cancel_order(OrderPayload(orderID=ids[0]))
+            return self.client.cancel_orders(ids)
+        except Exception as e2:  # noqa: BLE001
+            logger.warning("cancel open orders failed token=%s…: %s", tid[:12], e2)
+            return None
+
     @staticmethod
     def is_order_success(result: dict | None, *, market: bool = True) -> bool:
         """Whether a market order was accepted / filled.

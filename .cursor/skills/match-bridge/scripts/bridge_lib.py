@@ -30,6 +30,10 @@ DEFAULT_LEAGUE_FLOOR = 0.40
 # After status=Played but period not yet FT, poll at this cadence (same as live default).
 PENDING_FT_POLL_SEC = 5
 
+# Lazy import of dqd_lib.is_extra_time_clock (None = unavailable after warn-once).
+_IS_EXTRA_TIME_CLOCK: Any = ...
+_ET_FILTER_WARNED = False
+
 # Noise words stripped before fuzzy compare.
 _TEAM_STOP = frozenset(
     {
@@ -446,6 +450,31 @@ def _pm_event_handle(pm: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _extra_time_clock_fn() -> Any:
+    """Return ``is_extra_time_clock`` or None; warn once if import fails."""
+    global _IS_EXTRA_TIME_CLOCK, _ET_FILTER_WARNED
+    if _IS_EXTRA_TIME_CLOCK is not ...:
+        return _IS_EXTRA_TIME_CLOCK
+    try:
+        dqd_scripts = Path(__file__).resolve().parents[2] / "dongqiudi-match" / "scripts"
+        if dqd_scripts.is_dir() and str(dqd_scripts) not in sys.path:
+            sys.path.insert(0, str(dqd_scripts))
+        from dqd_lib import is_extra_time_clock as _is_et  # type: ignore
+
+        _IS_EXTRA_TIME_CLOCK = _is_et
+    except Exception as e:  # noqa: BLE001
+        _IS_EXTRA_TIME_CLOCK = None
+        if not _ET_FILTER_WARNED:
+            _ET_FILTER_WARNED = True
+            print(
+                f"match-bridge → extra-time filter unavailable ({e!r}); "
+                "ET score_change will not be suppressed",
+                file=sys.stderr,
+                flush=True,
+            )
+    return _IS_EXTRA_TIME_CLOCK
+
+
 def detect_score_changes(
     paired: list[dict[str, Any]],
     prev_scores: dict[str, dict[str, Any]],
@@ -454,9 +483,14 @@ def detect_score_changes(
 
     First sighting only seeds prev_scores. Goals: is_goal=True.
     Score drop on either side: is_reversal=True (polymarket-quote flattens).
+
+    Extra time (DQD: playing, minute>90, injury_time==0, or ET period): update
+    ``prev_scores`` only — do not fan out to quote (DQD ET scores are noisy).
     """
     events: list[dict[str, Any]] = []
     ts = datetime.now(TZ_CN).isoformat(timespec="seconds")
+    is_extra_time_clock = _extra_time_clock_fn()
+
     for row in paired:
         dqd = row.get("dongqiudi") or {}
         pm = row.get("polymarket") or {}
@@ -483,6 +517,12 @@ def detect_score_changes(
             continue
 
         if ph == hs_i and pa == aws_i:
+            continue
+
+        # Always advance baseline so ET flicker does not dump a huge delta later.
+        prev_scores[mid] = {"home": hs_i, "away": aws_i}
+
+        if is_extra_time_clock is not None and is_extra_time_clock(dqd):
             continue
 
         # Goal: scores only rise.
@@ -542,7 +582,6 @@ def detect_score_changes(
                     "polymarket": _pm_event_handle(pm),
                 }
             )
-        prev_scores[mid] = {"home": hs_i, "away": aws_i}
     return events
 
 

@@ -4,10 +4,10 @@
 Fixture **mapping** is owned by apifootball-bridge ``sync``/``watch``
 (``data/apifootball/fixture_cache.json``). The referee is **cache-only**: it
 never resolves DQD→AF fixtures on the quote hot path. Cache miss / unresolved
-→ skip the goal immediately (no 120s spin).
+→ skip the goal immediately (no timeout spin).
 
 Score confirmation polls ``fetch_events_for_match_id(..., cache_only=True)`` on
-a tiered schedule: **5s → every 2s until 60s → every 5s** (override with
+a flat schedule: **0s → every 1s until timeout** (default 90s; override with
 ``--af-poll`` for a fixed interval). Confirmations run on a thread pool so
 watch stays responsive; on confirm, burst + ``af_confirmed_scores.json``
 persist asynchronously.
@@ -28,16 +28,13 @@ TZ_CN = timezone(timedelta(hours=8))
 
 # Legacy fixed-interval default (tests / --af-poll override).
 DEFAULT_POLL_S = 0.5
-DEFAULT_TIMEOUT_S = 120.0
+DEFAULT_TIMEOUT_S = 90.0
 DEFAULT_WORKERS = 4
 
-# Tiered confirm schedule (production default): first look at 5s, then every 2s
-# through 60s, then every 5s until timeout. Cuts AF events quota vs 0.5s polling
-# while keeping ~1s mean wait after AF score is ready.
-DEFAULT_FIRST_DELAY_S = 5.0
-DEFAULT_MID_PERIOD_S = 2.0
-DEFAULT_MID_UNTIL_S = 60.0
-DEFAULT_LATE_PERIOD_S = 5.0
+# Confirm schedule (production default): immediate first look, then every 1s
+# until timeout (no late 2s tier). Default timeout 90s → checks at 0..90.
+DEFAULT_FIRST_DELAY_S = 0.0
+DEFAULT_PERIOD_S = 1.0
 
 _AF_SCRIPTS = Path(__file__).resolve().parents[2] / "apifootball-bridge" / "scripts"
 _af_sp = str(_AF_SCRIPTS)
@@ -306,52 +303,32 @@ def confirm_check_times(
     timeout_s: float,
     *,
     first_delay_s: float = DEFAULT_FIRST_DELAY_S,
-    mid_period_s: float = DEFAULT_MID_PERIOD_S,
-    mid_until_s: float = DEFAULT_MID_UNTIL_S,
-    late_period_s: float = DEFAULT_LATE_PERIOD_S,
+    period_s: float = DEFAULT_PERIOD_S,
 ) -> list[float]:
     """Absolute seconds (from goal) at which to call AF events.
 
-    Schedule: ``first_delay``, then every ``mid_period`` until ``mid_until``,
-    then every ``late_period`` until ``timeout_s``.
+    Schedule: ``first_delay``, then every ``period_s`` until ``timeout_s``
+    (inclusive). No polls after timeout.
     """
     timeout = max(0.0, float(timeout_s))
     first = max(0.0, float(first_delay_s))
-    mid_p = max(0.05, float(mid_period_s))
-    mid_until = max(first, float(mid_until_s))
-    late_p = max(0.05, float(late_period_s))
+    period = max(0.05, float(period_s))
 
     checks: list[float] = []
-    if first <= timeout:
-        checks.append(round(first, 3))
-    t = first + mid_p
-    while t <= mid_until + 1e-9 and t <= timeout + 1e-9:
-        checks.append(round(t, 3))
-        t += mid_p
-    # Ensure a check at mid_until when it falls on the grid boundary.
-    if mid_until <= timeout and (not checks or checks[-1] < mid_until - 1e-9):
-        if mid_until >= first:
-            checks.append(round(mid_until, 3))
-    t = (checks[-1] + late_p) if checks else late_p
+    t = first
     while t <= timeout + 1e-9:
         checks.append(round(t, 3))
-        t += late_p
-    # De-dupe / sort
-    out = sorted(set(checks))
-    return [c for c in out if c <= timeout + 1e-9]
+        t += period
+    return checks
 
 
 def schedule_label(
     *,
     first_delay_s: float = DEFAULT_FIRST_DELAY_S,
-    mid_period_s: float = DEFAULT_MID_PERIOD_S,
-    mid_until_s: float = DEFAULT_MID_UNTIL_S,
-    late_period_s: float = DEFAULT_LATE_PERIOD_S,
+    period_s: float = DEFAULT_PERIOD_S,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> str:
-    return (
-        f"{first_delay_s:g}s→every {mid_period_s:g}s to {mid_until_s:g}s→"
-        f"every {late_period_s:g}s"
-    )
+    return f"{first_delay_s:g}s→every {period_s:g}s→{timeout_s:g}s"
 
 
 class AfReferee:
@@ -368,18 +345,14 @@ class AfReferee:
         events_fn: Callable[..., dict[str, Any]] | None = None,
         poll_schedule: bool = True,
         first_delay_s: float = DEFAULT_FIRST_DELAY_S,
-        mid_period_s: float = DEFAULT_MID_PERIOD_S,
-        mid_until_s: float = DEFAULT_MID_UNTIL_S,
-        late_period_s: float = DEFAULT_LATE_PERIOD_S,
+        period_s: float = DEFAULT_PERIOD_S,
     ) -> None:
         self.root = Path(root)
         self.poll_s = max(0.05, float(poll_s))
         self.timeout_s = max(1.0, float(timeout_s))
         self.poll_schedule = bool(poll_schedule)
         self.first_delay_s = max(0.0, float(first_delay_s))
-        self.mid_period_s = max(0.05, float(mid_period_s))
-        self.mid_until_s = max(0.0, float(mid_until_s))
-        self.late_period_s = max(0.05, float(late_period_s))
+        self.period_s = max(0.05, float(period_s))
         self.env_path = env_path
         self._events_fn = events_fn
         self._af: aflib.AFClient | None = None
@@ -397,9 +370,8 @@ class AfReferee:
         if self.poll_schedule:
             return schedule_label(
                 first_delay_s=self.first_delay_s,
-                mid_period_s=self.mid_period_s,
-                mid_until_s=self.mid_until_s,
-                late_period_s=self.late_period_s,
+                period_s=self.period_s,
+                timeout_s=self.timeout_s,
             )
         return f"fixed {self.poll_s}s"
 
@@ -493,6 +465,7 @@ class AfReferee:
         baseline: tuple[int, int] | None = None,
         poll_s: float | None = None,
         timeout_s: float | None = None,
+        wait_cache: bool = False,
     ) -> dict[str, Any]:
         """Block until AF confirms target (or AF already covers it) / timeout.
 
@@ -500,11 +473,13 @@ class AfReferee:
         On confirm: return immediately (memory score); disk/burst async.
 
         Fixture mapping is cache-only (filled by AF sync/watch). If the DQD id
-        is not in ``fixture_cache.json`` entries, skip immediately — no resolve,
-        no 120s spin.
+        is not in ``fixture_cache.json`` entries:
+        - ``wait_cache=False`` (gate): skip immediately — no resolve, no timeout spin.
+        - ``wait_cache=True`` (postcheck): keep polling until timeout so late
+          sync/watch mappings can still confirm after a buy.
 
-        Default poll schedule: first check at 5s, every 2s until 60s, then every
-        5s (override with ``poll_schedule=False`` + ``poll_s`` for fixed interval).
+        Default poll schedule: first check at 0s, every 1s until timeout
+        (override with ``poll_schedule=False`` + ``poll_s`` for fixed interval).
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
         timeout = self.timeout_s if timeout_s is None else max(1.0, float(timeout_s))
@@ -516,7 +491,11 @@ class AfReferee:
         mid = str(match_id)
         # Fresh disk cache from AF board sync/watch.
         self._reload_fixture_cache()
-        if self._events_fn is None and self.cached_af_fixture_id(mid) is None:
+        if (
+            not wait_cache
+            and self._events_fn is None
+            and self.cached_af_fixture_id(mid) is None
+        ):
             err = aflib.fixture_miss_error(self._fixture_cache(), mid)
             print(
                 f"af-referee → skip {mid} target={th}-{ta} err={err} (cache-only)",
@@ -535,7 +514,13 @@ class AfReferee:
                 "elapsed_ms": 0,
                 "poll_s": poll,
                 "timeout_s": timeout,
-                "schedule": self._schedule_desc(),
+                "schedule": schedule_label(
+                    first_delay_s=self.first_delay_s,
+                    period_s=self.period_s,
+                    timeout_s=timeout,
+                )
+                if self.poll_schedule
+                else f"fixed {poll}s",
                 "error": err,
                 "via": "apifootball-bridge",
                 "cache_only": True,
@@ -545,9 +530,7 @@ class AfReferee:
             check_at = confirm_check_times(
                 timeout,
                 first_delay_s=self.first_delay_s,
-                mid_period_s=self.mid_period_s,
-                mid_until_s=self.mid_until_s,
-                late_period_s=self.late_period_s,
+                period_s=self.period_s,
             )
         else:
             # Fixed interval from t=0 (tests / --af-poll override).
@@ -595,24 +578,32 @@ class AfReferee:
 
             miss = str(last.get("error") or "")
             if miss in _CACHE_MISS_ERRORS:
-                return {
-                    "ok": False,
-                    "confirmed": False,
-                    "match_id": mid,
-                    "target": {"home": th, "away": ta},
-                    "goals": last_goals,
-                    "baseline": {"home": base[0], "away": base[1]} if base else None,
-                    "af_fixture_id": None,
-                    "burst_dir": None,
-                    "polls": polls,
-                    "elapsed_ms": elapsed_ms,
-                    "poll_s": poll,
-                    "timeout_s": timeout,
-                    "schedule": self._schedule_desc(),
-                    "error": miss,
-                    "via": "apifootball-bridge",
-                    "cache_only": True,
+                last_error = miss
+                last_goals = {
+                    "home": (last.get("goals") or {}).get("home"),
+                    "away": (last.get("goals") or {}).get("away"),
                 }
+                if not wait_cache:
+                    return {
+                        "ok": False,
+                        "confirmed": False,
+                        "match_id": mid,
+                        "target": {"home": th, "away": ta},
+                        "goals": last_goals,
+                        "baseline": {"home": base[0], "away": base[1]} if base else None,
+                        "af_fixture_id": None,
+                        "burst_dir": None,
+                        "polls": polls,
+                        "elapsed_ms": elapsed_ms,
+                        "poll_s": poll,
+                        "timeout_s": timeout,
+                        "schedule": self._schedule_desc(),
+                        "error": miss,
+                        "via": "apifootball-bridge",
+                        "cache_only": True,
+                    }
+                # postcheck: keep polling until timeout for late fixture mapping
+                continue
 
             if _is_rate_limited(last):
                 rate_hits += 1
@@ -703,8 +694,14 @@ class AfReferee:
         event_key: str,
         ev: dict[str, Any],
         target: tuple[int, int],
+        *,
+        wait_cache: bool = False,
     ) -> bool:
-        """Enqueue non-blocking confirmation. Returns False if already pending."""
+        """Enqueue non-blocking confirmation. Returns False if already pending.
+
+        ``wait_cache=True`` (postcheck): keep polling on fixture-cache miss until
+        timeout so late AF sync mappings can still confirm after a buy.
+        """
         mid = str(ev.get("match_id") or "")
         if not mid:
             return False
@@ -718,6 +715,7 @@ class AfReferee:
                 mid,
                 target,
                 baseline=baseline,
+                wait_cache=bool(wait_cache),
             )
             self._pending[event_key] = fut
             self._meta[event_key] = {
@@ -725,11 +723,13 @@ class AfReferee:
                 "target": (int(target[0]), int(target[1])),
                 "match_id": mid,
                 "submitted_at": iso_now(),
+                "wait_cache": bool(wait_cache),
             }
         print(
             f"af-referee → queued {mid} target={target[0]}-{target[1]} "
             f"key={event_key} (async · cache-only · {self._schedule_desc()} · "
-            f"timeout {self.timeout_s}s)",
+            f"timeout {self.timeout_s}s"
+            f"{' · wait_cache' if wait_cache else ''})",
             flush=True,
         )
         return True

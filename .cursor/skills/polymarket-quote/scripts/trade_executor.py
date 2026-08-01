@@ -13,8 +13,13 @@ from typing import Any
 import quote_lib as lib
 from clob_trader import ClobTrader
 from fill_planner import FillPlan, plan_fill
+from size_policy import compute_buy_size_caps
 from score_reversal import (
+    AF_STATUS_CONFIRMED,
+    AF_STATUS_NONE,
+    AF_STATUS_PENDING,
     OpenPositionLedger,
+    deadline_iso,
     entry_tuple,
     event_signals_reversal,
     ft_reversal_vs_entry,
@@ -30,8 +35,22 @@ FLATTEN_SHARE_DECIMALS = 2
 FLATTEN_MIN_SHARES = Decimal("0.01")
 # Emergency flatten floor price (do not dump into sub-0.2 bids forever).
 FLATTEN_MIN_PRICE = Decimal("0.2")
+# If 0.2 FAK leaves the full bag, one dump attempt at the tick floor.
+FLATTEN_DUMP_MIN_PRICE = Decimal("0.01")
+# Polymarket matched-order cache often rejects 100% sells; keep a haircut.
+FLATTEN_SELL_HAIRCUT = Decimal("0.99")
+# Live bal vs gate bal: within this → trust gate "free"; else size from live only.
+FLATTEN_GATE_BAL_EPS = Decimal("0.02")
 _TERMINAL_FLATTEN_ERR_RE = re.compile(
     r"invalid\s+maker\s+amount|invalid\s+amounts",
+    re.IGNORECASE,
+)
+_BALANCE_GATE_RE = re.compile(
+    r"balance:\s*(\d+).*?sum of matched orders:\s*(\d+).*?order amount[^:]*:\s*(\d+)",
+    re.IGNORECASE | re.DOTALL,
+)
+_NOT_ENOUGH_BAL_RE = re.compile(
+    r"not enough balance\s*/\s*allowance",
     re.IGNORECASE,
 )
 
@@ -47,6 +66,108 @@ def floor_shares(shares: Decimal | float | str, *, decimals: int = FLATTEN_SHARE
     if d <= 0:
         return Decimal("0")
     return (d / q).to_integral_value(rounding=ROUND_DOWN) * q
+
+
+def flatten_sell_shares(bal: Decimal) -> Decimal:
+    """Shares to FAK-sell: 2dp floor with 99% haircut (PM balance-gate workaround)."""
+    bal = Decimal(str(bal))
+    if bal <= 0:
+        return Decimal("0")
+    haircut = floor_shares(bal * FLATTEN_SELL_HAIRCUT)
+    if haircut >= FLATTEN_MIN_SHARES:
+        return haircut
+    # Tiny lots: leave 0.01 dust when possible, else full floor.
+    full = floor_shares(bal)
+    leave = full - Decimal("0.01")
+    if leave >= FLATTEN_MIN_SHARES:
+        return leave
+    return full
+
+
+def flatten_sell_shares_available(
+    bal: Decimal,
+    *,
+    free: Decimal | None = None,
+) -> Decimal:
+    """Haircut sell size, capped by free (unlocked) shares when known."""
+    bal = Decimal(str(bal))
+    sized = flatten_sell_shares(bal)
+    if free is None:
+        return sized
+    free_d = Decimal(str(free))
+    if free_d <= 0:
+        return Decimal("0")
+    capped = floor_shares(free_d)
+    if capped < FLATTEN_MIN_SHARES:
+        return Decimal("0")
+    return min(sized, capped)
+
+
+def parse_balance_gate_error(err: str | Exception | None) -> dict[str, Decimal] | None:
+    """Parse CLOB 'not enough balance' micro-unit fields → Decimal shares."""
+    if err is None:
+        return None
+    text = str(err)
+    if not _NOT_ENOUGH_BAL_RE.search(text):
+        return None
+    m = _BALANCE_GATE_RE.search(text)
+    if not m:
+        return None
+    scale = Decimal("1000000")
+    bal = Decimal(m.group(1)) / scale
+    matched = Decimal(m.group(2)) / scale
+    order_amt = Decimal(m.group(3)) / scale
+    return {
+        "balance": bal,
+        "matched": matched,
+        "order_amount": order_amt,
+        "free": bal - matched,
+    }
+
+
+def gate_has_locked_inventory(gate: dict[str, Decimal] | None) -> bool:
+    """True when matched orders leave nothing tradeable (do not dust-close)."""
+    if not gate:
+        return False
+    matched = Decimal(str(gate.get("matched") or 0))
+    bal = Decimal(str(gate.get("balance") or 0))
+    free = Decimal(str(gate.get("free") or 0))
+    # Nothing free to sell, but matched and/or bag still look real.
+    if free < FLATTEN_MIN_SHARES and matched >= FLATTEN_MIN_SHARES:
+        return True
+    if free < FLATTEN_MIN_SHARES and bal >= FLATTEN_MIN_SHARES:
+        return True
+    return False
+
+
+def gate_free_cap(
+    gate: dict[str, Decimal] | None,
+    live_bal: Decimal,
+    *,
+    eps: Decimal = FLATTEN_GATE_BAL_EPS,
+) -> Decimal | None:
+    """Return gate free shares only when live bal still matches the gate bag.
+
+    After cancel/settle, if live balance moved, ignore stale free and size from
+    live balance alone.
+    """
+    if not gate:
+        return None
+    try:
+        gbal = Decimal(str(gate.get("balance") or 0))
+        free = Decimal(str(gate.get("free") or 0))
+    except Exception:  # noqa: BLE001
+        return None
+    live = Decimal(str(live_bal))
+    if abs(live - gbal) > Decimal(str(eps)):
+        return None
+    return free
+
+
+def is_not_enough_balance_error(err: str | Exception | None) -> bool:
+    if err is None:
+        return False
+    return bool(_NOT_ENOUGH_BAL_RE.search(str(err)))
 
 
 def is_terminal_flatten_error(err: str | Exception | None) -> bool:
@@ -73,10 +194,17 @@ class TradeExecutor:
         settings: TradeSettings,
         *,
         trader: ClobTrader | None = None,
+        af_mode: str = "postcheck",
+        af_timeout_s: float = 90.0,
     ) -> None:
         self.root = Path(root)
         self.settings = settings
         self.trader = trader
+        mode = str(af_mode or "postcheck").strip().lower()
+        if mode not in ("postcheck", "gate", "off"):
+            mode = "postcheck"
+        self.af_mode = mode
+        self.af_timeout_s = max(1.0, float(af_timeout_s))
         self._done: set[str] = set()
         self._flatten_done: set[str] = set()
         self._lock = threading.RLock()
@@ -481,12 +609,58 @@ class TradeExecutor:
                 )
                 return row
 
+        max_usdc = float(self.settings.max_usdc)
+        max_shares = float(self.settings.max_shares)
+        size_meta: dict[str, Any] | None = None
+        if trade == "buy_win":
+            open_usdc = sum(
+                float(r.get("usdc") or 0)
+                for r in self.ledger.all_open()
+            )
+            caps = compute_buy_size_caps(
+                ref_f,
+                max_usdc=self.settings.max_usdc,
+                max_shares=self.settings.max_shares,
+                tiers=self.settings.size_tiers,
+                open_usdc=open_usdc,
+                max_open_usdc=self.settings.max_open_usdc,
+                floor_usdc=self.settings.size_floor_usdc,
+            )
+            size_meta = caps.to_dict()
+            if caps.skip_reason:
+                row = self._record(
+                    quote,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    plan=None,
+                    status="skipped",
+                    skip_reason=caps.skip_reason,
+                    response=None,
+                    success=False,
+                    idempotency_key=key,
+                    live=channel_live,
+                    extra={"size_policy": size_meta},
+                )
+                return row
+            max_usdc = float(caps.max_usdc)
+            max_shares = float(caps.max_shares)
+            logger.info(
+                "size_policy ask=%.3f tier=%.2f eff_usdc=%.2f eff_shares=%.2f "
+                "open=%.2f remaining=%s",
+                caps.ask,
+                caps.tier_usdc,
+                caps.max_usdc,
+                caps.max_shares,
+                caps.open_usdc,
+                caps.remaining_open,
+            )
+
         plan = plan_fill(
             quote,
             take_depth=self.settings.take_depth,
             max_levels=self.settings.max_levels,
-            max_usdc=self.settings.max_usdc,
-            max_shares=self.settings.max_shares,
+            max_usdc=max_usdc,
+            max_shares=max_shares,
             max_slippage=self.settings.max_slippage,
             min_order_shares=self.settings.min_order_shares,
             available_shares=available,
@@ -504,6 +678,7 @@ class TradeExecutor:
                 success=False,
                 idempotency_key=key,
                 live=channel_live,
+                extra={"size_policy": size_meta} if size_meta else None,
             )
             return row
 
@@ -519,6 +694,7 @@ class TradeExecutor:
                 success=True,
                 idempotency_key=key,
                 live=False,
+                extra={"size_policy": size_meta} if size_meta else None,
             )
             self._done.add(key)
             logger.info(
@@ -613,6 +789,7 @@ class TradeExecutor:
                 success=ok,
                 idempotency_key=key,
                 live=True,
+                extra={"size_policy": size_meta} if size_meta else None,
             )
             if ok:
                 self._done.add(key)
@@ -640,6 +817,7 @@ class TradeExecutor:
                 success=False,
                 idempotency_key=key,
                 live=True,
+                extra={"size_policy": size_meta} if size_meta else None,
             )
             return row
 
@@ -657,6 +835,15 @@ class TradeExecutor:
         if not mid:
             return
         neg = quote.get("neg_risk")
+        sig = signal_from_event_key(event_key)
+        af_status = AF_STATUS_NONE
+        af_deadline = None
+        if sig == "score_change" and self.af_mode == "postcheck":
+            af_status = AF_STATUS_PENDING
+            af_deadline = deadline_iso(self.af_timeout_s)
+        elif sig == "score_change" and self.af_mode == "gate":
+            # Bought only after AF confirm.
+            af_status = AF_STATUS_CONFIRMED
         self.ledger.register_buy(
             match_id=mid,
             token_id=str(quote.get("token_id") or ""),
@@ -672,7 +859,126 @@ class TradeExecutor:
             family=str(quote.get("family") or ""),
             tick_size=str(quote.get("tick_size") or "0.01"),
             neg_risk=bool(neg) if neg is not None else None,
+            af_status=af_status,
+            af_deadline=af_deadline,
         )
+
+    def mark_af_confirmed(self, match_id: str, *, event_key: str = "") -> int:
+        with self._lock:
+            return self.ledger.mark_af_confirmed(match_id, event_key=event_key)
+
+    def refresh_af_deadline(
+        self,
+        match_id: str,
+        *,
+        event_key: str = "",
+        timeout_s: float | None = None,
+    ) -> int:
+        """Align lot af_deadline with AF submit time (not buy time)."""
+        with self._lock:
+            return self.ledger.refresh_af_deadline(
+                match_id,
+                event_key=event_key,
+                timeout_s=self.af_timeout_s if timeout_s is None else float(timeout_s),
+            )
+
+    def flatten_af_unconfirmed(
+        self,
+        match_id: str,
+        *,
+        event_key: str = "",
+        reason: str = "af_confirm_timeout",
+    ) -> list[dict[str, Any]]:
+        """Flatten open lots still af_pending for this goal event_key."""
+        with self._lock:
+            return self._flatten_af_pending_locked(
+                match_id=str(match_id),
+                event_key=str(event_key or ""),
+                reason=reason,
+            )
+
+    def flatten_af_deadline_lots(
+        self,
+        *,
+        exclude_event_keys: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Flatten af_pending lots whose af_deadline has passed (drain safety net).
+
+        Skip ``exclude_event_keys`` (typically still in-flight AF confirms) so we
+        never sell a lot that AF is about to confirm on this tick.
+        """
+        with self._lock:
+            if self.af_mode != "postcheck" or not self.settings.enabled:
+                return []
+            overdue = self.ledger.overdue_af_pending_lots(
+                exclude_event_keys=exclude_event_keys
+            )
+            if not overdue:
+                return []
+            out: list[dict[str, Any]] = []
+            # Group by match+event_key to emit stable flatten keys.
+            seen_lots: set[tuple[str, str]] = set()
+            for lot in overdue:
+                mid = str(lot.get("match_id") or "")
+                tid = str(lot.get("token_id") or "")
+                if not mid or not tid or (mid, tid) in seen_lots:
+                    continue
+                seen_lots.add((mid, tid))
+                ek = str(lot.get("event_key") or "")
+                reason = "af_confirm_timeout"
+                flatten_ek = (
+                    f"flatten_af_deadline|{mid}|{ek}|{lib.now_cn_iso()}"
+                )
+                out.append(
+                    self._flatten_lot(
+                        lot,
+                        event_key=flatten_ek,
+                        reason=reason,
+                        match_ev={"match_id": mid, "type": "score_change"},
+                    )
+                )
+            return out
+
+    def _flatten_af_pending_locked(
+        self,
+        *,
+        match_id: str,
+        event_key: str,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        if not self.settings.enabled:
+            return []
+        mid = str(match_id)
+        if not mid:
+            return []
+        lots = self.ledger.af_pending_lots(
+            match_id=mid,
+            event_key=event_key or None,
+        )
+        if not lots:
+            return []
+        logger.warning(
+            "af-unconfirmed flatten match=%s lots=%d reason=%s event_key=%s",
+            mid,
+            len(lots),
+            reason,
+            event_key or "*",
+        )
+        out: list[dict[str, Any]] = []
+        for lot in lots:
+            flatten_ek = (
+                f"flatten_af_timeout|{mid}|{lot.get('event_key') or event_key}|"
+                f"{lib.now_cn_iso()}|{reason}"
+            )
+            out.append(
+                self._flatten_lot(
+                    lot,
+                    event_key=flatten_ek,
+                    reason=reason,
+                    match_ev={"match_id": mid, "type": "score_change"},
+                )
+            )
+        return out
 
     def maybe_flatten_for_event(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
         """Flatten only lots that depended on a disallowed goal (entry > after score)."""
@@ -873,62 +1179,145 @@ class TradeExecutor:
             )
             return row
 
-        # Live FAK sell: floor shares to 2dp (CLOB maker precision), min_price=0.2.
+        # Live FAK sell: cancel locks, haircut size, min_price=0.2 (dump fallback).
         try:
             trader = self.ensure_trader()
             if trader is None:
                 raise RuntimeError("no trader for flatten")
+
+            try:
+                trader.refresh_conditional_allowance(token_id)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                trader.cancel_orders_for_asset(token_id)
+            except Exception:  # noqa: BLE001
+                pass
+
             bal = Decimal(str(trader.get_conditional_balance(token_id)))
-            shares = floor_shares(bal)
+            shares = flatten_sell_shares(bal)
             if bal <= 0 or shares < FLATTEN_MIN_SHARES:
-                # Dust / empty: close ledger and stop retrying.
-                dust_reason = (
-                    f"{reason}|dust_bal={bal:.6f}|floor={shares}"
-                    if bal > 0
-                    else reason + "|empty"
-                )
+                # True empty → close. Tiny dust with no locks → close.
+                # If balance still tradeable but sizing floored to 0, or we only
+                # see dust while locks may remain, keep pending (Bodø case).
+                if bal <= 0:
+                    row = self._record(
+                        quote_stub,
+                        event_key=event_key,
+                        match_meta=meta,
+                        plan=None,
+                        status="flatten_skipped",
+                        skip_reason="no_position_on_flatten",
+                        response=None,
+                        success=False,
+                        idempotency_key=key,
+                        live=True,
+                    )
+                    self._flatten_done.add(key)
+                    self.ledger.mark_closed(token_id, mid, reason=reason + "|empty")
+                    return row
+                if bal >= FLATTEN_MIN_SHARES:
+                    # Have inventory but cannot size a legal sell this tick.
+                    self.ledger.mark_pending_flatten(
+                        token_id,
+                        mid,
+                        reason=f"{reason}|unsellable_bal={bal:.6f}|floor={shares}",
+                    )
+                    alert = (
+                        f"ALERT flatten_unsellable match={mid} token={token_id[:12]}… "
+                        f"bal={bal} sell={shares} — keep pending"
+                    )
+                    logger.warning(alert)
+                    print(alert, flush=True)
+                    return self._record(
+                        quote_stub,
+                        event_key=event_key,
+                        match_meta=meta,
+                        plan=None,
+                        status="flatten_error",
+                        skip_reason=f"unsellable_bal={bal}",
+                        response=None,
+                        success=False,
+                        idempotency_key=key,
+                        live=True,
+                    )
+                dust_reason = f"{reason}|dust_bal={bal:.6f}|floor={shares}"
                 row = self._record(
                     quote_stub,
                     event_key=event_key,
                     match_meta=meta,
                     plan=None,
                     status="flatten_skipped",
-                    skip_reason=(
-                        "flatten_dust" if bal > 0 else "no_position_on_flatten"
-                    ),
+                    skip_reason="flatten_dust",
                     response=None,
-                    success=True if bal > 0 else False,
+                    success=True,
                     idempotency_key=key,
                     live=True,
                 )
                 self._flatten_done.add(key)
                 self.ledger.mark_closed(token_id, mid, reason=dust_reason)
-                if bal > 0:
-                    alert = (
-                        f"ALERT flatten_dust match={mid} token={token_id[:12]}… "
-                        f"bal={bal} floor={shares} < {FLATTEN_MIN_SHARES} — closed"
-                    )
-                    logger.warning(alert)
-                    print(alert, flush=True)
+                alert = (
+                    f"ALERT flatten_dust match={mid} token={token_id[:12]}… "
+                    f"bal={bal} sell={shares} < {FLATTEN_MIN_SHARES} — closed"
+                )
+                logger.warning(alert)
+                print(alert, flush=True)
                 return row
+
             tick = str(lot.get("tick_size") or "0.01") or "0.01"
             neg = lot.get("neg_risk")
             neg_risk = bool(neg) if neg is not None else None
-            response = trader.post_market_sell(
-                token_id,
-                shares,
-                tick,
-                min_price=FLATTEN_MIN_PRICE,
-                order_type="FAK",
+            min_px = FLATTEN_MIN_PRICE
+            response, shares, ok = self._flatten_post_sell(
+                trader,
+                token_id=token_id,
+                shares=shares,
+                tick=tick,
+                min_price=min_px,
                 neg_risk=neg_risk,
             )
-            ok = trader.is_order_success(response)
-            # Confirm residual — FAK may partial-fill; dust residual closes.
+
             residual = Decimal("-1")
             try:
                 residual = Decimal(str(trader.get_conditional_balance(token_id)))
             except Exception:  # noqa: BLE001
                 residual = Decimal("-1")
+
+            # No fill at 0.2 (thin book): one dump attempt at 0.01.
+            if (
+                residual >= FLATTEN_MIN_SHARES
+                and bal > 0
+                and residual >= bal - Decimal("0.02")
+            ):
+                try:
+                    trader.cancel_orders_for_asset(token_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                dump_shares = flatten_sell_shares(residual)
+                if dump_shares >= FLATTEN_MIN_SHARES:
+                    logger.warning(
+                        "flatten dump retry match=%s token=%s… shares=%s min=%s",
+                        mid,
+                        token_id[:12],
+                        dump_shares,
+                        FLATTEN_DUMP_MIN_PRICE,
+                    )
+                    response, shares, ok = self._flatten_post_sell(
+                        trader,
+                        token_id=token_id,
+                        shares=dump_shares,
+                        tick=tick,
+                        min_price=FLATTEN_DUMP_MIN_PRICE,
+                        neg_risk=neg_risk,
+                    )
+                    min_px = FLATTEN_DUMP_MIN_PRICE
+                    try:
+                        residual = Decimal(
+                            str(trader.get_conditional_balance(token_id))
+                        )
+                    except Exception:  # noqa: BLE001
+                        residual = Decimal("-1")
+
             residual_floor = (
                 floor_shares(residual) if residual >= 0 else Decimal("-1")
             )
@@ -941,7 +1330,7 @@ class TradeExecutor:
                 order_type="FAK",
                 shares=float(shares),
                 usdc=0.0,
-                worst_price=float(FLATTEN_MIN_PRICE),
+                worst_price=float(min_px),
                 levels_used=0,
                 levels=[],
                 skip_reason=None,
@@ -979,6 +1368,19 @@ class TradeExecutor:
                 self.ledger.mark_pending_flatten(token_id, mid, reason=reason)
             return row
         except Exception as e:  # noqa: BLE001
+            if is_not_enough_balance_error(e):
+                recovered = self._flatten_retry_after_balance_gate(
+                    lot,
+                    event_key=event_key,
+                    reason=reason,
+                    match_ev=match_ev,
+                    key=key,
+                    quote_stub=quote_stub,
+                    meta=meta,
+                    err=e,
+                )
+                if recovered is not None:
+                    return recovered
             terminal = is_terminal_flatten_error(e)
             alert = (
                 f"ALERT flatten_failed match={mid} token={token_id[:12]}… "
@@ -1009,6 +1411,194 @@ class TradeExecutor:
                 live=True,
             )
 
+    def _flatten_post_sell(
+        self,
+        trader: ClobTrader,
+        *,
+        token_id: str,
+        shares: Decimal,
+        tick: str,
+        min_price: Decimal,
+        neg_risk: bool | None,
+    ) -> tuple[dict[str, Any], Decimal, bool]:
+        response = trader.post_market_sell(
+            token_id,
+            shares,
+            tick,
+            min_price=min_price,
+            order_type="FAK",
+            neg_risk=neg_risk,
+        )
+        return response, shares, trader.is_order_success(response)
+
+    def _flatten_retry_after_balance_gate(
+        self,
+        lot: dict[str, Any],
+        *,
+        event_key: str,
+        reason: str,
+        match_ev: dict[str, Any],
+        key: str,
+        quote_stub: dict[str, Any],
+        meta: dict[str, Any],
+        err: Exception,
+    ) -> dict[str, Any] | None:
+        """Cancel + sell free/haircut size after CLOB matched-order gate rejects.
+
+        No inline sleep (keeps watch responsive). If still locked, leave
+        ``pending_flatten`` for the next tick's ``retry_pending_flattens``.
+        """
+        token_id = str(lot.get("token_id") or "")
+        mid = str(lot.get("match_id") or "")
+        trader = self.ensure_trader()
+        if trader is None:
+            return None
+        gate = parse_balance_gate_error(err)
+        logger.warning(
+            "flatten balance-gate match=%s token=%s… gate=%s — cancel+resize",
+            mid,
+            token_id[:12],
+            {k: str(v) for k, v in (gate or {}).items()},
+        )
+        try:
+            trader.cancel_orders_for_asset(token_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            trader.refresh_conditional_allowance(token_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            bal = Decimal(str(trader.get_conditional_balance(token_id)))
+        except Exception:  # noqa: BLE001
+            bal = Decimal("0")
+
+        # Trust gate free only while live bal still looks like the same bag.
+        free = gate_free_cap(gate, bal)
+        shares = flatten_sell_shares_available(bal, free=free)
+        if shares < FLATTEN_MIN_SHARES and free is not None and free >= FLATTEN_MIN_SHARES:
+            shares = floor_shares(free)
+        if shares < FLATTEN_MIN_SHARES:
+            # Locked inventory or true dust. Never dust-close while matched
+            # still holds a tradeable bag — next tick retries after cancel.
+            if gate_has_locked_inventory(gate) or bal >= FLATTEN_MIN_SHARES:
+                lock_reason = (
+                    f"{reason}|err={err}|await_unlock|matched="
+                    f"{(gate or {}).get('matched')}|free={free}|bal={bal}"
+                )
+                self.ledger.mark_pending_flatten(token_id, mid, reason=lock_reason[:300])
+                alert = (
+                    f"ALERT flatten_locked match={mid} token={token_id[:12]}… "
+                    f"bal={bal} free={free} matched={(gate or {}).get('matched')} "
+                    f"— pending next tick"
+                )
+                logger.warning(alert)
+                print(alert, flush=True)
+                return self._record(
+                    quote_stub,
+                    event_key=event_key,
+                    match_meta=meta,
+                    plan=None,
+                    status="flatten_error",
+                    skip_reason=f"{err}|await_unlock",
+                    response=None,
+                    success=False,
+                    idempotency_key=key,
+                    live=True,
+                )
+            self.ledger.mark_pending_flatten(
+                token_id, mid, reason=f"{reason}|err={err}|free<{FLATTEN_MIN_SHARES}"
+            )
+            return self._record(
+                quote_stub,
+                event_key=event_key,
+                match_meta=meta,
+                plan=None,
+                status="flatten_error",
+                skip_reason=str(err),
+                response=None,
+                success=False,
+                idempotency_key=key,
+                live=True,
+            )
+
+        tick = str(lot.get("tick_size") or "0.01") or "0.01"
+        neg = lot.get("neg_risk")
+        neg_risk = bool(neg) if neg is not None else None
+        try:
+            response, shares, ok = self._flatten_post_sell(
+                trader,
+                token_id=token_id,
+                shares=shares,
+                tick=tick,
+                min_price=FLATTEN_DUMP_MIN_PRICE,
+                neg_risk=neg_risk,
+            )
+        except Exception as e2:  # noqa: BLE001
+            self.ledger.mark_pending_flatten(
+                token_id,
+                mid,
+                reason=f"{reason}|err={err}|retry_err={e2}"[:300],
+            )
+            return self._record(
+                quote_stub,
+                event_key=event_key,
+                match_meta=meta,
+                plan=None,
+                status="flatten_error",
+                skip_reason=f"{err}|retry={e2}",
+                response=None,
+                success=False,
+                idempotency_key=key,
+                live=True,
+            )
+
+        try:
+            residual = Decimal(str(trader.get_conditional_balance(token_id)))
+        except Exception:  # noqa: BLE001
+            residual = Decimal("-1")
+        residual_floor = floor_shares(residual) if residual >= 0 else Decimal("-1")
+        fully_flat = ok and residual >= 0 and residual_floor < FLATTEN_MIN_SHARES
+        plan = FillPlan(
+            trade="flatten_reversal",
+            side="SELL",
+            take_depth="emergency",
+            order_type="FAK",
+            shares=float(shares),
+            usdc=0.0,
+            worst_price=float(FLATTEN_DUMP_MIN_PRICE),
+            levels_used=0,
+            levels=[],
+            skip_reason=None,
+        )
+        row = self._record(
+            quote_stub,
+            event_key=event_key,
+            match_meta=meta,
+            plan=plan,
+            status="flatten_posted",
+            skip_reason=(
+                reason + f"|balance_gate_retry|residual={float(residual):.4f}"
+                if residual > FLATTEN_MIN_SHARES
+                else reason + "|balance_gate_retry"
+            ),
+            response=response,
+            success=fully_flat,
+            idempotency_key=key,
+            live=True,
+        )
+        if fully_flat:
+            self._flatten_done.add(key)
+            self.ledger.mark_closed(
+                token_id, mid, reason=f"{reason}|balance_gate_retry"
+            )
+        else:
+            self.ledger.mark_pending_flatten(
+                token_id, mid, reason=f"{reason}|balance_gate_partial"
+            )
+        return row
+
     def _position_shares(self, token_id: str) -> float | None:
         """Available conditional balance.
 
@@ -1038,6 +1628,7 @@ class TradeExecutor:
         success: bool,
         idempotency_key: str,
         live: bool | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         meta = match_meta or {}
         row: dict[str, Any] = {
@@ -1071,5 +1662,7 @@ class TradeExecutor:
             "skip_reason": skip_reason,
             "response": response,
         }
+        if extra:
+            row.update(extra)
         lib.append_jsonl_async(self.trades_path, [row])
         return row

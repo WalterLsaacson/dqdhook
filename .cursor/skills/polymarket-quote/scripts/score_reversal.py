@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("pm_quote.reversal")
+
+TZ_CN = timezone(timedelta(hours=8))
+
+AF_STATUS_PENDING = "pending"
+AF_STATUS_CONFIRMED = "confirmed"
+AF_STATUS_NONE = "none"
 
 
 def score_pair(home: Any, away: Any) -> tuple[int, int] | None:
@@ -73,6 +80,48 @@ def lot_depends_on_disallowed_goal(
     return is_score_decrease(entry_tuple(lot), after_score)
 
 
+def iso_now() -> str:
+    return datetime.now(TZ_CN).isoformat(timespec="seconds")
+
+
+def parse_iso(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    raw = str(ts).strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_CN)
+    return dt
+
+
+def deadline_iso(timeout_s: float, *, now: datetime | None = None) -> str:
+    base = now if now is not None else datetime.now(TZ_CN)
+    return (base + timedelta(seconds=max(0.0, float(timeout_s)))).isoformat(
+        timespec="seconds"
+    )
+
+
+def lot_af_pending(lot: dict[str, Any]) -> bool:
+    return str(lot.get("af_status") or "") == AF_STATUS_PENDING
+
+
+def lot_af_overdue(lot: dict[str, Any], *, now: datetime | None = None) -> bool:
+    if not lot_af_pending(lot):
+        return False
+    dl = parse_iso(str(lot.get("af_deadline") or "") or None)
+    if dl is None:
+        return False
+    cur = now if now is not None else datetime.now(TZ_CN)
+    return cur >= dl
+
+
 class OpenPositionLedger:
     """Persist open buy_win lots per match for reversal flatten."""
 
@@ -125,10 +174,15 @@ class OpenPositionLedger:
         family: str = "",
         tick_size: str = "0.01",
         neg_risk: bool | None = None,
+        af_status: str = AF_STATUS_NONE,
+        af_deadline: str | None = None,
     ) -> None:
         if not match_id or not token_id or shares <= 0:
             return
         sc = score_pair(home_score, away_score)
+        status = str(af_status or AF_STATUS_NONE)
+        if status not in (AF_STATUS_PENDING, AF_STATUS_CONFIRMED, AF_STATUS_NONE):
+            status = AF_STATUS_NONE
         row = {
             "status": "open",
             "match_id": str(match_id),
@@ -144,6 +198,8 @@ class OpenPositionLedger:
             "event_key": event_key,
             "tick_size": tick_size or "0.01",
             "neg_risk": neg_risk,
+            "af_status": status,
+            "af_deadline": af_deadline if status == AF_STATUS_PENDING else None,
         }
         # Replace prior open lot for same match+token (idempotent re-quote)
         self._rows = [
@@ -158,11 +214,12 @@ class OpenPositionLedger:
         self._rows.append(row)
         self._save()
         logger.info(
-            "ledger open match=%s token=%s… shares=%.4f entry=%s",
+            "ledger open match=%s token=%s… shares=%.4f entry=%s af=%s",
             match_id,
             token_id[:12],
             shares,
             sc,
+            status,
         )
 
     def open_for_match(self, match_id: str) -> list[dict[str, Any]]:
@@ -172,6 +229,98 @@ class OpenPositionLedger:
             for r in self._rows
             if r.get("status") == "open" and str(r.get("match_id")) == mid
         ]
+
+    def af_pending_lots(
+        self,
+        *,
+        match_id: str | None = None,
+        event_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        mid = str(match_id) if match_id else None
+        ek = str(event_key) if event_key else None
+        out: list[dict[str, Any]] = []
+        for r in self._rows:
+            if r.get("status") != "open" or not lot_af_pending(r):
+                continue
+            if mid is not None and str(r.get("match_id")) != mid:
+                continue
+            if ek is not None and str(r.get("event_key") or "") != ek:
+                continue
+            out.append(r)
+        return out
+
+    def overdue_af_pending_lots(
+        self,
+        *,
+        now: datetime | None = None,
+        exclude_event_keys: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        cur = now if now is not None else datetime.now(TZ_CN)
+        skip = exclude_event_keys or set()
+        return [
+            r
+            for r in self._rows
+            if r.get("status") == "open"
+            and lot_af_overdue(r, now=cur)
+            and str(r.get("event_key") or "") not in skip
+        ]
+
+    def mark_af_confirmed(
+        self,
+        match_id: str,
+        *,
+        event_key: str = "",
+    ) -> int:
+        mid = str(match_id)
+        ek = str(event_key or "")
+        n = 0
+        for r in self._rows:
+            if r.get("status") != "open" or str(r.get("match_id")) != mid:
+                continue
+            if not lot_af_pending(r):
+                continue
+            if ek and str(r.get("event_key") or "") != ek:
+                continue
+            r["af_status"] = AF_STATUS_CONFIRMED
+            r["af_deadline"] = None
+            # Cancel any in-flight emergency flatten from a near-timeout race.
+            r.pop("pending_flatten", None)
+            r.pop("pending_reason", None)
+            n += 1
+        if n:
+            self._save()
+            logger.info(
+                "ledger af_confirmed match=%s event_key=%s lots=%d",
+                mid,
+                ek or "*",
+                n,
+            )
+        return n
+
+    def refresh_af_deadline(
+        self,
+        match_id: str,
+        *,
+        event_key: str = "",
+        timeout_s: float = 90.0,
+    ) -> int:
+        """Reset af_deadline for pending lots (align with AF submit clock)."""
+        mid = str(match_id)
+        ek = str(event_key or "")
+        dl = deadline_iso(timeout_s)
+        n = 0
+        for r in self._rows:
+            if r.get("status") != "open" or str(r.get("match_id")) != mid:
+                continue
+            if not lot_af_pending(r):
+                continue
+            if ek and str(r.get("event_key") or "") != ek:
+                continue
+            r["af_deadline"] = dl
+            n += 1
+        if n:
+            self._save()
+        return n
 
     def mark_closed(self, token_id: str, match_id: str, *, reason: str) -> None:
         mid = str(match_id)

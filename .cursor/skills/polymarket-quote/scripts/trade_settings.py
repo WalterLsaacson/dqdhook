@@ -8,6 +8,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from size_policy import (
+    DEFAULT_SIZE_TIERS,
+    format_size_tiers,
+    parse_size_tiers,
+)
+
 
 def parse_trade_mode(mode: str | None, *, default_live: bool) -> bool:
     """Map dry|live (or None) to bool; None keeps ``default_live``."""
@@ -55,6 +61,10 @@ class TradeSettings:
     min_buy_price: float  # buy_win only: skip (but record) when best_ask < this
     min_order_shares: float
     enabled: bool
+    # Price-tiered buy sizing (from .env); hard caps remain max_usdc/max_shares.
+    size_tiers: tuple[tuple[float, float], ...]
+    max_open_usdc: float
+    size_floor_usdc: float
 
     @property
     def live(self) -> bool:
@@ -76,8 +86,8 @@ def load_trade_settings(
     ft_mode: str | None = None,
     take_depth: str = "top",
     max_levels: int = 5,
-    max_usdc: float = 5.0,
-    max_shares: float = 25.0,
+    max_usdc: float | None = None,
+    max_shares: float | None = None,
     max_slippage: float = 0.03,
     allow_extreme_prices: bool = False,
     min_buy_price: float = 0.8,
@@ -109,6 +119,24 @@ def load_trade_settings(
     if depth not in ("top", "walk"):
         raise ValueError(f"take_depth must be 'top' or 'walk', got {take_depth!r}")
 
+    # Hard caps: .env QUOTE_MAX_* wins when set; else CLI/hub arg; else defaults.
+    if os.getenv("QUOTE_MAX_USDC"):
+        hard_usdc = float(os.getenv("QUOTE_MAX_USDC") or 20)
+    elif max_usdc is not None:
+        hard_usdc = float(max_usdc)
+    else:
+        hard_usdc = 20.0
+    if os.getenv("QUOTE_MAX_SHARES"):
+        hard_shares = float(os.getenv("QUOTE_MAX_SHARES") or 25)
+    elif max_shares is not None:
+        hard_shares = float(max_shares)
+    else:
+        hard_shares = 25.0
+
+    tiers = parse_size_tiers(os.getenv("QUOTE_SIZE_TIERS"))
+    max_open = float(os.getenv("QUOTE_MAX_OPEN_USDC", "45") or 45)
+    floor_usdc = float(os.getenv("QUOTE_SIZE_FLOOR_USDC", "1") or 1)
+
     funder = os.getenv("FUNDER", "").strip() or None
     return TradeSettings(
         private_key=private_key,
@@ -121,12 +149,19 @@ def load_trade_settings(
         live_ft=f,
         take_depth=depth,
         max_levels=max(1, int(max_levels)),
-        max_usdc=float(max_usdc),
-        max_shares=float(max_shares),
+        max_usdc=hard_usdc,
+        max_shares=hard_shares,
         max_slippage=float(max_slippage),
         allow_extreme_prices=bool(allow_extreme_prices),
         min_buy_price=max(0.0, float(min_buy_price)),
         # Polymarket market buys are USDC-notional; do not impose a 5-share floor.
         min_order_shares=float(os.getenv("MIN_ORDER_SHARES", "0")),
         enabled=bool(enabled),
+        size_tiers=tuple(tiers) if tiers else tuple(DEFAULT_SIZE_TIERS),
+        max_open_usdc=max(0.0, max_open),
+        size_floor_usdc=max(0.0, floor_usdc),
     )
+
+
+def size_tiers_label(settings: TradeSettings) -> str:
+    return format_size_tiers(settings.size_tiers)
