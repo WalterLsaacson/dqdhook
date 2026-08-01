@@ -13,15 +13,15 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**进球事后确认（默认）**：`score_change` 进球后 **立刻**按懂球帝比分询价/下单，同时 **异步**用 apifootball-bridge 确认（与 `events` CLI 同路径）。Poll：**0s → 每 1s → 90s 截止停**。AF 确认 → 持有至结算；AF 超时/映射失败 → flatten 该进球 pending 仓；懂球帝回撤 → 立即 flatten。
+**进球 AF 门控（默认）**：`score_change` 进球后 **先**用 apifootball-bridge 异步确认（与 `events` CLI 同路径）。Poll：**5s → 每 2s → 60s 后每 5s → 90s 截止**。AF 确认 → 再按 AF 比分询价/下单，持有至结算；AF 超时/映射失败 → **忽略该球、不下单**；懂球帝回撤 → 若已有仓则立即 flatten。
 
-- AF 比分确认目标（或已覆盖该次上涨）→ 标记 lot `af_status=confirmed`，**不再二次下单**
-- 超时（默认 **90s**）→ flatten `af_pending` lots（`reason=af_confirm_timeout`）
+- AF 确认目标比分（或已覆盖该次上涨）→ `_quote_one` 下单
+- 超时（默认 **90s**）→ `mode=af_unconfirmed`，**不 flatten**
 - 中间 poll **不**写 burst；确认时写一次
-- 429 自动退避
+- 429 / SSL 等瞬态错误退避重试（不烧 poll 槽）
 - 懂球帝 **回撤** → 立即 flatten + 按修正比分询价
 
-旧门控（先 AF 再下单）用 `--af-gate-before-trade`；`--no-af-referee` 完全不管 AF。默认 **dry-run**；`--live` / `--goals-mode` / `--ft-mode` 控制真下单。
+激进模式（先买后 AF）用 `--af-postcheck-trade` / `QUOTE_AF_POSTCHECK_TRADE=1`；`--no-af-referee` 完全不管 AF。默认 **dry-run**；`--live` / `--goals-mode` / `--ft-mode` 控制真下单。
 
 人工/其它 skill 仍可：
 
@@ -72,10 +72,10 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 1. Prefer System Main (`frontend/run_main.py`): boots boards (UI) + AF watch + `pm_quote watch`, which owns **in-process** match-bridge (memory `event_queue` → AF referee → quote/trade). File writes are async. `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake. Do not start boards as skill hosts separately.
 2. Prefer bridge events in `data/bridge/events.jsonl`:
-   - `score_change` — mid-match after a goal; **trade immediately** (postcheck), AF confirms in background.
+   - `score_change` — mid-match after a goal; **wait for AF confirm** (gate default), then quote/trade.
    - `match_finished` — full moneyline + props + exact settlement (no AF goal gate).
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
-4. **AF referee (postcheck default)**: on goal-up, quote+trade on DQD score, then **async** poll AF events (**0s → every 1s → timeout**, default 90s, `cache_only`). Confirm → mark lots `af_confirmed` (hold); timeout/miss → flatten pending lots. Cache miss / unresolved still times out into flatten (does not block the buy). DQD score reversals flatten + requote immediately. Legacy `--af-gate-before-trade` waits for AF before trading (with preconfirm quote). Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
+4. **AF referee (gate default)**: on goal-up, **async** poll AF events (**5s → every 2s until 60s → every 5s until timeout**, default 90s, `cache_only`, `wait_cache` on late fixture mapping). Confirm → quote+trade on AF score; timeout/miss → ignore (no buy, no flatten). DQD score reversals flatten + requote if a lot exists. Aggressive `--af-postcheck-trade`: buy on DQD immediately, flatten on AF timeout. Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
 5. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
 6. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
 7. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.02` default).
@@ -93,9 +93,10 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--ft-mode dry\|live` | dry | Per-signal mode for终场 (`match_finished`); overrides `--live` for that channel |
 | `--no-trade` | off | Quote only |
 | `--no-af-referee` | off | Skip AF entirely (DQD-only; reversals still flatten) |
-| `--af-gate-before-trade` | off | Legacy: wait for AF before trade (preconfirm quote) |
-| `--af-poll` | (off) | If set, fixed poll interval; otherwise **0s → every 1s → timeout** |
-| `--af-timeout` | 90 | AF confirm deadline seconds (postcheck: flatten pending; gate: ignore goal) |
+| `--af-postcheck-trade` | off | Aggressive: buy on DQD goal, flatten on AF timeout |
+| `--af-gate-before-trade` | off | Explicit gate (same as default) |
+| `--af-poll` | (off) | If set, fixed poll interval; otherwise **5s → every 2s → 60s → every 5s → timeout** |
+| `--af-timeout` | 90 | AF confirm deadline (gate: ignore goal; postcheck: flatten pending) |
 | `--take-depth top\|walk` | `top` | Best level vs walk book |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 20 / 25 | Hard caps; **`.env` `QUOTE_MAX_*` wins**; per-ask tiers scale both together |

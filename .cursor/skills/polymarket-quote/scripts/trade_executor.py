@@ -34,7 +34,7 @@ logger = logging.getLogger("pm_quote.trade")
 FLATTEN_SHARE_DECIMALS = 2
 FLATTEN_MIN_SHARES = Decimal("0.01")
 # Emergency flatten floor price (do not dump into sub-0.2 bids forever).
-FLATTEN_MIN_PRICE = Decimal("0.2")
+FLATTEN_MIN_PRICE = Decimal("0.5")
 # If 0.2 FAK leaves the full bag, one dump attempt at the tick floor.
 FLATTEN_DUMP_MIN_PRICE = Decimal("0.01")
 # Polymarket matched-order cache often rejects 100% sells; keep a haircut.
@@ -194,15 +194,15 @@ class TradeExecutor:
         settings: TradeSettings,
         *,
         trader: ClobTrader | None = None,
-        af_mode: str = "postcheck",
+        af_mode: str = "gate",
         af_timeout_s: float = 90.0,
     ) -> None:
         self.root = Path(root)
         self.settings = settings
         self.trader = trader
-        mode = str(af_mode or "postcheck").strip().lower()
+        mode = str(af_mode or "gate").strip().lower()
         if mode not in ("postcheck", "gate", "off"):
-            mode = "postcheck"
+            mode = "gate"
         self.af_mode = mode
         self.af_timeout_s = max(1.0, float(af_timeout_s))
         self._done: set[str] = set()
@@ -336,10 +336,14 @@ class TradeExecutor:
                 tick_size="0.01",
                 neg_risk=None,
             )
-        self._close_stale_ft_reversed_lots()
+        self._close_stale_finished_lots()
 
-    def _close_stale_ft_reversed_lots(self) -> None:
-        """Drop zombie opens whose entry score was already undone by known FT."""
+    def _close_stale_finished_lots(self) -> None:
+        """Drop open lots for matches that already finished (free open-budget).
+
+        Also closes FT-vs-entry reversals (false-goal leftovers). Finished winners
+        must not keep blocking ``QUOTE_MAX_OPEN_USDC`` after the game ends.
+        """
         latest_ft: dict[str, tuple[int, int]] = {}
         try:
             for m in lib.load_bridge_matches(self.root):
@@ -359,11 +363,11 @@ class TradeExecutor:
         except Exception as e:  # noqa: BLE001
             logger.warning("stale FT scan matches.json failed: %s", e)
 
-        # Also peek last scores from events.jsonl for finished matches not in matches.json
+        # Peek finished scores from events.jsonl (matches drop off matches.json).
         try:
             for line in (lib.bridge_dir(self.root) / "events.jsonl").read_text(
                 encoding="utf-8"
-            ).splitlines()[-2000:]:
+            ).splitlines()[-50000:]:
                 if not line.strip():
                     continue
                 try:
@@ -383,15 +387,20 @@ class TradeExecutor:
         for lot in list(self.ledger.all_open()):
             mid = str(lot.get("match_id") or "")
             ft = latest_ft.get(mid)
+            if not ft:
+                continue
             if ft_reversal_vs_entry(entry=entry_tuple(lot), ft=ft):
-                self.ledger.mark_closed(
-                    str(lot.get("token_id")),
-                    mid,
-                    reason=f"stale_ft_reversal ft={ft[0]}-{ft[1]}",
-                )
-                closed += 1
+                reason = f"stale_ft_reversal ft={ft[0]}-{ft[1]}"
+            else:
+                reason = f"stale_ft_settled ft={ft[0]}-{ft[1]}"
+            self.ledger.mark_closed(
+                str(lot.get("token_id")),
+                mid,
+                reason=reason,
+            )
+            closed += 1
         if closed:
-            logger.info("closed %d stale FT-reversed open lots on rebuild", closed)
+            logger.info("closed %d stale finished open lots on rebuild", closed)
 
 
     @property

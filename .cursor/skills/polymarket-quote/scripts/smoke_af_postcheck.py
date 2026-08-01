@@ -18,6 +18,7 @@ if str(_SCRIPTS) not in sys.path:
 
 import af_referee as ref  # noqa: E402
 import quote_lib as lib  # noqa: E402
+import pm_quote  # noqa: E402
 from score_reversal import (  # noqa: E402
     AF_STATUS_CONFIRMED,
     AF_STATUS_PENDING,
@@ -377,7 +378,90 @@ def test_gate_mode_no_immediate_trade() -> None:
         )
         check("schedule default 90", ref.DEFAULT_TIMEOUT_S == 90.0)
         checks = ref.confirm_check_times(90.0)
-        check("flat 1s schedule count", len(checks) == 91, str(len(checks)))
+        check("tiered schedule starts 5", checks[0] == 5.0, str(checks[:3]))
+        check("tiered schedule count 35", len(checks) == 35, str(len(checks)))
+        check("late phase every 5s", 65.0 in checks and 61.0 not in checks)
+
+
+def test_resolve_af_mode_default() -> None:
+    print("test_resolve_af_mode_default")
+    import argparse
+
+    base = argparse.Namespace(
+        no_af_referee=False,
+        af_postcheck_trade=False,
+        af_gate_before_trade=False,
+    )
+    check("default is gate", pm_quote.resolve_af_mode(base) == "gate")
+    post = argparse.Namespace(
+        no_af_referee=False,
+        af_postcheck_trade=True,
+        af_gate_before_trade=False,
+    )
+    check("postcheck flag", pm_quote.resolve_af_mode(post) == "postcheck")
+    off = argparse.Namespace(
+        no_af_referee=True,
+        af_postcheck_trade=False,
+        af_gate_before_trade=False,
+    )
+    check("off when disabled", pm_quote.resolve_af_mode(off) == "off")
+
+
+def test_gate_timeout_no_flatten() -> None:
+    print("test_gate_timeout_no_flatten")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+        (root / "data" / "pm-quote" / "cursor.json").write_text(
+            json.dumps({"processed_keys": []}), encoding="utf-8"
+        )
+
+        def fake_events(_mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 0, "away": 0},
+                "af_fixture_id": 1,
+            }
+
+        referee = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=0.08,
+            events_fn=fake_events,
+            poll_schedule=False,
+        )
+        ex = TradeExecutor(root, _settings(), af_mode="gate", af_timeout_s=0.08)
+        ev = _goal_ev(match_id="m_gate_to", ts="2026-08-01T08:00:00+08:00")
+
+        with patch.object(lib, "quote_bridge_event", return_value={"count": 0, "opportunity_count": 0, "opportunities": []}):
+            with patch.object(lib, "load_bridge_quote_events", return_value=[]):
+                with patch.object(lib, "persist_bundle", return_value=None):
+                    lib.process_bridge_events(
+                        root,
+                        trade_executor=ex,
+                        af_referee=referee,
+                        af_mode="gate",
+                        events_override=[ev],
+                        force=True,
+                    )
+                    for _ in range(80):
+                        if not referee.pending_event_keys():
+                            break
+                        lib.process_bridge_events(
+                            root,
+                            trade_executor=ex,
+                            af_referee=referee,
+                            af_mode="gate",
+                            events_override=[],
+                            force=False,
+                        )
+                        time.sleep(0.02)
+
+        opens = ex.ledger.all_open()
+        check("no open lots after gate timeout", len(opens) == 0, str(opens))
+        check("no pending af keys", len(referee.pending_event_keys()) == 0)
 
 
 def test_confirm_clears_pending_flatten() -> None:
@@ -478,6 +562,8 @@ def main() -> int:
     test_postcheck_trade_then_confirm_hold()
     test_postcheck_timeout_flattens()
     test_gate_mode_no_immediate_trade()
+    test_resolve_af_mode_default()
+    test_gate_timeout_no_flatten()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

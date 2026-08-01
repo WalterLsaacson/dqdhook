@@ -209,7 +209,9 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
             args.extend(["--af-poll", str(poll)])
         if timeout:
             args.extend(["--af-timeout", str(timeout)])
-        if _env_bool("QUOTE_AF_GATE_BEFORE_TRADE", False):
+        if _env_bool("QUOTE_AF_POSTCHECK_TRADE", False):
+            args.append("--af-postcheck-trade")
+        elif _env_bool("QUOTE_AF_GATE_BEFORE_TRADE", False):
             args.append("--af-gate-before-trade")
     return args
 

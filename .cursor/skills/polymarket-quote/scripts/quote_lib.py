@@ -1717,16 +1717,16 @@ def process_bridge_events(
     trade_executor: Any | None = None,
     market_cache: Any | None = None,
     af_referee: Any | None = None,
-    af_mode: str = "postcheck",
+    af_mode: str = "gate",
     events_override: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     cursor = load_cursor(root)
     seen = set(cursor.get("processed_keys") or [])
     bundles: list[dict[str, Any]] = []
     tick_t0 = time.monotonic()
-    mode = str(af_mode or "postcheck").strip().lower()
+    mode = str(af_mode or "gate").strip().lower()
     if mode not in ("postcheck", "gate", "off"):
-        mode = "postcheck"
+        mode = "gate"
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
@@ -2199,7 +2199,7 @@ def process_bridge_events(
                     continue
 
                 # gate mode: wait for AF; preconfirm quote only (no trade yet)
-                af_referee.submit(key, ev, target)
+                af_referee.submit(key, ev, target, wait_cache=True)
                 pending_keys.add(key)
                 _start_preconfirm_quote(ev, key)
                 print(

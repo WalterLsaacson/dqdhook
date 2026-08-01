@@ -254,30 +254,121 @@ def test_cache_miss_wait_until_timeout() -> None:
 def test_confirm_check_times() -> None:
     print("test_confirm_check_times")
     checks = ref.confirm_check_times(90.0)
-    check("starts at 0", checks[0] == 0.0, str(checks[:3]))
-    check("has 1", 1.0 in checks)
+    check("starts at 5", checks[0] == 5.0, str(checks[:3]))
+    check("no immediate 0", 0.0 not in checks)
+    check("has 7", 7.0 in checks)
+    check("has 59", 59.0 in checks)
     check("has 60", 60.0 in checks)
+    check("has 65", 65.0 in checks)
     check("has 90", 90.0 in checks)
-    check("no late 2s grid", 62.0 not in checks or abs(checks[checks.index(62.0) - 1] - 61.0) < 0.01)
-    # Flat 1s: no 2s jump after 60
-    after60 = [c for c in checks if 60 < c <= 66]
+    check("no 61 on late grid", 61.0 not in checks)
+    # Early phase: 2s spacing before 60
+    early = [c for c in checks if c < 60]
     check(
-        "after 60 still 1s",
-        after60 == [61.0, 62.0, 63.0, 64.0, 65.0, 66.0],
-        str(after60),
+        "early spacing ~2s",
+        all(abs(early[i + 1] - early[i] - 2.0) < 0.01 for i in range(len(early) - 1)),
+        str(early[:5]),
     )
-    between = [c for c in checks if 20 < c < 40]
+    # Late phase: 5s spacing from 60
+    late = [c for c in checks if c >= 60]
     check(
-        "spacing ~1s",
-        all(abs(between[i + 1] - between[i] - 1.0) < 0.01 for i in range(len(between) - 1)),
-        str(between[:5]),
+        "late spacing ~5s",
+        late == [60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0],
+        str(late),
     )
-    # 0..90 @1s → 91
-    check("count 91", len(checks) == 91, str(len(checks)))
+    # 5..59 @2s → 28 ticks; 60..90 @5s → 7 ticks → 35
+    check("count 35", len(checks) == 35, str(len(checks)))
     check("last is timeout", checks[-1] == 90.0, str(checks[-1]))
-    short = ref.confirm_check_times(2.5, period_s=1.0)
+    short = ref.confirm_check_times(2.5, first_delay_s=0.0, period_s=1.0, late_after_s=10.0)
     check("short ends ≤timeout", short[-1] <= 2.5 + 1e-9, str(short))
     check("short no past timeout", all(c <= 2.5 + 1e-9 for c in short), str(short))
+    label = ref.schedule_label()
+    check("label mentions 5s→2s→60s→5s→90s", "5s→every 2s→60s→every 5s→90s" == label, label)
+
+
+def test_transient_network_retry() -> None:
+    print("test_transient_network_retry")
+    check(
+        "ssl dict",
+        ref._is_transient_af_error(
+            {"ok": False, "exception": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>"}
+        ),
+    )
+    check(
+        "ssl nested errors (real AF shape)",
+        ref._is_transient_af_error(
+            {
+                "ok": False,
+                "http_status": None,
+                "errors": {
+                    "exception": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred>"
+                },
+            }
+        ),
+    )
+    check(
+        "read timeout",
+        ref._is_transient_af_error({"ok": False, "error": "The read operation timed out"}),
+    )
+    check("not cache miss", not ref._is_transient_af_error({"error": "af_fixture_unresolved"}))
+    check(
+        "not confirm-timeout label",
+        not ref._is_transient_af_error("af_confirm_timeout"),
+    )
+    check("429 still rate", ref._is_rate_limited({"http_status": 429}))
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        calls = {"n": 0}
+
+        def events_fn(_mid: str, persist_burst: bool = False) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] < 4:
+                # Mirror af_bridge_lib HTTP failure shape.
+                return {
+                    "ok": False,
+                    "http_status": None,
+                    "errors": {
+                        "exception": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>"
+                    },
+                    "goals": {"home": None, "away": None},
+                }
+            return {
+                "ok": True,
+                "af_fixture_id": 42,
+                "goals": {"home": 1, "away": 0},
+                "events": [],
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.05, timeout_s=2.0, events_fn=events_fn, poll_schedule=False
+        )
+        out = referee.await_score("m_ssl", (1, 0), baseline=(0, 0))
+        check("recovered after ssl", out.get("confirmed") is True, str(out))
+        check("retried several times", calls["n"] >= 4, str(calls))
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+
+        def events_fn(_mid: str, persist_burst: bool = False) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "af_fixture_id": 7,
+                "goals": {"home": 0, "away": 0},
+                "events": [],
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.01, timeout_s=0.05, events_fn=events_fn, poll_schedule=False
+        )
+        out = referee.await_score("m_clean_to", (1, 0), baseline=(0, 0))
+        check("score-miss timeout not transient flag", out.get("transient_network") is not True)
+        check(
+            "score-miss error label",
+            out.get("error") == "af_confirm_timeout"
+            or "timeout" in str(out.get("error") or "").lower(),
+            str(out.get("error")),
+        )
 
 
 def test_apply_score() -> None:
@@ -303,6 +394,7 @@ def main() -> int:
     test_cache_miss_no_spin()
     test_cache_miss_wait_until_timeout()
     test_confirm_check_times()
+    test_transient_network_retry()
     test_apply_score()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

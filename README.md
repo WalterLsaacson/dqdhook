@@ -57,9 +57,9 @@ Stop: `Ctrl-C` / `kill` the `run_main` process, or `POST http://127.0.0.1:8790/a
 1. Hub pills: Quote up · Trade dry-run · AF watch · Boards 4/4.
 2. Bridge board shows paired matches (files written async by in-process bridge).
 3. AF board shows mapped fixtures after watch sync.
-4. On a DQD goal-up: `data/pm-quote/watch.log` shows `af-referee → CONFIRMED` then quote lines with `books=once` / `latency_ms=…`.
+4. On a DQD goal-up: `data/pm-quote/watch.log` shows `af-preconfirm` then `af-referee → CONFIRMED` before any live buy; quote lines with `books=once` / `latency_ms=…`.
 5. Planned fills land in `data/pm-quote/trades.jsonl` with `"live": false` / `status: dry_run` (no CLOB post).
-6. Reversals are ignored for new buys when AF referee is on (no flatten from DQD alone).
+6. AF timeout → `af_unconfirmed` (no flatten). DQD reversals flatten open lots only.
 
 ## Latency path (hot vs cold)
 
@@ -71,7 +71,7 @@ Stop: `Ctrl-C` / `kill` the `run_main` process, or `POST http://127.0.0.1:8790/a
 
 Events are appended to jsonl **before** `prev_*` so a crash cannot permanently drop a goal. Quote serializes trade/flatten with a lock.
 
-Env: `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake (not recommended for latency). `MAIN_AF_WATCH=0` skips hub auto-start of AF watch. `QUOTE_AF_REFEREE=0` / `--no-af-referee` disables the goal gate.
+Env: `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake (not recommended for latency). `MAIN_AF_WATCH=0` skips hub auto-start of AF watch. `QUOTE_AF_REFEREE=0` / `--no-af-referee` disables the goal gate. `QUOTE_AF_POSTCHECK_TRADE=1` / `--af-postcheck-trade` enables buy-before-AF mode.
 
 ## Trading modes
 
@@ -100,8 +100,9 @@ python3 frontend/run_main.py --no-trade
 | `--take-depth top\|walk` | Fill from best level or walk the book |
 | `--max-usdc` / `--max-shares` | Size caps (defaults 5 / 25) |
 | `--no-af-referee` | Skip AF goal confirm (not for production goals) |
+| `--af-postcheck-trade` | Buy on DQD goal before AF confirm (flatten on timeout) |
 
-Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, …
+Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, …
 
 ## Logs & data
 

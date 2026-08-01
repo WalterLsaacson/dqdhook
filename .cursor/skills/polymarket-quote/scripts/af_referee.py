@@ -7,8 +7,8 @@ never resolves DQD→AF fixtures on the quote hot path. Cache miss / unresolved
 → skip the goal immediately (no timeout spin).
 
 Score confirmation polls ``fetch_events_for_match_id(..., cache_only=True)`` on
-a flat schedule: **0s → every 1s until timeout** (default 90s; override with
-``--af-poll`` for a fixed interval). Confirmations run on a thread pool so
+a tiered schedule: **5s → every 2s until 60s → every 5s until 90s** (override
+with ``--af-poll`` for a fixed interval). Confirmations run on a thread pool so
 watch stays responsive; on confirm, burst + ``af_confirmed_scores.json``
 persist asynchronously.
 """
@@ -31,10 +31,12 @@ DEFAULT_POLL_S = 0.5
 DEFAULT_TIMEOUT_S = 90.0
 DEFAULT_WORKERS = 4
 
-# Confirm schedule (production default): immediate first look, then every 1s
-# until timeout (no late 2s tier). Default timeout 90s → checks at 0..90.
-DEFAULT_FIRST_DELAY_S = 0.0
-DEFAULT_PERIOD_S = 1.0
+# Confirm schedule (production default):
+#   first look at 5s → every 2s until 60s → every 5s until timeout (90s).
+DEFAULT_FIRST_DELAY_S = 5.0
+DEFAULT_PERIOD_S = 2.0  # early period (alias for early_period_s)
+DEFAULT_LATE_AFTER_S = 60.0
+DEFAULT_LATE_PERIOD_S = 5.0
 
 _AF_SCRIPTS = Path(__file__).resolve().parents[2] / "apifootball-bridge" / "scripts"
 _af_sp = str(_AF_SCRIPTS)
@@ -263,8 +265,70 @@ def af_score_satisfies(
 def _is_rate_limited(payload: dict[str, Any]) -> bool:
     if payload.get("http_status") == 429:
         return True
-    blob = str(payload.get("error") or payload.get("errors") or "").lower()
-    return "rate" in blob or "limit" in blob and "request" in blob
+    blob = _af_error_blob(payload)
+    return "rate" in blob or ("limit" in blob and "request" in blob)
+
+
+def _af_error_blob(payload: dict[str, Any] | str | None) -> str:
+    """Flatten AF / urllib error shapes into one lowercase string for matching."""
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload.lower()
+    if not isinstance(payload, dict):
+        return str(payload).lower()
+    parts: list[str] = []
+    for key in ("exception", "error", "errors", "message"):
+        v = payload.get(key)
+        if v is None or v == "" or v == {}:
+            continue
+        if isinstance(v, dict):
+            inner = v.get("exception") or v.get("error") or v.get("message")
+            parts.append(str(inner if inner is not None else v))
+        else:
+            parts.append(str(v))
+    status = payload.get("http_status")
+    if status is not None:
+        parts.append(f"http_{status}")
+    return " ".join(parts).lower() if parts else ""
+
+
+def _is_transient_af_error(payload: dict[str, Any] | str | None) -> bool:
+    """SSL / connect / read timeouts — retry same schedule slot (like 429)."""
+    if payload is None:
+        return False
+    if isinstance(payload, dict):
+        try:
+            if int(payload.get("http_status") or 0) in {408, 425, 502, 503, 504}:
+                return True
+        except (TypeError, ValueError):
+            pass
+    blob = _af_error_blob(payload)
+    if not blob:
+        return False
+    # Do not treat our own confirm-timeout label as a network blip.
+    if blob.strip() in {"af_confirm_timeout", "timeout"}:
+        return False
+    needles = (
+        "ssl",
+        "unexpected_eof",
+        "eof occurred",
+        "timed out",
+        "timeouterror",
+        "read timeout",
+        "connect timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "broken pipe",
+        "urlopen error",
+        "remote disconnected",
+        "network is unreachable",
+        "name or service not known",
+        "temporary failure",
+    )
+    return any(n in blob for n in needles)
 
 
 def call_af_bridge_events(
@@ -304,31 +368,51 @@ def confirm_check_times(
     *,
     first_delay_s: float = DEFAULT_FIRST_DELAY_S,
     period_s: float = DEFAULT_PERIOD_S,
+    late_after_s: float = DEFAULT_LATE_AFTER_S,
+    late_period_s: float = DEFAULT_LATE_PERIOD_S,
 ) -> list[float]:
     """Absolute seconds (from goal) at which to call AF events.
 
-    Schedule: ``first_delay``, then every ``period_s`` until ``timeout_s``
-    (inclusive). No polls after timeout.
+    Default: ``first_delay`` (5s), every ``period_s`` (2s) while ``t < late_after``,
+    then ``late_after`` and every ``late_period_s`` (5s) until ``timeout_s``
+    inclusive. No polls after timeout.
     """
     timeout = max(0.0, float(timeout_s))
     first = max(0.0, float(first_delay_s))
-    period = max(0.05, float(period_s))
+    early = max(0.05, float(period_s))
+    late_after = max(0.0, float(late_after_s))
+    late = max(0.05, float(late_period_s))
 
     checks: list[float] = []
     t = first
-    while t <= timeout + 1e-9:
+    while t < late_after - 1e-9 and t <= timeout + 1e-9:
         checks.append(round(t, 3))
-        t += period
-    return checks
+        t += early
+    t = late_after
+    while t <= timeout + 1e-9:
+        if t + 1e-9 >= first:
+            checks.append(round(t, 3))
+        t += late
+    # De-dupe / sort if late_after lands on an early tick.
+    out: list[float] = []
+    for c in checks:
+        if not out or abs(out[-1] - c) > 1e-9:
+            out.append(c)
+    return out
 
 
 def schedule_label(
     *,
     first_delay_s: float = DEFAULT_FIRST_DELAY_S,
     period_s: float = DEFAULT_PERIOD_S,
+    late_after_s: float = DEFAULT_LATE_AFTER_S,
+    late_period_s: float = DEFAULT_LATE_PERIOD_S,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> str:
-    return f"{first_delay_s:g}s→every {period_s:g}s→{timeout_s:g}s"
+    return (
+        f"{first_delay_s:g}s→every {period_s:g}s→{late_after_s:g}s"
+        f"→every {late_period_s:g}s→{timeout_s:g}s"
+    )
 
 
 class AfReferee:
@@ -346,6 +430,8 @@ class AfReferee:
         poll_schedule: bool = True,
         first_delay_s: float = DEFAULT_FIRST_DELAY_S,
         period_s: float = DEFAULT_PERIOD_S,
+        late_after_s: float = DEFAULT_LATE_AFTER_S,
+        late_period_s: float = DEFAULT_LATE_PERIOD_S,
     ) -> None:
         self.root = Path(root)
         self.poll_s = max(0.05, float(poll_s))
@@ -353,6 +439,8 @@ class AfReferee:
         self.poll_schedule = bool(poll_schedule)
         self.first_delay_s = max(0.0, float(first_delay_s))
         self.period_s = max(0.05, float(period_s))
+        self.late_after_s = max(0.0, float(late_after_s))
+        self.late_period_s = max(0.05, float(late_period_s))
         self.env_path = env_path
         self._events_fn = events_fn
         self._af: aflib.AFClient | None = None
@@ -371,6 +459,8 @@ class AfReferee:
             return schedule_label(
                 first_delay_s=self.first_delay_s,
                 period_s=self.period_s,
+                late_after_s=self.late_after_s,
+                late_period_s=self.late_period_s,
                 timeout_s=self.timeout_s,
             )
         return f"fixed {self.poll_s}s"
@@ -478,7 +568,7 @@ class AfReferee:
         - ``wait_cache=True`` (postcheck): keep polling until timeout so late
           sync/watch mappings can still confirm after a buy.
 
-        Default poll schedule: first check at 0s, every 1s until timeout
+        Default poll schedule: 5s → every 2s until 60s → every 5s until timeout
         (override with ``poll_schedule=False`` + ``poll_s`` for fixed interval).
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
@@ -517,6 +607,8 @@ class AfReferee:
                 "schedule": schedule_label(
                     first_delay_s=self.first_delay_s,
                     period_s=self.period_s,
+                    late_after_s=self.late_after_s,
+                    late_period_s=self.late_period_s,
                     timeout_s=timeout,
                 )
                 if self.poll_schedule
@@ -531,6 +623,8 @@ class AfReferee:
                 timeout,
                 first_delay_s=self.first_delay_s,
                 period_s=self.period_s,
+                late_after_s=self.late_after_s,
+                late_period_s=self.late_period_s,
             )
         else:
             # Fixed interval from t=0 (tests / --af-poll override).
@@ -547,7 +641,7 @@ class AfReferee:
         last: dict[str, Any] = {}
         last_goals: dict[str, int | None] = {"home": None, "away": None}
         last_error: Any = None
-        rate_hits = 0
+        retry_hits = 0
         check_i = 0
 
         while check_i < len(check_at):
@@ -606,15 +700,28 @@ class AfReferee:
                 continue
 
             if _is_rate_limited(last):
-                rate_hits += 1
+                retry_hits += 1
                 last_error = last.get("error") or last.get("errors") or "rate_limited"
-                backoff = min(8.0, 0.5 * (2 ** min(rate_hits, 4)))
+                backoff = min(8.0, 0.5 * (2 ** min(retry_hits, 4)))
                 # Retry same slot after backoff (do not burn next schedule slot).
                 check_i -= 1
                 if (time.monotonic() - t0) >= timeout:
                     break
                 time.sleep(backoff)
                 continue
+
+            if _is_transient_af_error(last):
+                # SSL / connect blips: short retry on same slot so the 90s window
+                # still gets usable AF reads instead of advancing past them.
+                err_blob = _af_error_blob(last) or "transient_af_error"
+                last_error = err_blob
+                check_i -= 1
+                if (time.monotonic() - t0) >= timeout:
+                    break
+                time.sleep(0.25)
+                continue
+
+            retry_hits = 0  # reset after a clean (non-transient) attempt
 
             if last.get("ok"):
                 goals = last.get("goals") or {}
@@ -670,7 +777,8 @@ class AfReferee:
             if (time.monotonic() - t0) >= timeout:
                 break
 
-        return {
+        final_err: Any = last_error or "af_confirm_timeout"
+        out_fail: dict[str, Any] = {
             "ok": False,
             "confirmed": False,
             "match_id": mid,
@@ -684,10 +792,15 @@ class AfReferee:
             "poll_s": poll,
             "timeout_s": timeout,
             "schedule": self._schedule_desc(),
-            "error": last_error or "af_confirm_timeout",
+            "error": final_err,
             "via": "apifootball-bridge",
             "cache_only": True,
         }
+        if _is_transient_af_error(final_err):
+            out_fail["error"] = "af_confirm_timeout"
+            out_fail["last_error"] = final_err
+            out_fail["transient_network"] = True
+        return out_fail
 
     def submit(
         self,

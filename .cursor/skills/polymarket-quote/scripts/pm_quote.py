@@ -43,9 +43,8 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
         return None
     timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
     poll = getattr(args, "af_poll", None)
-    gate_before = bool(getattr(args, "af_gate_before_trade", False))
-    af_mode = "gate" if gate_before else "postcheck"
-    # Default: flat schedule 0s → every 1s → timeout.
+    af_mode = resolve_af_mode(args)
+    # Default: tiered schedule 5s → every 2s → 60s → every 5s → timeout.
     # --af-poll N forces a fixed interval (disables the schedule).
     if poll is None:
         ref = AfReferee(rt, timeout_s=timeout, poll_schedule=True, env_path=None)
@@ -76,9 +75,9 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
 def resolve_af_mode(args: argparse.Namespace) -> str:
     if getattr(args, "no_af_referee", False):
         return "off"
-    if getattr(args, "af_gate_before_trade", False):
-        return "gate"
-    return "postcheck"
+    if getattr(args, "af_postcheck_trade", False):
+        return "postcheck"
+    return "gate"
 
 
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
@@ -513,12 +512,19 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         help="Disable AF confirmation (trade on DQD score_change only; reversals still flatten)",
     )
     sp.add_argument(
+        "--af-postcheck-trade",
+        action="store_true",
+        help=(
+            "Aggressive: trade on DQD goal immediately, hold if AF confirms, "
+            "flatten on AF timeout/reversal"
+        ),
+    )
+    sp.add_argument(
         "--af-gate-before-trade",
         action="store_true",
         help=(
-            "Legacy: wait for AF confirm before trading (preconfirm quote only). "
-            "Default is postcheck: trade on DQD goal, hold if AF confirms, "
-            "flatten on AF timeout/reversal"
+            "Explicit gate (same as default): wait for AF confirm before trading; "
+            "AF timeout ignores the goal (no flatten)"
         ),
     )
     sp.add_argument(
@@ -527,7 +533,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Fixed AF events poll interval seconds (disables default schedule: "
-            "0s → every 1s → timeout)"
+            "5s → every 2s → 60s → every 5s → timeout)"
         ),
     )
     sp.add_argument(
