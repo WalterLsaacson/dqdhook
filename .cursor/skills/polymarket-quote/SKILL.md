@@ -13,7 +13,7 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**进球 AF 门控（默认）**：`score_change` 进球后 **先**用 apifootball-bridge 异步确认（与 `events` CLI 同路径）。Poll：**5s → 每 2s → 60s 后每 5s → 90s 截止**。AF 确认 → 再按 AF 比分询价/下单，持有至结算；AF 超时/映射失败 → **忽略该球、不下单**；懂球帝回撤 → 若已有仓则立即 flatten。
+**进球 AF 门控（默认）**：`score_change` 进球后 **先**用 apifootball-bridge 异步确认（与 `events` CLI 同路径）。Poll：**5s → 每 2s → 60s 后每 5s → 90s 截止**（worker 间共享 ~0.35s 间隔；HTTP timeout 受剩余 deadline 约束）。AF 确认 → 再按 AF 比分询价/下单，持有至结算；AF 超时/映射失败 → **忽略该球、不下单**；懂球帝回撤 → 若已有仓则立即 flatten（同场禁新开仓）。
 
 - AF 确认目标比分（或已覆盖该次上涨）→ `_quote_one` 下单
 - 超时（默认 **90s**）→ `mode=af_unconfirmed`，**不 flatten**
@@ -104,7 +104,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `QUOTE_MAX_OPEN_USDC` | 45 | Sum of open lot `usdc` budget |
 | `QUOTE_SIZE_FLOOR_USDC` | 1 | Skip buy if effective usdc below floor |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
-| `--min-buy-price` | 0.8 | `buy_win` only when `best_ask ≥` this; below → skip + still write `trades.jsonl` |
+| `--min-buy-price` | 0 | `buy_win` only when `best_ask ≥` this; `0` = off; below → skip + still write `trades.jsonl` |
 | `--allow-extreme-prices` | off | Allow ≤0.01 / ≥0.99 |
 
 Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while posting FT fills. Flatten always uses the lot’s own `live` flag so a dry goal lot is never live-sold.

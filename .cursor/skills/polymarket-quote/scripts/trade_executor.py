@@ -18,6 +18,8 @@ from score_reversal import (
     AF_STATUS_CONFIRMED,
     AF_STATUS_NONE,
     AF_STATUS_PENDING,
+    FILL_STATUS_OPEN,
+    FILL_STATUS_PENDING,
     OpenPositionLedger,
     deadline_iso,
     entry_tuple,
@@ -207,6 +209,8 @@ class TradeExecutor:
         self.af_timeout_s = max(1.0, float(af_timeout_s))
         self._done: set[str] = set()
         self._flatten_done: set[str] = set()
+        # Matches with in-flight / pending exits — block new buy_win opens.
+        self._buy_blocked_matches: set[str] = set()
         self._lock = threading.RLock()
         self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
@@ -480,7 +484,7 @@ class TradeExecutor:
         return None
 
     def _min_buy_price_blocked(self, price: float | None) -> str | None:
-        """buy_win: require best_ask >= min_buy_price (default 0.8)."""
+        """buy_win: require best_ask >= min_buy_price (default 0=off)."""
         floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
         if floor <= 0 or price is None:
             return None
@@ -563,6 +567,31 @@ class TradeExecutor:
             return row
 
         if trade == "buy_win":
+            mid_block = str(
+                (match_meta or {}).get("match_id")
+                or quote.get("match_id")
+                or ""
+            )
+            if mid_block and (
+                mid_block in self._buy_blocked_matches
+                or any(
+                    r.get("pending_flatten")
+                    for r in self.ledger.open_for_match(mid_block)
+                )
+            ):
+                row = self._record(
+                    quote,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    plan=None,
+                    status="skipped",
+                    skip_reason="buy_blocked_pending_flatten",
+                    response=None,
+                    success=False,
+                    idempotency_key=key,
+                    live=channel_live,
+                )
+                return row
             below_min = self._min_buy_price_blocked(ref_f)
             if below_min:
                 row = self._record(
@@ -805,12 +834,17 @@ class TradeExecutor:
                 if trade == "buy_win":
                     # Must register even when delayed — otherwise score-reversal
                     # flatten never sees the lot (Alianza Over 4.5 bug).
+                    fill_st = FILL_STATUS_OPEN
+                    if resp_status == "DELAYED" and ledger_plan is plan:
+                        # Balance still 0 — pending until shares appear / flatten sees bal.
+                        fill_st = FILL_STATUS_PENDING
                     self._register_open_buy(
                         quote,
                         plan=ledger_plan,
                         event_key=event_key,
                         match_meta=match_meta,
                         live=True,
+                        fill_status=fill_st,
                     )
             return row
         except Exception as e:  # noqa: BLE001
@@ -838,6 +872,7 @@ class TradeExecutor:
         event_key: str,
         match_meta: dict[str, Any] | None,
         live: bool,
+        fill_status: str = FILL_STATUS_OPEN,
     ) -> None:
         meta = match_meta or {}
         mid = str(meta.get("match_id") or quote.get("match_id") or "")
@@ -870,6 +905,7 @@ class TradeExecutor:
             neg_risk=bool(neg) if neg is not None else None,
             af_status=af_status,
             af_deadline=af_deadline,
+            fill_status=fill_status,
         )
 
     def mark_af_confirmed(self, match_id: str, *, event_key: str = "") -> int:
@@ -1033,6 +1069,8 @@ class TradeExecutor:
         if not affected:
             return []
 
+        # Block new buys for this match until exits clear.
+        self._buy_blocked_matches.add(mid)
         logger.warning(
             "reversal flatten match=%s lots=%d/%d reason=%s",
             mid,
@@ -1044,6 +1082,12 @@ class TradeExecutor:
         ek = f"flatten|{mid}|{ev.get('ts') or lib.now_cn_iso()}|{reason}"
         for lot in affected:
             out.append(self._flatten_lot(lot, event_key=ek, reason=reason, match_ev=ev))
+        if not self.ledger.open_for_match(mid) and not self.ledger.pending_flatten_lots():
+            self._buy_blocked_matches.discard(mid)
+        elif not any(
+            str(r.get("match_id")) == mid for r in self.ledger.pending_flatten_lots()
+        ) and not self.ledger.open_for_match(mid):
+            self._buy_blocked_matches.discard(mid)
         return out
 
     def retry_pending_flattens(self) -> list[dict[str, Any]]:
@@ -1204,12 +1248,35 @@ class TradeExecutor:
                 pass
 
             bal = Decimal(str(trader.get_conditional_balance(token_id)))
+            if bal > 0 and lot.get("fill_status") == FILL_STATUS_PENDING:
+                self.ledger.mark_fill_open(token_id, mid)
             shares = flatten_sell_shares(bal)
             if bal <= 0 or shares < FLATTEN_MIN_SHARES:
                 # True empty → close. Tiny dust with no locks → close.
                 # If balance still tradeable but sizing floored to 0, or we only
                 # see dust while locks may remain, keep pending (Bodø case).
                 if bal <= 0:
+                    if lot.get("fill_status") == FILL_STATUS_PENDING:
+                        # Delayed fill not yet visible — keep pending; don't zombie-close.
+                        self.ledger.mark_pending_flatten(
+                            token_id,
+                            mid,
+                            reason=f"{reason}|awaiting_delayed_fill",
+                        )
+                        self._buy_blocked_matches.add(mid)
+                        row = self._record(
+                            quote_stub,
+                            event_key=event_key,
+                            match_meta=meta,
+                            plan=None,
+                            status="flatten_skipped",
+                            skip_reason="awaiting_delayed_fill",
+                            response=None,
+                            success=False,
+                            idempotency_key=key,
+                            live=True,
+                        )
+                        return row
                     row = self._record(
                         quote_stub,
                         event_key=event_key,
@@ -1224,6 +1291,7 @@ class TradeExecutor:
                     )
                     self._flatten_done.add(key)
                     self.ledger.mark_closed(token_id, mid, reason=reason + "|empty")
+                    self._buy_blocked_matches.discard(mid)
                     return row
                 if bal >= FLATTEN_MIN_SHARES:
                     # Have inventory but cannot size a legal sell this tick.

@@ -553,13 +553,9 @@ def detect_score_changes(
                     "polymarket": _pm_event_handle(pm),
                 }
             )
-        # Disallowed / correction: either side's score drops.
+        # Disallowed / correction: either side's score drops (includes mixed up+down).
         elif hs_i < ph or aws_i < pa:
-            side = (
-                "both"
-                if hs_i < ph and aws_i < pa
-                else ("home" if hs_i < ph else "away")
-            )
+            mixed = (hs_i > ph or aws_i > pa) and (hs_i < ph or aws_i < pa)
             events.append(
                 {
                     "type": "score_change",
@@ -572,9 +568,14 @@ def detect_score_changes(
                     "curr": {"home": hs_i, "away": aws_i},
                     "home_score": hs_i,
                     "away_score": aws_i,
-                    "side": side,
+                    "side": "mixed" if mixed else (
+                        "both"
+                        if hs_i < ph and aws_i < pa
+                        else ("home" if hs_i < ph else "away")
+                    ),
                     "is_goal": False,
                     "is_reversal": True,
+                    "is_mixed": mixed,
                     "status": dqd.get("status") or "",
                     "status_raw": dqd.get("status_raw") or "",
                     "official_clock": dqd.get("official_clock") or "",
@@ -721,6 +722,8 @@ class BridgeRuntime:
         self._persist_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._persist_thread: threading.Thread | None = None
         self._persist_lock = threading.Lock()
+        self._persist_gen = 0
+        self._persist_written_gen = 0
 
         for p in (self.dqd_scripts, self.pm_scripts):
             if str(p) not in sys.path:
@@ -749,6 +752,11 @@ class BridgeRuntime:
                 traceback.print_exc()
 
     def _persist_rematch_job(self, job: dict[str, Any]) -> None:
+        gen = int(job.get("generation") or 0)
+        with self._persist_lock:
+            if gen and gen < self._persist_written_gen:
+                # Stale rematch lost the race — do not overwrite newer disk state.
+                return
         # Durable event log first so a crash after prev_* advance cannot drop goals:
         # append events → matches snapshots → prev_* last.
         append_events(self.bridge_data / "events.jsonl", job.get("events") or [])
@@ -758,6 +766,9 @@ class BridgeRuntime:
         write_json(self.bridge_data / "prev_status.json", job["prev_status"])
         write_json(self.bridge_data / "prev_period.json", job["prev_period"])
         write_json(self.bridge_data / "prev_scores.json", job["prev_scores"])
+        with self._persist_lock:
+            if gen >= self._persist_written_gen:
+                self._persist_written_gen = gen
 
     def _load_prev_state(self) -> None:
         if self._prev_loaded:
@@ -908,12 +919,15 @@ class BridgeRuntime:
                     self.last_events = list(events)
 
             job = {
+                "generation": 0,
                 "prev_status": dict(prev_status),
                 "prev_period": dict(prev_period),
                 "prev_scores": {k: dict(v) for k, v in prev_scores.items()},
                 "events": [dict(ev) for ev in events],
                 "payload": payload,
             }
+            self._persist_gen += 1
+            job["generation"] = self._persist_gen
 
         if self.async_persist and not self._shutting_down:
             self._ensure_persist_worker()

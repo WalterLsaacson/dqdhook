@@ -889,8 +889,15 @@ def fetch_books(
     proxy: str | None | object = ...,
     timeout: float = 25.0,
     top_n: int = TOP_N,
+    sequential_fallback: bool = False,
+    max_sequential: int = 2,
 ) -> dict[str, dict[str, Any]]:
-    """Return map token_id -> normalized book summary."""
+    """Return map token_id -> normalized book summary.
+
+    On POST /books failure, default is fail-closed (mark missing) to avoid
+    ``N × timeout`` hot-path stalls. Opt into limited sequential GET via
+    ``sequential_fallback=True``.
+    """
     ids = [str(t) for t in token_ids if t]
     if not ids:
         return {}
@@ -915,25 +922,39 @@ def fetch_books(
                     if tid:
                         books[tid] = normalize_book(book, top_n=top_n)
         except (QuoteError, json.JSONDecodeError, pm.FetchError):
+            if sequential_fallback:
+                tried = 0
+                for tid in chunk:
+                    if tid in books:
+                        continue
+                    if tried >= max(0, int(max_sequential)):
+                        break
+                    tried += 1
+                    try:
+                        one = _http_clob(
+                            f"{CLOB_BASE}/book?token_id={urllib.parse.quote(tid)}",
+                            proxy_url,
+                            min(float(timeout), 5.0),
+                        )
+                        book = json.loads(one)
+                        if isinstance(book, dict):
+                            books[tid] = normalize_book(book, top_n=top_n)
+                    except Exception:  # noqa: BLE001
+                        books[tid] = {
+                            "token_id": tid,
+                            "book_missing": True,
+                            "best_bid": None,
+                            "best_ask": None,
+                            "error": "book_fetch_failed",
+                        }
             for tid in chunk:
-                if tid in books:
-                    continue
-                try:
-                    one = _http_clob(
-                        f"{CLOB_BASE}/book?token_id={urllib.parse.quote(tid)}",
-                        proxy_url,
-                        timeout,
-                    )
-                    book = json.loads(one)
-                    if isinstance(book, dict):
-                        books[tid] = normalize_book(book, top_n=top_n)
-                except Exception:  # noqa: BLE001
+                if tid not in books:
                     books[tid] = {
                         "token_id": tid,
                         "book_missing": True,
                         "best_bid": None,
                         "best_ask": None,
-                        "error": "book_fetch_failed",
+                        "error": "books_batch_failed",
                     }
     for tid in ids:
         if tid not in books:
@@ -1086,6 +1107,7 @@ def flag_misprice(
 
 
 def event_key(ev: dict[str, Any]) -> str:
+    """Semantic identity for score/FT (no wall-clock ts — avoids duplicate buys)."""
     typ = ev.get("type") or ""
     mid = ev.get("match_id") or ""
     if typ == "score_change":
@@ -1094,9 +1116,9 @@ def event_key(ev: dict[str, Any]) -> str:
         return (
             f"score_change|{mid}|"
             f"{prev.get('home')}-{prev.get('away')}->"
-            f"{curr.get('home')}-{curr.get('away')}|{ev.get('ts')}"
+            f"{curr.get('home')}-{curr.get('away')}"
         )
-    return f"{typ}|{mid}|{ev.get('ts')}"
+    return f"{typ}|{mid}|{ev.get('home_score')}-{ev.get('away_score')}"
 
 
 def load_bridge_matches(root: Path) -> list[dict[str, Any]]:
@@ -1104,13 +1126,36 @@ def load_bridge_matches(root: Path) -> list[dict[str, Any]]:
     return list(snap.get("matches") or [])
 
 
-def load_bridge_quote_events(root: Path) -> list[dict[str, Any]]:
-    """Load score_change + match_finished events for quoting."""
+def load_bridge_quote_events(
+    root: Path,
+    *,
+    byte_offset: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Load score_change + match_finished events for quoting.
+
+    When ``byte_offset`` is set, only read new bytes from that position (fast path).
+    Returns ``(events, new_offset)``. On truncate/rotate, rewinds to 0.
+    """
     path = bridge_dir(root) / "events.jsonl"
     rows: list[dict[str, Any]] = []
     if not path.is_file():
-        return rows
-    for line in path.read_text(encoding="utf-8").splitlines():
+        return rows, 0
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return rows, 0
+    start = int(byte_offset or 0)
+    if start < 0 or start > size:
+        start = 0
+    try:
+        with path.open("rb") as f:
+            if start:
+                f.seek(start)
+            raw = f.read().decode("utf-8", errors="replace")
+            new_off = f.tell()
+    except OSError:
+        return rows, start
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -1120,12 +1165,13 @@ def load_bridge_quote_events(root: Path) -> list[dict[str, Any]]:
             continue
         if isinstance(ev, dict) and ev.get("type") in ("match_finished", "score_change"):
             rows.append(ev)
-    return rows
+    return rows, int(new_off)
 
 
 def load_bridge_ft_events(root: Path) -> list[dict[str, Any]]:
     """Backward-compatible alias."""
-    return [e for e in load_bridge_quote_events(root) if e.get("type") == "match_finished"]
+    rows, _ = load_bridge_quote_events(root, byte_offset=0)
+    return [e for e in rows if e.get("type") == "match_finished"]
 
 
 def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
@@ -2115,11 +2161,14 @@ def process_bridge_events(
                 continue
             events_iter.append(ev)
             override_keys.add(event_key(ev))
-    for ev in load_bridge_quote_events(root):
+    file_off = int(cursor.get("events_byte_offset") or 0)
+    file_events, new_file_off = load_bridge_quote_events(root, byte_offset=file_off)
+    for ev in file_events:
         key = event_key(ev)
         if key in override_keys:
             continue
         events_iter.append(ev)
+    cursor["events_byte_offset"] = new_file_off
 
     for ev in events_iter:
         key = event_key(ev)
@@ -2198,13 +2247,12 @@ def process_bridge_events(
                     )
                     continue
 
-                # gate mode: wait for AF; preconfirm quote only (no trade yet)
+                # gate mode: wait for AF; no preconfirm CLOB quote (saves a books round-trip)
                 af_referee.submit(key, ev, target, wait_cache=True)
                 pending_keys.add(key)
-                _start_preconfirm_quote(ev, key)
                 print(
-                    f"af-preconfirm → started match_id={mid} key={key} "
-                    f"(DQD quote · no trade · parallel AF · gate)",
+                    f"af-gate → awaiting AF match_id={mid} key={key} "
+                    f"(no trade until confirm)",
                     flush=True,
                 )
                 continue

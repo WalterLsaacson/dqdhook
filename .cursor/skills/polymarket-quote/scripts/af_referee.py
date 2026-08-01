@@ -37,6 +37,10 @@ DEFAULT_FIRST_DELAY_S = 5.0
 DEFAULT_PERIOD_S = 2.0  # early period (alias for early_period_s)
 DEFAULT_LATE_AFTER_S = 60.0
 DEFAULT_LATE_PERIOD_S = 5.0
+# Shared AFClient spacing across referee workers (avoid stampede / 429).
+DEFAULT_AF_MIN_INTERVAL_S = 0.35
+# Soft coalesce: reuse last good poll for same DQD id within this window.
+_POLL_COALESCE_S = 1.0
 
 _AF_SCRIPTS = Path(__file__).resolve().parents[2] / "apifootball-bridge" / "scripts"
 _af_sp = str(_AF_SCRIPTS)
@@ -49,6 +53,8 @@ import af_bridge_lib as aflib  # noqa: E402
 _MEMORY_SCORES: dict[str, tuple[int, int]] = {}
 _MEMORY_LOCK = threading.Lock()
 _DISK_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="af-ref-disk")
+_POLL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_POLL_CACHE_LOCK = threading.Lock()
 
 
 def iso_now() -> str:
@@ -339,6 +345,7 @@ def call_af_bridge_events(
     persist_burst: bool = False,
     persist_cache: bool = False,
     cache_only: bool = True,
+    http_timeout: float | None = None,
 ) -> dict[str, Any]:
     """In-process apifootball-bridge events path (same as CLI ``events``).
 
@@ -351,6 +358,7 @@ def call_af_bridge_events(
         persist_cache=persist_cache,
         persist_burst=persist_burst,
         cache_only=cache_only,
+        http_timeout=http_timeout,
     )
 
 
@@ -468,8 +476,8 @@ class AfReferee:
     def _client(self) -> aflib.AFClient:
         if self._af is None:
             key = aflib.load_af_key(self.env_path)
-            # No Free-plan 6.5s spacing — referee needs ~500ms polls; backoff on 429.
-            self._af = aflib.AFClient(key, min_interval_s=0.0)
+            # Shared spacing across workers; 429 still backs off in await_score.
+            self._af = aflib.AFClient(key, min_interval_s=DEFAULT_AF_MIN_INTERVAL_S)
         return self._af
 
     def _reload_fixture_cache(self) -> dict[str, Any]:
@@ -501,20 +509,46 @@ class AfReferee:
         with self._lock:
             return set(self._pending.keys())
 
-    def poll_once(self, match_id: str, *, persist_burst: bool = False) -> dict[str, Any]:
+    def poll_once(
+        self,
+        match_id: str,
+        *,
+        persist_burst: bool = False,
+        http_timeout: float | None = None,
+        allow_coalesce: bool = True,
+    ) -> dict[str, Any]:
+        mid = str(match_id)
+        if (
+            allow_coalesce
+            and not persist_burst
+            and self._events_fn is None
+        ):
+            with _POLL_CACHE_LOCK:
+                hit = _POLL_CACHE.get(mid)
+            if hit is not None:
+                at, payload = hit
+                if (time.monotonic() - at) <= _POLL_COALESCE_S and isinstance(
+                    payload, dict
+                ):
+                    return dict(payload)
+
         if self._events_fn is not None:
             try:
-                return self._events_fn(str(match_id), persist_burst=persist_burst)
+                return self._events_fn(mid, persist_burst=persist_burst)
             except TypeError:
-                return self._events_fn(str(match_id))
+                return self._events_fn(mid)
         out = call_af_bridge_events(
-            str(match_id),
+            mid,
             af=self._client(),
             cache=self._fixture_cache(),
             persist_burst=persist_burst,
             persist_cache=False,
             cache_only=True,
+            http_timeout=http_timeout,
         )
+        if allow_coalesce and not persist_burst and out.get("ok"):
+            with _POLL_CACHE_LOCK:
+                _POLL_CACHE[mid] = (time.monotonic(), dict(out))
         return out
 
     def _persist_confirm_side_effects(
@@ -660,13 +694,26 @@ class AfReferee:
 
             polls += 1
             check_i += 1
+            # Hard deadline: never start a request that cannot finish in-window.
+            remain_budget = timeout - (time.monotonic() - t0)
+            if remain_budget <= 0.05:
+                break
             # Pick up late sync mappings between polls.
             self._reload_fixture_cache()
             try:
-                last = self.poll_once(mid, persist_burst=False)
+                last = self.poll_once(
+                    mid,
+                    persist_burst=False,
+                    http_timeout=min(8.0, max(0.5, remain_budget)),
+                )
             except Exception as e:  # noqa: BLE001
                 last_error = str(e)
                 last = {"ok": False, "error": str(e), "goals": last_goals}
+
+            # Discard late responses that arrived after the confirm deadline.
+            if (time.monotonic() - t0) >= timeout:
+                last_error = last_error or "af_confirm_timeout"
+                break
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
 

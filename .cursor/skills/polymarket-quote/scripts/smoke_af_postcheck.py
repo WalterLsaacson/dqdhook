@@ -210,7 +210,7 @@ def test_postcheck_trade_then_confirm_hold() -> None:
         )
 
         with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
-            with patch.object(lib, "load_bridge_quote_events", return_value=[]):
+            with patch.object(lib, "load_bridge_quote_events", return_value=([], 0)):
                 with patch.object(lib, "persist_bundle", return_value=None):
                     bundles = lib.process_bridge_events(
                         root,
@@ -332,7 +332,7 @@ def test_gate_mode_no_immediate_trade() -> None:
         ev = _goal_ev(match_id="m_gate", ts="2026-08-01T07:00:00+08:00")
 
         with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
-            with patch.object(lib, "load_bridge_quote_events", return_value=[]):
+            with patch.object(lib, "load_bridge_quote_events", return_value=([], 0)):
                 with patch.object(lib, "persist_bundle", return_value=None):
                     bundles = lib.process_bridge_events(
                         root,
@@ -436,7 +436,7 @@ def test_gate_timeout_no_flatten() -> None:
         ev = _goal_ev(match_id="m_gate_to", ts="2026-08-01T08:00:00+08:00")
 
         with patch.object(lib, "quote_bridge_event", return_value={"count": 0, "opportunity_count": 0, "opportunities": []}):
-            with patch.object(lib, "load_bridge_quote_events", return_value=[]):
+            with patch.object(lib, "load_bridge_quote_events", return_value=([], 0)):
                 with patch.object(lib, "persist_bundle", return_value=None):
                     lib.process_bridge_events(
                         root,

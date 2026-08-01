@@ -108,20 +108,27 @@ class AFClient:
         self._lock = threading.Lock()
         self._last_at = 0.0
 
-    def get(self, path: str, params: dict[str, Any] | None = None, timeout: float = 20.0) -> dict[str, Any]:
+    def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+    ) -> dict[str, Any]:
         qs = urllib.parse.urlencode(params or {})
         url = f"{AF_BASE}{path}" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(
             url,
             headers={"x-apisports-key": self.key, "Accept": "application/json"},
         )
+        # Cap so a single request cannot overrun a caller's remaining deadline.
+        http_timeout = max(0.5, min(float(timeout), 20.0))
         with self._lock:
             gap = self.min_interval_s - (time.monotonic() - self._last_at)
             if gap > 0:
                 time.sleep(gap)
             t0 = time.perf_counter()
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=http_timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                     status = getattr(resp, "status", 200)
             except urllib.error.HTTPError as e:
@@ -725,6 +732,7 @@ def fetch_events_for_match_id(
     force_resolve: bool = False,
     persist_burst: bool = True,
     cache_only: bool = False,
+    http_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Cache lookup → one AF /fixtures/events call.
 
@@ -763,7 +771,8 @@ def fetch_events_for_match_id(
         }
 
     fid = int(entry["af_fixture_id"])
-    events_payload = af.get("/fixtures/events", {"fixture": fid})
+    to = 20.0 if http_timeout is None else max(0.5, float(http_timeout))
+    events_payload = af.get("/fixtures/events", {"fixture": fid}, timeout=to)
     events_list = events_payload.get("response") if events_payload.get("ok") else []
     if not isinstance(events_list, list):
         events_list = []

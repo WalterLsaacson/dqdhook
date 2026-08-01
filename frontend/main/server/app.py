@@ -162,7 +162,7 @@ def load_quote_trade_config(
         "min_buy_price": float(
             min_buy_price
             if min_buy_price is not None
-            else os.getenv("QUOTE_MIN_BUY_PRICE", "0.8")
+            else os.getenv("QUOTE_MIN_BUY_PRICE", "0")
         ),
         "interval": max(
             0.05,
@@ -193,7 +193,10 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
     args.extend(["--max-usdc", str(float(c.get("max_usdc") or 20))])
     args.extend(["--max-shares", str(float(c.get("max_shares") or 25))])
     args.extend(["--max-slippage", str(float(c.get("max_slippage") or 0.03))])
-    args.extend(["--min-buy-price", str(float(c.get("min_buy_price") or 0.8))])
+    _mbp = c.get("min_buy_price")
+    args.extend(
+        ["--min-buy-price", str(float(0.0 if _mbp is None else _mbp))]
+    )
     if c.get("allow_extreme_prices"):
         args.append("--allow-extreme-prices")
     env_file = c.get("trade_env_file")
@@ -776,7 +779,7 @@ def main(argv: list[str] | None = None) -> int:
         "--min-buy-price",
         type=float,
         default=None,
-        help="buy_win floor (default 0.8; env QUOTE_MIN_BUY_PRICE)",
+        help="buy_win floor (default 0=off; env QUOTE_MIN_BUY_PRICE)",
     )
     parser.add_argument(
         "--interval",
@@ -836,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
-        f"min_buy_price={t.get('min_buy_price', 0.8)}",
+        f"min_buy_price={t.get('min_buy_price', 0.0)}",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

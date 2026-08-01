@@ -16,6 +16,9 @@ AF_STATUS_PENDING = "pending"
 AF_STATUS_CONFIRMED = "confirmed"
 AF_STATUS_NONE = "none"
 
+FILL_STATUS_OPEN = "open"
+FILL_STATUS_PENDING = "pending_fill"
+
 
 def score_pair(home: Any, away: Any) -> tuple[int, int] | None:
     try:
@@ -176,6 +179,7 @@ class OpenPositionLedger:
         neg_risk: bool | None = None,
         af_status: str = AF_STATUS_NONE,
         af_deadline: str | None = None,
+        fill_status: str = FILL_STATUS_OPEN,
     ) -> None:
         if not match_id or not token_id or shares <= 0:
             return
@@ -183,44 +187,93 @@ class OpenPositionLedger:
         status = str(af_status or AF_STATUS_NONE)
         if status not in (AF_STATUS_PENDING, AF_STATUS_CONFIRMED, AF_STATUS_NONE):
             status = AF_STATUS_NONE
+        fill = str(fill_status or FILL_STATUS_OPEN)
+        if fill not in (FILL_STATUS_OPEN, FILL_STATUS_PENDING):
+            fill = FILL_STATUS_OPEN
+        # Aggregate with prior open lot for same match+token (avoid under-selling).
+        existing = None
+        kept: list[dict[str, Any]] = []
+        for r in self._rows:
+            if (
+                r.get("status") == "open"
+                and str(r.get("match_id")) == str(match_id)
+                and str(r.get("token_id")) == str(token_id)
+            ):
+                existing = r
+            else:
+                kept.append(r)
+        self._rows = kept
+        if existing is not None:
+            shares = float(existing.get("shares") or 0) + float(shares)
+            usdc = float(existing.get("usdc") or 0) + float(usdc)
+            if existing.get("pending_flatten"):
+                # Keep exit intent across top-ups.
+                pass
+            # Prefer confirmed AF status if either lot is confirmed.
+            if existing.get("af_status") == AF_STATUS_CONFIRMED or status == AF_STATUS_CONFIRMED:
+                status = AF_STATUS_CONFIRMED
+                af_deadline = None
+            elif existing.get("af_status") == AF_STATUS_PENDING and status == AF_STATUS_NONE:
+                status = AF_STATUS_PENDING
+                af_deadline = existing.get("af_deadline") or af_deadline
+            if existing.get("fill_status") == FILL_STATUS_OPEN:
+                fill = FILL_STATUS_OPEN
+            event_key = str(existing.get("event_key") or event_key)
+            if existing.get("entry_score"):
+                sc = score_pair(
+                    (existing.get("entry_score") or [None, None])[0],
+                    (existing.get("entry_score") or [None, None])[1],
+                ) or sc
         row = {
             "status": "open",
             "match_id": str(match_id),
             "token_id": str(token_id),
-            "market_key": market_key,
-            "family": family,
+            "market_key": market_key or str(existing.get("market_key") if existing else ""),
+            "family": family or str(existing.get("family") if existing else ""),
             "shares": float(shares),
             "usdc": float(usdc),
             "entry_score": list(sc) if sc else None,
-            "home": home,
-            "away": away,
-            "live": bool(live),
+            "home": home or str(existing.get("home") if existing else ""),
+            "away": away or str(existing.get("away") if existing else ""),
+            "live": bool(live if existing is None else (live or existing.get("live"))),
             "event_key": event_key,
             "tick_size": tick_size or "0.01",
-            "neg_risk": neg_risk,
+            "neg_risk": neg_risk if neg_risk is not None else (existing.get("neg_risk") if existing else None),
             "af_status": status,
             "af_deadline": af_deadline if status == AF_STATUS_PENDING else None,
+            "fill_status": fill,
         }
-        # Replace prior open lot for same match+token (idempotent re-quote)
-        self._rows = [
-            r
-            for r in self._rows
-            if not (
-                r.get("status") == "open"
-                and str(r.get("match_id")) == str(match_id)
-                and str(r.get("token_id")) == str(token_id)
-            )
-        ]
+        if existing is not None and existing.get("pending_flatten"):
+            row["pending_flatten"] = True
+            row["pending_reason"] = existing.get("pending_reason")
         self._rows.append(row)
         self._save()
         logger.info(
-            "ledger open match=%s token=%s… shares=%.4f entry=%s af=%s",
+            "ledger open match=%s token=%s… shares=%.4f entry=%s af=%s fill=%s",
             match_id,
             token_id[:12],
             shares,
             sc,
             status,
+            fill,
         )
+
+    def mark_fill_open(self, token_id: str, match_id: str) -> int:
+        """Promote pending_fill → open after balance appears."""
+        n = 0
+        tid, mid = str(token_id), str(match_id)
+        for r in self._rows:
+            if (
+                r.get("status") == "open"
+                and str(r.get("token_id")) == tid
+                and str(r.get("match_id")) == mid
+                and r.get("fill_status") == FILL_STATUS_PENDING
+            ):
+                r["fill_status"] = FILL_STATUS_OPEN
+                n += 1
+        if n:
+            self._save()
+        return n
 
     def open_for_match(self, match_id: str) -> list[dict[str, Any]]:
         mid = str(match_id)
