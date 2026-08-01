@@ -15,11 +15,14 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 **进球 AF 门控（默认）**：`score_change` 进球后 **先**用 apifootball-bridge 异步确认（与 `events` CLI 同路径）。Poll：**5s → 每 2s → 60s 后每 5s → 90s 截止**（worker 间共享 ~0.35s 间隔；HTTP timeout 受剩余 deadline 约束）。AF 确认 → 再按 AF 比分询价/下单，持有至结算；AF 超时/映射失败 → **忽略该球、不下单**；懂球帝回撤 → 若已有仓则立即 flatten（同场禁新开仓）。
 
+**终场 AF 门控**：`match_finished` **同样先等 AF**，但读的是 fixture **`score.fulltime`（正赛 90'+补时）**——**加时 / 点球不作数**（与 Polymarket soccer 结算一致）。DQD 终场比分须与 AF 正赛比分**完全一致**才下单；不一致（如 VAR 改判）或超时 → **不下单**。另：事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** 或同 `match_id` 已处理过终场 → 跳过（防重启重放）。
+
 - AF 确认目标比分（或已覆盖该次上涨）→ `_quote_one` 下单
 - 超时（默认 **90s**）→ `mode=af_unconfirmed`，**不 flatten**
 - 中间 poll **不**写 burst；确认时写一次
 - 429 / SSL 等瞬态错误退避重试（不烧 poll 槽）
 - 懂球帝 **回撤** → 立即 flatten + 按修正比分询价
+- 终场确认失败 → `mode=af_ft_unconfirmed` / `ft_stale`（无 flatten）
 
 激进模式（先买后 AF）用 `--af-postcheck-trade` / `QUOTE_AF_POSTCHECK_TRADE=1`；`--no-af-referee` 完全不管 AF。默认 **dry-run**；`--live` / `--goals-mode` / `--ft-mode` 控制真下单。
 
@@ -73,7 +76,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 1. Prefer System Main (`frontend/run_main.py`): boots boards (UI) + AF watch + `pm_quote watch`, which owns **in-process** match-bridge (memory `event_queue` → AF referee → quote/trade). File writes are async. `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake. Do not start boards as skill hosts separately.
 2. Prefer bridge events in `data/bridge/events.jsonl`:
    - `score_change` — mid-match after a goal; **wait for AF confirm** (gate default), then quote/trade.
-   - `match_finished` — full moneyline + props + exact settlement (no AF goal gate).
+   - `match_finished` — AF **regulation** fulltime gate (`score.fulltime`; ET/pen ignored), then moneyline + props + exact; stale / once-per-match skip.
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **AF referee (gate default)**: on goal-up, **async** poll AF events (**5s → every 2s until 60s → every 5s until timeout**, default 90s, `cache_only`, `wait_cache` on late fixture mapping). Confirm → quote+trade on AF score; timeout/miss → ignore (no buy, no flatten). DQD score reversals flatten + requote if a lot exists. Aggressive `--af-postcheck-trade`: buy on DQD immediately, flatten on AF timeout. Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
 5. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.

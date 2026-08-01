@@ -1768,11 +1768,21 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     cursor = load_cursor(root)
     seen = set(cursor.get("processed_keys") or [])
+    processed_ft_ids = {
+        str(x)
+        for x in (cursor.get("processed_ft_match_ids") or [])
+        if x is not None and str(x).strip()
+    }
     bundles: list[dict[str, Any]] = []
     tick_t0 = time.monotonic()
     mode = str(af_mode or "gate").strip().lower()
     if mode not in ("postcheck", "gate", "off"):
         mode = "gate"
+
+    def _mark_ft_done(match_id: str) -> None:
+        mid = str(match_id or "").strip()
+        if mid:
+            processed_ft_ids.add(mid)
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
@@ -1955,6 +1965,68 @@ def process_bridge_events(
         gate = job.get("gate") or {}
         mid = str(job.get("match_id") or ev.get("match_id") or "")
         target = job.get("target") or (None, None)
+        job_kind = str(job.get("kind") or gate.get("kind") or "goal").strip().lower()
+        is_ft = job_kind == "ft" or str(ev.get("type") or "") == "match_finished"
+
+        if is_ft:
+            # FT always gates: never bought before AF; mismatch/timeout → skip.
+            if key in seen and not force:
+                _mark_ft_done(mid)
+                return
+            if not gate.get("confirmed"):
+                skip = {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "match_finished",
+                    "mode": "af_ft_unconfirmed",
+                    "event_key": key,
+                    "match_id": mid,
+                    "home": ev.get("home"),
+                    "away": ev.get("away"),
+                    "home_score": target[0] if target else ev.get("home_score"),
+                    "away_score": target[1] if target else ev.get("away_score"),
+                    "count": 0,
+                    "opportunity_count": 0,
+                    "af_referee": gate,
+                }
+                bundles.append(skip)
+                seen.add(key)
+                _mark_ft_done(mid)
+                print(
+                    f"af-ft-gate → IGNORE FT match_id={mid} "
+                    f"target={target[0] if target else '?'}-"
+                    f"{target[1] if target else '?'} "
+                    f"af={gate.get('goals')} err={gate.get('error')} "
+                    f"(regulation=score.fulltime)",
+                    flush=True,
+                )
+                return
+            work_ev = apply_af_score_to_event(
+                ev,
+                home=int(gate["goals"]["home"]),
+                away=int(gate["goals"]["away"]),
+            )
+            print(
+                f"af-ft-gate → CONFIRMED {mid} "
+                f"{gate['goals']['home']}-{gate['goals']['away']} "
+                f"in {gate.get('elapsed_ms')}ms polls={gate.get('polls')} "
+                f"status={gate.get('status_short')} (regulation=fulltime)",
+                flush=True,
+            )
+            af_gate: dict[str, Any] = {
+                "confirmed": True,
+                "kind": "ft",
+                "score_source": "score.fulltime",
+                "home_score": work_ev.get("home_score"),
+                "away_score": work_ev.get("away_score"),
+                "status_short": gate.get("status_short"),
+                "polls": gate.get("polls"),
+                "elapsed_ms": gate.get("elapsed_ms"),
+                "via": gate.get("via"),
+            }
+            _quote_one(work_ev, key, af_gate=af_gate)
+            if key in seen:
+                _mark_ft_done(mid)
+            return
 
         if mode == "postcheck":
             err = gate.get("error")
@@ -2179,6 +2251,79 @@ def process_bridge_events(
 
         typ = str(ev.get("type") or "")
 
+        if typ == "match_finished":
+            mid = str(ev.get("match_id") or "")
+            if mid and mid in processed_ft_ids and not force:
+                seen.add(key)
+                continue
+            from af_referee import ft_event_is_stale, target_score_from_event
+
+            stale, age = ft_event_is_stale(ev)
+            if stale:
+                skip = {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "match_finished",
+                    "mode": "ft_stale",
+                    "event_key": key,
+                    "match_id": mid,
+                    "home": ev.get("home"),
+                    "away": ev.get("away"),
+                    "home_score": ev.get("home_score"),
+                    "away_score": ev.get("away_score"),
+                    "count": 0,
+                    "opportunity_count": 0,
+                    "af_referee": {
+                        "skipped": True,
+                        "reason": "ft_stale",
+                        "age_s": age,
+                    },
+                }
+                bundles.append(skip)
+                seen.add(key)
+                _mark_ft_done(mid)
+                print(
+                    f"ft-gate → SKIP stale match_id={mid} age_s={age} key={key}",
+                    flush=True,
+                )
+                continue
+
+            if af_referee is not None:
+                target = target_score_from_event(ev)
+                if not mid or target is None:
+                    skip = {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "match_finished",
+                        "mode": "af_ft_skip_bad_event",
+                        "event_key": key,
+                        "match_id": mid,
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "af_referee": {
+                            "skipped": True,
+                            "reason": "missing_match_id_or_score",
+                        },
+                    }
+                    bundles.append(skip)
+                    seen.add(key)
+                    _mark_ft_done(mid)
+                    continue
+                # Always gate FT (even when goals use postcheck): wait for
+                # AF regulation fulltime to match DQD before any FT trade.
+                af_referee.submit_ft(key, ev, target, wait_cache=True)
+                pending_keys.add(key)
+                print(
+                    f"af-ft-gate → awaiting AF regulation match_id={mid} "
+                    f"key={key} target={target[0]}-{target[1]} "
+                    f"(score.fulltime; ET/pen ignored)",
+                    flush=True,
+                )
+                continue
+
+            _quote_one(ev, key)
+            if key in seen:
+                _mark_ft_done(mid)
+            continue
+
         if typ == "score_change" and af_referee is not None:
             from af_referee import (
                 event_is_goal_up,
@@ -2277,6 +2422,7 @@ def process_bridge_events(
     _deadline_flatten()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
+    cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]
     cursor["updated_at"] = now_cn_iso()
     save_cursor(root, cursor)
     tick_ms = int((time.monotonic() - tick_t0) * 1000)

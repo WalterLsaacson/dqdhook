@@ -41,6 +41,10 @@ DEFAULT_LATE_PERIOD_S = 5.0
 DEFAULT_AF_MIN_INTERVAL_S = 0.35
 # Soft coalesce: reuse last good poll for same DQD id within this window.
 _POLL_COALESCE_S = 1.0
+# match_finished older than this → skip (restart replay / late DQD).
+DEFAULT_FT_MAX_AGE_S = 15 * 60.0
+# Env override for FT freshness.
+_FT_MAX_AGE_ENV = "QUOTE_FT_MAX_AGE_S"
 
 _AF_SCRIPTS = Path(__file__).resolve().parents[2] / "apifootball-bridge" / "scripts"
 _af_sp = str(_AF_SCRIPTS)
@@ -241,6 +245,75 @@ def apply_af_score_to_event(
     out["curr"] = {"home": int(home), "away": int(away)}
     out["score_source"] = "api_football"
     return out
+
+
+def ft_max_age_s(override: float | None = None) -> float:
+    if override is not None:
+        return max(0.0, float(override))
+    import os
+
+    raw = os.getenv(_FT_MAX_AGE_ENV)
+    if raw is None or str(raw).strip() == "":
+        return float(DEFAULT_FT_MAX_AGE_S)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_FT_MAX_AGE_S)
+
+
+def event_age_seconds(ev: dict[str, Any], *, now: datetime | None = None) -> float | None:
+    """Age of event ``ts`` in seconds (CN wall clock); None if unparsable."""
+    ts = ev.get("ts")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_CN)
+    n = now or datetime.now(TZ_CN)
+    return max(0.0, (n - dt.astimezone(TZ_CN)).total_seconds())
+
+
+def ft_event_is_stale(
+    ev: dict[str, Any],
+    *,
+    max_age_s: float | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, float | None]:
+    """True when match_finished is older than max_age (0 = disable age check)."""
+    age = event_age_seconds(ev, now=now)
+    limit = ft_max_age_s(max_age_s)
+    if limit <= 0 or age is None:
+        return False, age
+    return age > limit + 1e-9, age
+
+
+def af_ft_score_matches(
+    af: tuple[int, int],
+    target: tuple[int, int],
+) -> bool:
+    """FT confirm requires exact regulation score agreement (no 'AF ahead' shortcut)."""
+    return int(af[0]) == int(target[0]) and int(af[1]) == int(target[1])
+
+
+def call_af_bridge_regulation_score(
+    match_id: str,
+    *,
+    af: aflib.AFClient,
+    cache: dict[str, Any],
+    cache_only: bool = True,
+    http_timeout: float | None = None,
+) -> dict[str, Any]:
+    """In-process AF fixture fulltime (regulation) score for FT gate."""
+    return aflib.fetch_regulation_score_for_match_id(
+        af,
+        str(match_id),
+        cache=cache,
+        cache_only=cache_only,
+        http_timeout=http_timeout,
+    )
 
 
 def af_score_satisfies(
@@ -551,6 +624,28 @@ class AfReferee:
                 _POLL_CACHE[mid] = (time.monotonic(), dict(out))
         return out
 
+    def poll_regulation_once(
+        self,
+        match_id: str,
+        *,
+        http_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """One AF ``/fixtures?id=`` poll for regulation (fulltime) score."""
+        mid = str(match_id)
+        if self._events_fn is not None:
+            # Tests inject regulation payloads via events_fn (same hook).
+            try:
+                return self._events_fn(mid, persist_burst=False, kind="ft")
+            except TypeError:
+                return self._events_fn(mid)
+        return call_af_bridge_regulation_score(
+            mid,
+            af=self._client(),
+            cache=self._fixture_cache(),
+            cache_only=True,
+            http_timeout=http_timeout,
+        )
+
     def _persist_confirm_side_effects(
         self, match_id: str, last: dict[str, Any], truth: tuple[int, int]
     ) -> None:
@@ -849,6 +944,263 @@ class AfReferee:
             out_fail["transient_network"] = True
         return out_fail
 
+    def await_ft_score(
+        self,
+        match_id: str,
+        target: tuple[int, int],
+        *,
+        poll_s: float | None = None,
+        timeout_s: float | None = None,
+        wait_cache: bool = True,
+    ) -> dict[str, Any]:
+        """Block until AF regulation fulltime equals DQD FT target (exact).
+
+        Uses ``score.fulltime`` only (ET/penalties ignored — Polymarket rule).
+        When AF fixture is finished with a different regulation score → immediate
+        mismatch (no trade). When not finished yet → keep polling until timeout.
+        """
+        poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
+        timeout = self.timeout_s if timeout_s is None else max(1.0, float(timeout_s))
+        th, ta = int(target[0]), int(target[1])
+        mid = str(match_id)
+        self._reload_fixture_cache()
+        if (
+            not wait_cache
+            and self._events_fn is None
+            and self.cached_af_fixture_id(mid) is None
+        ):
+            err = aflib.fixture_miss_error(self._fixture_cache(), mid)
+            return {
+                "ok": False,
+                "confirmed": False,
+                "kind": "ft",
+                "match_id": mid,
+                "target": {"home": th, "away": ta},
+                "goals": {"home": None, "away": None},
+                "finished": False,
+                "status_short": None,
+                "af_fixture_id": None,
+                "polls": 0,
+                "elapsed_ms": 0,
+                "timeout_s": timeout,
+                "schedule": self._schedule_desc(),
+                "error": err,
+                "via": "apifootball-bridge",
+                "score_source": "score.fulltime",
+                "cache_only": True,
+            }
+
+        if self.poll_schedule:
+            check_at = confirm_check_times(
+                timeout,
+                first_delay_s=self.first_delay_s,
+                period_s=self.period_s,
+                late_after_s=self.late_after_s,
+                late_period_s=self.late_period_s,
+            )
+        else:
+            check_at = []
+            t = 0.0
+            while t <= timeout + 1e-9:
+                check_at.append(round(t, 3))
+                t += poll
+            if not check_at:
+                check_at = [0.0]
+
+        t0 = time.monotonic()
+        polls = 0
+        last: dict[str, Any] = {}
+        last_goals: dict[str, int | None] = {"home": None, "away": None}
+        last_error: Any = None
+        last_finished = False
+        last_ready = False
+        last_status: str | None = None
+        retry_hits = 0
+        check_i = 0
+
+        while check_i < len(check_at):
+            target_at = check_at[check_i]
+            while True:
+                elapsed = time.monotonic() - t0
+                if elapsed >= timeout:
+                    break
+                remain = target_at - elapsed
+                if remain <= 0:
+                    break
+                time.sleep(min(remain, 0.25))
+            if (time.monotonic() - t0) >= timeout and (time.monotonic() - t0) < target_at:
+                break
+
+            polls += 1
+            check_i += 1
+            remain_budget = timeout - (time.monotonic() - t0)
+            if remain_budget <= 0.05:
+                break
+            self._reload_fixture_cache()
+            try:
+                last = self.poll_regulation_once(
+                    mid,
+                    http_timeout=min(8.0, max(0.5, remain_budget)),
+                )
+            except Exception as e:  # noqa: BLE001
+                last_error = str(e)
+                last = {"ok": False, "error": str(e), "goals": last_goals}
+
+            if (time.monotonic() - t0) >= timeout:
+                last_error = last_error or "af_confirm_timeout"
+                break
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            miss = str(last.get("error") or "")
+            if miss in _CACHE_MISS_ERRORS:
+                last_error = miss
+                if not wait_cache:
+                    return {
+                        "ok": False,
+                        "confirmed": False,
+                        "kind": "ft",
+                        "match_id": mid,
+                        "target": {"home": th, "away": ta},
+                        "goals": last.get("goals") or last_goals,
+                        "finished": bool(last.get("finished")),
+                        "regulation_ready": bool(last.get("regulation_ready")),
+                        "status_short": last.get("status_short"),
+                        "af_fixture_id": None,
+                        "polls": polls,
+                        "elapsed_ms": elapsed_ms,
+                        "timeout_s": timeout,
+                        "schedule": self._schedule_desc(),
+                        "error": miss,
+                        "via": "apifootball-bridge",
+                        "score_source": "score.fulltime",
+                        "cache_only": True,
+                    }
+                continue
+
+            if _is_rate_limited(last):
+                retry_hits += 1
+                last_error = last.get("error") or last.get("errors") or "rate_limited"
+                backoff = min(8.0, 0.5 * (2 ** min(retry_hits, 4)))
+                check_i -= 1
+                if (time.monotonic() - t0) >= timeout:
+                    break
+                time.sleep(backoff)
+                continue
+
+            if _is_transient_af_error(last):
+                last_error = _af_error_blob(last) or "transient_af_error"
+                check_i -= 1
+                if (time.monotonic() - t0) >= timeout:
+                    break
+                time.sleep(0.25)
+                continue
+
+            retry_hits = 0
+            if last.get("ok"):
+                goals = last.get("goals") or {}
+                last_goals = {"home": goals.get("home"), "away": goals.get("away")}
+                last_finished = bool(last.get("finished"))
+                # Prefer explicit flag; fall back for test doubles that only set finished.
+                last_ready = bool(
+                    last.get("regulation_ready")
+                    if "regulation_ready" in last
+                    else last_finished
+                )
+                last_status = (
+                    str(last.get("status_short") or "") or None
+                )
+                try:
+                    gh, ga = goals.get("home"), goals.get("away")
+                    if gh is not None and ga is not None and last_ready:
+                        if af_ft_score_matches((int(gh), int(ga)), (th, ta)):
+                            fid = last.get("af_fixture_id")
+                            truth = (int(gh), int(ga))
+                            set_confirmed_score_async(
+                                self.root,
+                                mid,
+                                truth[0],
+                                truth[1],
+                                af_fixture_id=int(fid) if fid is not None else None,
+                                source="af_fixture_fulltime",
+                            )
+                            return {
+                                "ok": True,
+                                "confirmed": True,
+                                "kind": "ft",
+                                "match_id": mid,
+                                "target": {"home": th, "away": ta},
+                                "goals": {"home": truth[0], "away": truth[1]},
+                                "finished": last_finished,
+                                "regulation_ready": True,
+                                "status_short": last_status,
+                                "af_fixture_id": fid,
+                                "polls": polls,
+                                "elapsed_ms": elapsed_ms,
+                                "timeout_s": timeout,
+                                "schedule": self._schedule_desc(),
+                                "via": "apifootball-bridge",
+                                "score_source": "score.fulltime",
+                                "cache_only": True,
+                            }
+                        # Regulation decided but ≠ DQD → do not trade.
+                        return {
+                            "ok": False,
+                            "confirmed": False,
+                            "kind": "ft",
+                            "match_id": mid,
+                            "target": {"home": th, "away": ta},
+                            "goals": {"home": int(gh), "away": int(ga)},
+                            "finished": last_finished,
+                            "regulation_ready": True,
+                            "status_short": last_status,
+                            "af_fixture_id": last.get("af_fixture_id"),
+                            "polls": polls,
+                            "elapsed_ms": elapsed_ms,
+                            "timeout_s": timeout,
+                            "schedule": self._schedule_desc(),
+                            "error": (
+                                f"af_ft_score_mismatch="
+                                f"{int(gh)}-{int(ga)}!={th}-{ta}"
+                            ),
+                            "via": "apifootball-bridge",
+                            "score_source": "score.fulltime",
+                            "cache_only": True,
+                        }
+                except (TypeError, ValueError):
+                    pass
+            else:
+                last_error = last.get("error") or last.get("errors") or last_error
+
+            if (time.monotonic() - t0) >= timeout:
+                break
+
+        final_err: Any = last_error or "af_confirm_timeout"
+        out_fail: dict[str, Any] = {
+            "ok": False,
+            "confirmed": False,
+            "kind": "ft",
+            "match_id": mid,
+            "target": {"home": th, "away": ta},
+            "goals": last_goals,
+            "finished": last_finished,
+            "regulation_ready": last_ready,
+            "status_short": last_status,
+            "af_fixture_id": last.get("af_fixture_id"),
+            "polls": polls,
+            "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            "timeout_s": timeout,
+            "schedule": self._schedule_desc(),
+            "error": final_err,
+            "via": "apifootball-bridge",
+            "score_source": "score.fulltime",
+            "cache_only": True,
+        }
+        if _is_transient_af_error(final_err):
+            out_fail["error"] = "af_confirm_timeout"
+            out_fail["last_error"] = final_err
+            out_fail["transient_network"] = True
+        return out_fail
+
     def submit(
         self,
         event_key: str,
@@ -856,27 +1208,38 @@ class AfReferee:
         target: tuple[int, int],
         *,
         wait_cache: bool = False,
+        kind: str = "goal",
     ) -> bool:
         """Enqueue non-blocking confirmation. Returns False if already pending.
 
-        ``wait_cache=True`` (postcheck): keep polling on fixture-cache miss until
-        timeout so late AF sync mappings can still confirm after a buy.
+        ``kind="ft"``: poll AF regulation fulltime (score.fulltime) for exact
+        agreement with DQD FT — Polymarket ignores ET/penalties.
+        ``wait_cache=True``: keep polling on fixture-cache miss until timeout.
         """
         mid = str(ev.get("match_id") or "")
         if not mid:
             return False
+        job_kind = "ft" if str(kind or "").strip().lower() == "ft" else "goal"
         with self._lock:
             if event_key in self._pending:
                 return False
             stored = get_confirmed_score(self.root, mid)
             baseline = stored if stored is not None else baseline_score_from_event(ev)
-            fut = self._exec.submit(
-                self.await_score,
-                mid,
-                target,
-                baseline=baseline,
-                wait_cache=bool(wait_cache),
-            )
+            if job_kind == "ft":
+                fut = self._exec.submit(
+                    self.await_ft_score,
+                    mid,
+                    target,
+                    wait_cache=bool(wait_cache),
+                )
+            else:
+                fut = self._exec.submit(
+                    self.await_score,
+                    mid,
+                    target,
+                    baseline=baseline,
+                    wait_cache=bool(wait_cache),
+                )
             self._pending[event_key] = fut
             self._meta[event_key] = {
                 "ev": dict(ev),
@@ -884,15 +1247,30 @@ class AfReferee:
                 "match_id": mid,
                 "submitted_at": iso_now(),
                 "wait_cache": bool(wait_cache),
+                "kind": job_kind,
             }
         print(
             f"af-referee → queued {mid} target={target[0]}-{target[1]} "
-            f"key={event_key} (async · cache-only · {self._schedule_desc()} · "
-            f"timeout {self.timeout_s}s"
-            f"{' · wait_cache' if wait_cache else ''})",
+            f"key={event_key} kind={job_kind} (async · cache-only · "
+            f"{self._schedule_desc()} · timeout {self.timeout_s}s"
+            f"{' · wait_cache' if wait_cache else ''}"
+            f"{' · regulation=fulltime' if job_kind == 'ft' else ''})",
             flush=True,
         )
         return True
+
+    def submit_ft(
+        self,
+        event_key: str,
+        ev: dict[str, Any],
+        target: tuple[int, int],
+        *,
+        wait_cache: bool = True,
+    ) -> bool:
+        """FT gate helper — always uses regulation fulltime confirm."""
+        return self.submit(
+            event_key, ev, target, wait_cache=wait_cache, kind="ft"
+        )
 
     def drain_done(self) -> list[dict[str, Any]]:
         """Return completed confirm jobs (confirmed or timed out)."""
@@ -912,6 +1290,7 @@ class AfReferee:
                     "ok": False,
                     "confirmed": False,
                     "error": str(e),
+                    "kind": meta.get("kind") or "goal",
                     "match_id": meta.get("match_id"),
                     "target": {
                         "home": meta["target"][0],
@@ -924,6 +1303,7 @@ class AfReferee:
                     "ev": meta["ev"],
                     "target": meta["target"],
                     "match_id": meta["match_id"],
+                    "kind": meta.get("kind") or "goal",
                     "gate": gate,
                 }
             )

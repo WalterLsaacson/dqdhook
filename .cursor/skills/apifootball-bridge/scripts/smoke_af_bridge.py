@@ -82,7 +82,12 @@ def _make_fx(fid: int, home: str, away: str, kickoff_cn: datetime, goals: tuple[
         "league": {"name": "Premier League", "country": "England"},
         "teams": {"home": {"name": home}, "away": {"name": away}},
         "goals": {"home": goals[0], "away": goals[1]},
-        "score": {},
+        "score": {
+            "halftime": {"home": None, "away": None},
+            "fulltime": {"home": None, "away": None},
+            "extratime": {"home": None, "away": None},
+            "penalty": {"home": None, "away": None},
+        },
     }
 
 
@@ -326,12 +331,65 @@ def test_load_cache_preserves_sync_meta() -> None:
         check("last_bridge kept", loaded.get("last_bridge_matched_at") == "2026-07-30T11:00:00+08:00")
 
 
+def test_regulation_score_ignores_et_pen() -> None:
+    print("test_regulation_score_ignores_et_pen")
+    fx = _make_fx(99, "Home", "Away", datetime(2026, 8, 1, 18, 30, tzinfo=TZ_CN), goals=(3, 2))
+    fx["fixture"]["status"] = {"short": "AET", "long": "After Extra Time"}
+    fx["score"]["fulltime"] = {"home": 2, "away": 2}
+    fx["score"]["extratime"] = {"home": 3, "away": 2}
+    fx["score"]["penalty"] = {"home": 5, "away": 4}
+    fx["goals"] = {"home": 3, "away": 2}
+    reg = lib.regulation_score_from_fixture(fx)
+    check("finished on AET", reg["finished"] is True)
+    check("ready on AET", reg["regulation_ready"] is True)
+    check("uses fulltime not ET", reg["goals"] == {"home": 2, "away": 2})
+
+    # Knockout still in ET: regulation fulltime must already unlock confirm.
+    fx_et = dict(fx)
+    fx_et["fixture"] = {"id": 99, "status": {"short": "ET", "long": "Extra Time"}}
+    fx_et["score"] = {
+        "fulltime": {"home": 1, "away": 1},
+        "extratime": {"home": 1, "away": 1},
+        "penalty": {"home": None, "away": None},
+        "halftime": {"home": 0, "away": 0},
+    }
+    reg_et = lib.regulation_score_from_fixture(fx_et)
+    check("not finished during ET", reg_et["finished"] is False)
+    check("regulation ready during ET", reg_et["regulation_ready"] is True)
+    check("ET uses fulltime", reg_et["goals"] == {"home": 1, "away": 1})
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        kick = datetime(2026, 8, 1, 18, 30, tzinfo=TZ_CN)
+        fx2 = _make_fx(1510397, "Cheongju", "Suwon Bluewings", kick, goals=(2, 2))
+        fx2["fixture"]["status"] = {"short": "FT", "long": "Match Finished"}
+        fx2["score"]["fulltime"] = {"home": 2, "away": 2}
+        date_key = kick.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        af = FakeAF({date_key: [fx2]})
+        cache = lib.empty_cache()
+        cache["entries"]["54364565"] = {
+            "dqd_match_id": "54364565",
+            "af_fixture_id": 1510397,
+            "af_home": "Cheongju",
+            "af_away": "Suwon Bluewings",
+        }
+        out = lib.fetch_regulation_score_for_match_id(
+            af, "54364565", cache=cache, cache_only=True
+        )
+        check("fetch ok", out.get("ok") is True)
+        check("regulation 2-2", out.get("goals") == {"home": 2, "away": 2})
+        check("finished", out.get("finished") is True)
+        check("regulation_ready", out.get("regulation_ready") is True)
+        check("fixtures id call", any(c[0] == "/fixtures" and "id" in (c[1] or {}) for c in af.calls))
+
+
 def main() -> int:
     test_cache_hit_miss_and_ttl()
     test_events_burst_layout()
     test_events_resolve_on_miss()
     test_events_cache_only_no_resolve()
     test_load_cache_preserves_sync_meta()
+    test_regulation_score_ignores_et_pen()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

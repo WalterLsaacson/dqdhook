@@ -567,6 +567,52 @@ def ensure_fixture_for_match_id(
     return hit
 
 
+# Fixture terminal statuses (match fully over).
+FT_STATUS_SHORT = frozenset({"FT", "AET", "PEN", "AWD", "WO"})
+# Regulation (90'+stoppage) is decided — includes knockout still in ET/penalties.
+# Polymarket soccer settles on fulltime only; ET/P status must still unlock confirm.
+REGULATION_DECIDED_SHORT = frozenset({"FT", "AET", "PEN", "AWD", "WO", "ET", "BT", "P"})
+
+
+def regulation_score_from_fixture(fx: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract Polymarket-style regulation score from an AF fixture row.
+
+    Uses ``score.fulltime`` only (ignores ``extratime`` / ``penalty``). Returns
+    ``regulation_ready`` when status shows regulation has ended (incl. live ET/P)
+    and fulltime ints are present.
+    """
+    if not isinstance(fx, dict):
+        return {
+            "finished": False,
+            "regulation_ready": False,
+            "status_short": None,
+            "goals": {"home": None, "away": None},
+            "source": "score.fulltime",
+        }
+    st = (fx.get("fixture") or {}).get("status") or {}
+    short = str(st.get("short") or "").upper() or None
+    finished = short in FT_STATUS_SHORT if short else False
+    ft = (fx.get("score") or {}).get("fulltime") or {}
+    gh, ga = ft.get("home"), ft.get("away")
+    goals: dict[str, int | None] = {"home": None, "away": None}
+    try:
+        if gh is not None and ga is not None:
+            goals = {"home": int(gh), "away": int(ga)}
+    except (TypeError, ValueError):
+        goals = {"home": None, "away": None}
+    has_ft = goals["home"] is not None and goals["away"] is not None
+    regulation_ready = bool(
+        has_ft and short is not None and short in REGULATION_DECIDED_SHORT
+    )
+    return {
+        "finished": finished,
+        "regulation_ready": regulation_ready,
+        "status_short": short,
+        "goals": goals,
+        "source": "score.fulltime",
+    }
+
+
 def goals_from_events(
     events: list[Any],
     *,
@@ -577,6 +623,9 @@ def goals_from_events(
 
     Own Goal: API-Football ``team`` is the benefiting side — same attribution.
     Falls back to a looser name threshold when the strict match fails.
+
+    Note: live event tallies may include ET goals. For Polymarket FT settlement
+    use ``regulation_score_from_fixture`` / ``fetch_regulation_score_for_match_id``.
     """
     home_n = 0
     away_n = 0
@@ -811,4 +860,70 @@ def fetch_events_for_match_id(
     out["cache_entry"] = entry
     if not out["ok"]:
         out["error"] = events_payload.get("errors") or "af_events_failed"
+    return out
+
+
+def fetch_regulation_score_for_match_id(
+    af: AFClient,
+    dqd_match_id: str,
+    *,
+    cache: dict[str, Any],
+    bridge_path: Path = DEFAULT_BRIDGE_MATCHES,
+    snapshot_path: Path = DEFAULT_DQD_SNAPSHOT,
+    cache_only: bool = True,
+    http_timeout: float | None = None,
+) -> dict[str, Any]:
+    """Cache lookup → ``/fixtures?id=`` → regulation (fulltime) score.
+
+    Polymarket soccer markets resolve on 90'+stoppage only; ET/penalties ignored.
+    """
+    entry = ensure_fixture_for_match_id(
+        af,
+        dqd_match_id,
+        cache=cache,
+        bridge_path=bridge_path,
+        snapshot_path=snapshot_path,
+        force_resolve=False,
+        cache_only=cache_only,
+    )
+    if not entry or not entry.get("af_fixture_id"):
+        err = fixture_miss_error(cache, dqd_match_id)
+        if cache_only and err == "af_fixture_not_cached":
+            err = "af_fixture_not_cached"
+        return {
+            "ok": False,
+            "dqd_match_id": str(dqd_match_id),
+            "af_fixture_id": None,
+            "fetched_at": iso_now(),
+            "goals": {"home": None, "away": None},
+            "finished": False,
+            "status_short": None,
+            "error": err,
+            "cache_only": cache_only,
+            "score_source": "score.fulltime",
+        }
+
+    fid = int(entry["af_fixture_id"])
+    to = 20.0 if http_timeout is None else max(0.5, float(http_timeout))
+    payload = af.get("/fixtures", {"id": fid}, timeout=to)
+    rows = payload.get("response") if payload.get("ok") else []
+    fx = rows[0] if isinstance(rows, list) and rows else None
+    reg = regulation_score_from_fixture(fx if isinstance(fx, dict) else None)
+    out: dict[str, Any] = {
+        "ok": bool(payload.get("ok")),
+        "dqd_match_id": str(dqd_match_id),
+        "af_fixture_id": fid,
+        "fetched_at": iso_now(),
+        "goals": reg["goals"],
+        "finished": bool(reg["finished"]),
+        "regulation_ready": bool(reg["regulation_ready"]),
+        "status_short": reg["status_short"],
+        "http_status": payload.get("http_status"),
+        "cache_entry": entry,
+        "cache_only": cache_only,
+        "score_source": "score.fulltime",
+        "burst_dir": None,
+    }
+    if not out["ok"]:
+        out["error"] = payload.get("errors") or "af_fixture_failed"
     return out
