@@ -103,12 +103,13 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--take-depth top\|walk` | `top` | Best level vs walk book |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 20 / 25 | Hard caps; **`.env` `QUOTE_MAX_*` wins**; per-ask tiers scale both together |
-| `QUOTE_SIZE_TIERS` | `0.93:20,…,1.01:1` | ask≤threshold → usdc (still buys ≥0.97, smaller) |
-| `QUOTE_MAX_OPEN_USDC` | 45 | Sum of open lot `usdc` budget |
+| `QUOTE_SIZE_TIERS` | `0.98:10` | ask≥threshold → usdc; below → `QUOTE_MAX_USDC` ($20) |
+| `QUOTE_MAX_OPEN_USDC` | 1000 | Sum of open lot `usdc` budget (effectively open) |
 | `QUOTE_SIZE_FLOOR_USDC` | 1 | Skip buy if effective usdc below floor |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
-| `--min-buy-price` | 0 | `buy_win` only when `best_ask ≥` this; `0` = off; below → skip + still write `trades.jsonl` |
+| `--min-buy-price` | 0.92 | `buy_win` only when `best_ask ≥` this; `0` = off; below → skip + still write `trades.jsonl` |
 | `--allow-extreme-prices` | off | Allow ≤0.01 / ≥0.99 |
+| `sell_lose` | off | Disabled at source — `LOSE` tokens skipped before `/books`; only `buy_win` |
 
 Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while posting FT fills. Flatten always uses the lot’s own `live` flag so a dry goal lot is never live-sold.
 

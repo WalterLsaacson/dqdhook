@@ -1,4 +1,4 @@
-"""Price-tiered buy size: scale max_usdc + max_shares together from ask."""
+"""Buy size from ask: binary high/low usdc, scale shares with usdc."""
 
 from __future__ import annotations
 
@@ -6,16 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# ask <= threshold → usdc cap (calibrated for ~$100 bankroll, hard max $20).
-DEFAULT_SIZE_TIERS: tuple[tuple[float, float], ...] = (
-    (0.93, 20.0),
-    (0.95, 15.0),
-    (0.96, 10.0),
-    (0.97, 7.0),
-    (0.98, 4.0),
-    (0.99, 2.0),
-    (1.01, 1.0),
-)
+# ask >= threshold → usdc; below all thresholds → hard max_usdc (default $20).
+DEFAULT_SIZE_TIERS: tuple[tuple[float, float], ...] = ((0.98, 10.0),)
 
 
 @dataclass(frozen=True)
@@ -41,7 +33,7 @@ class BuySizeCaps:
 
 
 def parse_size_tiers(raw: str | None) -> list[tuple[float, float]]:
-    """Parse ``0.93:20,0.95:15,...`` → sorted (max_ask, usdc) ascending by ask."""
+    """Parse ``0.98:10`` → sorted (min_ask, usdc); ask >= threshold uses usdc."""
     if raw is None or not str(raw).strip():
         return list(DEFAULT_SIZE_TIERS)
     out: list[tuple[float, float]] = []
@@ -73,13 +65,17 @@ def tier_max_usdc(
     *,
     fallback: float,
 ) -> float:
-    """First tier with ask <= threshold wins; else last tier / fallback."""
+    """Highest threshold with ask >= threshold wins; else ``fallback`` (low-ask size)."""
+    hard = float(fallback)
     if not tiers:
-        return float(fallback)
+        return hard
+    chosen: float | None = None
     for threshold, usdc in tiers:
-        if ask <= threshold + 1e-12:
-            return min(float(usdc), float(fallback))
-    return min(float(tiers[-1][1]), float(fallback))
+        if float(ask) + 1e-12 >= float(threshold):
+            chosen = float(usdc)
+    if chosen is None:
+        return hard
+    return min(chosen, hard)
 
 
 def scale_max_shares(

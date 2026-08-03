@@ -90,7 +90,7 @@ def load_trade_settings(
     max_shares: float | None = None,
     max_slippage: float = 0.03,
     allow_extreme_prices: bool = False,
-    min_buy_price: float = 0.0,
+    min_buy_price: float = 0.92,
     enabled: bool = True,
     env_file: str | Path | None = None,
     require_key: bool = False,
@@ -134,7 +134,7 @@ def load_trade_settings(
         hard_shares = 25.0
 
     tiers = parse_size_tiers(os.getenv("QUOTE_SIZE_TIERS"))
-    max_open = float(os.getenv("QUOTE_MAX_OPEN_USDC", "45") or 45)
+    max_open = float(os.getenv("QUOTE_MAX_OPEN_USDC", "1000") or 1000)
     floor_usdc = float(os.getenv("QUOTE_SIZE_FLOOR_USDC", "1") or 1)
 
     funder = os.getenv("FUNDER", "").strip() or None

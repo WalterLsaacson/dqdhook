@@ -1078,27 +1078,18 @@ def flag_misprice(
         return True, f"WIN buy ask={p} net={net:.4f} after fee={fee:.4f}", meta
 
     if settlement == "LOSE" and bid is not None:
+        # sell_lose disabled: only buy_win on settled WIN legs.
         p = float(bid)
-        if p <= 1e-12:
-            return False, "bid_zero", meta
-        # Sell the losing token into the bid; settles to 0 → keep the proceeds.
-        gross = p
-        fee = taker_fee_per_share(p, fee_rate)
-        net = gross - fee
         meta.update(
             {
                 "trade": "sell_lose",
                 "price": p,
-                "gross_edge": round(gross, 6),
-                "fee": round(fee, 6),
-                "net_edge": round(net, 6),
+                "gross_edge": None,
+                "fee": None,
+                "net_edge": None,
             }
         )
-        if net + 1e-12 < float(min_net):
-            return False, f"LOSE bid={p} net={net:.4f} < min_net={min_net} (fee={fee:.4f})", meta
-        if gross < float(eps):
-            return False, f"LOSE bid={p} gross<{eps}", meta
-        return True, f"LOSE sell bid={p} net={net:.4f} after fee={fee:.4f}", meta
+        return False, "sell_lose_disabled", meta
 
     return False, "", meta
 
@@ -1452,6 +1443,15 @@ def collect_target_tokens(
     return tokens, meta
 
 
+def tradeable_token_rows(token_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop settled LOSE legs before CLOB /books (sell_lose disabled)."""
+    return [
+        r
+        for r in token_rows
+        if str(r.get("settlement") or "").upper() != "LOSE"
+    ]
+
+
 def quote_tokens(
     token_rows: list[dict[str, Any]],
     *,
@@ -1465,8 +1465,14 @@ def quote_tokens(
     books: dict[str, dict[str, Any]] | None = None,
     trade_workers: int | None = None,
 ) -> list[dict[str, Any]]:
+    token_rows = tradeable_token_rows(token_rows)
     ids = [r["token_id"] for r in token_rows if r.get("token_id")]
-    book_map = books if books is not None else fetch_books(ids, proxy=proxy)
+    if books is not None:
+        book_map = books
+    elif ids:
+        book_map = fetch_books(ids, proxy=proxy)
+    else:
+        book_map = {}
     t0 = time.monotonic()
     priced: list[dict[str, Any]] = []
     trade_jobs: list[tuple[int, dict[str, Any]]] = []
@@ -1668,6 +1674,9 @@ def quote_bridge_event(
         mode=mode,
         market_cache=market_cache,
     )
+    n_before = len(tokens)
+    tokens = tradeable_token_rows(tokens)
+    discovery["skipped_lose_tokens"] = max(0, n_before - len(tokens))
     ek = event_key(ev)
     match_meta = {
         "match_id": ev.get("match_id") or (ctx.get("dongqiudi") or {}).get("id") or "",

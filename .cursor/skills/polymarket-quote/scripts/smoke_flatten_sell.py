@@ -12,12 +12,14 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from trade_executor import (  # noqa: E402
+    flatten_reason_append,
     flatten_sell_shares,
     flatten_sell_shares_available,
     floor_shares,
     gate_free_cap,
     gate_has_locked_inventory,
     is_not_enough_balance_error,
+    is_terminal_flatten_error,
     parse_balance_gate_error,
 )
 
@@ -27,6 +29,18 @@ def main() -> int:
     assert flatten_sell_shares(Decimal("3.333332")) == Decimal("3.29")
     assert flatten_sell_shares(Decimal("1.0")) == Decimal("0.99")
     assert flatten_sell_shares(Decimal("0.015")) == Decimal("0.01")
+
+    assert is_terminal_flatten_error("invalid maker amount")
+    assert is_terminal_flatten_error(
+        "PolyApiException[status_code=400, error_message={'error': 'invalid token id'}]"
+    )
+    assert not is_terminal_flatten_error("Request exception!")
+    # Append should not explode on repeated delayed-fill tags.
+    r = "ft_reversal_vs_entry ft=0-1"
+    for _ in range(50):
+        r = flatten_reason_append(r, "awaiting_delayed_fill")
+    assert r.count("awaiting_delayed_fill") == 1
+    assert len(r) < 200
 
     err = (
         "PolyApiException[status_code=400, error_message={'error': "
@@ -71,7 +85,7 @@ def main() -> int:
         == Decimal("0")
     )
 
-    print("ok: flatten sell haircut + balance-gate parse")
+    print("ok: flatten sell haircut + balance-gate parse + terminal/reason")
     return 0
 
 

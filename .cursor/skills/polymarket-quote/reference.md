@@ -61,7 +61,7 @@ Sports taker fee (2026): `fee = feeRate × p × (1 − p)` with default `feeRate
 | Trade | Gross | Net |
 |---|---|---|
 | Buy WIN at ask `p` | `1 − p` | `gross − fee(p)` |
-| Sell LOSE into bid `p` | `p` | `gross − fee(p)` |
+| Sell LOSE into bid `p` | — | **disabled** (not traded) |
 
 Only rows with **`net_edge ≥ min_net`** (default **0.02** USDC/share) go to `opportunities.jsonl`.  
 Quotes still record all tokens; dust / fee-insufficient edges stay out of oppo.  
@@ -83,15 +83,17 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 
 **Take depth**
 
-| `--take-depth` | Buy WIN | Sell LOSE |
-|---|---|---|
-| `top` (default) | Only best ask size / price; FAK | Only best bid; needs position |
-| `walk` | Accumulate `asks_top` until max_levels / max_usdc / max_shares / slippage; FAK | Walk `bids_top` downward; FAK |
+| `--take-depth` | Buy WIN |
+|---|---|
+| `top` (default) | Only best ask size / price; FAK |
+| `walk` | Accumulate `asks_top` until max_levels / max_usdc / max_shares / slippage; FAK |
+
+`sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 
 Price guard: skip when best ≤0.01 or ≥0.99 unless `--allow-extreme-prices`.  
-`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0** = off). Env: `QUOTE_MIN_BUY_PRICE`.
+`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.92**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`.
 
-**Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 20/25). Per-ask tier `QUOTE_SIZE_TIERS=0.93:20,0.95:15,…` picks an effective usdc; **shares scale with that usdc** (`eff_shares = min(max_shares * eff/hard, eff/ask)`). Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default 45). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1). High asks (0.97+) still buy — just smaller.  
+**Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 20/25). `QUOTE_SIZE_TIERS=0.98:10` means **ask ≥ 0.98 → $10**, else **$20** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1).  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  
 SDK: `py-clob-client-v2` (see `requirements-trade.txt`). Env: `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAIN_ID`, `CLOB_HOST`.
 

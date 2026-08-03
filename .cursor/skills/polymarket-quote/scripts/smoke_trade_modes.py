@@ -33,8 +33,8 @@ def _settings(*, goals: bool, ft: bool) -> TradeSettings:
         min_buy_price=0.0,
         min_order_shares=0.0,
         enabled=True,
-        size_tiers=((0.93, 20.0), (0.95, 15.0), (0.96, 10.0), (0.97, 7.0), (0.98, 4.0), (0.99, 2.0), (1.01, 1.0)),
-        max_open_usdc=45.0,
+        size_tiers=((0.98, 10.0),),
+        max_open_usdc=1000.0,
         size_floor_usdc=1.0,
     )
 
@@ -83,7 +83,7 @@ def main() -> int:
         env_file="/dev/null",
     )
     assert s.live_goals is False and s.live_ft is True and s.live is True
-    assert s.min_buy_price == 0.0
+    assert s.min_buy_price == 0.92
 
     s2 = load_trade_settings(
         live=False,
@@ -110,7 +110,7 @@ def main() -> int:
         ["watch", "--goals-mode", "dry", "--ft-mode", "live", "--no-upstream"]
     )
     assert ns.goals_mode == "dry" and ns.ft_mode == "live" and not ns.live
-    assert ns.min_buy_price == 0.0
+    assert ns.min_buy_price == 0.92
     ns2 = p.parse_args(["watch", "--live", "--no-upstream"])
     assert ns2.live and ns2.goals_mode is None and ns2.ft_mode is None
     ns3 = p.parse_args(["watch", "--min-buy-price", "0.75", "--no-upstream"])
@@ -119,7 +119,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "data" / "pm-quote").mkdir(parents=True)
-        # default floor off: any ask allowed
+        # floor off (0): any ask allowed
         ex = TradeExecutor(root, _settings(goals=False, ft=True))
         assert ex._min_buy_price_blocked(0.05) is None
         assert ex._min_buy_price_blocked(0.79) is None
@@ -130,6 +130,11 @@ def main() -> int:
         assert ex._min_buy_price_blocked(0.79) is not None
         assert ex._min_buy_price_blocked(0.8) is None
         assert "buy_price_below_min" in (ex._min_buy_price_blocked(0.5) or "")
+        # 0.92 floor blocks last night's cheap legs
+        ex.settings = replace(ex.settings, min_buy_price=0.92)
+        assert ex._min_buy_price_blocked(0.83) is not None
+        assert ex._min_buy_price_blocked(0.92) is None
+        assert ex._min_buy_price_blocked(0.97) is None
 
     print("ok: split goals/ft trade modes")
     return 0

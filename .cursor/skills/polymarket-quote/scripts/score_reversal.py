@@ -412,7 +412,7 @@ class OpenPositionLedger:
                 and str(r.get("token_id")) == tid
             ):
                 r["pending_flatten"] = True
-                r["pending_reason"] = reason
+                r["pending_reason"] = str(reason or "")[:500]
                 r["flatten_attempts"] = int(r.get("flatten_attempts") or 0) + 1
                 changed = True
         if changed:

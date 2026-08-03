@@ -43,8 +43,14 @@ FLATTEN_DUMP_MIN_PRICE = Decimal("0.01")
 FLATTEN_SELL_HAIRCUT = Decimal("0.99")
 # Live bal vs gate bal: within this → trust gate "free"; else size from live only.
 FLATTEN_GATE_BAL_EPS = Decimal("0.02")
+# Hard stop: zombie pending_flatten loops (resolved markets / never-filled buys).
+FLATTEN_MAX_ATTEMPTS = 60
+# Delayed buy never shows balance → abandon (don't retry forever).
+FLATTEN_DELAYED_FILL_MAX_ATTEMPTS = 30
+# Keep pending_reason bounded (append loops used to grow to 80KB+).
+FLATTEN_REASON_MAX_LEN = 400
 _TERMINAL_FLATTEN_ERR_RE = re.compile(
-    r"invalid\s+maker\s+amount|invalid\s+amounts",
+    r"invalid\s+maker\s+amount|invalid\s+amounts|invalid\s+token\s+id",
     re.IGNORECASE,
 )
 _BALANCE_GATE_RE = re.compile(
@@ -177,6 +183,24 @@ def is_terminal_flatten_error(err: str | Exception | None) -> bool:
     if err is None:
         return False
     return bool(_TERMINAL_FLATTEN_ERR_RE.search(str(err)))
+
+
+def flatten_reason_append(base: str, *parts: str) -> str:
+    """Join reason fragments without unbounded growth from retry appends."""
+    chunks: list[str] = []
+    for p in (base, *parts):
+        s = str(p or "").strip()
+        if not s:
+            continue
+        # Drop repeated awaiting_delayed_fill / balance_gate_partial spam.
+        if chunks and s in ("awaiting_delayed_fill", "balance_gate_partial"):
+            if chunks[-1] == s or chunks[-1].endswith("|" + s):
+                continue
+        chunks.append(s)
+    out = "|".join(chunks)
+    if len(out) <= FLATTEN_REASON_MAX_LEN:
+        return out
+    return out[: FLATTEN_REASON_MAX_LEN - 3] + "..."
 
 
 def signal_from_event_key(event_key: str) -> str:
@@ -484,7 +508,7 @@ class TradeExecutor:
         return None
 
     def _min_buy_price_blocked(self, price: float | None) -> str | None:
-        """buy_win: require best_ask >= min_buy_price (default 0=off)."""
+        """buy_win: require best_ask >= min_buy_price (default 0.92; 0=off)."""
         floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
         if floor <= 0 or price is None:
             return None
@@ -617,35 +641,20 @@ class TradeExecutor:
 
         available: float | None = None
         if trade == "sell_lose":
-            available = self._position_shares(token_id)
-            if available is None:
-                row = self._record(
-                    quote,
-                    event_key=event_key,
-                    match_meta=match_meta,
-                    plan=None,
-                    status="skipped",
-                    skip_reason="no_position_query",
-                    response=None,
-                    success=False,
-                    idempotency_key=key,
-                    live=channel_live,
-                )
-                return row
-            if available <= 0:
-                row = self._record(
-                    quote,
-                    event_key=event_key,
-                    match_meta=match_meta,
-                    plan=None,
-                    status="skipped",
-                    skip_reason="no_position",
-                    response=None,
-                    success=False,
-                    idempotency_key=key,
-                    live=channel_live,
-                )
-                return row
+            row = self._record(
+                quote,
+                event_key=event_key,
+                match_meta=match_meta,
+                plan=None,
+                status="skipped",
+                skip_reason="sell_lose_disabled",
+                response=None,
+                success=False,
+                idempotency_key=key,
+                live=channel_live,
+            )
+            self._done.add(key)
+            return row
 
         max_usdc = float(self.settings.max_usdc)
         max_shares = float(self.settings.max_shares)
@@ -1106,14 +1115,23 @@ class TradeExecutor:
             mid = str(lot.get("match_id") or "")
             tid = str(lot.get("token_id") or "")
             reason = str(lot.get("pending_reason") or "retry_pending_flatten")
-            # Stop looping terminal CLOB amount errors left in the ledger.
+            attempts = int(lot.get("flatten_attempts") or 0)
+            # Stop looping terminal CLOB errors left in the ledger.
+            # Delayed-fill timeout is handled inside _flatten_lot after a live
+            # balance check (so late credits still get sold).
+            give_up = ""
             if is_terminal_flatten_error(reason):
+                give_up = "terminal_flatten_error"
+            elif attempts >= FLATTEN_MAX_ATTEMPTS:
+                give_up = f"max_attempts={attempts}"
+            if give_up:
                 self.ledger.mark_closed(
-                    tid, mid, reason="terminal_flatten_error|" + reason[:180]
+                    tid, mid, reason=flatten_reason_append(give_up, reason)
                 )
+                self._buy_blocked_matches.discard(mid)
                 alert = (
                     f"ALERT flatten_give_up match={mid} token={tid[:12]}… "
-                    f"terminal prior error — stopped retry"
+                    f"{give_up} — stopped retry"
                 )
                 logger.error(alert)
                 print(alert, flush=True)
@@ -1121,20 +1139,20 @@ class TradeExecutor:
                     {
                         "quoted_at": lib.now_cn_iso(),
                         "status": "flatten_abandoned",
-                        "skip_reason": reason[:300],
+                        "skip_reason": flatten_reason_append(give_up, reason),
                         "trade": "flatten_reversal",
                         "match_id": mid,
                         "token_id": tid,
                     }
                 )
                 continue
-            ek = f"flatten_retry|{mid}|{lib.now_cn_iso()}|{reason}"
+            ek = f"flatten_retry|{mid}|{lib.now_cn_iso()}|{reason[:80]}"
             logger.error(
                 "ALERT flatten_retry match=%s token=%s… attempt=%s reason=%s",
                 mid,
                 tid[:12],
-                lot.get("flatten_attempts"),
-                reason,
+                attempts,
+                reason[:200],
             )
             out.append(
                 self._flatten_lot(
@@ -1257,11 +1275,38 @@ class TradeExecutor:
                 # see dust while locks may remain, keep pending (Bodø case).
                 if bal <= 0:
                     if lot.get("fill_status") == FILL_STATUS_PENDING:
+                        attempts = int(lot.get("flatten_attempts") or 0)
+                        if attempts >= FLATTEN_DELAYED_FILL_MAX_ATTEMPTS:
+                            close_r = flatten_reason_append(
+                                reason, "delayed_fill_never_appeared", f"attempts={attempts}"
+                            )
+                            row = self._record(
+                                quote_stub,
+                                event_key=event_key,
+                                match_meta=meta,
+                                plan=None,
+                                status="flatten_abandoned",
+                                skip_reason="delayed_fill_never_appeared",
+                                response=None,
+                                success=False,
+                                idempotency_key=key,
+                                live=True,
+                            )
+                            self._flatten_done.add(key)
+                            self.ledger.mark_closed(token_id, mid, reason=close_r)
+                            self._buy_blocked_matches.discard(mid)
+                            alert = (
+                                f"ALERT flatten_give_up match={mid} token={token_id[:12]}… "
+                                f"delayed fill never appeared after {attempts} attempts"
+                            )
+                            logger.error(alert)
+                            print(alert, flush=True)
+                            return row
                         # Delayed fill not yet visible — keep pending; don't zombie-close.
                         self.ledger.mark_pending_flatten(
                             token_id,
                             mid,
-                            reason=f"{reason}|awaiting_delayed_fill",
+                            reason=flatten_reason_append(reason, "awaiting_delayed_fill"),
                         )
                         self._buy_blocked_matches.add(mid)
                         row = self._record(
@@ -1298,7 +1343,9 @@ class TradeExecutor:
                     self.ledger.mark_pending_flatten(
                         token_id,
                         mid,
-                        reason=f"{reason}|unsellable_bal={bal:.6f}|floor={shares}",
+                        reason=flatten_reason_append(
+                            reason, f"unsellable_bal={bal:.6f}", f"floor={shares}"
+                        ),
                     )
                     alert = (
                         f"ALERT flatten_unsellable match={mid} token={token_id[:12]}… "
@@ -1442,7 +1489,16 @@ class TradeExecutor:
                 )
                 logger.error(alert)
                 print(alert, flush=True)
-                self.ledger.mark_pending_flatten(token_id, mid, reason=reason)
+                self.ledger.mark_pending_flatten(
+                    token_id,
+                    mid,
+                    reason=flatten_reason_append(
+                        reason,
+                        f"incomplete residual={float(residual):.4f}"
+                        if residual >= 0
+                        else "incomplete",
+                    ),
+                )
             return row
         except Exception as e:  # noqa: BLE001
             if is_not_enough_balance_error(e):
@@ -1469,11 +1525,15 @@ class TradeExecutor:
             if terminal:
                 self._flatten_done.add(key)
                 self.ledger.mark_closed(
-                    token_id, mid, reason=f"{reason}|terminal|{e}"[:240]
+                    token_id,
+                    mid,
+                    reason=flatten_reason_append(reason, "terminal", str(e)),
                 )
             else:
                 self.ledger.mark_pending_flatten(
-                    token_id, mid, reason=f"{reason}|err={e}"
+                    token_id,
+                    mid,
+                    reason=flatten_reason_append(reason, f"err={e}"),
                 )
             return self._record(
                 quote_stub,
@@ -1585,7 +1645,11 @@ class TradeExecutor:
                     live=True,
                 )
             self.ledger.mark_pending_flatten(
-                token_id, mid, reason=f"{reason}|err={err}|free<{FLATTEN_MIN_SHARES}"
+                token_id,
+                mid,
+                reason=flatten_reason_append(
+                    reason, f"err={err}", f"free<{FLATTEN_MIN_SHARES}"
+                ),
             )
             return self._record(
                 quote_stub,
@@ -1668,11 +1732,15 @@ class TradeExecutor:
         if fully_flat:
             self._flatten_done.add(key)
             self.ledger.mark_closed(
-                token_id, mid, reason=f"{reason}|balance_gate_retry"
+                token_id,
+                mid,
+                reason=flatten_reason_append(reason, "balance_gate_retry"),
             )
         else:
             self.ledger.mark_pending_flatten(
-                token_id, mid, reason=f"{reason}|balance_gate_partial"
+                token_id,
+                mid,
+                reason=flatten_reason_append(reason, "balance_gate_partial"),
             )
         return row
 

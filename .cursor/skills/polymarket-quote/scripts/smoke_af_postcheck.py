@@ -62,8 +62,8 @@ def _settings() -> TradeSettings:
         min_buy_price=0.01,
         min_order_shares=0.0,
         enabled=True,
-        size_tiers=((0.93, 20.0), (0.95, 15.0), (0.96, 10.0), (0.97, 7.0), (0.98, 4.0), (0.99, 2.0), (1.01, 1.0)),
-        max_open_usdc=45.0,
+        size_tiers=((0.98, 10.0),),
+        max_open_usdc=1000.0,
         size_floor_usdc=1.0,
     )
 

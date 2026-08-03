@@ -101,7 +101,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         max_shares=float(getattr(args, "max_shares", 25.0)),
         max_slippage=float(getattr(args, "max_slippage", 0.03)),
         allow_extreme_prices=bool(getattr(args, "allow_extreme_prices", False)),
-        min_buy_price=float(getattr(args, "min_buy_price", 0.0)),
+        min_buy_price=float(getattr(args, "min_buy_price", 0.92)),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
         require_key=bool(live_goals or live_ft),
@@ -115,7 +115,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         af_timeout_s=timeout,
     )
     # Plan: initialize ClobClient once at watch/start when trading is on (reuse).
-    # Also needed in dry-run so sell_lose can query position.
+    # Position client still used for flatten / open-lot balance checks.
     if settings.private_key:
         try:
             executor.ensure_trader()
@@ -497,8 +497,8 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--min-buy-price",
         type=float,
-        default=0.0,
-        help="buy_win: skip (still log trades.jsonl) when best_ask < this (default 0=off)",
+        default=0.92,
+        help="buy_win: skip (still log trades.jsonl) when best_ask < this (default 0.92; 0=off)",
     )
     sp.add_argument(
         "--trade-env-file",
