@@ -185,4 +185,15 @@ LEAGUE_ALIASES: dict[str, str] = {
     "爱沙甲": "est1",
     "est1": "est1",
     "meistriliiga": "est1",
+    # --- Leagues Cup / Faroe / UWCL (PM codes vs DQD shorts) ---
+    "北美联杯": "lec",
+    "lec": "lec",
+    "leagues cup": "lec",
+    "法罗超": "fro1",
+    "fro1": "fro1",
+    "faroe islands premier": "fro1",
+    "女足欧冠": "uwcl",
+    "uwcl": "uwcl",
+    "uefa women champions league": "uwcl",
+    "uwcl women": "uwcl",
 }

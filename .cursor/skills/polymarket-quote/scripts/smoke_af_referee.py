@@ -284,6 +284,7 @@ def test_confirm_check_times() -> None:
     check("short no past timeout", all(c <= 2.5 + 1e-9 for c in short), str(short))
     label = ref.schedule_label()
     check("label mentions 5s→2s→60s→5s→90s", "5s→every 2s→60s→every 5s→90s" == label, label)
+    check("default AF min interval is free-plan safe", abs(ref.af_min_interval_s() - 6.5) < 1e-9, str(ref.af_min_interval_s()))
 
 
 def test_transient_network_retry() -> None:

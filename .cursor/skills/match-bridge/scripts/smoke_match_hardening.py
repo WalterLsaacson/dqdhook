@@ -132,6 +132,65 @@ def main() -> int:
     kept = bl.filter_fresh_pm_matches([stale, fresh], stale_hours=6, now=now)
     _assert(len(kept) == 1 and kept[0]["home"] == "C", f"stale filter failed: {kept}")
 
+    # League aliases: LEC / Faroe / UWCL
+    _assert(bl.normalize_league("北美联杯") == "lec", "北美联杯→lec")
+    _assert(bl.normalize_league("LEC", "lec") == "lec", "LEC→lec")
+    _assert(bl.normalize_league("法罗超") == "fro1", "法罗超→fro1")
+    _assert(bl.normalize_league("女足欧冠") == "uwcl", "女足欧冠→uwcl")
+
+    # Team aliases that were blocking PM↔DQD
+    _assert(bl.normalize_team("OB") == bl.normalize_team("Odense BK"), "OB↔Odense")
+    _assert(bl.normalize_team("Seinajoen JK") == bl.normalize_team("SJK Seinäjoki"), "SJK")
+    _assert(
+        bl.normalize_team("LDU Quito")
+        == bl.normalize_team("Liga Dep Universitaria Quito"),
+        "LDU",
+    )
+    _assert(
+        bl.normalize_team("Qairat FK") == bl.normalize_team("FC Kairat Almaty"),
+        "Qairat↔Kairat",
+    )
+    _assert(bl.team_similarity("HB Torshavn", "HB") >= 0.92, "HB Torshavn")
+    _assert(bl.team_similarity("NSI Runavik", "NSÍ") >= 0.92, "NSI")
+
+    lec_dqd = {
+        "home": "Cincinnati",
+        "away": "Pachuca",
+        "league": "北美联杯",
+        "local_date": "2026-08-05",
+        "time": "07:45",
+    }
+    lec_pm = {
+        "home": "FC Cincinnati",
+        "away": "CF Pachuca",
+        "league": "LEC",
+        "league_id": "lec",
+        "kickoff_beijing": "2026-08-05 07:30",
+        "local_date": "2026-08-05",
+        "time": "07:30",
+    }
+    s_lec = bl.score_pair(lec_dqd, lec_pm)
+    _assert(s_lec >= bl.DEFAULT_MIN_SCORE, f"LEC Cincinnati should match, got {s_lec}")
+
+    den_dqd = {
+        "home": "OB",
+        "away": "Sönderjyske",
+        "league": "丹超",
+        "local_date": "2026-08-04",
+        "time": "01:00",
+    }
+    den_pm = {
+        "home": "Odense BK",
+        "away": "Sønderjyske Fodbold",
+        "league": "DEN",
+        "league_id": "den",
+        "kickoff_beijing": "2026-08-04 01:00",
+        "local_date": "2026-08-04",
+        "time": "01:00",
+    }
+    s_den = bl.score_pair(den_dqd, den_pm)
+    _assert(s_den >= bl.DEFAULT_MIN_SCORE, f"OB/Odense should match, got {s_den}")
+
     print("smoke_match_hardening: ok")
     return 0
 

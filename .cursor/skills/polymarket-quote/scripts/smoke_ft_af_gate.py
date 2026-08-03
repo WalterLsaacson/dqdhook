@@ -237,11 +237,120 @@ def test_stale_skip_in_pipeline() -> None:
         )
 
 
+def _goal_ev(
+    *,
+    match_id: str = "m_goal",
+    prev: tuple[int, int] = (0, 0),
+    curr: tuple[int, int] = (1, 0),
+    ts: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "score_change",
+        "ts": ts or datetime.now(TZ_CN).isoformat(timespec="seconds"),
+        "match_id": match_id,
+        "home": "Home FC",
+        "away": "Away FC",
+        "prev": {"home": prev[0], "away": prev[1]},
+        "curr": {"home": curr[0], "away": curr[1]},
+        "home_score": curr[0],
+        "away_score": curr[1],
+        "is_goal": True,
+        "polymarket": {"event_id": "1", "slug": "x", "url": "", "condition_ids": [], "market_refs": []},
+    }
+
+
+def test_goal_stale_skips_af() -> None:
+    print("test_goal_stale_skips_af")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        (root / "data" / "bridge" / "matches.json").write_text('{"matches":[]}', encoding="utf-8")
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+        old_ts = (datetime.now(TZ_CN) - timedelta(hours=4)).isoformat(timespec="seconds")
+        submitted: list[str] = []
+
+        class _StubRef:
+            def pending_event_keys(self) -> set[str]:
+                return set()
+
+            def drain_done(self) -> list:
+                return []
+
+            def submit(self, event_key: str, ev: dict, target: tuple, **kwargs: Any) -> bool:
+                submitted.append(event_key)
+                return True
+
+        bundles = lib.process_bridge_events(
+            root,
+            events_override=[_goal_ev(match_id="m_old_g", ts=old_ts)],
+            af_referee=_StubRef(),  # type: ignore[arg-type]
+            af_mode="gate",
+            trade_executor=None,
+        )
+        check("no AF submit for stale goal", submitted == [], str(submitted))
+        check(
+            "pipeline marks af_goal_stale",
+            any(b.get("mode") == "af_goal_stale" for b in bundles if isinstance(b, dict)),
+            str([b.get("mode") for b in bundles]),
+        )
+
+
+def test_events_offset_clamps_on_shrink() -> None:
+    """data_prune shrink must not rewind cursor and replay retained events."""
+    print("test_events_offset_clamps_on_shrink")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        bridge = root / "data" / "bridge"
+        bridge.mkdir(parents=True)
+        path = bridge / "events.jsonl"
+        line1 = (
+            '{"type":"score_change","ts":"2026-08-02T10:00:00+08:00",'
+            '"match_id":"1","prev":{"home":0,"away":0},"curr":{"home":1,"away":0},'
+            '"home_score":1,"away_score":0,"is_goal":true}\n'
+        )
+        line2 = (
+            '{"type":"score_change","ts":"2026-08-02T11:00:00+08:00",'
+            '"match_id":"2","prev":{"home":0,"away":0},"curr":{"home":1,"away":0},'
+            '"home_score":1,"away_score":0,"is_goal":true}\n'
+        )
+        path.write_text(line1 + line2, encoding="utf-8")
+        full = path.stat().st_size
+        rows, off = lib.load_bridge_quote_events(root, byte_offset=0)
+        check("initial read both events", len(rows) == 2 and off == full, f"{len(rows)} off={off}")
+
+        # Simulate prune: drop first line, file shrinks below prior EOF offset.
+        path.write_text(line2, encoding="utf-8")
+        new_size = path.stat().st_size
+        check("file shrank", new_size < full and new_size > 0)
+        rows2, off2 = lib.load_bridge_quote_events(root, byte_offset=full)
+        check(
+            "shrink clamps to EOF with no replay",
+            rows2 == [] and off2 == new_size,
+            f"rows={len(rows2)} off={off2} size={new_size}",
+        )
+        # New append after prune still visible from clamped offset.
+        line3 = (
+            '{"type":"match_finished","ts":"2026-08-02T12:00:00+08:00",'
+            '"match_id":"3","home_score":1,"away_score":0}\n'
+        )
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line3)
+        rows3, off3 = lib.load_bridge_quote_events(root, byte_offset=off2)
+        check(
+            "append after clamp is readable",
+            len(rows3) == 1 and rows3[0].get("match_id") == "3" and off3 == path.stat().st_size,
+            str(rows3),
+        )
+
+
 def main() -> int:
     test_ft_stale_and_helpers()
     test_ft_mismatch_and_confirm()
     test_ft_confirm_quotes_regulation()
     test_stale_skip_in_pipeline()
+    test_goal_stale_skips_af()
+    test_events_offset_clamps_on_shrink()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

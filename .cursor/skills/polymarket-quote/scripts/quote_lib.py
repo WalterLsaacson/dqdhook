@@ -1125,7 +1125,11 @@ def load_bridge_quote_events(
     """Load score_change + match_finished events for quoting.
 
     When ``byte_offset`` is set, only read new bytes from that position (fast path).
-    Returns ``(events, new_offset)``. On truncate/rotate, rewinds to 0.
+    Returns ``(events, new_offset)``.
+
+    If the file shrank (data_prune rewrite) so ``byte_offset > size``, clamp to
+    EOF and return no events — do **not** rewind to 0. A rewind would replay
+    every retained score_change into AF referee and burn API quota.
     """
     path = bridge_dir(root) / "events.jsonl"
     rows: list[dict[str, Any]] = []
@@ -1136,8 +1140,11 @@ def load_bridge_quote_events(
     except OSError:
         return rows, 0
     start = int(byte_offset or 0)
-    if start < 0 or start > size:
+    if start < 0:
         start = 0
+    if start > size:
+        # Prune/truncate removed a prefix we already consumed — stay caught up.
+        return rows, size
     try:
         with path.open("rb") as f:
             if start:
@@ -2337,6 +2344,7 @@ def process_bridge_events(
             from af_referee import (
                 event_is_goal_up,
                 event_is_reversal,
+                ft_event_is_stale,
                 target_score_from_event,
             )
 
@@ -2369,6 +2377,37 @@ def process_bridge_events(
                     }
                     bundles.append(skip)
                     seen.add(key)
+                    continue
+
+                # Same age gate as FT: historical goals after prune/cursor reset
+                # must not open AF confirm jobs (was burning API-Football quota).
+                stale, age = ft_event_is_stale(ev)
+                if stale:
+                    skip = {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "af_goal_stale",
+                        "event_key": key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": target[0],
+                        "away_score": target[1],
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "af_referee": {
+                            "skipped": True,
+                            "reason": "goal_stale",
+                            "age_s": age,
+                        },
+                    }
+                    bundles.append(skip)
+                    seen.add(key)
+                    print(
+                        f"af-gate → SKIP stale goal match_id={mid} "
+                        f"age_s={age} key={key}",
+                        flush=True,
+                    )
                     continue
 
                 if mode == "postcheck":

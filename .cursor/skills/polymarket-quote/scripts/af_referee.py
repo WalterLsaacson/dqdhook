@@ -38,13 +38,15 @@ DEFAULT_PERIOD_S = 2.0  # early period (alias for early_period_s)
 DEFAULT_LATE_AFTER_S = 60.0
 DEFAULT_LATE_PERIOD_S = 5.0
 # Shared AFClient spacing across referee workers (avoid stampede / 429).
-DEFAULT_AF_MIN_INTERVAL_S = 0.35
+# Default to the same Free-plan throttle used by apifootball-bridge watch.
+DEFAULT_AF_MIN_INTERVAL_S = 6.5
 # Soft coalesce: reuse last good poll for same DQD id within this window.
 _POLL_COALESCE_S = 1.0
 # match_finished older than this → skip (restart replay / late DQD).
 DEFAULT_FT_MAX_AGE_S = 15 * 60.0
 # Env override for FT freshness.
 _FT_MAX_AGE_ENV = "QUOTE_FT_MAX_AGE_S"
+_AF_MIN_INTERVAL_ENV = "QUOTE_AF_MIN_INTERVAL_S"
 
 _AF_SCRIPTS = Path(__file__).resolve().parents[2] / "apifootball-bridge" / "scripts"
 _af_sp = str(_AF_SCRIPTS)
@@ -63,6 +65,18 @@ _POLL_CACHE_LOCK = threading.Lock()
 
 def iso_now() -> str:
     return datetime.now(TZ_CN).isoformat(timespec="seconds")
+
+
+def af_min_interval_s() -> float:
+    import os
+
+    raw = os.getenv(_AF_MIN_INTERVAL_ENV)
+    if raw is None or str(raw).strip() == "":
+        return float(DEFAULT_AF_MIN_INTERVAL_S)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_AF_MIN_INTERVAL_S)
 
 
 def confirmed_scores_path(root: Path) -> Path:
@@ -550,7 +564,7 @@ class AfReferee:
         if self._af is None:
             key = aflib.load_af_key(self.env_path)
             # Shared spacing across workers; 429 still backs off in await_score.
-            self._af = aflib.AFClient(key, min_interval_s=DEFAULT_AF_MIN_INTERVAL_S)
+            self._af = aflib.AFClient(key, min_interval_s=af_min_interval_s())
         return self._af
 
     def _reload_fixture_cache(self) -> dict[str, Any]:
