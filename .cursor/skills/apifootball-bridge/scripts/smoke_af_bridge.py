@@ -116,31 +116,118 @@ def test_cache_hit_miss_and_ttl() -> None:
         "matched_at": "2026-07-30T12:00:00+08:00",
         "matches": [_bridge_match("54528347", "Arsenal", "Chelsea", ko)],
     }
-    cache = lib.empty_cache()
-    cache = lib.sync_fixture_cache(af, cache=cache, bridge_snap=bridge_snap)
-    check("resolved on miss", "54528347" in cache["entries"] and cache["entries"]["54528347"]["af_fixture_id"] == 1546417)
-    check("stats resolved", (cache.get("last_sync_stats") or {}).get("resolved") == 1)
-    calls_after_miss = len(af.calls)
+    with tempfile.TemporaryDirectory() as td:
+        date_dir = Path(td) / "dates"
+        cache = lib.empty_cache()
+        cache = lib.sync_fixture_cache(
+            af, cache=cache, bridge_snap=bridge_snap, date_cache_dir=date_dir
+        )
+        check("resolved on miss", "54528347" in cache["entries"] and cache["entries"]["54528347"]["af_fixture_id"] == 1546417)
+        check("stats resolved", (cache.get("last_sync_stats") or {}).get("resolved") == 1)
+        check(
+            "date fetches recorded",
+            int((cache.get("last_sync_stats") or {}).get("date_fetches") or 0) >= 1,
+            str(cache.get("last_sync_stats")),
+        )
+        calls_after_miss = len(af.calls)
 
-    # Cache hit: no new AF date fetches needed for this match
-    cache2 = lib.sync_fixture_cache(af, cache=cache, bridge_snap=bridge_snap)
-    check("cache hit keeps id", cache2["entries"]["54528347"]["af_fixture_id"] == 1546417)
-    check("cache hit no extra date calls", len([c for c in af.calls[calls_after_miss:] if c[0] == "/fixtures" and "date" in (c[1] or {})]) == 0)
+        # Cache hit: no new AF date fetches needed for this match
+        cache2 = lib.sync_fixture_cache(
+            af, cache=cache, bridge_snap=bridge_snap, date_cache_dir=date_dir
+        )
+        check("cache hit keeps id", cache2["entries"]["54528347"]["af_fixture_id"] == 1546417)
+        check("cache hit no extra date calls", len([c for c in af.calls[calls_after_miss:] if c[0] == "/fixtures" and "date" in (c[1] or {})]) == 0)
 
-    # Unresolved TTL skip
-    bad_ko = datetime(2026, 7, 30, 21, 0, tzinfo=TZ_CN)
-    bridge_bad = {
-        "matched_at": "2026-07-30T12:01:00+08:00",
-        "matches": [_bridge_match("999", "NoSuch FC", "Ghost United", bad_ko)],
+        # Unresolved TTL skip
+        bad_ko = datetime(2026, 7, 30, 21, 0, tzinfo=TZ_CN)
+        bridge_bad = {
+            "matched_at": "2026-07-30T12:01:00+08:00",
+            "matches": [_bridge_match("999", "NoSuch FC", "Ghost United", bad_ko)],
+        }
+        af2 = FakeAF({bad_ko.date().isoformat(): [fx]})
+        cache_u = lib.empty_cache()
+        cache_u = lib.sync_fixture_cache(
+            af2, cache=cache_u, bridge_snap=bridge_bad, date_cache_dir=date_dir
+        )
+        check("unresolved recorded", "999" in cache_u["unresolved"])
+        calls_u = len(af2.calls)
+        cache_u2 = lib.sync_fixture_cache(
+            af2, cache=cache_u, bridge_snap=bridge_bad, date_cache_dir=date_dir
+        )
+        check("unresolved TTL skips AF", len(af2.calls) == calls_u, f"calls grew {calls_u}->{len(af2.calls)}")
+        check("still unresolved", "999" in cache_u2["unresolved"])
+
+
+def test_date_fixtures_disk_cache() -> None:
+    """Second unresolved match on the same kickoff day must reuse date blobs."""
+    print("test_date_fixtures_disk_cache")
+    ko = datetime(2026, 7, 30, 20, 0, tzinfo=TZ_CN)
+    d0 = ko.date()
+    dates = {
+        (d0 - timedelta(days=1)).isoformat(): [],
+        d0.isoformat(): [
+            _make_fx(1001, "Arsenal", "Chelsea", ko),
+            _make_fx(1002, "Liverpool", "Everton", ko + timedelta(minutes=30)),
+        ],
+        (d0 + timedelta(days=1)).isoformat(): [],
     }
-    af2 = FakeAF({bad_ko.date().isoformat(): [fx]})
-    cache_u = lib.empty_cache()
-    cache_u = lib.sync_fixture_cache(af2, cache=cache_u, bridge_snap=bridge_bad)
-    check("unresolved recorded", "999" in cache_u["unresolved"])
-    calls_u = len(af2.calls)
-    cache_u2 = lib.sync_fixture_cache(af2, cache=cache_u, bridge_snap=bridge_bad)
-    check("unresolved TTL skips AF", len(af2.calls) == calls_u, f"calls grew {calls_u}->{len(af2.calls)}")
-    check("still unresolved", "999" in cache_u2["unresolved"])
+    af = FakeAF(dates)
+    with tempfile.TemporaryDirectory() as td:
+        date_dir = Path(td) / "dates"
+        # First match → fetch ±1 dates once
+        snap1 = {
+            "matched_at": "2026-07-30T12:00:00+08:00",
+            "matches": [_bridge_match("m1", "Arsenal", "Chelsea", ko)],
+        }
+        cache = lib.sync_fixture_cache(
+            af,
+            cache=lib.empty_cache(),
+            bridge_snap=snap1,
+            date_cache_dir=date_dir,
+        )
+        date_calls_1 = [c for c in af.calls if c[0] == "/fixtures" and "date" in (c[1] or {})]
+        check("first resolve date calls", len(date_calls_1) == 3, str(date_calls_1))
+        check("m1 mapped", cache["entries"]["m1"]["af_fixture_id"] == 1001)
+        check(
+            "day file written",
+            (date_dir / f"{d0.isoformat()}.json").is_file(),
+        )
+        n_calls = len(af.calls)
+
+        # Drop DQD→AF entry but keep date cache; new match same day → no AF date=
+        cache["entries"].pop("m1", None)
+        snap2 = {
+            "matched_at": "2026-07-30T12:05:00+08:00",
+            "matches": [_bridge_match("m2", "Liverpool", "Everton", ko + timedelta(minutes=30))],
+        }
+        cache2 = lib.sync_fixture_cache(
+            af,
+            cache=cache,
+            bridge_snap=snap2,
+            date_cache_dir=date_dir,
+        )
+        date_calls_2 = [
+            c
+            for c in af.calls[n_calls:]
+            if c[0] == "/fixtures" and "date" in (c[1] or {})
+        ]
+        check("second resolve uses date cache", date_calls_2 == [], str(date_calls_2))
+        check("m2 mapped from cache", cache2["entries"]["m2"]["af_fixture_id"] == 1002)
+        st = cache2.get("last_sync_stats") or {}
+        check("date_cache_hits > 0", int(st.get("date_cache_hits") or 0) >= 1, str(st))
+        check("date_fetches == 0", int(st.get("date_fetches") or 0) == 0, str(st))
+
+        # force_refresh bypasses disk
+        n3 = len(af.calls)
+        lib.sync_fixture_cache(
+            af,
+            cache=lib.empty_cache(),
+            bridge_snap=snap2,
+            date_cache_dir=date_dir,
+            force_date_refresh=True,
+        )
+        forced = [c for c in af.calls[n3:] if c[0] == "/fixtures" and "date" in (c[1] or {})]
+        check("force_refresh re-fetches dates", len(forced) == 3, str(forced))
 
 
 def test_events_burst_layout() -> None:
@@ -244,6 +331,7 @@ def test_events_resolve_on_miss() -> None:
             bridge_path=bridge_path,
             bursts_dir=root / "bursts",
             burst_index=root / "index.jsonl",
+            date_cache_dir=root / "dates",
         )
         check("resolve then events", out.get("ok") is True and out.get("af_fixture_id") == 777)
         check("cache updated", cache["entries"]["111"]["af_fixture_id"] == 777)
@@ -385,6 +473,7 @@ def test_regulation_score_ignores_et_pen() -> None:
 
 def main() -> int:
     test_cache_hit_miss_and_ttl()
+    test_date_fixtures_disk_cache()
     test_events_burst_layout()
     test_events_resolve_on_miss()
     test_events_cache_only_no_resolve()

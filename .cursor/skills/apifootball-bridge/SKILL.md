@@ -32,7 +32,7 @@ python3 .cursor/skills/apifootball-bridge/scripts/af_bridge.py list --json
 python3 .cursor/skills/apifootball-bridge/scripts/af_bridge.py status --json
 ```
 
-Defaults: Free-plan AF spacing **6.5s** (`--free-plan` on). Mapping cache: `data/apifootball/fixture_cache.json`. Events artifacts share the latency probe tree: `data/dqd-probe/af-latency/bursts/`.
+Defaults: Free-plan AF spacing **6.5s** (`--free-plan` on). Mapping cache: `data/apifootball/fixture_cache.json`. Per-day AF schedule cache: `data/apifootball/date_fixtures/{YYYY-MM-DD}.json` (avoids repeat `GET /fixtures?date=`). Events artifacts share the latency probe tree: `data/dqd-probe/af-latency/bursts/`.
 
 `events` path: **cache lookup → one** `GET /fixtures/events` (fixture id already cached by sync/watch).  
 Quote referee always uses **cache_only** (no on-demand resolve); mapping is owned by sync/watch only.
@@ -49,6 +49,7 @@ Quote referee always uses **cache_only** (no on-demand resolve); mapping is owne
 |---|---|---|
 | Bridge input | `data/bridge/matches.json` | Source of DQD↔PM pairs to map |
 | Fixture cache | `data/apifootball/fixture_cache.json` | DQD id → AF fixture_id |
+| Date fixtures | `data/apifootball/date_fixtures/{date}.json` | Cached `GET /fixtures?date=` blobs |
 | Events CLI | `events --match-id … --json` stdout | On-demand AF events for consumers |
 | Events disk | `data/dqd-probe/af-latency/bursts/{id}_{ts}/` | Same layout as latency bursts |
 | Burst index | `data/dqd-probe/af-latency/burst_index.jsonl` | Append `kind=events_request` |

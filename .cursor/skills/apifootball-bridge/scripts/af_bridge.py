@@ -50,6 +50,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         max_skew_min=int(args.max_skew_min),
         unresolved_ttl_h=float(args.unresolved_ttl_h),
         prune_h=float(args.prune_h),
+        date_cache_dir=Path(args.date_fixtures_dir),
+        force_date_refresh=bool(args.refresh_dates),
     )
     lib.save_cache(cache_path, cache)
     out = {
@@ -97,6 +99,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 max_skew_min=int(args.max_skew_min),
                 unresolved_ttl_h=float(args.unresolved_ttl_h),
                 prune_h=float(args.prune_h),
+                date_cache_dir=Path(args.date_fixtures_dir),
+                force_date_refresh=bool(args.refresh_dates),
             )
             lib.save_cache(cache_path, cache)
             last_fp = fp
@@ -223,6 +227,16 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-skew-min", type=int, default=lib.DEFAULT_MAX_SKEW_MIN)
     p.add_argument("--unresolved-ttl-h", type=float, default=lib.UNRESOLVED_TTL_H)
     p.add_argument("--prune-h", type=float, default=lib.ENTRY_PRUNE_H)
+    p.add_argument(
+        "--date-fixtures-dir",
+        default=str(lib.DEFAULT_DATE_FIXTURES_DIR),
+        help="Per-day AF /fixtures?date= cache directory",
+    )
+    p.add_argument(
+        "--refresh-dates",
+        action="store_true",
+        help="Ignore per-day date fixtures cache and re-fetch from AF",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

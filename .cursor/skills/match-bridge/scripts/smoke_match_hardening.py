@@ -132,11 +132,13 @@ def main() -> int:
     kept = bl.filter_fresh_pm_matches([stale, fresh], stale_hours=6, now=now)
     _assert(len(kept) == 1 and kept[0]["home"] == "C", f"stale filter failed: {kept}")
 
-    # League aliases: LEC / Faroe / UWCL
+    # League aliases: LEC / Faroe / UWCL / ASEAN
     _assert(bl.normalize_league("北美联杯") == "lec", "北美联杯→lec")
     _assert(bl.normalize_league("LEC", "lec") == "lec", "LEC→lec")
     _assert(bl.normalize_league("法罗超") == "fro1", "法罗超→fro1")
     _assert(bl.normalize_league("女足欧冠") == "uwcl", "女足欧冠→uwcl")
+    _assert(bl.normalize_league("东南锦") == "asean", "东南锦→asean")
+    _assert(bl.normalize_league("ASEAN") == "asean", "ASEAN→asean")
 
     # Team aliases that were blocking PM↔DQD
     _assert(bl.normalize_team("OB") == bl.normalize_team("Odense BK"), "OB↔Odense")
@@ -152,7 +154,85 @@ def main() -> int:
     )
     _assert(bl.team_similarity("HB Torshavn", "HB") >= 0.92, "HB Torshavn")
     _assert(bl.team_similarity("NSI Runavik", "NSÍ") >= 0.92, "NSI")
+    _assert(
+        bl.normalize_team("Inter Milano")
+        == bl.normalize_team("Internazionale"),
+        "Inter Milano",
+    )
+    _assert(
+        bl.normalize_team("Heart of Midlothian LFC")
+        == bl.normalize_team("Hearts (w)"),
+        "Hearts W",
+    )
+    _assert(
+        bl.normalize_team("ZHFK Sisters")
+        == bl.normalize_team("SeaSters Odessa Women"),
+        "SeaSters",
+    )
+    _assert(
+        bl.normalize_team("GV CD San José")
+        == bl.normalize_team("Gualberto Villarroel Deportivo San José"),
+        "GV San José",
+    )
+    _assert(
+        bl.normalize_team("CD La Equidad Seguros")
+        == bl.normalize_team("Internacional de Bogota"),
+        "La Equidad",
+    )
 
+    # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
+    _assert(
+        bl.sides_are_swapped(
+            "BG Pathum United",
+            "Aston Villa",
+            "Aston Villa",
+            "BG Pathum United",
+        ),
+        "Villa/Pathum sides swapped",
+    )
+    oh, oa = bl.orient_scores(
+        "BG Pathum United",
+        "Aston Villa",
+        1,
+        3,
+        "Aston Villa",
+        "BG Pathum United",
+    )
+    _assert((oh, oa) == (3, 1), f"orient Pathum-home 1-3 → Villa-home got {oh}-{oa}")
+
+    prev_scores: dict = {"m_flip": {"home": 1, "away": 2}}
+    paired = [
+        {
+            "dongqiudi": {
+                "id": "m_flip",
+                "home": "BG Pathum United",
+                "away": "Aston Villa",
+                "home_score": 1,
+                "away_score": 3,
+                "status": "Playing",
+                "status_raw": "Playing",
+                "official_clock": "90'",
+            },
+            "polymarket": {
+                "home": "Aston Villa",
+                "away": "BG Pathum United",
+                "event_id": "1",
+                "slug": "x",
+            },
+            "kickoff_beijing": "2026-08-04 21:00",
+        }
+    ]
+    evs = bl.detect_score_changes(paired, prev_scores)
+    _assert(len(evs) == 1, f"expected 1 score_change, got {len(evs)}")
+    _assert(evs[0]["home"] == "Aston Villa", "event home is PM")
+    _assert(
+        (evs[0]["home_score"], evs[0]["away_score"]) == (3, 1),
+        f"PM-oriented score got {evs[0]['home_score']}-{evs[0]['away_score']}",
+    )
+    _assert(
+        evs[0]["prev"] == {"home": 2, "away": 1},
+        f"prev also oriented, got {evs[0]['prev']}",
+    )
     lec_dqd = {
         "home": "Cincinnati",
         "away": "Pachuca",

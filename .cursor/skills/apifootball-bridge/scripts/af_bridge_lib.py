@@ -39,6 +39,7 @@ TZ_CN = timezone(timedelta(hours=8))
 AF_BASE = "https://v3.football.api-sports.io"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_CACHE_PATH = REPO_ROOT / "data" / "apifootball" / "fixture_cache.json"
+DEFAULT_DATE_FIXTURES_DIR = REPO_ROOT / "data" / "apifootball" / "date_fixtures"
 DEFAULT_BRIDGE_MATCHES = REPO_ROOT / "data" / "bridge" / "matches.json"
 DEFAULT_DQD_SNAPSHOT = REPO_ROOT / "data" / "snapshot.json"
 DEFAULT_BURSTS_DIR = REPO_ROOT / "data" / "dqd-probe" / "af-latency" / "bursts"
@@ -46,6 +47,8 @@ DEFAULT_BURST_INDEX = REPO_ROOT / "data" / "dqd-probe" / "af-latency" / "burst_i
 
 UNRESOLVED_TTL_H = 6.0
 ENTRY_PRUNE_H = 24.0
+# Keep per-day AF /fixtures?date= blobs this many calendar days around today.
+DATE_FIXTURES_RETAIN_DAYS = 14
 DEFAULT_MIN_NAME = 0.75
 DEFAULT_MAX_SKEW_MIN = 120
 FREE_PLAN_MIN_INTERVAL_S = 6.5
@@ -299,21 +302,109 @@ def fixture_dates_for_dqd(dqd: dict[str, Any]) -> list[str]:
     return [d.isoformat() for d in days]
 
 
-def fetch_fixtures_for_dates(af: AFClient, dates: list[str]) -> tuple[list[dict[str, Any]], bool]:
-    """Fetch fixtures for dates. Returns (fixtures, any_ok).
+def date_fixtures_path(date: str, *, cache_dir: Path | None = None) -> Path:
+    root = cache_dir or DEFAULT_DATE_FIXTURES_DIR
+    # YYYY-MM-DD only — reject path tricks.
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)):
+        raise ValueError(f"invalid fixture date key: {date!r}")
+    return root / f"{date}.json"
 
-    If every date call fails (network / rate limit), any_ok is False so callers
-    should not mark matches as unresolved.
+
+def load_date_fixtures(
+    date: str,
+    *,
+    cache_dir: Path | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return cached AF fixtures for a calendar date, or None if missing."""
+    try:
+        path = date_fixtures_path(date, cache_dir=cache_dir)
+    except ValueError:
+        return None
+    raw = read_json(path, None)
+    if not isinstance(raw, dict):
+        return None
+    rows = raw.get("fixtures")
+    if not isinstance(rows, list):
+        return None
+    return [fx for fx in rows if isinstance(fx, dict)]
+
+
+def save_date_fixtures(
+    date: str,
+    fixtures: list[dict[str, Any]],
+    *,
+    cache_dir: Path | None = None,
+) -> Path:
+    path = date_fixtures_path(date, cache_dir=cache_dir)
+    write_json(
+        path,
+        {
+            "date": date,
+            "fetched_at": iso_now(),
+            "count": len(fixtures),
+            "fixtures": fixtures,
+        },
+    )
+    return path
+
+
+def prune_date_fixtures(
+    *,
+    cache_dir: Path | None = None,
+    retain_days: int = DATE_FIXTURES_RETAIN_DAYS,
+    now: datetime | None = None,
+) -> int:
+    """Drop per-day fixture files outside today±retain_days. Returns removed count."""
+    root = cache_dir or DEFAULT_DATE_FIXTURES_DIR
+    if not root.is_dir():
+        return 0
+    today = (now or now_cn()).astimezone(TZ_CN).date()
+    keep = retain_days if retain_days > 0 else DATE_FIXTURES_RETAIN_DAYS
+    removed = 0
+    for path in root.glob("*.json"):
+        key = path.stem
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
+            continue
+        try:
+            d = datetime.strptime(key, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if abs((d - today).days) > keep:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def fetch_fixtures_for_dates(
+    af: AFClient,
+    dates: list[str],
+    *,
+    cache_dir: Path | None = None,
+    force_refresh: bool = False,
+    stats: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Load fixtures for dates (disk cache first). Returns (fixtures, any_ok).
+
+    Once a calendar day has been fetched successfully, later resolves reuse the
+    local blob and do **not** call ``GET /fixtures?date=`` again (unless
+    ``force_refresh``).
+
+    If every needed date misses cache **and** every AF call fails, ``any_ok`` is
+    False so callers should not mark matches as unresolved.
     """
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
     any_ok = False
-    for date in dates:
-        payload = af.get("/fixtures", {"date": date})
-        if not payload.get("ok"):
-            continue
+    date_dir = cache_dir or DEFAULT_DATE_FIXTURES_DIR
+    hits = fetches = fails = 0
+
+    def _absorb(rows: list[dict[str, Any]]) -> None:
+        nonlocal any_ok
         any_ok = True
-        for fx in payload.get("response") or []:
+        for fx in rows:
             if not isinstance(fx, dict):
                 continue
             fid = int((fx.get("fixture") or {}).get("id") or 0)
@@ -321,6 +412,31 @@ def fetch_fixtures_for_dates(af: AFClient, dates: list[str]) -> tuple[list[dict[
                 continue
             seen.add(fid)
             out.append(fx)
+
+    for date in dates:
+        if not force_refresh:
+            cached = load_date_fixtures(date, cache_dir=date_dir)
+            if cached is not None:
+                hits += 1
+                _absorb(cached)
+                continue
+        payload = af.get("/fixtures", {"date": date})
+        if not payload.get("ok"):
+            fails += 1
+            continue
+        rows = [fx for fx in (payload.get("response") or []) if isinstance(fx, dict)]
+        try:
+            save_date_fixtures(date, rows, cache_dir=date_dir)
+        except ValueError:
+            pass
+        fetches += 1
+        _absorb(rows)
+
+    if stats is not None:
+        stats["date_cache_hits"] = int(stats.get("date_cache_hits") or 0) + hits
+        stats["date_fetches"] = int(stats.get("date_fetches") or 0) + fetches
+        stats["date_fetch_fails"] = int(stats.get("date_fetch_fails") or 0) + fails
+
     return out, any_ok
 
 
@@ -331,11 +447,16 @@ def resolve_af_fixture(
     fixtures: list[dict[str, Any]] | None = None,
     min_name: float = DEFAULT_MIN_NAME,
     max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
+    date_cache_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     if fixtures is not None:
         pool = fixtures
     else:
-        pool, _ok = fetch_fixtures_for_dates(af, fixture_dates_for_dqd(dqd))
+        pool, _ok = fetch_fixtures_for_dates(
+            af,
+            fixture_dates_for_dqd(dqd),
+            cache_dir=date_cache_dir,
+        )
     best: tuple[float, float, int, dict[str, Any]] | None = None
     for fx in pool:
         scored = score_af_candidate(dqd, fx, min_name=min_name, max_skew_min=max_skew_min)
@@ -390,6 +511,8 @@ def sync_fixture_cache(
     max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
     unresolved_ttl_h: float = UNRESOLVED_TTL_H,
     prune_h: float = ENTRY_PRUNE_H,
+    date_cache_dir: Path | None = None,
+    force_date_refresh: bool = False,
 ) -> dict[str, Any]:
     """Cache-first sync of bridge matches onto AF fixtures. Mutates and returns cache."""
     now = now_cn()
@@ -398,6 +521,7 @@ def sync_fixture_cache(
     matches = [m for m in (bridge_snap.get("matches") or []) if isinstance(m, dict)]
     bridge_matched_at = bridge_snap.get("matched_at")
     seen_ids: set[str] = set()
+    date_dir = date_cache_dir or DEFAULT_DATE_FIXTURES_DIR
 
     need_resolve: list[dict[str, Any]] = []
     stats = {
@@ -408,6 +532,10 @@ def sync_fixture_cache(
         "skipped_ttl": 0,
         "af_fetch_failed": 0,
         "pruned": 0,
+        "date_cache_hits": 0,
+        "date_fetches": 0,
+        "date_fetch_fails": 0,
+        "date_pruned": 0,
     }
 
     for row in matches:
@@ -442,7 +570,13 @@ def sync_fixture_cache(
         dates: set[str] = set()
         for dqd in need_resolve:
             dates.update(fixture_dates_for_dqd(dqd))
-        fixtures_pool, fetch_ok = fetch_fixtures_for_dates(af, sorted(dates))
+        fixtures_pool, fetch_ok = fetch_fixtures_for_dates(
+            af,
+            sorted(dates),
+            cache_dir=date_dir,
+            force_refresh=force_date_refresh,
+            stats=stats,
+        )
         if not fetch_ok:
             stats["af_fetch_failed"] = len(need_resolve)
             # Do not burn unresolved TTL on transport / rate-limit failures
@@ -456,6 +590,7 @@ def sync_fixture_cache(
             fixtures=fixtures_pool,
             min_name=min_name,
             max_skew_min=max_skew_min,
+            date_cache_dir=date_dir,
         )
         if hit:
             hit["last_bridge_matched_at"] = bridge_matched_at or iso_now()
@@ -486,6 +621,8 @@ def sync_fixture_cache(
             entries.pop(mid, None)
             stats["pruned"] += 1
 
+    stats["date_pruned"] = prune_date_fixtures(cache_dir=date_dir, now=now)
+
     cache["entries"] = entries
     cache["unresolved"] = unresolved
     cache["last_sync_at"] = iso_now()
@@ -515,6 +652,7 @@ def ensure_fixture_for_match_id(
     unresolved_ttl_h: float = UNRESOLVED_TTL_H,
     force_resolve: bool = False,
     cache_only: bool = False,
+    date_cache_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     """Return cache entry for dqd_id.
 
@@ -545,7 +683,13 @@ def ensure_fixture_for_match_id(
     if not dqd:
         return None
 
-    hit = resolve_af_fixture(af, dqd, min_name=min_name, max_skew_min=max_skew_min)
+    hit = resolve_af_fixture(
+        af,
+        dqd,
+        min_name=min_name,
+        max_skew_min=max_skew_min,
+        date_cache_dir=date_cache_dir or DEFAULT_DATE_FIXTURES_DIR,
+    )
     if not hit:
         unresolved = dict(cache.get("unresolved") or {})
         unresolved[mid] = {
@@ -782,6 +926,7 @@ def fetch_events_for_match_id(
     persist_burst: bool = True,
     cache_only: bool = False,
     http_timeout: float | None = None,
+    date_cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Cache lookup → one AF /fixtures/events call.
 
@@ -798,6 +943,7 @@ def fetch_events_for_match_id(
         snapshot_path=snapshot_path,
         force_resolve=force_resolve,
         cache_only=cache_only,
+        date_cache_dir=date_cache_dir,
     )
     if persist_cache and not cache_only:
         save_cache(cache_path, cache)

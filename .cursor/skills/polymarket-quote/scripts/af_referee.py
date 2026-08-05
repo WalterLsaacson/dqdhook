@@ -8,9 +8,11 @@ never resolves DQD→AF fixtures on the quote hot path. Cache miss / unresolved
 
 Score confirmation polls ``fetch_events_for_match_id(..., cache_only=True)`` on
 a tiered schedule: **5s → every 2s until 60s → every 5s until 90s** (override
-with ``--af-poll`` for a fixed interval). Confirmations run on a thread pool so
-watch stays responsive; on confirm, burst + ``af_confirmed_scores.json``
-persist asynchronously.
+with ``--af-poll`` for a fixed interval). That cadence is the contract: the
+referee does **not** insert a multi-second shared throttle between schedule
+ticks (optional ``QUOTE_AF_MIN_INTERVAL_S`` is per-worker only). Confirmations
+run on a thread pool so watch stays responsive; on confirm, burst +
+``af_confirmed_scores.json`` persist asynchronously.
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ TZ_CN = timezone(timedelta(hours=8))
 # Legacy fixed-interval default (tests / --af-poll override).
 DEFAULT_POLL_S = 0.5
 DEFAULT_TIMEOUT_S = 90.0
-DEFAULT_WORKERS = 4
+# Enough parallel confirms so new goals are not queued behind 90s jobs.
+DEFAULT_WORKERS = 8
 
 # Confirm schedule (production default):
 #   first look at 5s → every 2s until 60s → every 5s until timeout (90s).
@@ -37,9 +40,10 @@ DEFAULT_FIRST_DELAY_S = 5.0
 DEFAULT_PERIOD_S = 2.0  # early period (alias for early_period_s)
 DEFAULT_LATE_AFTER_S = 60.0
 DEFAULT_LATE_PERIOD_S = 5.0
-# Shared AFClient spacing across referee workers (avoid stampede / 429).
-# Default to the same Free-plan throttle used by apifootball-bridge watch.
-DEFAULT_AF_MIN_INTERVAL_S = 6.5
+# Per-worker AFClient spacing only (default off). A shared 6.5s throttle used
+# to destroy the 2s schedule when several confirms ran at once — do not restore
+# that as the default. Set QUOTE_AF_MIN_INTERVAL_S if you need free-plan pacing.
+DEFAULT_AF_MIN_INTERVAL_S = 0.0
 # Soft coalesce: reuse last good poll for same DQD id within this window.
 _POLL_COALESCE_S = 1.0
 # match_finished older than this → skip (restart replay / late DQD).
@@ -55,6 +59,13 @@ if _af_sp not in sys.path:
 
 import af_bridge_lib as aflib  # noqa: E402
 
+_BRIDGE_SCRIPTS = Path(__file__).resolve().parents[2] / "match-bridge" / "scripts"
+_br_sp = str(_BRIDGE_SCRIPTS)
+if _br_sp not in sys.path:
+    sys.path.insert(0, _br_sp)
+
+import bridge_lib as bridge  # noqa: E402
+
 # Process-local confirmed scores (disk is async / best-effort).
 _MEMORY_SCORES: dict[str, tuple[int, int]] = {}
 _MEMORY_LOCK = threading.Lock()
@@ -66,6 +77,29 @@ _POLL_CACHE_LOCK = threading.Lock()
 def iso_now() -> str:
     return datetime.now(TZ_CN).isoformat(timespec="seconds")
 
+
+def orient_af_goals_to_event(
+    goals_home: Any,
+    goals_away: Any,
+    *,
+    af_home: str,
+    af_away: str,
+    event_home: str,
+    event_away: str,
+) -> tuple[Any, Any]:
+    """Map AF fixture-frame goals onto event (usually Polymarket) home/away."""
+    if goals_home is None or goals_away is None:
+        return goals_home, goals_away
+    if not af_home or not event_home:
+        return goals_home, goals_away
+    return bridge.orient_scores(
+        af_home,
+        af_away,
+        goals_home,
+        goals_away,
+        event_home,
+        event_away,
+    )
 
 def af_min_interval_s() -> float:
     import os
@@ -496,6 +530,23 @@ def confirm_check_times(
     return out
 
 
+def advance_schedule_index(
+    check_at: list[float], check_i: int, elapsed: float
+) -> int:
+    """Collapse missed ticks to the latest overdue slot.
+
+    If a prior HTTP call ran long, skip intermediate checkpoints so the next
+    wait targets the following *future* cadence point instead of stampeding
+    every skipped GET.
+    """
+    n = len(check_at)
+    if check_i >= n:
+        return check_i
+    while check_i + 1 < n and check_at[check_i + 1] <= elapsed + 1e-9:
+        check_i += 1
+    return check_i
+
+
 def schedule_label(
     *,
     first_delay_s: float = DEFAULT_FIRST_DELAY_S,
@@ -530,7 +581,7 @@ class AfReferee:
     ) -> None:
         self.root = Path(root)
         self.poll_s = max(0.05, float(poll_s))
-        self.timeout_s = max(1.0, float(timeout_s))
+        self.timeout_s = max(0.05, float(timeout_s))
         self.poll_schedule = bool(poll_schedule)
         self.first_delay_s = max(0.0, float(first_delay_s))
         self.period_s = max(0.05, float(period_s))
@@ -538,7 +589,8 @@ class AfReferee:
         self.late_period_s = max(0.05, float(late_period_s))
         self.env_path = env_path
         self._events_fn = events_fn
-        self._af: aflib.AFClient | None = None
+        self._af_key: str | None = None
+        self._tls = threading.local()
         self._cache: dict[str, Any] | None = None
         self._cache_mtime: float | None = None
         self._exec = ThreadPoolExecutor(
@@ -561,11 +613,15 @@ class AfReferee:
         return f"fixed {self.poll_s}s"
 
     def _client(self) -> aflib.AFClient:
-        if self._af is None:
-            key = aflib.load_af_key(self.env_path)
-            # Shared spacing across workers; 429 still backs off in await_score.
-            self._af = aflib.AFClient(key, min_interval_s=af_min_interval_s())
-        return self._af
+        # Per-worker client so optional QUOTE_AF_MIN_INTERVAL_S does not serialize
+        # unrelated confirms onto one global 2s+ queue (that broke the schedule).
+        af = getattr(self._tls, "af", None)
+        if af is None:
+            if self._af_key is None:
+                self._af_key = aflib.load_af_key(self.env_path)
+            af = aflib.AFClient(self._af_key, min_interval_s=af_min_interval_s())
+            self._tls.af = af
+        return af
 
     def _reload_fixture_cache(self) -> dict[str, Any]:
         """Re-read fixture_cache.json when AF watch/sync updates it on disk."""
@@ -699,6 +755,8 @@ class AfReferee:
         poll_s: float | None = None,
         timeout_s: float | None = None,
         wait_cache: bool = False,
+        event_home: str = "",
+        event_away: str = "",
     ) -> dict[str, Any]:
         """Block until AF confirms target (or AF already covers it) / timeout.
 
@@ -713,9 +771,13 @@ class AfReferee:
 
         Default poll schedule: 5s → every 2s until 60s → every 5s until timeout
         (override with ``poll_schedule=False`` + ``poll_s`` for fixed interval).
+
+        ``event_home`` / ``event_away``: consumer-facing sides (PM labels on the
+        bridge event). AF goals are remapped from fixture home/away into this
+        frame before compare/apply.
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
-        timeout = self.timeout_s if timeout_s is None else max(1.0, float(timeout_s))
+        timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
         th, ta = int(target[0]), int(target[1])
         # Prefer persisted AF truth as baseline when present.
         stored = get_confirmed_score(self.root, str(match_id))
@@ -788,6 +850,12 @@ class AfReferee:
         check_i = 0
 
         while check_i < len(check_at):
+            elapsed = time.monotonic() - t0
+            if elapsed >= timeout:
+                break
+            check_i = advance_schedule_index(check_at, check_i, elapsed)
+            if check_i >= len(check_at):
+                break
             target_at = check_at[check_i]
             # Sleep until this check's wall time (from confirm start).
             while True:
@@ -881,9 +949,18 @@ class AfReferee:
 
             if last.get("ok"):
                 goals = last.get("goals") or {}
-                last_goals = {"home": goals.get("home"), "away": goals.get("away")}
+                ent = aflib.cached_fixture_entry(self._fixture_cache(), mid) or {}
+                gh_o, ga_o = orient_af_goals_to_event(
+                    goals.get("home"),
+                    goals.get("away"),
+                    af_home=str(ent.get("af_home") or ""),
+                    af_away=str(ent.get("af_away") or ""),
+                    event_home=event_home,
+                    event_away=event_away,
+                )
+                last_goals = {"home": gh_o, "away": ga_o}
                 try:
-                    gh, ga = goals.get("home"), goals.get("away")
+                    gh, ga = gh_o, ga_o
                     if gh is not None and ga is not None:
                         ok, truth = af_score_satisfies(
                             (int(gh), int(ga)), (th, ta), baseline=base
@@ -966,15 +1043,18 @@ class AfReferee:
         poll_s: float | None = None,
         timeout_s: float | None = None,
         wait_cache: bool = True,
+        event_home: str = "",
+        event_away: str = "",
     ) -> dict[str, Any]:
         """Block until AF regulation fulltime equals DQD FT target (exact).
 
         Uses ``score.fulltime`` only (ET/penalties ignored — Polymarket rule).
         When AF fixture is finished with a different regulation score → immediate
         mismatch (no trade). When not finished yet → keep polling until timeout.
+        Remaps AF fixture-frame goals into ``event_home``/``event_away`` before compare.
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
-        timeout = self.timeout_s if timeout_s is None else max(1.0, float(timeout_s))
+        timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
         th, ta = int(target[0]), int(target[1])
         mid = str(match_id)
         self._reload_fixture_cache()
@@ -1033,6 +1113,12 @@ class AfReferee:
         check_i = 0
 
         while check_i < len(check_at):
+            elapsed = time.monotonic() - t0
+            if elapsed >= timeout:
+                break
+            check_i = advance_schedule_index(check_at, check_i, elapsed)
+            if check_i >= len(check_at):
+                break
             target_at = check_at[check_i]
             while True:
                 elapsed = time.monotonic() - t0
@@ -1112,7 +1198,16 @@ class AfReferee:
             retry_hits = 0
             if last.get("ok"):
                 goals = last.get("goals") or {}
-                last_goals = {"home": goals.get("home"), "away": goals.get("away")}
+                ent = aflib.cached_fixture_entry(self._fixture_cache(), mid) or {}
+                gh_o, ga_o = orient_af_goals_to_event(
+                    goals.get("home"),
+                    goals.get("away"),
+                    af_home=str(ent.get("af_home") or ""),
+                    af_away=str(ent.get("af_away") or ""),
+                    event_home=event_home,
+                    event_away=event_away,
+                )
+                last_goals = {"home": gh_o, "away": ga_o}
                 last_finished = bool(last.get("finished"))
                 # Prefer explicit flag; fall back for test doubles that only set finished.
                 last_ready = bool(
@@ -1124,7 +1219,7 @@ class AfReferee:
                     str(last.get("status_short") or "") or None
                 )
                 try:
-                    gh, ga = goals.get("home"), goals.get("away")
+                    gh, ga = gh_o, ga_o
                     if gh is not None and ga is not None and last_ready:
                         if af_ft_score_matches((int(gh), int(ga)), (th, ta)):
                             fid = last.get("af_fixture_id")
@@ -1239,12 +1334,16 @@ class AfReferee:
                 return False
             stored = get_confirmed_score(self.root, mid)
             baseline = stored if stored is not None else baseline_score_from_event(ev)
+            ev_home = str(ev.get("home") or "")
+            ev_away = str(ev.get("away") or "")
             if job_kind == "ft":
                 fut = self._exec.submit(
                     self.await_ft_score,
                     mid,
                     target,
                     wait_cache=bool(wait_cache),
+                    event_home=ev_home,
+                    event_away=ev_away,
                 )
             else:
                 fut = self._exec.submit(
@@ -1253,6 +1352,8 @@ class AfReferee:
                     target,
                     baseline=baseline,
                     wait_cache=bool(wait_cache),
+                    event_home=ev_home,
+                    event_away=ev_away,
                 )
             self._pending[event_key] = fut
             self._meta[event_key] = {

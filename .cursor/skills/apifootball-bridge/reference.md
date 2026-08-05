@@ -13,10 +13,12 @@ For each bridge row with Dongqiudi `id`:
 
 1. **Cache hit** — `fixture_cache.json` `entries[id].af_fixture_id` set → reuse; refresh bridge metadata timestamps
 2. **Unresolved TTL** — if `unresolved[id].tried_at` within **6h**, skip AF call
-3. **Resolve** — `GET /fixtures?date=` for kickoff Beijing day and ±1 calendar day; score candidates with:
+3. **Resolve** — load `GET /fixtures?date=` for kickoff Beijing day and ±1 calendar day from **per-day disk cache** (`data/apifootball/date_fixtures/{YYYY-MM-DD}.json`); only call AF when that day is missing. Then score candidates with:
    - team name similarity (via match-bridge `team_similarity`) average ≥ **0.75** (direct or swapped)
    - kickoff skew ≤ **120** minutes (`match_timestamp` / AF `fixture.timestamp`)
 4. Best score wins; write `entries[id]` or `unresolved[id]`
+
+Days already fetched are **not** re-requested. Force with CLI `--refresh-dates`. Old day files outside today±14d are pruned on sync.
 
 ## Cache schema
 

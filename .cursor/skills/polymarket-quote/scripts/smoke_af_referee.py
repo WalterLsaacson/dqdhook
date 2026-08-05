@@ -284,7 +284,80 @@ def test_confirm_check_times() -> None:
     check("short no past timeout", all(c <= 2.5 + 1e-9 for c in short), str(short))
     label = ref.schedule_label()
     check("label mentions 5s→2s→60s→5s→90s", "5s→every 2s→60s→every 5s→90s" == label, label)
-    check("default AF min interval is free-plan safe", abs(ref.af_min_interval_s() - 6.5) < 1e-9, str(ref.af_min_interval_s()))
+    check(
+        "default AF min interval off (schedule-first)",
+        abs(ref.af_min_interval_s() - 0.0) < 1e-9,
+        str(ref.af_min_interval_s()),
+    )
+    # Missed ticks collapse to latest overdue, then resume future cadence.
+    checks = [5.0, 7.0, 9.0, 11.0, 13.0]
+    check("advance at t=5 stays 0", ref.advance_schedule_index(checks, 0, 5.0) == 0)
+    check("advance at t=8 → slot 7", ref.advance_schedule_index(checks, 0, 8.0) == 1)
+    check("advance at t=12 → slot 11", ref.advance_schedule_index(checks, 0, 12.0) == 3)
+    check("advance from mid index", ref.advance_schedule_index(checks, 2, 12.0) == 3)
+
+
+def test_schedule_cadence_wall_times() -> None:
+    """Polls land on the tiered checkpoints (not a shared min-interval queue)."""
+    print("test_schedule_cadence_wall_times")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        hits: list[float] = []
+        t_start = {"v": 0.0}
+
+        def events_fn(_mid: str, persist_burst: bool = False, **_k: Any) -> dict[str, Any]:
+            hits.append(time.monotonic() - t_start["v"])
+            return {
+                "ok": True,
+                "goals": {"home": 0, "away": 0},
+                "af_fixture_id": 1,
+            }
+
+        referee = ref.AfReferee(
+            root,
+            timeout_s=0.45,
+            events_fn=events_fn,
+            poll_schedule=True,
+            first_delay_s=0.05,
+            period_s=0.08,
+            late_after_s=0.25,
+            late_period_s=0.1,
+            max_workers=2,
+        )
+        expect = ref.confirm_check_times(
+            0.45,
+            first_delay_s=0.05,
+            period_s=0.08,
+            late_after_s=0.25,
+            late_period_s=0.1,
+        )
+        t_start["v"] = time.monotonic()
+        out = referee.await_score("m1", (1, 0), baseline=(0, 0), wait_cache=True)
+        check("timed out (score never matches)", not out.get("confirmed"), str(out))
+        # Ignore any overrun past the inclusive timeout tick (scheduler may
+        # finish one in-flight GET slightly after deadline).
+        in_window = [h for h in hits if h <= 0.45 + 0.05]
+        check(
+            "polled near every checkpoint",
+            len(in_window) >= max(1, len(expect) - 1),
+            f"hits={in_window} expect={expect} raw={hits}",
+        )
+        for h in in_window:
+            nearest = min(abs(h - e) for e in expect)
+            check(
+                f"hit {h:.3f}s near a tick",
+                nearest < 0.08,
+                f"nearest={nearest:.3f} expect={expect}",
+            )
+            if nearest >= 0.08:
+                break
+        gaps = [in_window[i + 1] - in_window[i] for i in range(len(in_window) - 1)]
+        check("no multi-second throttle gap", all(g < 0.35 for g in gaps), str(gaps))
+        check(
+            "polls matches schedule scale",
+            int(out.get("polls") or 0) >= len(expect) - 1,
+            str(out.get("polls")),
+        )
 
 
 def test_transient_network_retry() -> None:
@@ -383,6 +456,25 @@ def test_apply_score() -> None:
     out = ref.apply_af_score_to_event(ev, home=1, away=0)
     check("rewrote", out["home_score"] == 1 and out["away_score"] == 0)
     check("source", out.get("score_source") == "api_football")
+    # AF fixture Pathum home 1-3, event labeled Villa home → consumer sees 3-1
+    gh, ga = ref.orient_af_goals_to_event(
+        1,
+        3,
+        af_home="BG Pathum United",
+        af_away="Aston Villa",
+        event_home="Aston Villa",
+        event_away="BG Pathum United",
+    )
+    check("AF→PM orient", (gh, ga) == (3, 1), f"got {gh}-{ga}")
+    same = ref.orient_af_goals_to_event(
+        2,
+        1,
+        af_home="Aston Villa",
+        af_away="BG Pathum United",
+        event_home="Aston Villa",
+        event_away="BG Pathum United",
+    )
+    check("same orientation passthrough", same == (2, 1), str(same))
 
 
 def main() -> int:
@@ -395,6 +487,7 @@ def main() -> int:
     test_cache_miss_no_spin()
     test_cache_miss_wait_until_timeout()
     test_confirm_check_times()
+    test_schedule_cadence_wall_times()
     test_transient_network_retry()
     test_apply_score()
     print(f"\n{PASS} passed, {FAIL} failed")

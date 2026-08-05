@@ -126,6 +126,52 @@ def team_similarity(a: str, b: str) -> float:
     return max(jacc, seq)
 
 
+def sides_are_swapped(
+    src_home: str,
+    src_away: str,
+    dst_home: str,
+    dst_away: str,
+    *,
+    min_side: float = 0.75,
+) -> bool:
+    """True when ``dst_home`` aligns with ``src_away`` (home/away crossed).
+
+    Used when Polymarket lists teams opposite Dongqiudi / API-Football so scores
+    must be swapped before settlement.
+    """
+    sh, sa = str(src_home or "").strip(), str(src_away or "").strip()
+    dh, da = str(dst_home or "").strip(), str(dst_away or "").strip()
+    if not sh or not sa or not dh:
+        return False
+    to_home = team_similarity(dh, sh)
+    to_away = team_similarity(dh, sa)
+    if to_away >= min_side and to_away > to_home + 1e-9:
+        return True
+    if to_home >= min_side and to_home >= to_away:
+        return False
+    # Weak home signal: use away side as tie-break.
+    if da:
+        aw_to_src_home = team_similarity(da, sh)
+        aw_to_src_away = team_similarity(da, sa)
+        if aw_to_src_home >= min_side and aw_to_src_home > aw_to_src_away + 1e-9:
+            return True
+    return False
+
+
+def orient_scores(
+    src_home: str,
+    src_away: str,
+    home_score: Any,
+    away_score: Any,
+    dst_home: str,
+    dst_away: str,
+) -> tuple[Any, Any]:
+    """Re-express ``(home_score, away_score)`` from src sides into dst sides."""
+    if sides_are_swapped(src_home, src_away, dst_home, dst_away):
+        return away_score, home_score
+    return home_score, away_score
+
+
 def normalize_league(name: str = "", league_id: str = "") -> str:
     """Map DQD/PM league labels to a comparable string (prefer alias codes)."""
     for raw in (league_id, name):
@@ -527,22 +573,46 @@ def detect_score_changes(
 
         # Goal: scores only rise.
         if hs_i >= ph and aws_i >= pa and (hs_i > ph or aws_i > pa):
+            pm_home = pm.get("home") or dqd.get("home") or ""
+            pm_away = pm.get("away") or dqd.get("away") or ""
+            # DQD scores are in DQD home/away frame; event labels prefer PM order.
+            cur_h, cur_a = orient_scores(
+                dqd.get("home") or "",
+                dqd.get("away") or "",
+                hs_i,
+                aws_i,
+                pm_home,
+                pm_away,
+            )
+            prev_h, prev_a = orient_scores(
+                dqd.get("home") or "",
+                dqd.get("away") or "",
+                ph,
+                pa,
+                pm_home,
+                pm_away,
+            )
+            try:
+                cur_h_i, cur_a_i = int(cur_h), int(cur_a)
+                prev_h_i, prev_a_i = int(prev_h), int(prev_a)
+            except (TypeError, ValueError):
+                cur_h_i, cur_a_i, prev_h_i, prev_a_i = hs_i, aws_i, ph, pa
             events.append(
                 {
                     "type": "score_change",
                     "ts": ts,
                     "match_id": mid,
                     "league": pm.get("league") or dqd.get("league") or "",
-                    "home": pm.get("home") or dqd.get("home") or "",
-                    "away": pm.get("away") or dqd.get("away") or "",
-                    "prev": {"home": ph, "away": pa},
-                    "curr": {"home": hs_i, "away": aws_i},
-                    "home_score": hs_i,
-                    "away_score": aws_i,
+                    "home": pm_home,
+                    "away": pm_away,
+                    "prev": {"home": prev_h_i, "away": prev_a_i},
+                    "curr": {"home": cur_h_i, "away": cur_a_i},
+                    "home_score": cur_h_i,
+                    "away_score": cur_a_i,
                     "side": (
                         "both"
-                        if hs_i > ph and aws_i > pa
-                        else ("home" if hs_i > ph else "away")
+                        if cur_h_i > prev_h_i and cur_a_i > prev_a_i
+                        else ("home" if cur_h_i > prev_h_i else "away")
                     ),
                     "is_goal": True,
                     "is_reversal": False,
@@ -556,22 +626,45 @@ def detect_score_changes(
         # Disallowed / correction: either side's score drops (includes mixed up+down).
         elif hs_i < ph or aws_i < pa:
             mixed = (hs_i > ph or aws_i > pa) and (hs_i < ph or aws_i < pa)
+            pm_home = pm.get("home") or dqd.get("home") or ""
+            pm_away = pm.get("away") or dqd.get("away") or ""
+            cur_h, cur_a = orient_scores(
+                dqd.get("home") or "",
+                dqd.get("away") or "",
+                hs_i,
+                aws_i,
+                pm_home,
+                pm_away,
+            )
+            prev_h, prev_a = orient_scores(
+                dqd.get("home") or "",
+                dqd.get("away") or "",
+                ph,
+                pa,
+                pm_home,
+                pm_away,
+            )
+            try:
+                cur_h_i, cur_a_i = int(cur_h), int(cur_a)
+                prev_h_i, prev_a_i = int(prev_h), int(prev_a)
+            except (TypeError, ValueError):
+                cur_h_i, cur_a_i, prev_h_i, prev_a_i = hs_i, aws_i, ph, pa
             events.append(
                 {
                     "type": "score_change",
                     "ts": ts,
                     "match_id": mid,
                     "league": pm.get("league") or dqd.get("league") or "",
-                    "home": pm.get("home") or dqd.get("home") or "",
-                    "away": pm.get("away") or dqd.get("away") or "",
-                    "prev": {"home": ph, "away": pa},
-                    "curr": {"home": hs_i, "away": aws_i},
-                    "home_score": hs_i,
-                    "away_score": aws_i,
+                    "home": pm_home,
+                    "away": pm_away,
+                    "prev": {"home": prev_h_i, "away": prev_a_i},
+                    "curr": {"home": cur_h_i, "away": cur_a_i},
+                    "home_score": cur_h_i,
+                    "away_score": cur_a_i,
                     "side": "mixed" if mixed else (
                         "both"
-                        if hs_i < ph and aws_i < pa
-                        else ("home" if hs_i < ph else "away")
+                        if cur_h_i < prev_h_i and cur_a_i < prev_a_i
+                        else ("home" if cur_h_i < prev_h_i else "away")
                     ),
                     "is_goal": False,
                     "is_reversal": True,
@@ -624,6 +717,16 @@ def detect_match_finished(
         prev_p = str(prev_period.get(mid) or "")
         prev_s = str(prev_status.get(mid) or "")
         if prev_p != "FT" and curr_period == "FT":
+            pm_home = pm.get("home") or dqd.get("home") or ""
+            pm_away = pm.get("away") or dqd.get("away") or ""
+            hs, aws = orient_scores(
+                dqd.get("home") or "",
+                dqd.get("away") or "",
+                dqd.get("home_score"),
+                dqd.get("away_score"),
+                pm_home,
+                pm_away,
+            )
             events.append(
                 {
                     "type": "match_finished",
@@ -635,10 +738,10 @@ def detect_match_finished(
                     "period": curr_period,
                     "status_display": dqd.get("status") or "Played",
                     "league": pm.get("league") or dqd.get("league") or "",
-                    "home": pm.get("home") or dqd.get("home") or "",
-                    "away": pm.get("away") or dqd.get("away") or "",
-                    "home_score": dqd.get("home_score"),
-                    "away_score": dqd.get("away_score"),
+                    "home": pm_home,
+                    "away": pm_away,
+                    "home_score": hs,
+                    "away_score": aws,
                     "kickoff_beijing": row.get("kickoff_beijing") or "",
                     "official_clock": dqd.get("official_clock") or "FT",
                     "polymarket": _pm_event_handle(pm),

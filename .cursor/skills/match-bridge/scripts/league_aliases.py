@@ -196,4 +196,11 @@ LEAGUE_ALIASES: dict[str, str] = {
     "uwcl": "uwcl",
     "uefa women champions league": "uwcl",
     "uwcl women": "uwcl",
+    # --- ASEAN Championship (PM ASEAN ↔ DQD 东南锦) ---
+    "东南锦": "asean",
+    "asean": "asean",
+    "asean championship": "asean",
+    "aff": "asean",
+    "aff championship": "asean",
+    "aff suzuki cup": "asean",
 }
