@@ -179,6 +179,47 @@ def main() -> int:
         == bl.normalize_team("Internacional de Bogota"),
         "La Equidad",
     )
+    # 2026-08-05 coverage gaps (UEL/COL + UWCL AF "… W" shorts)
+    _assert(bl.normalize_team("Kuopion PS") == bl.normalize_team("KuPS"), "Kuopion PS↔KuPS")
+    _assert(
+        bl.normalize_team("KF Víkingur")
+        == bl.normalize_team("Víkingur Reykjavík"),
+        "Víkingur",
+    )
+    _assert(
+        bl.normalize_team("FK Rīgas Futbola Skola")
+        == bl.normalize_team("Rīgas FS"),
+        "Rīgas Futbola Skola↔RFS",
+    )
+    _assert(
+        bl.normalize_team("KF Shkëndija 79")
+        == bl.normalize_team("Shkendija Tetovo"),
+        "Shkendija",
+    )
+    _assert(
+        bl.normalize_team("Gualberto Villarroel SJ")
+        == bl.normalize_team("GV CD San José"),
+        "Villarroel SJ",
+    )
+    _assert(
+        bl.normalize_team("Ajax Amsterdam Women") == bl.normalize_team("Ajax W"),
+        "Ajax W",
+    )
+    _assert(
+        bl.normalize_team("TSC W") == bl.normalize_team("FK TSC Bačka Topola"),
+        "TSC W",
+    )
+    _assert(
+        bl.normalize_team("Racing W")
+        == bl.normalize_team("Racing FC Union Luxembourg"),
+        "Racing W",
+    )
+    _assert(
+        bl.normalize_team("Metalist 1925 W") == bl.normalize_team("Zhytlobud-1"),
+        "Metalist W↔Zhytlobud",
+    )
+    _assert(bl.team_similarity("HJK", "HJK W") >= 0.92, "HJK W")
+    _assert(bl.team_similarity("OH Leuven", "OH Leuven W") >= 0.92, "OH Leuven W")
 
     # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
     _assert(
