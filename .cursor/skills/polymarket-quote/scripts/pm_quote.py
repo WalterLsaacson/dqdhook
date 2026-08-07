@@ -31,6 +31,12 @@ from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import load_trade_settings, resolve_live_modes, size_tiers_label  # noqa: E402
 from af_referee import AfReferee, DEFAULT_TIMEOUT_S  # noqa: E402
+from bid_gate import (  # noqa: E402
+    BidGate,
+    DEFAULT_MIN_BID as BID_GATE_DEFAULT_MIN,
+    DEFAULT_POLL_S as BID_GATE_DEFAULT_POLL,
+    DEFAULT_TIMEOUT_S as BID_GATE_DEFAULT_TIMEOUT,
+)
 
 
 def root() -> Path:
@@ -44,7 +50,7 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
     timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
     poll = getattr(args, "af_poll", None)
     af_mode = resolve_af_mode(args)
-    # Default: tiered schedule 5s → every 2s → 60s → every 5s → timeout.
+    # Default: tiered schedule 3s → every 1s → 60s → every 2s → timeout.
     # --af-poll N forces a fixed interval (disables the schedule).
     if poll is None:
         ref = AfReferee(rt, timeout_s=timeout, poll_schedule=True, env_path=None)
@@ -80,6 +86,51 @@ def resolve_af_mode(args: argparse.Namespace) -> str:
     return "gate"
 
 
+def bid_gate_enabled(args: argparse.Namespace) -> bool:
+    """Bid gate default on for AF gate mode; off with --no-bid-gate or no AF."""
+    if getattr(args, "no_bid_gate", False):
+        return False
+    if resolve_af_mode(args) != "gate":
+        return False
+    return True
+
+
+def build_bid_gate(
+    args: argparse.Namespace,
+    rt: Path,
+    *,
+    market_cache: object | None = None,
+    proxy: object = ...,
+    include_props: bool = True,
+    include_exact: bool = True,
+) -> BidGate | None:
+    if not bid_gate_enabled(args):
+        return None
+    min_bid = float(getattr(args, "bid_gate_min", BID_GATE_DEFAULT_MIN))
+    poll = float(getattr(args, "bid_gate_poll", BID_GATE_DEFAULT_POLL))
+    timeout = float(getattr(args, "bid_gate_timeout", BID_GATE_DEFAULT_TIMEOUT))
+    gate = BidGate(
+        rt,
+        min_bid=min_bid,
+        poll_s=poll,
+        timeout_s=timeout,
+        proxy=proxy,
+        include_props=include_props,
+        include_exact=include_exact,
+        eps=float(getattr(args, "eps", lib.DEFAULT_EPS)),
+        fee_rate=float(getattr(args, "fee_rate", lib.SPORTS_TAKER_FEE_RATE)),
+        min_net=float(getattr(args, "min_net", lib.DEFAULT_MIN_NET)),
+        market_cache=market_cache,
+    )
+    print(
+        f"bid-gate → on (min_bid={min_bid} poll={poll}s timeout={timeout}s · "
+        f"AF confirm then market bid)",
+        file=sys.stderr,
+        flush=True,
+    )
+    return gate
+
+
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     """Build TradeExecutor when trading is enabled (default on; --no-trade disables)."""
     if getattr(args, "no_trade", False):
@@ -97,11 +148,16 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         ft_mode=ft_mode,
         take_depth=str(getattr(args, "take_depth", "top") or "top"),
         max_levels=int(getattr(args, "max_levels", 5)),
-        max_usdc=float(getattr(args, "max_usdc", 20.0)),
+        max_usdc=float(getattr(args, "max_usdc", 2.0)),
         max_shares=float(getattr(args, "max_shares", 25.0)),
         max_slippage=float(getattr(args, "max_slippage", 0.03)),
         allow_extreme_prices=bool(getattr(args, "allow_extreme_prices", False)),
         min_buy_price=float(getattr(args, "min_buy_price", 0.92)),
+        min_market_bid=(
+            float(getattr(args, "bid_gate_min", BID_GATE_DEFAULT_MIN))
+            if bid_gate_enabled(args)
+            else 0.0
+        ),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
         require_key=bool(live_goals or live_ft),
@@ -156,6 +212,14 @@ def cmd_once(args: argparse.Namespace) -> int:
     try:
         if args.from_bridge:
             cache = mcache.MarketCatalogCache(rt)
+            bg = build_bid_gate(
+                args,
+                rt,
+                market_cache=cache,
+                proxy=proxy,
+                include_props=include_props,
+                include_exact=include_exact,
+            )
             bundles = lib.process_bridge_events(
                 rt,
                 proxy=proxy,
@@ -169,6 +233,7 @@ def cmd_once(args: argparse.Namespace) -> int:
                 market_cache=cache,
                 af_referee=referee,
                 af_mode=resolve_af_mode(args) if referee is not None else "off",
+                bid_gate=bg,
             )
             payload = {
                 "quoted_at": lib.now_cn_iso(),
@@ -284,6 +349,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"trade setup failed: {e}", file=sys.stderr)
         return 1
     referee = build_af_referee(args, rt)
+    bg = build_bid_gate(
+        args,
+        rt,
+        market_cache=cache,
+        proxy=proxy,
+        include_props=include_props,
+        include_exact=include_exact,
+    )
 
     # Configure process proxy once before warmer + quote share SOCKS socket patch.
     try:
@@ -348,6 +421,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 market_cache=cache,
                 af_referee=referee,
                 af_mode=resolve_af_mode(args) if referee is not None else "off",
+                bid_gate=bg,
                 events_override=mem_events if mem_events else None,
             )
             for b in bundles:
@@ -365,7 +439,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         f"trigger={b.get('trigger')}: {b.get('error')}{lat_s}",
                         flush=True,
                     )
-                elif str(b.get("mode") or "").startswith("af_"):
+                elif str(b.get("mode") or "").startswith("af_") or str(
+                    b.get("mode") or ""
+                ).startswith("market_bid"):
                     gate = b.get("af_referee") or {}
                     print(
                         f"[{b.get('quoted_at')}] {b.get('mode')} "
@@ -476,7 +552,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         default=5,
         help="Walk max book levels (default 5, matches TOP_N)",
     )
-    sp.add_argument("--max-usdc", type=float, default=20.0, help="Hard max USDC per buy (default 20; .env QUOTE_MAX_USDC wins)")
+    sp.add_argument("--max-usdc", type=float, default=2.0, help="Hard max USDC per buy (default 2; .env QUOTE_MAX_USDC wins)")
     sp.add_argument(
         "--max-shares",
         type=float,
@@ -492,7 +568,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--allow-extreme-prices",
         action="store_true",
-        help="Allow orders when best price <=0.01 or >=0.99 (default blocked)",
+        help="Allow orders when best price <=0.01 or >0.992 (default blocked)",
     )
     sp.add_argument(
         "--min-buy-price",
@@ -533,7 +609,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Fixed AF events poll interval seconds (disables default schedule: "
-            "5s → every 2s → 60s → every 5s → timeout)"
+            "3s → every 1s → 60s → every 2s → timeout)"
         ),
     )
     sp.add_argument(
@@ -541,6 +617,30 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_TIMEOUT_S,
         help=f"Give up confirming a goal after this many seconds (default {DEFAULT_TIMEOUT_S})",
+    )
+    # --- Market bid gate (third confirm after AF) ---
+    sp.add_argument(
+        "--no-bid-gate",
+        action="store_true",
+        help="Disable post-AF market best_bid confirmation (default on in AF gate mode)",
+    )
+    sp.add_argument(
+        "--bid-gate-min",
+        type=float,
+        default=BID_GATE_DEFAULT_MIN,
+        help=f"Require best_bid >= this before buy_win (default {BID_GATE_DEFAULT_MIN})",
+    )
+    sp.add_argument(
+        "--bid-gate-poll",
+        type=float,
+        default=BID_GATE_DEFAULT_POLL,
+        help=f"Seconds between CLOB book polls while waiting for bid (default {BID_GATE_DEFAULT_POLL})",
+    )
+    sp.add_argument(
+        "--bid-gate-timeout",
+        type=float,
+        default=BID_GATE_DEFAULT_TIMEOUT,
+        help=f"Give up waiting for market bid after this many seconds (default {BID_GATE_DEFAULT_TIMEOUT})",
     )
 
 

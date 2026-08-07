@@ -23,7 +23,7 @@ Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
 | Target | Rule |
 |---|---|
 | `market_cache/*.json` | Keep only **open** paired matches still in `matches.json`; drop finished / orphan. **Skip** if matches file missing / bad / empty. |
-| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` | Keep rows with `quoted_at`/`sampled_at` ≥ now − retain_hours |
+| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` / `af_reversal_latency.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
 | `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
 
 Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
@@ -63,7 +63,7 @@ Sports taker fee (2026): `fee = feeRate × p × (1 − p)` with default `feeRate
 | Buy WIN at ask `p` | `1 − p` | `gross − fee(p)` |
 | Sell LOSE into bid `p` | — | **disabled** (not traded) |
 
-Only rows with **`net_edge ≥ min_net`** (default **0.02** USDC/share) go to `opportunities.jsonl`.  
+Only rows with **`net_edge ≥ min_net`** (default **0.0076** USDC/share ≈ ask≤**0.992**) go to `opportunities.jsonl`.  
 Quotes still record all tokens; dust / fee-insufficient edges stay out of oppo.  
 CLI: `--fee-rate`, `--min-net`.
 
@@ -90,23 +90,25 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 
 `sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 
-Price guard: skip when best ≤0.01 or ≥0.99 unless `--allow-extreme-prices`.  
+Price guard: skip when best ≤0.01 or >0.992 unless `--allow-extreme-prices`.  
 `buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.92**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`.
 
-**Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 20/25). `QUOTE_SIZE_TIERS=0.98:10` means **ask ≥ 0.98 → $10**, else **$20** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1).  
+**Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 2/25). `QUOTE_SIZE_TIERS=0.98:1` means **ask ≥ 0.98 → $1**, else **$2** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1).  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  
 SDK: `py-clob-client-v2` (see `requirements-trade.txt`). Env: `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAIN_ID`, `CLOB_HOST`.
 
-Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`, `score_reversal.py`.
+Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`, `score_reversal.py`, `bid_gate.py`.
 
 **Score reversal / disallowed goal**
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
-- With AF referee on (**gate default**), goal-ups **wait for AF confirm** before trading (no preconfirm CLOB quote). AF timeout / miss → ignore the goal (no flatten). **Reversals flatten immediately** if a lot exists; same match blocks new buys until exit clears. Aggressive `--af-postcheck-trade`: buy on DQD score immediately; AF confirm marks lots `af_status=confirmed` (hold); AF timeout flattens `af_pending` lots (`reason=af_confirm_timeout`). Event identity is semantic (`mid|prev→curr`, no wall-clock `ts`).
+- With AF referee on (**gate default**), goal-ups **wait for AF confirm** before trading (no preconfirm CLOB quote). AF default cadence is **3s first look, then every 1s until 60s, then every 2s until 90s timeout**; `--af-poll` still overrides this with a fixed interval. After AF confirms, a **market bid gate** requires at least one WIN candidate token `best_bid ≥ QUOTE_BID_GATE_MIN` (default **0.9**): check immediately, else poll CLOB every **2s** up to **120s**. Pass → quote/trade; timeout → `market_bid_timeout` (no buy). DQD reversal **cancels** pending AF + bid-gate jobs and flattens open lots. Separately, an **observe-only** AF events probe runs on a **dedicated 2-worker pool** (starts immediately, then every **2s** up to **30s**) to see whether AF goals catch the corrected DQD score; results (`af_reversed` / `lag_ms`, or `af_never_reversed` / cache-miss) append to `data/pm-quote/af_reversal_latency.jsonl` (24h pruned) and do **not** change flatten. AF timeout / miss → ignore the goal (no flatten). Aggressive `--af-postcheck-trade`: buy on DQD score immediately; AF confirm marks lots `af_status=confirmed` (hold); AF timeout flattens `af_pending` lots (`reason=af_confirm_timeout`). Event identity is semantic (`mid|prev→curr`, no wall-clock `ts`).
+- Env: `QUOTE_BID_GATE` (default on), `QUOTE_BID_GATE_MIN`, `QUOTE_BID_GATE_POLL_S`, `QUOTE_BID_GATE_TIMEOUT_S`. CLI: `--no-bid-gate`, `--bid-gate-min`, `--bid-gate-poll`, `--bid-gate-timeout`.
+- `maybe_trade` also hard-skips `score_change` `buy_win` when `best_bid < min_market_bid` (`skip_reason=market_bid_below_min=…`).
 - **`match_finished` always AF-gates** (even under postcheck): poll AF fixture **`score.fulltime`** (regulation / 90'+stoppage only — **ET and penalties ignored**, matching Polymarket). Trade only when AF regulation equals DQD FT exactly; mismatch / timeout → `af_ft_unconfirmed` (no buy). Skip if event age > `QUOTE_FT_MAX_AGE_S` (default **900**) or `match_id` already in `cursor.processed_ft_match_ids`.
 - Open lots carry `af_status` (`pending`|`confirmed`|`none`), optional `af_deadline`, and `fill_status` (`open`|`pending_fill` for delayed CLOB accepts).
 - **One event, two phases**: (1) FAK-flatten affected open `buy_win` lots whose **entry_score** is strictly higher than post-reversal / FT score; (2) **quote once** on the corrected `curr` score (may open newly locked markets). Unaffected lots stay open.
-- Live flatten sells floored shares (**2 decimal** maker precision) with a **99% haircut**, `min_price=0.2`. Before sell: refresh conditional allowance + cancel open orders for that token (frees `sum_of_matched_orders` locks). On CLOB `not enough balance` → cancel again, size by **gate free only while live bal still matches the gate bag** (else size from live bal alone), dump at `min_price=0.01`. If still locked, **keep `pending_flatten` for the next tick** (no inline sleep on the watch path). Dust close only when live balance itself is `< 0.01`.
+- Live flatten sells floored shares (**2 decimal** maker precision) with a **99% haircut**. Before pricing the FAK floor, ledger ``shares``/``usdc`` are reconciled to the live conditional balance (raise shares on better fills; scale ``usdc`` on residuals so VWAP holds). FAK `min_price` = **entry × (1 − 3%)** (tick-floored; unknown entry falls back to `0.5`) — no panic dump at `0.01` after false goals; unfilled residual stays `pending_flatten` for later retries. Before sell: refresh conditional allowance + cancel open orders for that token (frees `sum_of_matched_orders` locks). On CLOB `not enough balance` → cancel again, size by **gate free only while live bal still matches the gate bag** (else size from live bal alone), same entry−3% floor. If still locked, **keep `pending_flatten` for the next tick** (no inline sleep on the watch path). Dust close only when live balance itself is `< 0.01`.
 - CLOB `status=delayed` (+ `success`/`orderID`) counts as an accepted fill: register the open lot (brief balance poll) so a later reversal can flatten.
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
 - Dry-run logs `flatten_dry_run`. Default size cap remains **`max_usdc=5`**.

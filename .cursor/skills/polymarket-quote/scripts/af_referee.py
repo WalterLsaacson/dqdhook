@@ -7,12 +7,17 @@ never resolves DQD→AF fixtures on the quote hot path. Cache miss / unresolved
 → skip the goal immediately (no timeout spin).
 
 Score confirmation polls ``fetch_events_for_match_id(..., cache_only=True)`` on
-a tiered schedule: **5s → every 2s until 60s → every 5s until 90s** (override
+a tiered schedule: **3s → every 1s until 60s → every 2s until 90s** (override
 with ``--af-poll`` for a fixed interval). That cadence is the contract: the
 referee does **not** insert a multi-second shared throttle between schedule
 ticks (optional ``QUOTE_AF_MIN_INTERVAL_S`` is per-worker only). Confirmations
 run on a thread pool so watch stays responsive; on confirm, burst +
 ``af_confirmed_scores.json`` persist asynchronously.
+
+DQD score reversals still flatten immediately; an independent observe-only
+probe (``submit_reversal_probe``) polls AF from ``t=0`` every 2s / 30s on a
+dedicated 2-worker pool to measure whether AF also reaches the corrected
+score and records ``lag_ms``.
 """
 
 from __future__ import annotations
@@ -35,11 +40,11 @@ DEFAULT_TIMEOUT_S = 90.0
 DEFAULT_WORKERS = 8
 
 # Confirm schedule (production default):
-#   first look at 5s → every 2s until 60s → every 5s until timeout (90s).
-DEFAULT_FIRST_DELAY_S = 5.0
-DEFAULT_PERIOD_S = 2.0  # early period (alias for early_period_s)
+#   first look at 3s → every 1s until 60s → every 2s until timeout (90s).
+DEFAULT_FIRST_DELAY_S = 3.0
+DEFAULT_PERIOD_S = 1.0  # early period (alias for early_period_s)
 DEFAULT_LATE_AFTER_S = 60.0
-DEFAULT_LATE_PERIOD_S = 5.0
+DEFAULT_LATE_PERIOD_S = 2.0
 # Per-worker AFClient spacing only (default off). A shared 6.5s throttle used
 # to destroy the 2s schedule when several confirms ran at once — do not restore
 # that as the default. Set QUOTE_AF_MIN_INTERVAL_S if you need free-plan pacing.
@@ -48,6 +53,12 @@ DEFAULT_AF_MIN_INTERVAL_S = 0.0
 _POLL_COALESCE_S = 1.0
 # match_finished older than this → skip (restart replay / late DQD).
 DEFAULT_FT_MAX_AGE_S = 15 * 60.0
+# DQD reversal → AF events latency probe (observe-only; does not gate flatten).
+# Separate pool + shorter window so probes do not starve goal/FT confirms or
+# burn ~90 events calls per DQD flicker.
+DEFAULT_REV_PROBE_POLL_S = 2.0
+DEFAULT_REV_PROBE_TIMEOUT_S = 30.0
+DEFAULT_REV_PROBE_WORKERS = 2
 # Env override for FT freshness.
 _FT_MAX_AGE_ENV = "QUOTE_FT_MAX_AGE_S"
 _AF_MIN_INTERVAL_ENV = "QUOTE_AF_MIN_INTERVAL_S"
@@ -115,6 +126,34 @@ def af_min_interval_s() -> float:
 
 def confirmed_scores_path(root: Path) -> Path:
     return root / "data" / "pm-quote" / "af_confirmed_scores.json"
+
+
+def reversal_latency_path(root: Path) -> Path:
+    return root / "data" / "pm-quote" / "af_reversal_latency.jsonl"
+
+
+def reversal_probe_key(ev: dict[str, Any]) -> str:
+    """Semantic key for a DQD reversal probe (no wall-clock ts)."""
+    mid = str(ev.get("match_id") or "")
+    prev = baseline_score_from_event(ev)
+    curr = target_score_from_event(ev)
+    if prev is None or curr is None:
+        return f"af_rev_probe|{mid}|?"
+    return f"af_rev_probe|{mid}|{prev[0]}-{prev[1]}→{curr[0]}-{curr[1]}"
+
+
+def lag_ms_from_dqd_ts(dqd_ts: str | None, detected_at: datetime | None = None) -> int | None:
+    """Wall-clock ms from DQD event ts to detection (may be 0/small if AF already curr)."""
+    if not dqd_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(dqd_ts))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_CN)
+    now = detected_at or datetime.now(TZ_CN)
+    return int((now.astimezone(TZ_CN) - dt.astimezone(TZ_CN)).total_seconds() * 1000)
 
 
 def load_confirmed_scores(root: Path) -> dict[str, Any]:
@@ -502,8 +541,8 @@ def confirm_check_times(
 ) -> list[float]:
     """Absolute seconds (from goal) at which to call AF events.
 
-    Default: ``first_delay`` (5s), every ``period_s`` (2s) while ``t < late_after``,
-    then ``late_after`` and every ``late_period_s`` (5s) until ``timeout_s``
+    Default: ``first_delay`` (3s), every ``period_s`` (1s) while ``t < late_after``,
+    then ``late_after`` and every ``late_period_s`` (2s) until ``timeout_s``
     inclusive. No polls after timeout.
     """
     timeout = max(0.0, float(timeout_s))
@@ -597,9 +636,16 @@ class AfReferee:
             max_workers=max(1, int(max_workers)),
             thread_name_prefix="af-ref",
         )
+        self._rev_exec = ThreadPoolExecutor(
+            max_workers=max(1, int(DEFAULT_REV_PROBE_WORKERS)),
+            thread_name_prefix="af-rev-probe",
+        )
         self._lock = threading.Lock()
         self._pending: dict[str, Future] = {}
         self._meta: dict[str, dict[str, Any]] = {}
+        # Observe-only DQD-reversal → AF latency probes (separate from confirms).
+        self._rev_pending: dict[str, Future] = {}
+        self._rev_meta: dict[str, dict[str, Any]] = {}
 
     def _schedule_desc(self) -> str:
         if self.poll_schedule:
@@ -651,6 +697,45 @@ class AfReferee:
     def pending_event_keys(self) -> set[str]:
         with self._lock:
             return set(self._pending.keys())
+
+    def cancel_key(self, event_key: str, reason: str = "cancelled") -> bool:
+        """Abort a pending confirm (DQD reversal / superseded goal)."""
+        with self._lock:
+            fut = self._pending.pop(event_key, None)
+            meta = self._meta.pop(event_key, None)
+        if meta is None and fut is None:
+            return False
+        if meta is not None:
+            holder = meta.get("abort_reason_holder")
+            if isinstance(holder, dict):
+                holder["reason"] = str(reason or "cancelled")
+            abort = meta.get("abort")
+            if isinstance(abort, threading.Event):
+                abort.set()
+        if fut is not None and not fut.done():
+            fut.cancel()
+        print(
+            f"af-referee → cancelled key={event_key} reason={reason}",
+            flush=True,
+        )
+        return True
+
+    def cancel_match(self, match_id: str, reason: str = "cancelled") -> int:
+        """Abort all pending confirms for a Dongqiudi match id."""
+        mid = str(match_id or "")
+        if not mid:
+            return 0
+        with self._lock:
+            keys = [
+                k
+                for k, m in self._meta.items()
+                if str(m.get("match_id") or "") == mid
+            ]
+        n = 0
+        for k in keys:
+            if self.cancel_key(k, reason=reason):
+                n += 1
+        return n
 
     def poll_once(
         self,
@@ -757,6 +842,8 @@ class AfReferee:
         wait_cache: bool = False,
         event_home: str = "",
         event_away: str = "",
+        abort_event: threading.Event | None = None,
+        abort_reason_holder: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Block until AF confirms target (or AF already covers it) / timeout.
 
@@ -769,7 +856,7 @@ class AfReferee:
         - ``wait_cache=True`` (postcheck): keep polling until timeout so late
           sync/watch mappings can still confirm after a buy.
 
-        Default poll schedule: 5s → every 2s until 60s → every 5s until timeout
+        Default poll schedule: 3s → every 1s until 60s → every 2s until timeout
         (override with ``poll_schedule=False`` + ``poll_s`` for fixed interval).
 
         ``event_home`` / ``event_away``: consumer-facing sides (PM labels on the
@@ -782,10 +869,32 @@ class AfReferee:
         # Prefer persisted AF truth as baseline when present.
         stored = get_confirmed_score(self.root, str(match_id))
         base = stored if stored is not None else baseline
+        abort = abort_event if abort_event is not None else threading.Event()
+        reason_holder = abort_reason_holder if abort_reason_holder is not None else {}
 
         mid = str(match_id)
+
+        def _aborted(polls: int, elapsed_ms: int, last_goals: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "confirmed": False,
+                "match_id": mid,
+                "target": {"home": th, "away": ta},
+                "goals": last_goals,
+                "baseline": {"home": base[0], "away": base[1]} if base else None,
+                "polls": polls,
+                "elapsed_ms": elapsed_ms,
+                "timeout_s": timeout,
+                "schedule": self._schedule_desc(),
+                "error": "aborted",
+                "reason": reason_holder.get("reason") or "cancelled",
+                "via": "apifootball-bridge",
+                "cache_only": True,
+            }
         # Fresh disk cache from AF board sync/watch.
         self._reload_fixture_cache()
+        if abort.is_set():
+            return _aborted(0, 0, {"home": None, "away": None})
         if (
             not wait_cache
             and self._events_fn is None
@@ -850,6 +959,12 @@ class AfReferee:
         check_i = 0
 
         while check_i < len(check_at):
+            if abort.is_set():
+                return _aborted(
+                    polls,
+                    int((time.monotonic() - t0) * 1000),
+                    last_goals,
+                )
             elapsed = time.monotonic() - t0
             if elapsed >= timeout:
                 break
@@ -859,6 +974,12 @@ class AfReferee:
             target_at = check_at[check_i]
             # Sleep until this check's wall time (from confirm start).
             while True:
+                if abort.is_set():
+                    return _aborted(
+                        polls,
+                        int((time.monotonic() - t0) * 1000),
+                        last_goals,
+                    )
                 elapsed = time.monotonic() - t0
                 if elapsed >= timeout:
                     break
@@ -866,6 +987,12 @@ class AfReferee:
                 if remain <= 0:
                     break
                 time.sleep(min(remain, 0.25))
+            if abort.is_set():
+                return _aborted(
+                    polls,
+                    int((time.monotonic() - t0) * 1000),
+                    last_goals,
+                )
             if (time.monotonic() - t0) >= timeout and (time.monotonic() - t0) < target_at:
                 break
 
@@ -1045,6 +1172,8 @@ class AfReferee:
         wait_cache: bool = True,
         event_home: str = "",
         event_away: str = "",
+        abort_event: threading.Event | None = None,
+        abort_reason_holder: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Block until AF regulation fulltime equals DQD FT target (exact).
 
@@ -1057,7 +1186,33 @@ class AfReferee:
         timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
         th, ta = int(target[0]), int(target[1])
         mid = str(match_id)
+        abort = abort_event if abort_event is not None else threading.Event()
+        reason_holder = abort_reason_holder if abort_reason_holder is not None else {}
+
+        def _aborted(polls: int, elapsed_ms: int) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "confirmed": False,
+                "kind": "ft",
+                "match_id": mid,
+                "target": {"home": th, "away": ta},
+                "goals": {"home": None, "away": None},
+                "finished": False,
+                "status_short": None,
+                "polls": polls,
+                "elapsed_ms": elapsed_ms,
+                "timeout_s": timeout,
+                "schedule": self._schedule_desc(),
+                "error": "aborted",
+                "reason": reason_holder.get("reason") or "cancelled",
+                "via": "apifootball-bridge",
+                "score_source": "score.fulltime",
+                "cache_only": True,
+            }
+
         self._reload_fixture_cache()
+        if abort.is_set():
+            return _aborted(0, 0)
         if (
             not wait_cache
             and self._events_fn is None
@@ -1113,6 +1268,8 @@ class AfReferee:
         check_i = 0
 
         while check_i < len(check_at):
+            if abort.is_set():
+                return _aborted(polls, int((time.monotonic() - t0) * 1000))
             elapsed = time.monotonic() - t0
             if elapsed >= timeout:
                 break
@@ -1121,6 +1278,8 @@ class AfReferee:
                 break
             target_at = check_at[check_i]
             while True:
+                if abort.is_set():
+                    return _aborted(polls, int((time.monotonic() - t0) * 1000))
                 elapsed = time.monotonic() - t0
                 if elapsed >= timeout:
                     break
@@ -1128,6 +1287,8 @@ class AfReferee:
                 if remain <= 0:
                     break
                 time.sleep(min(remain, 0.25))
+            if abort.is_set():
+                return _aborted(polls, int((time.monotonic() - t0) * 1000))
             if (time.monotonic() - t0) >= timeout and (time.monotonic() - t0) < target_at:
                 break
 
@@ -1329,6 +1490,8 @@ class AfReferee:
         if not mid:
             return False
         job_kind = "ft" if str(kind or "").strip().lower() == "ft" else "goal"
+        abort = threading.Event()
+        reason_holder: dict[str, str] = {"reason": ""}
         with self._lock:
             if event_key in self._pending:
                 return False
@@ -1344,6 +1507,8 @@ class AfReferee:
                     wait_cache=bool(wait_cache),
                     event_home=ev_home,
                     event_away=ev_away,
+                    abort_event=abort,
+                    abort_reason_holder=reason_holder,
                 )
             else:
                 fut = self._exec.submit(
@@ -1354,6 +1519,8 @@ class AfReferee:
                     wait_cache=bool(wait_cache),
                     event_home=ev_home,
                     event_away=ev_away,
+                    abort_event=abort,
+                    abort_reason_holder=reason_holder,
                 )
             self._pending[event_key] = fut
             self._meta[event_key] = {
@@ -1363,6 +1530,8 @@ class AfReferee:
                 "submitted_at": iso_now(),
                 "wait_cache": bool(wait_cache),
                 "kind": job_kind,
+                "abort": abort,
+                "abort_reason_holder": reason_holder,
             }
         print(
             f"af-referee → queued {mid} target={target[0]}-{target[1]} "
@@ -1420,6 +1589,314 @@ class AfReferee:
                     "match_id": meta["match_id"],
                     "kind": meta.get("kind") or "goal",
                     "gate": gate,
+                }
+            )
+        return out
+
+    def await_reversal_probe(
+        self,
+        match_id: str,
+        prev: tuple[int, int],
+        curr: tuple[int, int],
+        *,
+        dqd_ts: str | None = None,
+        poll_s: float | None = None,
+        timeout_s: float | None = None,
+        event_home: str = "",
+        event_away: str = "",
+        abort_event: threading.Event | None = None,
+        abort_reason_holder: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Poll AF events until goals == DQD curr (reversal) or timeout.
+
+        Observe-only: does not update confirmed scores or trade. First poll at
+        t=0, then every ``poll_s`` (default 2s) until ``timeout_s`` (default 30s).
+        """
+        mid = str(match_id)
+        ph, pa = int(prev[0]), int(prev[1])
+        ch, ca = int(curr[0]), int(curr[1])
+        poll = (
+            DEFAULT_REV_PROBE_POLL_S
+            if poll_s is None
+            else max(0.05, float(poll_s))
+        )
+        timeout = (
+            DEFAULT_REV_PROBE_TIMEOUT_S
+            if timeout_s is None
+            else max(0.05, float(timeout_s))
+        )
+        abort = abort_event if abort_event is not None else threading.Event()
+        reason_holder = abort_reason_holder if abort_reason_holder is not None else {}
+
+        def _base(
+            *,
+            af_reversed: bool,
+            polls: int,
+            elapsed_ms: int,
+            first_af: dict[str, Any],
+            last_af: dict[str, Any],
+            error: str | None = None,
+            lag_ms: int | None = None,
+            af_detected_at: str | None = None,
+            first_poll_ms: int | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "ok": bool(af_reversed),
+                "af_reversed": bool(af_reversed),
+                "match_id": mid,
+                "dqd_ts": dqd_ts,
+                "dqd_prev": {"home": ph, "away": pa},
+                "dqd_curr": {"home": ch, "away": ca},
+                "first_af_goals": first_af,
+                "first_poll_ms": first_poll_ms,
+                "af_goals_at_detect": last_af if af_reversed else None,
+                "last_af_goals": last_af,
+                "af_detected_at": af_detected_at,
+                "lag_ms": lag_ms,
+                "polls": polls,
+                "elapsed_ms": elapsed_ms,
+                "poll_s": poll,
+                "timeout_s": timeout,
+                "error": error,
+                "reason": reason_holder.get("reason") or None,
+                "via": "af_reversal_probe",
+                "cache_only": True,
+            }
+
+        if abort.is_set():
+            return _base(
+                af_reversed=False,
+                polls=0,
+                elapsed_ms=0,
+                first_af={"home": None, "away": None},
+                last_af={"home": None, "away": None},
+                error="aborted",
+            )
+
+        # Cache-only mapping (same as goal confirm).
+        if self._events_fn is None:
+            self._reload_fixture_cache()
+            if self.cached_af_fixture_id(mid) is None:
+                err = aflib.fixture_miss_error(self._fixture_cache(), mid)
+                return _base(
+                    af_reversed=False,
+                    polls=0,
+                    elapsed_ms=0,
+                    first_af={"home": None, "away": None},
+                    last_af={"home": None, "away": None},
+                    error=err,
+                )
+
+        t0 = time.monotonic()
+        polls = 0
+        first_af: dict[str, Any] = {"home": None, "away": None}
+        first_poll_ms: int | None = None
+        last_af: dict[str, Any] = {"home": None, "away": None}
+        last_error: str | None = None
+
+        while True:
+            if abort.is_set():
+                return _base(
+                    af_reversed=False,
+                    polls=polls,
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    first_af=first_af,
+                    last_af=last_af,
+                    error="aborted",
+                    first_poll_ms=first_poll_ms,
+                )
+            elapsed = time.monotonic() - t0
+            if elapsed >= timeout and polls > 0:
+                break
+            # Spacing after first poll.
+            if polls > 0:
+                target_at = polls * poll
+                while True:
+                    if abort.is_set():
+                        return _base(
+                            af_reversed=False,
+                            polls=polls,
+                            elapsed_ms=int((time.monotonic() - t0) * 1000),
+                            first_af=first_af,
+                            last_af=last_af,
+                            error="aborted",
+                            first_poll_ms=first_poll_ms,
+                        )
+                    elapsed = time.monotonic() - t0
+                    if elapsed >= timeout:
+                        break
+                    remain = target_at - elapsed
+                    if remain <= 0:
+                        break
+                    time.sleep(min(remain, 0.25))
+                if (time.monotonic() - t0) >= timeout:
+                    break
+
+            remain_budget = timeout - (time.monotonic() - t0)
+            if polls > 0 and remain_budget <= 0.05:
+                break
+
+            polls += 1
+            if self._events_fn is None:
+                self._reload_fixture_cache()
+            try:
+                last = self.poll_once(
+                    mid,
+                    persist_burst=False,
+                    http_timeout=min(8.0, max(0.5, remain_budget if polls > 1 else 8.0)),
+                    allow_coalesce=False,
+                )
+            except Exception as e:  # noqa: BLE001
+                last_error = str(e)
+                last = {"ok": False, "error": str(e), "goals": last_af}
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            miss = str(last.get("error") or "")
+            if miss in _CACHE_MISS_ERRORS:
+                return _base(
+                    af_reversed=False,
+                    polls=polls,
+                    elapsed_ms=elapsed_ms,
+                    first_af=first_af,
+                    last_af=last_af,
+                    error=miss,
+                    first_poll_ms=first_poll_ms,
+                )
+
+            if _is_rate_limited(last) or _is_transient_af_error(last):
+                last_error = _af_error_blob(last) or miss or "transient"
+                # Don't advance poll index conceptually — retry after short sleep.
+                polls -= 1
+                time.sleep(0.25)
+                continue
+
+            if last.get("ok"):
+                goals = last.get("goals") or {}
+                ent = (
+                    aflib.cached_fixture_entry(self._fixture_cache(), mid) or {}
+                    if self._events_fn is None
+                    else {}
+                )
+                gh_o, ga_o = orient_af_goals_to_event(
+                    goals.get("home"),
+                    goals.get("away"),
+                    af_home=str(ent.get("af_home") or ""),
+                    af_away=str(ent.get("af_away") or ""),
+                    event_home=event_home,
+                    event_away=event_away,
+                )
+                last_af = {"home": gh_o, "away": ga_o}
+                if first_poll_ms is None:
+                    first_af = dict(last_af)
+                    first_poll_ms = elapsed_ms
+                try:
+                    if gh_o is not None and ga_o is not None:
+                        if af_ft_score_matches((int(gh_o), int(ga_o)), (ch, ca)):
+                            detected = datetime.now(TZ_CN)
+                            detected_iso = detected.isoformat(timespec="seconds")
+                            lag = lag_ms_from_dqd_ts(dqd_ts, detected)
+                            return _base(
+                                af_reversed=True,
+                                polls=polls,
+                                elapsed_ms=elapsed_ms,
+                                first_af=first_af,
+                                last_af=last_af,
+                                lag_ms=lag if lag is not None else elapsed_ms,
+                                af_detected_at=detected_iso,
+                                first_poll_ms=first_poll_ms,
+                            )
+                except (TypeError, ValueError):
+                    pass
+            else:
+                last_error = miss or str(last.get("errors") or "af_poll_failed")
+
+            if (time.monotonic() - t0) >= timeout:
+                break
+
+        return _base(
+            af_reversed=False,
+            polls=polls,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            first_af=first_af,
+            last_af=last_af,
+            error=last_error or "af_never_reversed",
+            first_poll_ms=first_poll_ms,
+        )
+
+    def submit_reversal_probe(self, event_key: str, ev: dict[str, Any]) -> bool:
+        """Enqueue observe-only AF latency probe after a DQD score reversal."""
+        mid = str(ev.get("match_id") or "")
+        prev = baseline_score_from_event(ev)
+        curr = target_score_from_event(ev)
+        if not mid or prev is None or curr is None:
+            return False
+        key = str(event_key or reversal_probe_key(ev))
+        abort = threading.Event()
+        reason_holder: dict[str, str] = {"reason": ""}
+        with self._lock:
+            if key in self._rev_pending:
+                return False
+            fut = self._rev_exec.submit(
+                self.await_reversal_probe,
+                mid,
+                prev,
+                curr,
+                dqd_ts=str(ev.get("ts") or "") or None,
+                event_home=str(ev.get("home") or ""),
+                event_away=str(ev.get("away") or ""),
+                abort_event=abort,
+                abort_reason_holder=reason_holder,
+            )
+            self._rev_pending[key] = fut
+            self._rev_meta[key] = {
+                "ev": dict(ev),
+                "match_id": mid,
+                "prev": prev,
+                "curr": curr,
+                "submitted_at": iso_now(),
+                "abort": abort,
+                "abort_reason_holder": reason_holder,
+            }
+        print(
+            f"af-rev-probe → queued {mid} "
+            f"{prev[0]}-{prev[1]}→{curr[0]}-{curr[1]} "
+            f"key={key} (poll={DEFAULT_REV_PROBE_POLL_S:g}s "
+            f"timeout={DEFAULT_REV_PROBE_TIMEOUT_S:g}s · observe-only)",
+            flush=True,
+        )
+        return True
+
+    def drain_reversal_probes(self) -> list[dict[str, Any]]:
+        """Return completed reversal-latency probe jobs."""
+        with self._lock:
+            done_keys = [k for k, fut in self._rev_pending.items() if fut.done()]
+        out: list[dict[str, Any]] = []
+        for key in done_keys:
+            with self._lock:
+                fut = self._rev_pending.pop(key, None)
+                meta = self._rev_meta.pop(key, None)
+            if fut is None or meta is None:
+                continue
+            try:
+                probe = fut.result()
+            except Exception as e:  # noqa: BLE001
+                prev = meta.get("prev") or (None, None)
+                curr = meta.get("curr") or (None, None)
+                probe = {
+                    "ok": False,
+                    "af_reversed": False,
+                    "match_id": meta.get("match_id"),
+                    "dqd_prev": {"home": prev[0], "away": prev[1]},
+                    "dqd_curr": {"home": curr[0], "away": curr[1]},
+                    "error": str(e),
+                    "via": "af_reversal_probe",
+                }
+            out.append(
+                {
+                    "event_key": key,
+                    "ev": meta["ev"],
+                    "match_id": meta["match_id"],
+                    "probe": probe,
                 }
             )
         return out

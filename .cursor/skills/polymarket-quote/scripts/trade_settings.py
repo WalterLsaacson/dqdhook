@@ -59,6 +59,7 @@ class TradeSettings:
     max_slippage: float
     allow_extreme_prices: bool
     min_buy_price: float  # buy_win only: skip (but record) when best_ask < this; 0 = off
+    min_market_bid: float  # score_change buy_win: require best_bid >= this; 0 = off
     min_order_shares: float
     enabled: bool
     # Price-tiered buy sizing (from .env); hard caps remain max_usdc/max_shares.
@@ -91,6 +92,7 @@ def load_trade_settings(
     max_slippage: float = 0.03,
     allow_extreme_prices: bool = False,
     min_buy_price: float = 0.92,
+    min_market_bid: float = 0.0,
     enabled: bool = True,
     env_file: str | Path | None = None,
     require_key: bool = False,
@@ -121,11 +123,11 @@ def load_trade_settings(
 
     # Hard caps: .env QUOTE_MAX_* wins when set; else CLI/hub arg; else defaults.
     if os.getenv("QUOTE_MAX_USDC"):
-        hard_usdc = float(os.getenv("QUOTE_MAX_USDC") or 20)
+        hard_usdc = float(os.getenv("QUOTE_MAX_USDC") or 2)
     elif max_usdc is not None:
         hard_usdc = float(max_usdc)
     else:
-        hard_usdc = 20.0
+        hard_usdc = 2.0
     if os.getenv("QUOTE_MAX_SHARES"):
         hard_shares = float(os.getenv("QUOTE_MAX_SHARES") or 25)
     elif max_shares is not None:
@@ -154,6 +156,7 @@ def load_trade_settings(
         max_slippage=float(max_slippage),
         allow_extreme_prices=bool(allow_extreme_prices),
         min_buy_price=max(0.0, float(min_buy_price)),
+        min_market_bid=max(0.0, float(min_market_bid)),
         # Polymarket market buys are USDC-notional; do not impose a 5-share floor.
         min_order_shares=float(os.getenv("MIN_ORDER_SHARES", "0")),
         enabled=bool(enabled),

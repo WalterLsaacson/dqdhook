@@ -26,6 +26,7 @@ from score_reversal import (
     event_signals_reversal,
     ft_reversal_vs_entry,
     lot_depends_on_disallowed_goal,
+    reconcile_lot_inventory,
     score_pair,
 )
 from trade_settings import TradeSettings
@@ -35,10 +36,11 @@ logger = logging.getLogger("pm_quote.trade")
 # CLOB FAK/FOK sell: maker (shares) max 2 decimals; floor to avoid invalid maker amount.
 FLATTEN_SHARE_DECIMALS = 2
 FLATTEN_MIN_SHARES = Decimal("0.01")
-# Emergency flatten floor price (do not dump into sub-0.2 bids forever).
+# Fallback floor only when entry price is unknown (never dump at 0.01).
 FLATTEN_MIN_PRICE = Decimal("0.5")
-# If 0.2 FAK leaves the full bag, one dump attempt at the tick floor.
-FLATTEN_DUMP_MIN_PRICE = Decimal("0.01")
+# Max loss vs entry on emergency flatten: min_sell = entry * (1 - this).
+# Thin books that cannot fill leave residual for later retry ticks.
+FLATTEN_MAX_LOSS_FRAC = Decimal("0.03")
 # Polymarket matched-order cache often rejects 100% sells; keep a haircut.
 FLATTEN_SELL_HAIRCUT = Decimal("0.99")
 # Live bal vs gate bal: within this → trust gate "free"; else size from live only.
@@ -74,6 +76,61 @@ def floor_shares(shares: Decimal | float | str, *, decimals: int = FLATTEN_SHARE
     if d <= 0:
         return Decimal("0")
     return (d / q).to_integral_value(rounding=ROUND_DOWN) * q
+
+
+def lot_entry_price(lot: dict[str, Any]) -> Decimal | None:
+    """Best-effort buy price for an open lot (VWAP from usdc/shares, else stored fields)."""
+    try:
+        shares = Decimal(str(lot.get("shares") or 0))
+        usdc = Decimal(str(lot.get("usdc") or 0))
+    except Exception:  # noqa: BLE001
+        shares = Decimal("0")
+        usdc = Decimal("0")
+    if shares > 0 and usdc > 0:
+        return usdc / shares
+    for key in ("fill_price", "entry_price", "ask", "worst_price"):
+        raw = lot.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            px = Decimal(str(raw))
+        except Exception:  # noqa: BLE001
+            continue
+        if px > 0:
+            return px
+    return None
+
+
+def flatten_min_sell_price(
+    lot: dict[str, Any],
+    *,
+    tick: str = "0.01",
+    max_loss_frac: Decimal = FLATTEN_MAX_LOSS_FRAC,
+) -> Decimal:
+    """FAK sell floor: entry × (1 − max_loss), floored to tick.
+
+    Avoids panic dumps at 0.01 after false goals; unfilled size stays pending for retry.
+    """
+    try:
+        tick_d = Decimal(str(tick or "0.01"))
+    except Exception:  # noqa: BLE001
+        tick_d = Decimal("0.01")
+    if tick_d <= 0:
+        tick_d = Decimal("0.01")
+    entry = lot_entry_price(lot)
+    if entry is None or entry <= 0:
+        return max(FLATTEN_MIN_PRICE, tick_d)
+    loss = max(Decimal("0"), min(Decimal("0.5"), Decimal(str(max_loss_frac))))
+    raw = entry * (Decimal("1") - loss)
+    # Floor to tick so min_price stays on the price grid.
+    stepped = (raw / tick_d).to_integral_value(rounding=ROUND_DOWN) * tick_d
+    if stepped < tick_d:
+        stepped = tick_d
+    # Keep below par.
+    cap = Decimal("1") - tick_d
+    if stepped > cap:
+        stepped = cap
+    return stepped
 
 
 def flatten_sell_shares(bal: Decimal) -> Decimal:
@@ -503,8 +560,10 @@ class TradeExecutor:
             return None
         if price <= 0.01 + 1e-12:
             return f"extreme_price={price} (<=0.01)"
-        if price >= 0.99 - 1e-12:
-            return f"extreme_price={price} (>=0.99)"
+        # Cap aligned with quote_lib.DEFAULT_MAX_BUY_ASK (ask≤0.992).
+        max_ask = float(getattr(lib, "DEFAULT_MAX_BUY_ASK", 0.992))
+        if price > max_ask + 1e-12:
+            return f"extreme_price={price} (>{max_ask})"
         return None
 
     def _min_buy_price_blocked(self, price: float | None) -> str | None:
@@ -514,6 +573,21 @@ class TradeExecutor:
             return None
         if price < floor - 1e-12:
             return f"buy_price_below_min={price}<{floor}"
+        return None
+
+    def _min_market_bid_blocked(self, bid: float | None) -> str | None:
+        """score_change buy_win: require best_bid >= min_market_bid (0=off)."""
+        floor = float(getattr(self.settings, "min_market_bid", 0.0) or 0.0)
+        if floor <= 0:
+            return None
+        if bid is None:
+            return f"market_bid_below_min=None<{floor}"
+        try:
+            bid_f = float(bid)
+        except (TypeError, ValueError):
+            return f"market_bid_below_min=None<{floor}"
+        if bid_f + 1e-12 < floor:
+            return f"market_bid_below_min={bid_f}<{floor}"
         return None
 
     def maybe_trade(
@@ -638,6 +712,38 @@ class TradeExecutor:
                     below_min,
                 )
                 return row
+            # Third gate hard check (score_change only): market must bid ≥ floor.
+            if typ == "score_change":
+                try:
+                    bid_f = (
+                        float(quote.get("best_bid"))
+                        if quote.get("best_bid") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    bid_f = None
+                bid_block = self._min_market_bid_blocked(bid_f)
+                if bid_block:
+                    row = self._record(
+                        quote,
+                        event_key=event_key,
+                        match_meta=match_meta,
+                        plan=None,
+                        status="skipped",
+                        skip_reason=bid_block,
+                        response=None,
+                        success=False,
+                        idempotency_key=key,
+                        live=channel_live,
+                    )
+                    self._done.add(key)
+                    logger.info(
+                        "skip buy_win %s bid=%s (%s)",
+                        (quote.get("market_key") or "")[:40],
+                        bid_f,
+                        bid_block,
+                    )
+                    return row
 
         available: float | None = None
         if trade == "sell_lose":
@@ -1250,7 +1356,8 @@ class TradeExecutor:
             )
             return row
 
-        # Live FAK sell: cancel locks, haircut size, min_price=0.2 (dump fallback).
+        # Live FAK sell: cancel locks, haircut size, min_price = entry×(1−3%).
+        # No 0.01 panic dump — if the book cannot fill, residual stays for retry.
         try:
             trader = self.ensure_trader()
             if trader is None:
@@ -1266,8 +1373,11 @@ class TradeExecutor:
                 pass
 
             bal = Decimal(str(trader.get_conditional_balance(token_id)))
-            if bal > 0 and lot.get("fill_status") == FILL_STATUS_PENDING:
-                self.ledger.mark_fill_open(token_id, mid)
+            if bal > 0:
+                # Align ledger VWAP before pricing the sell floor (delayed fills
+                # often still hold planned shares until balance appears).
+                self.ledger.reconcile_inventory(token_id, mid, bal)
+                reconcile_lot_inventory(lot, bal)
             shares = flatten_sell_shares(bal)
             if bal <= 0 or shares < FLATTEN_MIN_SHARES:
                 # True empty → close. Tiny dust with no locks → close.
@@ -1391,7 +1501,15 @@ class TradeExecutor:
             tick = str(lot.get("tick_size") or "0.01") or "0.01"
             neg = lot.get("neg_risk")
             neg_risk = bool(neg) if neg is not None else None
-            min_px = FLATTEN_MIN_PRICE
+            min_px = flatten_min_sell_price(lot, tick=tick)
+            logger.info(
+                "flatten sell match=%s token=%s… shares=%s min=%s entry≈%s",
+                mid,
+                token_id[:12],
+                shares,
+                min_px,
+                lot_entry_price(lot),
+            )
             response, shares, ok = self._flatten_post_sell(
                 trader,
                 token_id=token_id,
@@ -1406,41 +1524,6 @@ class TradeExecutor:
                 residual = Decimal(str(trader.get_conditional_balance(token_id)))
             except Exception:  # noqa: BLE001
                 residual = Decimal("-1")
-
-            # No fill at 0.2 (thin book): one dump attempt at 0.01.
-            if (
-                residual >= FLATTEN_MIN_SHARES
-                and bal > 0
-                and residual >= bal - Decimal("0.02")
-            ):
-                try:
-                    trader.cancel_orders_for_asset(token_id)
-                except Exception:  # noqa: BLE001
-                    pass
-                dump_shares = flatten_sell_shares(residual)
-                if dump_shares >= FLATTEN_MIN_SHARES:
-                    logger.warning(
-                        "flatten dump retry match=%s token=%s… shares=%s min=%s",
-                        mid,
-                        token_id[:12],
-                        dump_shares,
-                        FLATTEN_DUMP_MIN_PRICE,
-                    )
-                    response, shares, ok = self._flatten_post_sell(
-                        trader,
-                        token_id=token_id,
-                        shares=dump_shares,
-                        tick=tick,
-                        min_price=FLATTEN_DUMP_MIN_PRICE,
-                        neg_risk=neg_risk,
-                    )
-                    min_px = FLATTEN_DUMP_MIN_PRICE
-                    try:
-                        residual = Decimal(
-                            str(trader.get_conditional_balance(token_id))
-                        )
-                    except Exception:  # noqa: BLE001
-                        residual = Decimal("-1")
 
             residual_floor = (
                 floor_shares(residual) if residual >= 0 else Decimal("-1")
@@ -1611,6 +1694,10 @@ class TradeExecutor:
         except Exception:  # noqa: BLE001
             bal = Decimal("0")
 
+        if bal > 0:
+            self.ledger.reconcile_inventory(token_id, mid, bal)
+            reconcile_lot_inventory(lot, bal)
+
         # Trust gate free only while live bal still looks like the same bag.
         free = gate_free_cap(gate, bal)
         shares = flatten_sell_shares_available(bal, free=free)
@@ -1667,13 +1754,14 @@ class TradeExecutor:
         tick = str(lot.get("tick_size") or "0.01") or "0.01"
         neg = lot.get("neg_risk")
         neg_risk = bool(neg) if neg is not None else None
+        min_px = flatten_min_sell_price(lot, tick=tick)
         try:
             response, shares, ok = self._flatten_post_sell(
                 trader,
                 token_id=token_id,
                 shares=shares,
                 tick=tick,
-                min_price=FLATTEN_DUMP_MIN_PRICE,
+                min_price=min_px,
                 neg_risk=neg_risk,
             )
         except Exception as e2:  # noqa: BLE001
@@ -1708,7 +1796,7 @@ class TradeExecutor:
             order_type="FAK",
             shares=float(shares),
             usdc=0.0,
-            worst_price=float(FLATTEN_DUMP_MIN_PRICE),
+            worst_price=float(min_px),
             levels_used=0,
             levels=[],
             skip_reason=None,

@@ -46,8 +46,11 @@ SCORE_PAIR_RE = re.compile(r"\b(\d+)\s*[-–]\s*(\d+)\b")
 DEFAULT_EPS = 0.005
 # Polymarket sports taker feeRate (2026): fee/share = feeRate * p * (1-p)
 SPORTS_TAKER_FEE_RATE = 0.05
-# Min net edge per share after fee before writing opportunities.jsonl
-DEFAULT_MIN_NET = 0.02
+# Max buy ask we will trade (executor also hard-blocks above this).
+DEFAULT_MAX_BUY_ASK = 0.992
+# Min net edge per share after fee before writing opportunities.jsonl.
+# 0.0076 ≈ allow ask≤0.992 (fee-aware); ask 0.993 net≈0.0067 is blocked.
+DEFAULT_MIN_NET = 0.0076
 TOP_N = 5
 
 
@@ -1039,7 +1042,7 @@ def flag_misprice(
     """Return (is_opp, reason, economics).
 
     Only flag opportunities whose net edge after sports taker fee covers
-    `min_net` (default 0.02 USDC/share). Economics always filled when priced.
+    `min_net` (default 0.0076 USDC/share ≈ ask≤0.992). Economics always filled when priced.
     """
     meta: dict[str, Any] = {
         "fee_rate": fee_rate,
@@ -1780,6 +1783,7 @@ def process_bridge_events(
     market_cache: Any | None = None,
     af_referee: Any | None = None,
     af_mode: str = "gate",
+    bid_gate: Any | None = None,
     events_override: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     cursor = load_cursor(root)
@@ -1990,6 +1994,15 @@ def process_bridge_events(
                 _mark_ft_done(mid)
                 return
             if not gate.get("confirmed"):
+                if str(gate.get("error") or "") == "aborted":
+                    seen.add(key)
+                    _mark_ft_done(mid)
+                    print(
+                        f"af-ft-gate → ABORTED FT match_id={mid} "
+                        f"reason={gate.get('reason') or 'cancelled'} key={key}",
+                        flush=True,
+                    )
+                    return
                 skip = {
                     "quoted_at": now_cn_iso(),
                     "trigger": "match_finished",
@@ -2147,6 +2160,15 @@ def process_bridge_events(
         if key in seen and not force:
             return
         if not gate.get("confirmed"):
+            # Aborted by reverse / cancel — silent skip (no buy).
+            if str(gate.get("error") or "") == "aborted":
+                seen.add(key)
+                print(
+                    f"af-referee → ABORTED goal match_id={mid} "
+                    f"reason={gate.get('reason') or 'cancelled'} key={key}",
+                    flush=True,
+                )
+                return
             skip = {
                 "quoted_at": now_cn_iso(),
                 "trigger": "score_change",
@@ -2197,6 +2219,10 @@ def process_bridge_events(
         }
         if pre is not None:
             af_gate["preconfirm"] = pre
+        # Third gate: wait for market best_bid ≥ threshold before buy.
+        if bid_gate is not None:
+            bid_gate.submit(key, work_ev, af_gate=af_gate)
+            return
         _quote_one(work_ev, key, af_gate=af_gate)
 
     def _drain_af() -> None:
@@ -2207,6 +2233,157 @@ def process_bridge_events(
                 _finish_af_job(job)
         except Exception as e:  # noqa: BLE001
             print(f"ALERT af-referee drain failed: {e}", flush=True)
+        try:
+            for job in af_referee.drain_reversal_probes():
+                _finish_rev_probe(job)
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT af-rev-probe drain failed: {e}", flush=True)
+
+    def _finish_rev_probe(job: dict[str, Any]) -> None:
+        """Log + persist DQD-reversal vs AF latency (observe-only)."""
+        from af_referee import reversal_latency_path
+
+        probe = job.get("probe") or {}
+        mid = str(job.get("match_id") or probe.get("match_id") or "")
+        key = str(job.get("event_key") or "")
+        prev = probe.get("dqd_prev") or {}
+        curr = probe.get("dqd_curr") or {}
+        first = probe.get("first_af_goals") or {}
+        row = {
+            "quoted_at": now_cn_iso(),
+            "kind": "af_reversal_probe",
+            "event_key": key,
+            "match_id": mid,
+            "home": (job.get("ev") or {}).get("home"),
+            "away": (job.get("ev") or {}).get("away"),
+            **{k: probe.get(k) for k in (
+                "dqd_ts",
+                "dqd_prev",
+                "dqd_curr",
+                "first_af_goals",
+                "first_poll_ms",
+                "af_reversed",
+                "af_goals_at_detect",
+                "last_af_goals",
+                "af_detected_at",
+                "lag_ms",
+                "polls",
+                "elapsed_ms",
+                "poll_s",
+                "timeout_s",
+                "error",
+                "via",
+            )},
+        }
+        try:
+            append_jsonl_async(reversal_latency_path(root), [row])
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT af-rev-probe persist failed: {e}", flush=True)
+        if probe.get("af_reversed"):
+            print(
+                f"af-rev-probe → AF_REVERSED {mid} "
+                f"dqd={prev.get('home')}-{prev.get('away')}→"
+                f"{curr.get('home')}-{curr.get('away')} "
+                f"af_first={first.get('home')}-{first.get('away')} "
+                f"lag_ms={probe.get('lag_ms')} polls={probe.get('polls')} "
+                f"key={key}",
+                flush=True,
+            )
+            return
+        err = str(probe.get("error") or "")
+        if err in (
+            "af_fixture_not_cached",
+            "af_fixture_unresolved",
+            "af_fixture_unresolved_ttl",
+        ):
+            tag = "AF_CACHE_MISS"
+        elif err == "aborted":
+            tag = "AF_ABORTED"
+        elif err == "af_never_reversed":
+            tag = "AF_NEVER"
+        elif err:
+            tag = "AF_PROBE_FAIL"
+        else:
+            tag = "AF_STILL_AHEAD"
+        print(
+            f"af-rev-probe → {tag} {mid} "
+            f"dqd_curr={curr.get('home')}-{curr.get('away')} "
+            f"first={first.get('home')}-{first.get('away')} "
+            f"last={(probe.get('last_af_goals') or {}).get('home')}-"
+            f"{(probe.get('last_af_goals') or {}).get('away')} "
+            f"err={err or None} polls={probe.get('polls')} "
+            f"key={key}",
+            flush=True,
+        )
+
+    def _finish_bid_gate_job(job: dict[str, Any]) -> None:
+        key = str(job.get("event_key") or "")
+        work_ev = job.get("work_ev") or {}
+        af_gate = dict(job.get("af_gate") or {})
+        gate = job.get("gate") or {}
+        mid = str(job.get("match_id") or work_ev.get("match_id") or "")
+        if key in seen and not force:
+            return
+        af_gate["bid_gate"] = {
+            "confirmed": bool(gate.get("confirmed")),
+            "polls": gate.get("polls"),
+            "elapsed_ms": gate.get("elapsed_ms"),
+            "min_bid": gate.get("min_bid"),
+            "first_bid": gate.get("first_bid"),
+            "pass_bid": gate.get("pass_bid"),
+            "last_max_bid": gate.get("last_max_bid"),
+            "token_id": gate.get("token_id"),
+            "error": gate.get("error"),
+            "reason": gate.get("reason"),
+            "via": gate.get("via") or "bid_gate",
+        }
+        if gate.get("confirmed"):
+            print(
+                f"bid-gate → PASS {mid} bid={gate.get('pass_bid')} "
+                f">= {gate.get('min_bid')} polls={gate.get('polls')} "
+                f"in {gate.get('elapsed_ms')}ms key={key}",
+                flush=True,
+            )
+            _quote_one(work_ev, key, af_gate=af_gate)
+            return
+        err = str(gate.get("error") or "market_bid_unconfirmed")
+        if err == "aborted":
+            mode_s = "market_bid_aborted"
+        elif err == "market_bid_timeout":
+            mode_s = "market_bid_timeout"
+        else:
+            mode_s = "af_bid_unconfirmed"
+        skip = {
+            "quoted_at": now_cn_iso(),
+            "trigger": "score_change",
+            "mode": mode_s,
+            "event_key": key,
+            "match_id": mid,
+            "home": work_ev.get("home"),
+            "away": work_ev.get("away"),
+            "home_score": work_ev.get("home_score"),
+            "away_score": work_ev.get("away_score"),
+            "count": 0,
+            "opportunity_count": 0,
+            "af_referee": af_gate,
+        }
+        bundles.append(skip)
+        seen.add(key)
+        print(
+            f"bid-gate → FAIL {mid} mode={mode_s} err={err} "
+            f"first_bid={gate.get('first_bid')} last_max={gate.get('last_max_bid')} "
+            f"polls={gate.get('polls')} key={key}",
+            flush=True,
+        )
+
+    def _drain_bid_gate() -> None:
+        if bid_gate is None:
+            return
+        try:
+            for job in bid_gate.drain_done():
+                _finish_bid_gate_job(job)
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT bid-gate drain failed: {e}", flush=True)
 
     def _deadline_flatten() -> None:
         if mode != "postcheck" or trade_executor is None:
@@ -2232,13 +2409,16 @@ def process_bridge_events(
         except Exception as e:  # noqa: BLE001
             print(f"ALERT af deadline flatten failed: {e}", flush=True)
 
-    # Drain AF first, then deadline safety-net (never sell a still-pending confirm).
+    # Drain AF only before events: bid-gate drain waits until after reversals
+    # / superseding goals in this tick can cancel pending jobs (avoids race buy).
     _drain_af()
     _deadline_flatten()
 
     pending_keys = (
         af_referee.pending_event_keys() if af_referee is not None else set()
     )
+    if bid_gate is not None:
+        pending_keys |= bid_gate.pending_event_keys()
 
     # Memory events (in-process bridge) first; file scan for restart / board path.
     events_iter: list[dict[str, Any]] = []
@@ -2350,7 +2530,37 @@ def process_bridge_events(
 
             if event_is_reversal(ev):
                 # Flatten + requote on corrected score (even with AF referee on).
+                mid_rev = str(ev.get("match_id") or "")
+                if mid_rev and af_referee is not None:
+                    try:
+                        af_referee.cancel_match(mid_rev, reason="dqd_reversal")
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT af cancel_match failed match={mid_rev}: {e}",
+                            flush=True,
+                        )
+                if mid_rev and bid_gate is not None:
+                    try:
+                        bid_gate.cancel_match(mid_rev, reason="dqd_reversal")
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT bid-gate cancel_match failed match={mid_rev}: {e}",
+                            flush=True,
+                        )
                 _quote_one(ev, key)
+                # Observe-only: did AF also reverse, and how late vs DQD?
+                if af_referee is not None:
+                    from af_referee import reversal_probe_key
+
+                    try:
+                        af_referee.submit_reversal_probe(
+                            reversal_probe_key(ev), ev
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT af-rev-probe submit failed match={mid_rev}: {e}",
+                            flush=True,
+                        )
                 print(
                     f"af-referee → DQD reversal flatten+quote match_id={ev.get('match_id')} "
                     f"key={key}",
@@ -2441,6 +2651,17 @@ def process_bridge_events(
                     continue
 
                 # gate mode: wait for AF; no preconfirm CLOB quote (saves a books round-trip)
+                # Supersede any prior AF/bid-gate wait for this match (new goal target).
+                if af_referee is not None:
+                    try:
+                        af_referee.cancel_match(mid, reason="new_goal_up")
+                    except Exception:  # noqa: BLE001
+                        pass
+                if bid_gate is not None:
+                    try:
+                        bid_gate.cancel_match(mid, reason="new_goal_up")
+                    except Exception:  # noqa: BLE001
+                        pass
                 af_referee.submit(key, ev, target, wait_cache=True)
                 pending_keys.add(key)
                 print(
@@ -2467,6 +2688,7 @@ def process_bridge_events(
         _quote_one(ev, key)
 
     _drain_af()
+    _drain_bid_gate()
     _deadline_flatten()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]

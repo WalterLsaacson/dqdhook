@@ -12,6 +12,9 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from trade_executor import (  # noqa: E402
+    FLATTEN_MAX_LOSS_FRAC,
+    FLATTEN_MIN_PRICE,
+    flatten_min_sell_price,
     flatten_reason_append,
     flatten_sell_shares,
     flatten_sell_shares_available,
@@ -20,8 +23,10 @@ from trade_executor import (  # noqa: E402
     gate_has_locked_inventory,
     is_not_enough_balance_error,
     is_terminal_flatten_error,
+    lot_entry_price,
     parse_balance_gate_error,
 )
+from score_reversal import reconcile_lot_inventory  # noqa: E402
 
 
 def main() -> int:
@@ -85,7 +90,32 @@ def main() -> int:
         == Decimal("0")
     )
 
-    print("ok: flatten sell haircut + balance-gate parse + terminal/reason")
+    # Entry−3% floor (no 0.01 panic dump).
+    assert FLATTEN_MAX_LOSS_FRAC == Decimal("0.03")
+    lot = {"shares": "20.618557", "usdc": "20.0", "tick_size": "0.01"}
+    assert abs(lot_entry_price(lot) - Decimal("0.97")) < Decimal("0.001")
+    # 0.97 * 0.97 = 0.9409 → tick floor 0.94
+    assert flatten_min_sell_price(lot) == Decimal("0.94")
+    assert flatten_min_sell_price({"ask": "0.50"}) == Decimal("0.48")
+    assert flatten_min_sell_price({}) == FLATTEN_MIN_PRICE
+
+    # Delayed fill: plan shares understate live bal → cheaper VWAP → lower floor.
+    delayed = {"shares": 20.618557, "usdc": 20.0, "fill_status": "pending_fill"}
+    assert reconcile_lot_inventory(delayed, Decimal("25.0"))
+    assert delayed["shares"] == 25.0
+    assert delayed["usdc"] == 20.0
+    assert abs(lot_entry_price(delayed) - Decimal("0.8")) < Decimal("0.001")
+    assert flatten_min_sell_price(delayed) == Decimal("0.77")  # 0.8*0.97=0.776
+
+    # Residual after partial sell: scale usdc so VWAP (and floor) hold.
+    residual = {"shares": 20.0, "usdc": 19.4}  # entry 0.97
+    assert reconcile_lot_inventory(residual, Decimal("10.0"))
+    assert residual["shares"] == 10.0
+    assert abs(float(residual["usdc"]) - 9.7) < 1e-9
+    assert abs(lot_entry_price(residual) - Decimal("0.97")) < Decimal("0.001")
+    assert flatten_min_sell_price(residual) == Decimal("0.94")
+
+    print("ok: flatten sell haircut + balance-gate parse + entry-3% floor")
     return 0
 
 

@@ -31,9 +31,10 @@ def _settings(*, goals: bool, ft: bool) -> TradeSettings:
         max_slippage=0.03,
         allow_extreme_prices=False,
         min_buy_price=0.0,
+        min_market_bid=0.0,
         min_order_shares=0.0,
         enabled=True,
-        size_tiers=((0.98, 10.0),),
+        size_tiers=((0.98, 1.0),),
         max_open_usdc=1000.0,
         size_floor_usdc=1.0,
     )

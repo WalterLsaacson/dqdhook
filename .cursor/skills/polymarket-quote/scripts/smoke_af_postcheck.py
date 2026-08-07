@@ -60,9 +60,10 @@ def _settings() -> TradeSettings:
         max_slippage=0.03,
         allow_extreme_prices=False,
         min_buy_price=0.01,
+        min_market_bid=0.0,
         min_order_shares=0.0,
         enabled=True,
-        size_tiers=((0.98, 10.0),),
+        size_tiers=((0.98, 1.0),),
         max_open_usdc=1000.0,
         size_floor_usdc=1.0,
     )
@@ -378,9 +379,9 @@ def test_gate_mode_no_immediate_trade() -> None:
         )
         check("schedule default 90", ref.DEFAULT_TIMEOUT_S == 90.0)
         checks = ref.confirm_check_times(90.0)
-        check("tiered schedule starts 5", checks[0] == 5.0, str(checks[:3]))
-        check("tiered schedule count 35", len(checks) == 35, str(len(checks)))
-        check("late phase every 5s", 65.0 in checks and 61.0 not in checks)
+        check("tiered schedule starts 3", checks[0] == 3.0, str(checks[:3]))
+        check("tiered schedule count 73", len(checks) == 73, str(len(checks)))
+        check("late phase every 2s", 62.0 in checks and 61.0 not in checks)
 
 
 def test_resolve_af_mode_default() -> None:

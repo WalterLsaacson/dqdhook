@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("pm_quote.reversal")
+
+# Ignore sub-dust share drift when aligning ledger to chain balance.
+_INVENTORY_EPS = Decimal("0.000001")
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -36,6 +40,44 @@ def is_score_decrease(
     if prev is None or curr is None:
         return False
     return curr[0] < prev[0] or curr[1] < prev[1]
+
+
+def reconcile_lot_inventory(lot: dict[str, Any], live_shares: Any) -> bool:
+    """Align lot ``shares``/``usdc`` with live conditional balance for VWAP.
+
+    - live > ledger shares (better/understated fill): keep ``usdc``, raise shares.
+    - live < ledger shares (partial exit / overstated plan): scale ``usdc`` so
+      VWAP is preserved on the residual.
+    Mutates ``lot`` in place. Returns True when fields changed.
+    """
+    try:
+        live = Decimal(str(live_shares))
+    except Exception:  # noqa: BLE001
+        return False
+    if live <= 0:
+        return False
+    try:
+        ledger_sh = Decimal(str(lot.get("shares") or 0))
+    except Exception:  # noqa: BLE001
+        ledger_sh = Decimal("0")
+    try:
+        usdc = Decimal(str(lot.get("usdc") or 0))
+    except Exception:  # noqa: BLE001
+        usdc = Decimal("0")
+
+    if ledger_sh <= 0:
+        lot["shares"] = float(live)
+        return True
+    if abs(live - ledger_sh) <= _INVENTORY_EPS:
+        return False
+    if live < ledger_sh:
+        if usdc > 0:
+            lot["usdc"] = float(usdc * (live / ledger_sh))
+        lot["shares"] = float(live)
+        return True
+    # live > ledger: more shares than planned → cheaper true VWAP.
+    lot["shares"] = float(live)
+    return True
 
 
 def event_signals_reversal(ev: dict[str, Any]) -> bool:
@@ -258,8 +300,18 @@ class OpenPositionLedger:
             fill,
         )
 
-    def mark_fill_open(self, token_id: str, match_id: str) -> int:
-        """Promote pending_fill → open after balance appears."""
+    def mark_fill_open(
+        self,
+        token_id: str,
+        match_id: str,
+        *,
+        live_shares: Any = None,
+    ) -> int:
+        """Promote pending_fill → open after balance appears.
+
+        When ``live_shares`` is set, also reconcile ``shares``/``usdc`` so
+        flatten floors use true VWAP (not the pre-trade plan size).
+        """
         n = 0
         tid, mid = str(token_id), str(match_id)
         for r in self._rows:
@@ -267,13 +319,27 @@ class OpenPositionLedger:
                 r.get("status") == "open"
                 and str(r.get("token_id")) == tid
                 and str(r.get("match_id")) == mid
-                and r.get("fill_status") == FILL_STATUS_PENDING
             ):
-                r["fill_status"] = FILL_STATUS_OPEN
-                n += 1
+                changed = False
+                if r.get("fill_status") == FILL_STATUS_PENDING:
+                    r["fill_status"] = FILL_STATUS_OPEN
+                    changed = True
+                if live_shares is not None and reconcile_lot_inventory(r, live_shares):
+                    changed = True
+                if changed:
+                    n += 1
         if n:
             self._save()
         return n
+
+    def reconcile_inventory(
+        self,
+        token_id: str,
+        match_id: str,
+        live_shares: Any,
+    ) -> int:
+        """Align open lot inventory to chain balance; promote pending_fill if needed."""
+        return self.mark_fill_open(token_id, match_id, live_shares=live_shares)
 
     def open_for_match(self, match_id: str) -> list[dict[str, Any]]:
         mid = str(match_id)

@@ -254,36 +254,36 @@ def test_cache_miss_wait_until_timeout() -> None:
 def test_confirm_check_times() -> None:
     print("test_confirm_check_times")
     checks = ref.confirm_check_times(90.0)
-    check("starts at 5", checks[0] == 5.0, str(checks[:3]))
+    check("starts at 3", checks[0] == 3.0, str(checks[:3]))
     check("no immediate 0", 0.0 not in checks)
-    check("has 7", 7.0 in checks)
+    check("has 4", 4.0 in checks)
     check("has 59", 59.0 in checks)
     check("has 60", 60.0 in checks)
-    check("has 65", 65.0 in checks)
+    check("has 62", 62.0 in checks)
     check("has 90", 90.0 in checks)
     check("no 61 on late grid", 61.0 not in checks)
-    # Early phase: 2s spacing before 60
+    # Early phase: 1s spacing before 60
     early = [c for c in checks if c < 60]
     check(
-        "early spacing ~2s",
-        all(abs(early[i + 1] - early[i] - 2.0) < 0.01 for i in range(len(early) - 1)),
+        "early spacing ~1s",
+        all(abs(early[i + 1] - early[i] - 1.0) < 0.01 for i in range(len(early) - 1)),
         str(early[:5]),
     )
-    # Late phase: 5s spacing from 60
+    # Late phase: 2s spacing from 60
     late = [c for c in checks if c >= 60]
     check(
-        "late spacing ~5s",
-        late == [60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0],
+        "late spacing ~2s",
+        late == [60.0, 62.0, 64.0, 66.0, 68.0, 70.0, 72.0, 74.0, 76.0, 78.0, 80.0, 82.0, 84.0, 86.0, 88.0, 90.0],
         str(late),
     )
-    # 5..59 @2s → 28 ticks; 60..90 @5s → 7 ticks → 35
-    check("count 35", len(checks) == 35, str(len(checks)))
+    # 3..59 @1s → 57 ticks; 60..90 @2s → 16 ticks → 73
+    check("count 73", len(checks) == 73, str(len(checks)))
     check("last is timeout", checks[-1] == 90.0, str(checks[-1]))
     short = ref.confirm_check_times(2.5, first_delay_s=0.0, period_s=1.0, late_after_s=10.0)
     check("short ends ≤timeout", short[-1] <= 2.5 + 1e-9, str(short))
     check("short no past timeout", all(c <= 2.5 + 1e-9 for c in short), str(short))
     label = ref.schedule_label()
-    check("label mentions 5s→2s→60s→5s→90s", "5s→every 2s→60s→every 5s→90s" == label, label)
+    check("label mentions 3s→1s→60s→2s→90s", "3s→every 1s→60s→every 2s→90s" == label, label)
     check(
         "default AF min interval off (schedule-first)",
         abs(ref.af_min_interval_s() - 0.0) < 1e-9,
@@ -477,6 +477,119 @@ def test_apply_score() -> None:
     check("same orientation passthrough", same == (2, 1), str(same))
 
 
+def test_reversal_probe_af_reverses() -> None:
+    print("test_reversal_probe_af_reverses")
+    calls = {"n": 0}
+
+    def events_fn(mid: str, persist_burst: bool = False, **_kw: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return {"ok": True, "goals": {"home": 1, "away": 0}, "af_fixture_id": 1}
+        return {"ok": True, "goals": {"home": 0, "away": 0}, "af_fixture_id": 1}
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        g = ref.AfReferee(
+            root,
+            events_fn=events_fn,
+            poll_schedule=False,
+            timeout_s=2.0,
+        )
+        out = g.await_reversal_probe(
+            "m_rev",
+            (1, 0),
+            (0, 0),
+            dqd_ts=ref.iso_now(),
+            poll_s=0.05,
+            timeout_s=2.0,
+        )
+        check("af_reversed", out.get("af_reversed") is True, str(out))
+        check("lag_ms set", out.get("lag_ms") is not None, str(out.get("lag_ms")))
+        check("polls>=3", int(out.get("polls") or 0) >= 3, str(out.get("polls")))
+        check(
+            "first was 1-0",
+            (out.get("first_af_goals") or {}) == {"home": 1, "away": 0},
+            str(out.get("first_af_goals")),
+        )
+        check(
+            "detect 0-0",
+            (out.get("af_goals_at_detect") or {}) == {"home": 0, "away": 0},
+            str(out.get("af_goals_at_detect")),
+        )
+
+
+def test_reversal_probe_never_reverses() -> None:
+    print("test_reversal_probe_never_reverses")
+
+    def events_fn(mid: str, persist_burst: bool = False, **_kw: Any) -> dict[str, Any]:
+        return {"ok": True, "goals": {"home": 1, "away": 0}, "af_fixture_id": 1}
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        g = ref.AfReferee(root, events_fn=events_fn, poll_schedule=False)
+        out = g.await_reversal_probe(
+            "m_stay",
+            (1, 0),
+            (0, 0),
+            dqd_ts=ref.iso_now(),
+            poll_s=0.05,
+            timeout_s=0.2,
+        )
+        check("not reversed", out.get("af_reversed") is False, str(out))
+        check(
+            "error never",
+            out.get("error") == "af_never_reversed",
+            str(out.get("error")),
+        )
+        check(
+            "first 1-0",
+            (out.get("first_af_goals") or {}) == {"home": 1, "away": 0},
+            str(out.get("first_af_goals")),
+        )
+
+
+def test_reversal_probe_submit_drain() -> None:
+    print("test_reversal_probe_submit_drain")
+    state = {"goals": (1, 0)}
+
+    def events_fn(mid: str, persist_burst: bool = False, **_kw: Any) -> dict[str, Any]:
+        h, a = state["goals"]
+        return {"ok": True, "goals": {"home": h, "away": a}, "af_fixture_id": 9}
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        g = ref.AfReferee(root, events_fn=events_fn, poll_schedule=False)
+        ev = {
+            "type": "score_change",
+            "match_id": "m_async",
+            "ts": ref.iso_now(),
+            "home": "H",
+            "away": "A",
+            "prev": {"home": 1, "away": 0},
+            "curr": {"home": 0, "away": 0},
+            "is_reversal": True,
+        }
+        key = ref.reversal_probe_key(ev)
+        check("submitted", g.submit_reversal_probe(key, ev) is True)
+        check("dup submit false", g.submit_reversal_probe(key, ev) is False)
+        time.sleep(0.08)
+        state["goals"] = (0, 0)
+        deadline = time.monotonic() + 2.0
+        jobs: list = []
+        while time.monotonic() < deadline:
+            jobs = g.drain_reversal_probes()
+            if jobs:
+                break
+            time.sleep(0.05)
+        check("drained", len(jobs) == 1, str(jobs))
+        if jobs:
+            check(
+                "probe reversed",
+                (jobs[0].get("probe") or {}).get("af_reversed") is True,
+                str(jobs[0]),
+            )
+
+
 def main() -> int:
     test_classifiers()
     test_af_score_satisfies()
@@ -490,6 +603,9 @@ def main() -> int:
     test_schedule_cadence_wall_times()
     test_transient_network_retry()
     test_apply_score()
+    test_reversal_probe_af_reverses()
+    test_reversal_probe_never_reverses()
+    test_reversal_probe_submit_drain()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
