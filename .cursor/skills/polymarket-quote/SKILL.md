@@ -108,7 +108,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--take-depth top\|walk` | `top` | Best level vs walk book |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 2 / 25 | Hard caps; **`.env` `QUOTE_MAX_*` wins**; per-ask tiers scale both together |
-| `QUOTE_SIZE_TIERS` | `0.98:1` | ask≥threshold → usdc; below → `QUOTE_MAX_USDC` ($2) |
+| `QUOTE_SIZE_TIERS` | `0.98:2` | ask≥threshold → usdc; below → `QUOTE_MAX_USDC` ($2) |
 | `QUOTE_MAX_OPEN_USDC` | 1000 | Sum of open lot `usdc` budget (effectively open) |
 | `QUOTE_SIZE_FLOOR_USDC` | 1 | Skip buy if effective usdc below floor |
 | `--max-slippage` | 0.03 | Walk adverse price cap |

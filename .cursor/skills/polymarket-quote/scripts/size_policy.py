@@ -7,7 +7,7 @@ from typing import Any
 
 
 # ask >= threshold → usdc; below all thresholds → hard max_usdc (default $2).
-DEFAULT_SIZE_TIERS: tuple[tuple[float, float], ...] = ((0.98, 1.0),)
+DEFAULT_SIZE_TIERS: tuple[tuple[float, float], ...] = ((0.98, 2.0),)
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class BuySizeCaps:
 
 
 def parse_size_tiers(raw: str | None) -> list[tuple[float, float]]:
-    """Parse ``0.98:1`` → sorted (min_ask, usdc); ask >= threshold uses usdc."""
+    """Parse ``0.98:2`` → sorted (min_ask, usdc); ask >= threshold uses usdc."""
     if raw is None or not str(raw).strip():
         return list(DEFAULT_SIZE_TIERS)
     out: list[tuple[float, float]] = []

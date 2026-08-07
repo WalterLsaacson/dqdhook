@@ -1197,13 +1197,21 @@ class TradeExecutor:
         ek = f"flatten|{mid}|{ev.get('ts') or lib.now_cn_iso()}|{reason}"
         for lot in affected:
             out.append(self._flatten_lot(lot, event_key=ek, reason=reason, match_ev=ev))
-        if not self.ledger.open_for_match(mid) and not self.ledger.pending_flatten_lots():
-            self._buy_blocked_matches.discard(mid)
-        elif not any(
-            str(r.get("match_id")) == mid for r in self.ledger.pending_flatten_lots()
-        ) and not self.ledger.open_for_match(mid):
-            self._buy_blocked_matches.discard(mid)
+        self._maybe_clear_buy_block(mid)
         return out
+
+    def _maybe_clear_buy_block(self, mid: str) -> None:
+        """Lift buy_win block once this match has no open / pending_flatten lots."""
+        mid = str(mid or "")
+        if not mid:
+            return
+        if self.ledger.open_for_match(mid):
+            return
+        if any(
+            str(r.get("match_id")) == mid for r in self.ledger.pending_flatten_lots()
+        ):
+            return
+        self._buy_blocked_matches.discard(mid)
 
     def retry_pending_flattens(self) -> list[dict[str, Any]]:
         """Retry live FAK exits that failed earlier (lot still open + pending_flatten)."""
@@ -1234,7 +1242,7 @@ class TradeExecutor:
                 self.ledger.mark_closed(
                     tid, mid, reason=flatten_reason_append(give_up, reason)
                 )
-                self._buy_blocked_matches.discard(mid)
+                self._maybe_clear_buy_block(mid)
                 alert = (
                     f"ALERT flatten_give_up match={mid} token={tid[:12]}… "
                     f"{give_up} — stopped retry"
@@ -1347,6 +1355,7 @@ class TradeExecutor:
             )
             self._flatten_done.add(key)
             self.ledger.mark_closed(token_id, mid, reason=reason)
+            self._maybe_clear_buy_block(mid)
             logger.info(
                 "flatten dry-run match=%s token=%s… shares=%.4f (%s)",
                 mid,
@@ -1404,7 +1413,7 @@ class TradeExecutor:
                             )
                             self._flatten_done.add(key)
                             self.ledger.mark_closed(token_id, mid, reason=close_r)
-                            self._buy_blocked_matches.discard(mid)
+                            self._maybe_clear_buy_block(mid)
                             alert = (
                                 f"ALERT flatten_give_up match={mid} token={token_id[:12]}… "
                                 f"delayed fill never appeared after {attempts} attempts"
@@ -1446,7 +1455,7 @@ class TradeExecutor:
                     )
                     self._flatten_done.add(key)
                     self.ledger.mark_closed(token_id, mid, reason=reason + "|empty")
-                    self._buy_blocked_matches.discard(mid)
+                    self._maybe_clear_buy_block(mid)
                     return row
                 if bal >= FLATTEN_MIN_SHARES:
                     # Have inventory but cannot size a legal sell this tick.
@@ -1490,6 +1499,7 @@ class TradeExecutor:
                 )
                 self._flatten_done.add(key)
                 self.ledger.mark_closed(token_id, mid, reason=dust_reason)
+                self._maybe_clear_buy_block(mid)
                 alert = (
                     f"ALERT flatten_dust match={mid} token={token_id[:12]}… "
                     f"bal={bal} sell={shares} < {FLATTEN_MIN_SHARES} — closed"
@@ -1565,6 +1575,7 @@ class TradeExecutor:
                 if residual > 0:
                     close_r += f"|dust_residual={residual}"
                 self.ledger.mark_closed(token_id, mid, reason=close_r)
+                self._maybe_clear_buy_block(mid)
             else:
                 alert = (
                     f"ALERT flatten_incomplete match={mid} token={token_id[:12]}… "
@@ -1612,6 +1623,7 @@ class TradeExecutor:
                     mid,
                     reason=flatten_reason_append(reason, "terminal", str(e)),
                 )
+                self._maybe_clear_buy_block(mid)
             else:
                 self.ledger.mark_pending_flatten(
                     token_id,
@@ -1824,6 +1836,7 @@ class TradeExecutor:
                 mid,
                 reason=flatten_reason_append(reason, "balance_gate_retry"),
             )
+            self._maybe_clear_buy_block(mid)
         else:
             self.ledger.mark_pending_flatten(
                 token_id,

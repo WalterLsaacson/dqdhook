@@ -115,7 +115,71 @@ def main() -> int:
     assert abs(lot_entry_price(residual) - Decimal("0.97")) < Decimal("0.001")
     assert flatten_min_sell_price(residual) == Decimal("0.94")
 
-    print("ok: flatten sell haircut + balance-gate parse + entry-3% floor")
+    # Dust/close must lift buy_blocked_pending_flatten for the match.
+    import tempfile
+    from trade_settings import TradeSettings
+    from trade_executor import TradeExecutor
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        settings = TradeSettings(
+            private_key="",
+            funder=None,
+            signature_type=2,
+            chain_id=137,
+            clob_host="https://clob.polymarket.com",
+            data_api_url="https://data-api.polymarket.com",
+            live_goals=False,
+            live_ft=False,
+            take_depth="top",
+            max_levels=5,
+            max_usdc=2.0,
+            max_shares=25.0,
+            max_slippage=0.03,
+            allow_extreme_prices=False,
+            min_buy_price=0.0,
+            min_market_bid=0.0,
+            min_order_shares=0.0,
+            enabled=True,
+            size_tiers=((0.98, 2.0),),
+            max_open_usdc=1000.0,
+            size_floor_usdc=1.0,
+        )
+        ex = TradeExecutor(root, settings, af_mode="gate")
+        mid = "m_block"
+        ex.ledger.register_buy(
+            match_id=mid,
+            token_id="tok_block",
+            market_key="match_total_0.5_over",
+            shares=1.02,
+            usdc=1.0,
+            home_score=1,
+            away_score=0,
+            live=True,
+            event_key="score_change|m_block|0-0->1-0",
+        )
+        ex._buy_blocked_matches.add(mid)
+        ex.ledger.mark_closed("tok_block", mid, reason="score_reversal|dust_bal=0.0004")
+        ex._maybe_clear_buy_block(mid)
+        assert mid not in ex._buy_blocked_matches
+        # Still-open lot must keep the block.
+        ex.ledger.register_buy(
+            match_id=mid,
+            token_id="tok_block2",
+            market_key="match_total_1.5_over",
+            shares=1.0,
+            usdc=1.0,
+            home_score=1,
+            away_score=0,
+            live=True,
+            event_key="score_change|m_block|0-0->1-0|b",
+        )
+        ex._buy_blocked_matches.add(mid)
+        ex._maybe_clear_buy_block(mid)
+        assert mid in ex._buy_blocked_matches
+
+    print("ok: flatten sell haircut + balance-gate parse + entry-3% floor + buy-block clear")
     return 0
 
 

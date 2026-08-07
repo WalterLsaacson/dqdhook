@@ -195,7 +195,7 @@ def main() -> int:
                 min_market_bid=0.9,
                 min_order_shares=0.0,
                 enabled=True,
-                size_tiers=((0.98, 1.0),),
+                size_tiers=((0.98, 2.0),),
                 max_open_usdc=1000.0,
                 size_floor_usdc=1.0,
             )
