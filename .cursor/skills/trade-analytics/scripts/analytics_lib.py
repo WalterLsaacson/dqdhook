@@ -171,12 +171,20 @@ def usdc_of(row: dict[str, Any]) -> float | None:
 
 def compact_trade(row: dict[str, Any]) -> dict[str, Any]:
     plan = plan_of(row)
+    resp = as_dict(row.get("response"))
+    skip = row.get("skip_reason") or plan.get("skip_reason")
+    # CLOB delayed accepts stash "delayed|…" into skip_reason but are still fills.
+    delayed = bool(
+        str(skip or "").startswith("delayed")
+        or str(resp.get("status") or "").lower() == "delayed"
+    )
     return {
         "quoted_at": row.get("quoted_at"),
         "status": row.get("status"),
         "trade": row.get("trade"),
         "live": row.get("live"),
         "success": row.get("success"),
+        "event_type": row.get("event_type"),
         "match_id": row.get("match_id"),
         "home": row.get("home"),
         "away": row.get("away"),
@@ -186,14 +194,190 @@ def compact_trade(row: dict[str, Any]) -> dict[str, Any]:
         "market_key": row.get("market_key"),
         "settlement": row.get("settlement"),
         "net_edge": row.get("net_edge"),
+        "gross_edge": row.get("gross_edge"),
+        "fee": row.get("fee"),
         "best_ask": row.get("best_ask"),
         "best_bid": row.get("best_bid"),
+        "take_depth": row.get("take_depth") or plan.get("take_depth"),
         "usdc": usdc_of(row),
         "shares": plan.get("shares"),
+        "worst_price": plan.get("worst_price"),
         "est_profit": est_buy_win_profit(row),
-        "skip_reason": row.get("skip_reason") or plan.get("skip_reason"),
+        "skip_reason": skip,
+        "delayed": delayed,
+        "order_id": resp.get("orderID") or resp.get("order_id"),
+        "response_status": resp.get("status"),
         "event_key": row.get("event_key"),
+        "idempotency_key": row.get("idempotency_key"),
+        "note": trade_note(row, skip=skip, delayed=delayed),
     }
+
+
+def trade_note(
+    row: dict[str, Any],
+    *,
+    skip: Any = None,
+    delayed: bool | None = None,
+) -> str:
+    """One short human label for ledger rows."""
+    status = str(row.get("status") or "")
+    skip_s = str(skip if skip is not None else (row.get("skip_reason") or ""))
+    if delayed is None:
+        delayed = skip_s.startswith("delayed") or str(
+            as_dict(row.get("response")).get("status") or ""
+        ).lower() == "delayed"
+    if delayed and status in ("posted", "live", "filled", "dry_run"):
+        return "CLOB delayed (accepted)"
+    if status == "skipped" and skip_s:
+        return _shorten_note(skip_s)
+    if status.startswith("flatten"):
+        return _shorten_note(skip_s or status)
+    if status == "error":
+        return _shorten_note(skip_s or "error")
+    if status in ("posted", "live", "filled"):
+        return "filled" if not delayed else "CLOB delayed (accepted)"
+    if status == "dry_run":
+        return "dry-run plan"
+    return _shorten_note(skip_s or status or "—")
+
+
+def _shorten_note(text: str, *, max_len: int = 96) -> str:
+    s = " ".join(str(text).split())
+    # Collapse repeated flatten residual spam: a|incomplete residual=x|…|residual=x
+    if "incomplete residual=" in s:
+        head = s.split("|", 1)[0]
+        # keep last residual token if present
+        tail = ""
+        for part in reversed(s.split("|")):
+            if "residual=" in part:
+                tail = part.strip()
+                break
+        s = f"{head}|…|{tail}" if tail and tail not in head else f"{head}|…"
+    if len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
+def format_ledger_line(row: dict[str, Any]) -> str:
+    """Fixed-ish columns for terminal / companion text ledger."""
+    c = compact_trade(row) if "note" not in row or "score" not in row else row
+    ts = str(c.get("quoted_at") or "")
+    if "T" in ts:
+        # 2026-08-09T23:04:40+08:00 → 08-09 23:04:40
+        try:
+            body = ts.split("T", 1)
+            date = body[0][5:] if len(body[0]) >= 10 else body[0]
+            clock = body[1][:8] if len(body) > 1 else ""
+            ts = f"{date} {clock}".strip()
+        except Exception:  # noqa: BLE001
+            pass
+    mode = "LIVE" if c.get("live") else "dry"
+    match = f"{c.get('home') or '?'} {c.get('score') or '?'} {c.get('away') or '?'}"
+    mkt = c.get("market_key") or f"{c.get('family') or '?'}/{c.get('outcome') or '?'}"
+    usdc = c.get("usdc")
+    usdc_s = f"${usdc:.2f}" if isinstance(usdc, (int, float)) else "—"
+    edge = c.get("net_edge")
+    edge_s = f"edge={edge:.4f}" if isinstance(edge, (int, float)) else ""
+    est = c.get("est_profit")
+    est_s = f"est=+{est:.3f}" if isinstance(est, (int, float)) else ""
+    note = c.get("note") or ""
+    extras = " ".join(x for x in (edge_s, est_s) if x)
+    return (
+        f"{ts:<17}  {mode:<4}  {str(c.get('status') or '?'):<16}  "
+        f"{str(c.get('trade') or '?'):<16}  {match:<42}  "
+        f"{str(mkt):<28}  {usdc_s:>7}  {extras}  {note}"
+    ).rstrip()
+
+
+def build_ledger(
+    trades: list[dict[str, Any]],
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    trade: str | None = None,
+    status: str | None = None,
+    family: str | None = None,
+    match_id: str | None = None,
+    live: bool | None = None,
+    q: str | None = None,
+    limit: int | None = 200,
+    newest_first: bool = True,
+) -> dict[str, Any]:
+    """Filter trades.jsonl into compact ledger rows for UI / CLI."""
+    rows = filter_window(trades, since=since, until=until)
+    if trade:
+        rows = [r for r in rows if r.get("trade") == trade]
+    if status:
+        rows = [r for r in rows if r.get("status") == status]
+    if family:
+        rows = [r for r in rows if r.get("family") == family]
+    if match_id:
+        rows = [r for r in rows if str(r.get("match_id")) == str(match_id)]
+    if live is not None:
+        rows = [r for r in rows if bool(r.get("live")) is live]
+    needle = (q or "").strip().lower()
+    if needle:
+        def _hit(r: dict[str, Any]) -> bool:
+            blob = " ".join(
+                str(r.get(k) or "")
+                for k in (
+                    "home",
+                    "away",
+                    "market_key",
+                    "family",
+                    "outcome",
+                    "status",
+                    "trade",
+                    "event_type",
+                    "skip_reason",
+                    "match_id",
+                )
+            ).lower()
+            return needle in blob
+
+        rows = [r for r in rows if _hit(r)]
+
+    compact = [compact_trade(r) for r in rows]
+    total = len(compact)
+    if newest_first:
+        compact.reverse()
+        if limit is not None and limit >= 0:
+            compact = compact[: int(limit)]
+    elif limit is not None and limit >= 0:
+        compact = compact[-int(limit) :]
+    return {
+        "analyzed_at": now_cn_iso(),
+        "total_matched": total,
+        "returned": len(compact),
+        "limit": limit,
+        "trades": compact,
+    }
+
+
+DEFAULT_LEDGER_TXT = Path("data/pm-quote/trades_ledger.txt")
+
+
+def write_ledger_text(
+    trades: list[dict[str, Any]],
+    path: Path,
+    *,
+    limit: int | None = None,
+) -> Path:
+    """Write a plain-text companion ledger (does not alter trades.jsonl)."""
+    payload = build_ledger(trades, limit=limit, newest_first=True)
+    lines = [
+        f"# pm-quote trades ledger  generated={payload['analyzed_at']}",
+        f"# source=data/pm-quote/trades.jsonl  matched={payload['total_matched']}  "
+        f"shown={payload['returned']}",
+        "# time              mode  status            trade             "
+        "match                                       market                         $      notes",
+        "#" + "-" * 140,
+    ]
+    for row in payload["trades"]:
+        lines.append(format_ledger_line(row))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def load_open_positions(path: Path) -> list[dict[str, Any]]:

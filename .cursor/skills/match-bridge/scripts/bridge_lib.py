@@ -404,6 +404,8 @@ def match_fixtures(
                     "minute_str": d.get("minute_str") or "",
                     "injury_time": d.get("injury_time") or 0,
                     "period": d.get("period") or "",
+                    "team_A_event": d.get("team_A_event"),
+                    "team_B_event": d.get("team_B_event"),
                     "official_clock": d.get("official_clock") or "",
                     "wall_clock": d.get("wall_clock") or "",
                     "wall_elapsed_sec": d.get("wall_elapsed_sec"),

@@ -204,6 +204,9 @@ def map_match(raw: dict[str, Any]) -> dict[str, Any]:
         "minute_str": minute_str,
         "injury_time": injury_time,
         "period": period,
+        # List-side event codes (G/COR/YC/…) — useful as goal-context 旁证.
+        "team_A_event": raw.get("team_A_event"),
+        "team_B_event": raw.get("team_B_event"),
         "start_play": start_play,
         "match_timestamp": match_ts,
         "update_timestamp": update_ts,

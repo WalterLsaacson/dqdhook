@@ -231,10 +231,16 @@ def prune_runtime_data(
             "post_goal_samples.jsonl",
         ),
         (
-            lib.data_dir(root) / "af_reversal_latency.jsonl",
-            ("quoted_at", "dqd_ts", "af_detected_at", "ts"),
+            lib.data_dir(root) / "goal_context_observe.jsonl",
+            ("quoted_at", "ts"),
             None,
-            "af_reversal_latency.jsonl",
+            "goal_context_observe.jsonl",
+        ),
+        (
+            lib.data_dir(root) / "livescore_observe.jsonl",
+            ("sampled_at", "quoted_at", "ts"),
+            None,
+            "livescore_observe.jsonl",
         ),
         (
             lib.bridge_dir(root) / "events.jsonl",

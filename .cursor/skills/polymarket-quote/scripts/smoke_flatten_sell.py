@@ -90,13 +90,13 @@ def main() -> int:
         == Decimal("0")
     )
 
-    # Entry−3% floor (no 0.01 panic dump).
-    assert FLATTEN_MAX_LOSS_FRAC == Decimal("0.03")
+    # Entry−10% floor (no 0.01 panic dump).
+    assert FLATTEN_MAX_LOSS_FRAC == Decimal("0.10")
     lot = {"shares": "20.618557", "usdc": "20.0", "tick_size": "0.01"}
     assert abs(lot_entry_price(lot) - Decimal("0.97")) < Decimal("0.001")
-    # 0.97 * 0.97 = 0.9409 → tick floor 0.94
-    assert flatten_min_sell_price(lot) == Decimal("0.94")
-    assert flatten_min_sell_price({"ask": "0.50"}) == Decimal("0.48")
+    # 0.97 * 0.90 = 0.873 → tick floor 0.87
+    assert flatten_min_sell_price(lot) == Decimal("0.87")
+    assert flatten_min_sell_price({"ask": "0.50"}) == Decimal("0.45")
     assert flatten_min_sell_price({}) == FLATTEN_MIN_PRICE
 
     # Delayed fill: plan shares understate live bal → cheaper VWAP → lower floor.
@@ -105,7 +105,7 @@ def main() -> int:
     assert delayed["shares"] == 25.0
     assert delayed["usdc"] == 20.0
     assert abs(lot_entry_price(delayed) - Decimal("0.8")) < Decimal("0.001")
-    assert flatten_min_sell_price(delayed) == Decimal("0.77")  # 0.8*0.97=0.776
+    assert flatten_min_sell_price(delayed) == Decimal("0.72")  # 0.8*0.90=0.72
 
     # Residual after partial sell: scale usdc so VWAP (and floor) hold.
     residual = {"shares": 20.0, "usdc": 19.4}  # entry 0.97
@@ -113,7 +113,7 @@ def main() -> int:
     assert residual["shares"] == 10.0
     assert abs(float(residual["usdc"]) - 9.7) < 1e-9
     assert abs(lot_entry_price(residual) - Decimal("0.97")) < Decimal("0.001")
-    assert flatten_min_sell_price(residual) == Decimal("0.94")
+    assert flatten_min_sell_price(residual) == Decimal("0.87")
 
     # Dust/close must lift buy_blocked_pending_flatten for the match.
     import tempfile
@@ -139,7 +139,6 @@ def main() -> int:
             max_slippage=0.03,
             allow_extreme_prices=False,
             min_buy_price=0.0,
-            min_market_bid=0.0,
             min_order_shares=0.0,
             enabled=True,
             size_tiers=((0.98, 2.0),),
@@ -179,7 +178,7 @@ def main() -> int:
         ex._maybe_clear_buy_block(mid)
         assert mid in ex._buy_blocked_matches
 
-    print("ok: flatten sell haircut + balance-gate parse + entry-3% floor + buy-block clear")
+    print("ok: flatten sell haircut + balance-gate parse + entry-10% floor + buy-block clear")
     return 0
 
 

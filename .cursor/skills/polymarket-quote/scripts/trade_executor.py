@@ -40,7 +40,7 @@ FLATTEN_MIN_SHARES = Decimal("0.01")
 FLATTEN_MIN_PRICE = Decimal("0.5")
 # Max loss vs entry on emergency flatten: min_sell = entry * (1 - this).
 # Thin books that cannot fill leave residual for later retry ticks.
-FLATTEN_MAX_LOSS_FRAC = Decimal("0.03")
+FLATTEN_MAX_LOSS_FRAC = Decimal("0.10")
 # Polymarket matched-order cache often rejects 100% sells; keep a haircut.
 FLATTEN_SELL_HAIRCUT = Decimal("0.99")
 # Live bal vs gate bal: within this → trust gate "free"; else size from live only.
@@ -575,21 +575,6 @@ class TradeExecutor:
             return f"buy_price_below_min={price}<{floor}"
         return None
 
-    def _min_market_bid_blocked(self, bid: float | None) -> str | None:
-        """score_change buy_win: require best_bid >= min_market_bid (0=off)."""
-        floor = float(getattr(self.settings, "min_market_bid", 0.0) or 0.0)
-        if floor <= 0:
-            return None
-        if bid is None:
-            return f"market_bid_below_min=None<{floor}"
-        try:
-            bid_f = float(bid)
-        except (TypeError, ValueError):
-            return f"market_bid_below_min=None<{floor}"
-        if bid_f + 1e-12 < floor:
-            return f"market_bid_below_min={bid_f}<{floor}"
-        return None
-
     def maybe_trade(
         self,
         quote: dict[str, Any],
@@ -712,38 +697,6 @@ class TradeExecutor:
                     below_min,
                 )
                 return row
-            # Third gate hard check (score_change only): market must bid ≥ floor.
-            if typ == "score_change":
-                try:
-                    bid_f = (
-                        float(quote.get("best_bid"))
-                        if quote.get("best_bid") is not None
-                        else None
-                    )
-                except (TypeError, ValueError):
-                    bid_f = None
-                bid_block = self._min_market_bid_blocked(bid_f)
-                if bid_block:
-                    row = self._record(
-                        quote,
-                        event_key=event_key,
-                        match_meta=match_meta,
-                        plan=None,
-                        status="skipped",
-                        skip_reason=bid_block,
-                        response=None,
-                        success=False,
-                        idempotency_key=key,
-                        live=channel_live,
-                    )
-                    self._done.add(key)
-                    logger.info(
-                        "skip buy_win %s bid=%s (%s)",
-                        (quote.get("market_key") or "")[:40],
-                        bid_f,
-                        bid_block,
-                    )
-                    return row
 
         available: float | None = None
         if trade == "sell_lose":
@@ -1365,7 +1318,7 @@ class TradeExecutor:
             )
             return row
 
-        # Live FAK sell: cancel locks, haircut size, min_price = entry×(1−3%).
+        # Live FAK sell: cancel locks, haircut size, min_price = entry×(1−10%).
         # No 0.01 panic dump — if the book cannot fill, residual stays for retry.
         try:
             trader = self.ensure_trader()

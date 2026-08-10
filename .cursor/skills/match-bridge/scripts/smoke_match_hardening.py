@@ -139,6 +139,19 @@ def main() -> int:
     _assert(bl.normalize_league("女足欧冠") == "uwcl", "女足欧冠→uwcl")
     _assert(bl.normalize_league("东南锦") == "asean", "东南锦→asean")
     _assert(bl.normalize_league("ASEAN") == "asean", "ASEAN→asean")
+    # 2026-08-09: ERE/POR/BEL1/TUR2/GEO1/ITC/NED2/GRC
+    _assert(bl.normalize_league("荷甲") == "ere", "荷甲→ere")
+    _assert(bl.normalize_league("ERE", "ere") == "ere", "ERE→ere")
+    _assert(bl.normalize_league("葡超") == "por", "葡超→por")
+    _assert(bl.normalize_league("POR", "por") == "por", "POR→por")
+    _assert(bl.normalize_league("比甲") == "bel1", "比甲→bel1")
+    _assert(bl.normalize_league("BEL1", "bel1") == "bel1", "BEL1→bel1")
+    _assert(bl.normalize_league("土甲") == "tur2", "土甲→tur2")
+    _assert(bl.normalize_league("TUR2", "tur2") == "tur2", "TUR2→tur2")
+    _assert(bl.normalize_league("格鲁甲") == "geo1", "格鲁甲→geo1")
+    _assert(bl.normalize_league("荷乙") == "ned2", "荷乙→ned2")
+    _assert(bl.normalize_league("意大利杯") == "itc", "意大利杯→itc")
+    _assert(bl.normalize_league("希腊杯") == "grc", "希腊杯→grc")
 
     # Team aliases that were blocking PM↔DQD
     _assert(bl.normalize_team("OB") == bl.normalize_team("Odense BK"), "OB↔Odense")
@@ -208,6 +221,50 @@ def main() -> int:
     _assert(
         bl.normalize_team("TSC W") == bl.normalize_team("FK TSC Bačka Topola"),
         "TSC W",
+    )
+    # 2026-08-09 side-name gaps
+    _assert(
+        bl.normalize_team("Royal Charleroi SC")
+        == bl.normalize_team("RC Sporting Charleroi"),
+        "Charleroi",
+    )
+    _assert(
+        bl.normalize_team("Jong AZ Alkmaar") == bl.normalize_team("AZ II"),
+        "Jong AZ↔AZ II",
+    )
+    _assert(
+        bl.normalize_team("Jong PSV Eindhoven") == bl.normalize_team("PSV II"),
+        "Jong PSV↔PSV II",
+    )
+    _assert(
+        bl.normalize_team("Jong FC Utrecht") == bl.normalize_team("Utrecht II"),
+        "Jong Utrecht↔Utrecht II",
+    )
+    _assert(
+        bl.normalize_team("AC Goianiense") == bl.normalize_team("Atlético GO"),
+        "Goianiense↔Atlético GO",
+    )
+    _assert(
+        bl.normalize_team("FC Corvinul 1921 Hunedoara")
+        == bl.normalize_team("CS Hunedoara"),
+        "Corvinul↔Hunedoara",
+    )
+    _assert(
+        bl.normalize_team("NK Varaždin")
+        == bl.normalize_team("NK Varteks Varazdin"),
+        "Varazdin↔Varteks",
+    )
+    _assert(
+        bl.normalize_team("AE Lárisas 1964") == bl.normalize_team("Larissa"),
+        "Larisas↔Larissa",
+    )
+    _assert(
+        bl.normalize_team("Aluminij Kidricevo") == bl.normalize_team("NK Aluminij"),
+        "Aluminij",
+    )
+    _assert(
+        bl.normalize_team("Bravo Ljubljana") == bl.normalize_team("NK Bravo"),
+        "Bravo",
     )
     _assert(
         bl.normalize_team("Racing W")

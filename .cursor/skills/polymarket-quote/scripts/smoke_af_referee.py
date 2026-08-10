@@ -477,119 +477,6 @@ def test_apply_score() -> None:
     check("same orientation passthrough", same == (2, 1), str(same))
 
 
-def test_reversal_probe_af_reverses() -> None:
-    print("test_reversal_probe_af_reverses")
-    calls = {"n": 0}
-
-    def events_fn(mid: str, persist_burst: bool = False, **_kw: Any) -> dict[str, Any]:
-        calls["n"] += 1
-        if calls["n"] < 3:
-            return {"ok": True, "goals": {"home": 1, "away": 0}, "af_fixture_id": 1}
-        return {"ok": True, "goals": {"home": 0, "away": 0}, "af_fixture_id": 1}
-
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        root = Path(td)
-        g = ref.AfReferee(
-            root,
-            events_fn=events_fn,
-            poll_schedule=False,
-            timeout_s=2.0,
-        )
-        out = g.await_reversal_probe(
-            "m_rev",
-            (1, 0),
-            (0, 0),
-            dqd_ts=ref.iso_now(),
-            poll_s=0.05,
-            timeout_s=2.0,
-        )
-        check("af_reversed", out.get("af_reversed") is True, str(out))
-        check("lag_ms set", out.get("lag_ms") is not None, str(out.get("lag_ms")))
-        check("polls>=3", int(out.get("polls") or 0) >= 3, str(out.get("polls")))
-        check(
-            "first was 1-0",
-            (out.get("first_af_goals") or {}) == {"home": 1, "away": 0},
-            str(out.get("first_af_goals")),
-        )
-        check(
-            "detect 0-0",
-            (out.get("af_goals_at_detect") or {}) == {"home": 0, "away": 0},
-            str(out.get("af_goals_at_detect")),
-        )
-
-
-def test_reversal_probe_never_reverses() -> None:
-    print("test_reversal_probe_never_reverses")
-
-    def events_fn(mid: str, persist_burst: bool = False, **_kw: Any) -> dict[str, Any]:
-        return {"ok": True, "goals": {"home": 1, "away": 0}, "af_fixture_id": 1}
-
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        root = Path(td)
-        g = ref.AfReferee(root, events_fn=events_fn, poll_schedule=False)
-        out = g.await_reversal_probe(
-            "m_stay",
-            (1, 0),
-            (0, 0),
-            dqd_ts=ref.iso_now(),
-            poll_s=0.05,
-            timeout_s=0.2,
-        )
-        check("not reversed", out.get("af_reversed") is False, str(out))
-        check(
-            "error never",
-            out.get("error") == "af_never_reversed",
-            str(out.get("error")),
-        )
-        check(
-            "first 1-0",
-            (out.get("first_af_goals") or {}) == {"home": 1, "away": 0},
-            str(out.get("first_af_goals")),
-        )
-
-
-def test_reversal_probe_submit_drain() -> None:
-    print("test_reversal_probe_submit_drain")
-    state = {"goals": (1, 0)}
-
-    def events_fn(mid: str, persist_burst: bool = False, **_kw: Any) -> dict[str, Any]:
-        h, a = state["goals"]
-        return {"ok": True, "goals": {"home": h, "away": a}, "af_fixture_id": 9}
-
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        root = Path(td)
-        g = ref.AfReferee(root, events_fn=events_fn, poll_schedule=False)
-        ev = {
-            "type": "score_change",
-            "match_id": "m_async",
-            "ts": ref.iso_now(),
-            "home": "H",
-            "away": "A",
-            "prev": {"home": 1, "away": 0},
-            "curr": {"home": 0, "away": 0},
-            "is_reversal": True,
-        }
-        key = ref.reversal_probe_key(ev)
-        check("submitted", g.submit_reversal_probe(key, ev) is True)
-        check("dup submit false", g.submit_reversal_probe(key, ev) is False)
-        time.sleep(0.08)
-        state["goals"] = (0, 0)
-        deadline = time.monotonic() + 2.0
-        jobs: list = []
-        while time.monotonic() < deadline:
-            jobs = g.drain_reversal_probes()
-            if jobs:
-                break
-            time.sleep(0.05)
-        check("drained", len(jobs) == 1, str(jobs))
-        if jobs:
-            check(
-                "probe reversed",
-                (jobs[0].get("probe") or {}).get("af_reversed") is True,
-                str(jobs[0]),
-            )
-
-
 def main() -> int:
     test_classifiers()
     test_af_score_satisfies()
@@ -603,9 +490,6 @@ def main() -> int:
     test_schedule_cadence_wall_times()
     test_transient_network_retry()
     test_apply_score()
-    test_reversal_probe_af_reverses()
-    test_reversal_probe_never_reverses()
-    test_reversal_probe_submit_drain()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

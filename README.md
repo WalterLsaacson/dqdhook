@@ -159,3 +159,12 @@ data/               # Runtime snapshots / jsonl (gitignored)
 - Goal trades wait for API-Football confirmation; DQD reversals do not open new buys.
 - Do not commit `.env` or private keys.
 - Prefer small `--max-usdc` while validating.
+
+
+python3 frontend/run_main.py --live --no-browser
+
+
+
+1 bet360 
+2 ai decide
+3 live stream

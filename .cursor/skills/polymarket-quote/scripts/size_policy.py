@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# ask >= threshold → usdc; below all thresholds → hard max_usdc (default $2).
-DEFAULT_SIZE_TIERS: tuple[tuple[float, float], ...] = ((0.98, 2.0),)
+# ask >= threshold → usdc; below all thresholds → hard max_usdc (default $1).
+DEFAULT_SIZE_TIERS: tuple[tuple[float, float], ...] = ((0.98, 1.0),)
 
 
 @dataclass(frozen=True)

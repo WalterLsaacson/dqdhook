@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: flat ask usdc ($2 all tiers) + open cap."""
+"""Smoke: flat ask usdc ($1 all tiers) + open cap."""
 
 from __future__ import annotations
 
@@ -18,28 +18,28 @@ from size_policy import (  # noqa: E402
     tier_max_usdc,
 )
 
-TIERS = parse_size_tiers("0.98:2")
+TIERS = parse_size_tiers("0.98:1")
 
 
 def main() -> int:
-    assert TIERS == [(0.98, 2.0)]
-    assert list(DEFAULT_SIZE_TIERS) == [(0.98, 2.0)]
+    assert TIERS == [(0.98, 1.0)]
+    assert list(DEFAULT_SIZE_TIERS) == [(0.98, 1.0)]
 
-    assert tier_max_usdc(0.97, TIERS, fallback=2) == 2
-    assert tier_max_usdc(0.979, TIERS, fallback=2) == 2
-    assert tier_max_usdc(0.98, TIERS, fallback=2) == 2
-    assert tier_max_usdc(0.99, TIERS, fallback=2) == 2
-    assert tier_max_usdc(0.995, TIERS, fallback=2) == 2
+    assert tier_max_usdc(0.97, TIERS, fallback=1) == 1
+    assert tier_max_usdc(0.979, TIERS, fallback=1) == 1
+    assert tier_max_usdc(0.98, TIERS, fallback=1) == 1
+    assert tier_max_usdc(0.99, TIERS, fallback=1) == 1
+    assert tier_max_usdc(0.995, TIERS, fallback=1) == 1
     # hard cap still wins when below tier usdc
-    assert tier_max_usdc(0.97, TIERS, fallback=1.5) == 1.5
-    assert tier_max_usdc(0.99, TIERS, fallback=1.5) == 1.5
+    assert tier_max_usdc(0.97, TIERS, fallback=0.5) == 0.5
+    assert tier_max_usdc(0.99, TIERS, fallback=0.5) == 0.5
 
-    sh2 = scale_max_shares(max_shares=25, max_usdc_cap=2, eff_usdc=2, ask=0.97)
-    assert abs(sh2 - min(25.0, 2 / 0.97)) < 1e-6
+    sh1 = scale_max_shares(max_shares=25, max_usdc_cap=1, eff_usdc=1, ask=0.97)
+    assert abs(sh1 - min(25.0, 1 / 0.97)) < 1e-6
 
     caps_lo = compute_buy_size_caps(
         0.97,
-        max_usdc=2,
+        max_usdc=1,
         max_shares=25,
         tiers=TIERS,
         open_usdc=0,
@@ -47,13 +47,13 @@ def main() -> int:
         floor_usdc=1,
     )
     assert caps_lo.skip_reason is None
-    assert abs(caps_lo.max_usdc - 2) < 1e-9
-    assert abs(caps_lo.max_shares - sh2) < 1e-6
+    assert abs(caps_lo.max_usdc - 1) < 1e-9
+    assert abs(caps_lo.max_shares - sh1) < 1e-6
 
-    sh_hi = scale_max_shares(max_shares=25, max_usdc_cap=2, eff_usdc=2, ask=0.98)
+    sh_hi = scale_max_shares(max_shares=25, max_usdc_cap=1, eff_usdc=1, ask=0.98)
     caps_hi = compute_buy_size_caps(
         0.98,
-        max_usdc=2,
+        max_usdc=1,
         max_shares=25,
         tiers=TIERS,
         open_usdc=0,
@@ -61,23 +61,23 @@ def main() -> int:
         floor_usdc=1,
     )
     assert caps_hi.skip_reason is None
-    assert abs(caps_hi.max_usdc - 2) < 1e-9
+    assert abs(caps_hi.max_usdc - 1) < 1e-9
     assert abs(caps_hi.max_shares - sh_hi) < 1e-6
 
     capped = compute_buy_size_caps(
         0.97,
-        max_usdc=2,
+        max_usdc=1,
         max_shares=25,
         tiers=TIERS,
-        open_usdc=999,
+        open_usdc=999.5,
         max_open_usdc=1000,
-        floor_usdc=1,
+        floor_usdc=0.5,
     )
-    assert abs(capped.max_usdc - 1) < 1e-9
+    assert abs(capped.max_usdc - 0.5) < 1e-9
 
     skip = compute_buy_size_caps(
         0.96,
-        max_usdc=2,
+        max_usdc=1,
         max_shares=25,
         tiers=TIERS,
         open_usdc=1000,
@@ -87,7 +87,7 @@ def main() -> int:
     assert skip.skip_reason == "size_policy_open_budget"
     assert skip.max_usdc == 0 and skip.max_shares == 0
 
-    print("ok: flat size ($2) + open cap")
+    print("ok: flat size ($1) + open cap")
     return 0
 
 

@@ -1009,6 +1009,124 @@ def fetch_events_for_match_id(
     return out
 
 
+def live_fixture_status_from_fixture(fx: dict[str, Any] | None) -> dict[str, Any]:
+    """Compact live status + goals + score halves from an AF ``/fixtures`` row."""
+    empty = {
+        "status_short": None,
+        "status_long": None,
+        "elapsed": None,
+        "extra": None,
+        "goals": {"home": None, "away": None},
+        "score": {
+            "halftime": {"home": None, "away": None},
+            "fulltime": {"home": None, "away": None},
+            "extratime": {"home": None, "away": None},
+            "penalty": {"home": None, "away": None},
+        },
+    }
+    if not isinstance(fx, dict):
+        return empty
+
+    def _pair(block: Any) -> dict[str, int | None]:
+        if not isinstance(block, dict):
+            return {"home": None, "away": None}
+        out: dict[str, int | None] = {"home": None, "away": None}
+        for side in ("home", "away"):
+            try:
+                v = block.get(side)
+                out[side] = int(v) if v is not None else None
+            except (TypeError, ValueError):
+                out[side] = None
+        return out
+
+    st = (fx.get("fixture") or {}).get("status") or {}
+    goals = _pair(fx.get("goals") or {})
+    score_raw = fx.get("score") if isinstance(fx.get("score"), dict) else {}
+    elapsed = st.get("elapsed")
+    extra = st.get("extra")
+    try:
+        elapsed_i = int(elapsed) if elapsed is not None else None
+    except (TypeError, ValueError):
+        elapsed_i = None
+    try:
+        extra_i = int(extra) if extra is not None else None
+    except (TypeError, ValueError):
+        extra_i = None
+    return {
+        "status_short": str(st.get("short") or "").upper() or None,
+        "status_long": str(st.get("long") or "") or None,
+        "elapsed": elapsed_i,
+        "extra": extra_i,
+        "goals": goals,
+        "score": {
+            "halftime": _pair(score_raw.get("halftime")),
+            "fulltime": _pair(score_raw.get("fulltime")),
+            "extratime": _pair(score_raw.get("extratime")),
+            "penalty": _pair(score_raw.get("penalty")),
+        },
+    }
+
+
+def fetch_live_fixture_status_for_match_id(
+    af: AFClient,
+    dqd_match_id: str,
+    *,
+    cache: dict[str, Any],
+    bridge_path: Path = DEFAULT_BRIDGE_MATCHES,
+    snapshot_path: Path = DEFAULT_DQD_SNAPSHOT,
+    cache_only: bool = True,
+    http_timeout: float | None = None,
+) -> dict[str, Any]:
+    """Cache lookup → ``/fixtures?id=`` → live status + goals + score halves.
+
+    Unlike ``fetch_regulation_score_for_match_id``, this keeps the full live
+    ``fixture.status`` clock and live ``goals`` (not only ``score.fulltime``).
+    """
+    entry = ensure_fixture_for_match_id(
+        af,
+        dqd_match_id,
+        cache=cache,
+        bridge_path=bridge_path,
+        snapshot_path=snapshot_path,
+        force_resolve=False,
+        cache_only=cache_only,
+    )
+    if not entry or not entry.get("af_fixture_id"):
+        err = fixture_miss_error(cache, dqd_match_id)
+        if cache_only and err == "af_fixture_not_cached":
+            err = "af_fixture_not_cached"
+        live = live_fixture_status_from_fixture(None)
+        return {
+            "ok": False,
+            "dqd_match_id": str(dqd_match_id),
+            "af_fixture_id": None,
+            "fetched_at": iso_now(),
+            "error": err,
+            "cache_only": cache_only,
+            **live,
+        }
+
+    fid = int(entry["af_fixture_id"])
+    to = 20.0 if http_timeout is None else max(0.5, float(http_timeout))
+    payload = af.get("/fixtures", {"id": fid}, timeout=to)
+    rows = payload.get("response") if payload.get("ok") else []
+    fx = rows[0] if isinstance(rows, list) and rows else None
+    live = live_fixture_status_from_fixture(fx if isinstance(fx, dict) else None)
+    out: dict[str, Any] = {
+        "ok": bool(payload.get("ok")),
+        "dqd_match_id": str(dqd_match_id),
+        "af_fixture_id": fid,
+        "fetched_at": iso_now(),
+        "http_status": payload.get("http_status"),
+        "cache_entry": entry,
+        "cache_only": cache_only,
+        **live,
+    }
+    if not out["ok"]:
+        out["error"] = payload.get("errors") or "af_fixture_failed"
+    return out
+
+
 def fetch_regulation_score_for_match_id(
     af: AFClient,
     dqd_match_id: str,

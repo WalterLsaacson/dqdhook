@@ -60,7 +60,6 @@ def _settings() -> TradeSettings:
         max_slippage=0.03,
         allow_extreme_prices=False,
         min_buy_price=0.01,
-        min_market_bid=0.0,
         min_order_shares=0.0,
         enabled=True,
         size_tiers=((0.98, 2.0),),

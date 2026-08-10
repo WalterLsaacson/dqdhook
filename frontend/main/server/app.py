@@ -16,13 +16,18 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 MODULE_DIR = Path(__file__).resolve().parents[1]
 FRONTEND = MODULE_DIR.parent
 ROOT = FRONTEND.parent
 PUBLIC = MODULE_DIR / "public"
 SRC = MODULE_DIR / "src"
+
+_ANALYTICS = ROOT / ".cursor" / "skills" / "trade-analytics" / "scripts"
+if str(_ANALYTICS) not in sys.path:
+    sys.path.insert(0, str(_ANALYTICS))
+import analytics_lib as _ta  # noqa: E402
 
 HOST = "127.0.0.1"
 PORT = 8790
@@ -144,7 +149,7 @@ def load_quote_trade_config(
             max_levels if max_levels is not None else os.getenv("QUOTE_MAX_LEVELS", "5")
         ),
         "max_usdc": float(
-            max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "2")
+            max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "1")
         ),
         "max_shares": float(
             max_shares if max_shares is not None else os.getenv("QUOTE_MAX_SHARES", "25")
@@ -190,7 +195,7 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
         args.extend(["--ft-mode", f])
     args.extend(["--take-depth", str(c.get("take_depth") or "top")])
     args.extend(["--max-levels", str(int(c.get("max_levels") or 5))])
-    args.extend(["--max-usdc", str(float(c.get("max_usdc") or 2))])
+    args.extend(["--max-usdc", str(float(c.get("max_usdc") or 1))])
     args.extend(["--max-shares", str(float(c.get("max_shares") or 25))])
     args.extend(["--max-slippage", str(float(c.get("max_slippage") or 0.03))])
     _mbp = c.get("min_buy_price")
@@ -216,19 +221,6 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
             args.append("--af-postcheck-trade")
         elif _env_bool("QUOTE_AF_GATE_BEFORE_TRADE", False):
             args.append("--af-gate-before-trade")
-        # Market bid gate (default on with AF gate).
-        if not _env_bool("QUOTE_BID_GATE", True):
-            args.append("--no-bid-gate")
-        else:
-            bid_min = os.getenv("QUOTE_BID_GATE_MIN")
-            bid_poll = os.getenv("QUOTE_BID_GATE_POLL_S")
-            bid_timeout = os.getenv("QUOTE_BID_GATE_TIMEOUT_S")
-            if bid_min:
-                args.extend(["--bid-gate-min", str(bid_min)])
-            if bid_poll:
-                args.extend(["--bid-gate-poll", str(bid_poll)])
-            if bid_timeout:
-                args.extend(["--bid-gate-timeout", str(bid_timeout)])
     return args
 
 
@@ -679,6 +671,87 @@ def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> N
     handler.wfile.write(body)
 
 
+def _qs_first(qs: dict[str, list[str]], key: str, default: str | None = None) -> str | None:
+    vals = qs.get(key) or []
+    if not vals:
+        return default
+    return vals[0]
+
+
+def trades_ledger_payload(qs: dict[str, list[str]]) -> dict[str, Any]:
+    """Compact human ledger over trades.jsonl (source file format unchanged)."""
+    tpath = ROOT / "data" / "pm-quote" / "trades.jsonl"
+    last_hours_raw = _qs_first(qs, "last_hours")
+    last_hours = float(last_hours_raw) if last_hours_raw not in (None, "") else None
+    since, until = _ta.resolve_window(
+        since=_qs_first(qs, "since"),
+        until=_qs_first(qs, "until"),
+        last_hours=last_hours,
+        last_days=None,
+    )
+    limit_raw = _qs_first(qs, "limit", "200")
+    try:
+        limit = int(limit_raw) if limit_raw not in (None, "") else 200
+    except ValueError:
+        limit = 200
+    live_raw = (_qs_first(qs, "live") or "").strip().lower()
+    live: bool | None
+    if live_raw in ("1", "true", "yes", "live"):
+        live = True
+    elif live_raw in ("0", "false", "no", "dry"):
+        live = False
+    else:
+        live = None
+    payload = _ta.build_ledger(
+        _ta.load_jsonl(tpath),
+        since=since,
+        until=until,
+        trade=_qs_first(qs, "trade") or None,
+        status=_qs_first(qs, "status") or None,
+        family=_qs_first(qs, "family") or None,
+        match_id=_qs_first(qs, "match_id") or None,
+        live=live,
+        q=_qs_first(qs, "q") or None,
+        limit=limit,
+        newest_first=True,
+    )
+    opens_path = ROOT / "data" / "pm-quote" / "open_positions.json"
+    opens = _ta.load_open_positions(opens_path)
+    open_usdc = 0.0
+    open_n = 0
+    for lot in opens:
+        if lot.get("status") != "open":
+            continue
+        open_n += 1
+        try:
+            open_usdc += float(lot.get("usdc") or 0)
+        except (TypeError, ValueError):
+            pass
+    payload["source"] = str(tpath)
+    payload["opens"] = {
+        "open": open_n,
+        "open_usdc": round(open_usdc, 4),
+        "total": len(opens),
+    }
+    payload["hub_trades_url"] = f"http://{HOST}:{PORT}/trades"
+    return payload
+
+
+def trade_detail_payload(qs: dict[str, list[str]]) -> dict[str, Any]:
+    key = (_qs_first(qs, "idempotency_key") or "").strip()
+    if not key:
+        return {"ok": False, "error": "idempotency_key required"}
+    tpath = ROOT / "data" / "pm-quote" / "trades.jsonl"
+    for row in reversed(_ta.load_jsonl(tpath)):
+        if str(row.get("idempotency_key") or "") == key:
+            return {
+                "ok": True,
+                "compact": _ta.compact_trade(row),
+                "raw": row,
+            }
+    return {"ok": False, "error": "not_found", "idempotency_key": key}
+
+
 def read_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     n = int(handler.headers.get("Content-Length") or 0)
     if n <= 0:
@@ -702,9 +775,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             json_response(self, 200, status())
             return
+        if path == "/api/trades":
+            qs = parse_qs(parsed.query)
+            try:
+                json_response(self, 200, trades_ledger_payload(qs))
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                json_response(self, 500, {"ok": False, "error": str(e)})
+            return
+        if path == "/api/trades/detail":
+            qs = parse_qs(parsed.query)
+            try:
+                detail = trade_detail_payload(qs)
+                json_response(self, 200 if detail.get("ok") else 404, detail)
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                json_response(self, 500, {"ok": False, "error": str(e)})
+            return
 
         if path == "/" or path == "/index.html":
             return self._file(PUBLIC / "index.html", "text/html; charset=utf-8")
+        if path == "/trades" or path == "/trades.html":
+            return self._file(PUBLIC / "trades.html", "text/html; charset=utf-8")
         if path.startswith("/src/"):
             rel = path[len("/src/") :]
             fp = SRC / rel

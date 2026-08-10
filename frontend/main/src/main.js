@@ -54,7 +54,15 @@ function render(st) {
     up: true,
   };
 
-  const items = [hub, ...boards];
+  const trades = {
+    id: "trades-ledger",
+    name: "Trades Ledger",
+    skill: "pm-quote · trades.jsonl 浓缩视图",
+    url: `${(st.hub || "/").replace(/\/?$/, "")}/trades`,
+    up: true,
+  };
+
+  const items = [hub, trades, ...boards];
   $("grid").innerHTML = items
     .map((b) => {
       const detail =
@@ -68,7 +76,7 @@ function render(st) {
               (b.unresolved_count != null ? ` · ${b.unresolved_count} unresolved` : "")
             : "";
       return `
-      <a class="card ${b.up ? "" : "is-down"}" href="${b.url}" target="_blank" rel="noreferrer">
+      <a class="card ${b.up ? "" : "is-down"}" href="${b.url}" target="${b.id === "trades-ledger" || b.id === "main" ? "_self" : "_blank"}" rel="noreferrer">
         <div>
           <h2>${b.name || b.id}</h2>
           <p class="skill">${b.skill || ""}${detail}</p>

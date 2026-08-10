@@ -6,6 +6,8 @@ Examples:
   python3 trade_analytics.py summary --last-hours 12
   python3 trade_analytics.py summary --since 2026-07-22T23:20:00+08:00 --json
   python3 trade_analytics.py list --trade buy_win --last-hours 24
+  python3 trade_analytics.py ledger --limit 50
+  python3 trade_analytics.py ledger --write   # companion txt next to trades.jsonl
   python3 trade_analytics.py opens
 """
 
@@ -58,19 +60,18 @@ def cmd_list(args: argparse.Namespace) -> int:
         last_hours=args.last_hours,
         last_days=args.last_days,
     )
-    rows = lib.filter_window(lib.load_jsonl(tpath), since=since, until=until)
-    if args.trade:
-        rows = [r for r in rows if r.get("trade") == args.trade]
-    if args.status:
-        rows = [r for r in rows if r.get("status") == args.status]
-    if args.family:
-        rows = [r for r in rows if r.get("family") == args.family]
-    if args.match_id:
-        rows = [r for r in rows if str(r.get("match_id")) == str(args.match_id)]
-
-    compact = [lib.compact_trade(r) for r in rows]
-    if args.limit is not None:
-        compact = compact[-int(args.limit) :]
+    payload = lib.build_ledger(
+        lib.load_jsonl(tpath),
+        since=since,
+        until=until,
+        trade=args.trade,
+        status=args.status,
+        family=args.family,
+        match_id=args.match_id,
+        limit=args.limit,
+        newest_first=False,
+    )
+    compact = payload["trades"]
 
     if args.json:
         json.dump(
@@ -84,15 +85,71 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     print(f"trades={len(compact)}")
     for t in compact:
-        est = t.get("est_profit")
-        est_s = f" est=+{est:.3f}" if isinstance(est, (int, float)) else ""
-        skip = f" skip={t.get('skip_reason')}" if t.get("skip_reason") else ""
-        print(
-            f"{t.get('quoted_at')}  {t.get('status')}/{t.get('trade')}  "
-            f"{t.get('home')} {t.get('score')} {t.get('away')}  "
-            f"{t.get('family')}/{t.get('outcome')}  "
-            f"usdc={t.get('usdc')}{est_s}{skip}"
-        )
+        print(lib.format_ledger_line(t))
+    return 0
+
+
+def cmd_ledger(args: argparse.Namespace) -> int:
+    """Human-readable ledger (stdout and/or companion .txt). Does not alter trades.jsonl."""
+    root = lib.repo_root()
+    tpath = Path(args.trades) if args.trades else root / lib.DEFAULT_TRADES
+    since, until = lib.resolve_window(
+        since=args.since,
+        until=args.until,
+        last_hours=args.last_hours,
+        last_days=args.last_days,
+    )
+    live = None
+    if args.live is True:
+        live = True
+    elif args.dry is True:
+        live = False
+    payload = lib.build_ledger(
+        lib.load_jsonl(tpath),
+        since=since,
+        until=until,
+        trade=args.trade,
+        status=args.status,
+        family=args.family,
+        match_id=args.match_id,
+        live=live,
+        q=args.q,
+        limit=args.limit,
+        newest_first=True,
+    )
+
+    if args.write:
+        out = Path(args.out) if args.out else root / lib.DEFAULT_LEDGER_TXT
+        # Re-build with same filters but write via helper needs raw rows —
+        # write from formatted payload lines instead.
+        lines = [
+            f"# pm-quote trades ledger  generated={payload['analyzed_at']}",
+            f"# source={tpath}  matched={payload['total_matched']}  "
+            f"shown={payload['returned']}",
+            "# (companion only — trades.jsonl format unchanged)",
+            "#" + "-" * 140,
+        ]
+        for row in payload["trades"]:
+            lines.append(lib.format_ledger_line(row))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"wrote {out}  ({payload['returned']} rows)")
+        if args.json:
+            json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+            print()
+        return 0
+
+    if args.json:
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0
+
+    print(
+        f"ledger matched={payload['total_matched']} shown={payload['returned']} "
+        f"@ {payload['analyzed_at']}"
+    )
+    for t in payload["trades"]:
+        print(lib.format_ledger_line(t))
     return 0
 
 
@@ -143,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     p_sum.add_argument("--no-persist", action="store_true", help="Do not write data/trade-analytics/latest.json")
     p_sum.set_defaults(func=cmd_summary)
 
-    p_list = sub.add_parser("list", help="List compact trade rows")
+    p_list = sub.add_parser("list", help="List compact trade rows (oldest→newest)")
     _add_window_flags(p_list)
     p_list.add_argument("--trades", default=None)
     p_list.add_argument("--trade", default=None, help="buy_win|sell_lose|flatten_reversal")
@@ -153,6 +210,29 @@ def main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--limit", type=int, default=None)
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_list)
+
+    p_led = sub.add_parser(
+        "ledger",
+        help="Human ledger (newest first); optional companion .txt next to trades.jsonl",
+    )
+    _add_window_flags(p_led)
+    p_led.add_argument("--trades", default=None)
+    p_led.add_argument("--trade", default=None)
+    p_led.add_argument("--status", default=None)
+    p_led.add_argument("--family", default=None)
+    p_led.add_argument("--match-id", default=None)
+    p_led.add_argument("--q", default=None, help="Substring filter (team/market/status…)")
+    p_led.add_argument("--live", action="store_true", help="Only live fills")
+    p_led.add_argument("--dry", action="store_true", help="Only dry-run rows")
+    p_led.add_argument("--limit", type=int, default=80)
+    p_led.add_argument(
+        "--write",
+        action="store_true",
+        help="Write data/pm-quote/trades_ledger.txt (does not change trades.jsonl)",
+    )
+    p_led.add_argument("--out", default=None, help="Override companion path")
+    p_led.add_argument("--json", action="store_true")
+    p_led.set_defaults(func=cmd_ledger)
 
     p_open = sub.add_parser("opens", help="Show open_positions ledger")
     p_open.add_argument("--opens", default=None)

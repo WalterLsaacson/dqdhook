@@ -9,8 +9,14 @@ trade_analytics.py summary [--since ISO] [--until ISO] [--last-hours N] [--last-
 trade_analytics.py list    [window flags] [--trade KIND] [--status S] [--family F]
                            [--match-id ID] [--limit N] [--json]
 
+trade_analytics.py ledger  [window flags] [--trade KIND] [--status S] [--family F]
+                           [--match-id ID] [--q TEXT] [--live|--dry] [--limit N]
+                           [--write] [--out PATH] [--json]
+
 trade_analytics.py opens   [--opens PATH] [--status S] [--json]
 ```
+
+**Human viewing:** System Main hub → **Trades Ledger** at `/trades` (API `/api/trades`). Optional companion text via `ledger --write` → `data/pm-quote/trades_ledger.txt`. Neither changes `trades.jsonl`.
 
 Times are parsed as ISO-8601; naive timestamps are treated as Asia/Shanghai (+08:00).
 

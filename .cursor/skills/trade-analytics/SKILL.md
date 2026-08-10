@@ -12,6 +12,8 @@ description: >-
 
 独立 Skill：只读分析 **polymarket-quote** 落盘，不拉起 watch / 不下单。
 
+人工扫成交优先用 System Main 的 **Trades Ledger**（`http://127.0.0.1:8790/trades`）：浓缩表 + 点行看完整 JSON，**不改** `trades.jsonl` 格式。终端可用 `ledger`；需要 IDE 旁路文件时用 `ledger --write` 生成 `data/pm-quote/trades_ledger.txt`。
+
 ## Inputs
 
 | Path | Purpose |
@@ -30,7 +32,11 @@ python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py summary --last
 python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py summary \
   --since 2026-07-22T23:20:00+08:00 --json
 
-# List fills
+# Human one-line ledger (newest first)
+python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py ledger --last-hours 24
+python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py ledger --write
+
+# List fills (oldest→newest)
 python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py list --trade buy_win --last-hours 24
 python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py list --status flatten_dry_run
 
@@ -38,7 +44,8 @@ python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py list --status 
 python3 .cursor/skills/trade-analytics/scripts/trade_analytics.py opens --status open
 ```
 
-Report snapshot（默认写出）：`data/trade-analytics/latest.json`
+Report snapshot（默认写出）：`data/trade-analytics/latest.json`  
+Companion text（可选）：`data/pm-quote/trades_ledger.txt`
 
 ## Agent workflow
 
