@@ -27,6 +27,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
+from book_context_observe import try_create_observer as try_create_book_observer  # noqa: E402
 from goal_context_observe import GoalContextObserver  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
@@ -339,6 +340,22 @@ def cmd_watch(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
+    book_obs = try_create_book_observer(rt)
+    if book_obs is not None:
+        book_obs.start()
+        print(
+            f"book-context observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
+            f"(OddsPapi/Odds-API.io/The Odds · AF confirm/+5/+15/+45 + DQD reverse · observe-only)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "book-context observe skipped "
+            "(set ODDSPAPI_KEY and/or ODDS_API_IO_KEY and/or THE_ODDS_API_KEY)",
+            file=sys.stderr,
+            flush=True,
+        )
     print(
         f"polymarket-quote watch (wake≤{interval}s · memory queue|file · "
         f"market_cache · retain={retain_h}h) → {lib.data_dir(rt)}",
@@ -442,6 +459,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         goal_obs.stop()
         if lsa_obs is not None:
             lsa_obs.stop()
+        if book_obs is not None:
+            book_obs.stop()
         if not args.no_upstream:
             lib.stop_owned_bridge()
         return 0

@@ -1,0 +1,1546 @@
+"""Observe-only multi-bookmaker odds status snapshots (OddsPapi / Odds-API.io / The Odds API).
+
+Event-driven phases mirror goal-context observe (``af_confirmed``, delayed follow-ups,
+``dqd_reversal``). Pulls moneyline / h2h availability and suspension signals from three
+free-tier aggregators.
+
+Every HTTP response body is persisted under ``data/pm-quote/book_context_raw/`` (URLs
+redact ``apiKey``); observe rows also keep ``raw`` / ``raw_path`` / ``requests``.
+
+Does **not** gate buys or flatten. Failures are isolated per source in ``error`` fields.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Callable
+
+import quote_lib as lib
+
+logger = logging.getLogger("pm_quote.book_context_observe")
+
+ODDSPAPI_BASE = "https://api.oddspapi.io/v4"
+ODDS_API_IO_BASE = "https://api.odds-api.io/v3"
+THE_ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+ENV_ODDSPAPI_KEY = "ODDSPAPI_KEY"
+ENV_ODDS_API_IO_KEY = "ODDS_API_IO_KEY"
+ENV_THE_ODDS_API_KEY = "THE_ODDS_API_KEY"
+ENV_BOOK_OBSERVE_SOURCES = "BOOK_OBSERVE_SOURCES"
+ENV_BOOK_ODDSPAPI_BOOKS = "BOOK_ODDSPAPI_BOOKS"
+ENV_BOOK_ODDS_API_IO_BOOKS = "BOOK_ODDS_API_IO_BOOKS"
+ENV_BOOK_THE_ODDS_REGIONS = "BOOK_THE_ODDS_REGIONS"
+ENV_BOOK_THE_ODDS_SPORT_KEYS = "BOOK_THE_ODDS_SPORT_KEYS"
+
+SOURCE_ODDSPAPI = "oddspapi"
+SOURCE_ODDSAPIIO = "oddsapiio"
+SOURCE_THEODDSAPI = "theoddsapi"
+
+DEFAULT_SOURCES = (SOURCE_ODDSPAPI, SOURCE_ODDSAPIIO, SOURCE_THEODDSAPI)
+DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
+DEFAULT_ODDS_API_IO_BOOKS = ("Bet365",)
+DEFAULT_THE_ODDS_REGIONS = ("eu",)
+DEFAULT_THE_ODDS_SPORT_KEYS = (
+    "soccer_epl",
+    "soccer_efl_champ",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    "soccer_fifa_world_cup",
+    "soccer_uefa_european_championship",
+)
+
+DEFAULT_DELAY_5_S = 5.0
+DEFAULT_DELAY_15_S = 15.0
+DEFAULT_DELAY_45_S = 45.0
+DEFAULT_WORKERS = 4
+DEFAULT_HTTP_TIMEOUT_S = 12.0
+DEFAULT_MIN_SIDE_SIM = 0.72
+
+PHASE_AF_CONFIRMED = "af_confirmed"
+PHASE_POST_5 = "post_confirm_5s"
+PHASE_POST_15 = "post_confirm_15s"
+PHASE_POST_45 = "post_confirm_45s"
+PHASE_DQD_REVERSAL = "dqd_reversal"
+
+_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_WS_RE = re.compile(r"\s+")
+
+FetchBookFn = Callable[[str, str, str], dict[str, Any]]
+
+_active: "BookContextObserver | None" = None
+_active_lock = threading.Lock()
+
+
+def set_active_observer(observer: "BookContextObserver | None") -> None:
+    global _active
+    with _active_lock:
+        _active = observer
+
+
+def get_active_observer() -> "BookContextObserver | None":
+    with _active_lock:
+        return _active
+
+
+def observe_path(root: Path) -> Path:
+    return lib.data_dir(root) / "book_context_observe.jsonl"
+
+
+def fixture_cache_path(root: Path) -> Path:
+    return lib.data_dir(root) / "book_fixture_cache.json"
+
+
+def raw_dir(root: Path) -> Path:
+    """Per-request raw HTTP dumps (quota-precious; not auto-pruned)."""
+    return lib.data_dir(root) / "book_context_raw"
+
+
+_APIKEY_QUERY_RE = re.compile(r"([?&](?:apiKey|api_key|key)=)[^&]*", re.IGNORECASE)
+_SAFE_NAME_RE = re.compile(r"[^\w.\-]+", re.UNICODE)
+
+
+def redact_url(url: str) -> str:
+    return _APIKEY_QUERY_RE.sub(r"\1REDACTED", str(url or ""))
+
+
+def select_response_headers(hdrs: dict[str, str] | None) -> dict[str, str]:
+    if not hdrs:
+        return {}
+    out: dict[str, str] = {}
+    for k, v in hdrs.items():
+        lk = str(k).lower()
+        if (
+            lk.startswith("x-")
+            or lk
+            in (
+                "date",
+                "content-type",
+                "retry-after",
+                "ratelimit-limit",
+                "ratelimit-remaining",
+                "ratelimit-reset",
+            )
+        ):
+            out[lk] = str(v)
+    return out
+
+
+def _safe_name(value: str, *, max_len: int = 80) -> str:
+    s = _SAFE_NAME_RE.sub("_", str(value or "").strip()) or "na"
+    return s[:max_len]
+
+
+def persist_raw_blob(
+    root: Path,
+    *,
+    source: str,
+    kind: str,
+    match_id: str,
+    phase: str,
+    observe_group_id: str,
+    seq: int,
+    record: dict[str, Any],
+) -> str:
+    """Write one raw request/response JSON; return path relative to ``data/pm-quote``."""
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    fname = (
+        f"{ts}_{_safe_name(match_id)}_{_safe_name(phase, max_len=40)}_"
+        f"{_safe_name(source)}_{_safe_name(kind)}_{int(seq):03d}.json"
+    )
+    path = raw_dir(root) / fname
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "saved_at": lib.now_cn_iso(),
+        "source": source,
+        "kind": kind,
+        "match_id": match_id,
+        "phase": phase,
+        "observe_group_id": observe_group_id,
+        **record,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return f"book_context_raw/{fname}"
+
+
+def request_meta_for_jsonl(
+    *,
+    kind: str,
+    url: str,
+    http_status: int | None,
+    headers: dict[str, str],
+    error: str | None,
+    body: Any,
+    raw_path: str,
+    inline_raw: bool,
+) -> dict[str, Any]:
+    """Compact request record embedded in observe jsonl (full body always on ``raw_path``)."""
+    meta: dict[str, Any] = {
+        "kind": kind,
+        "url": redact_url(url),
+        "http_status": http_status,
+        "headers": headers,
+        "raw_path": raw_path,
+    }
+    if error:
+        meta["error"] = error
+    if inline_raw:
+        meta["raw"] = body
+    elif isinstance(body, list):
+        meta["raw_summary"] = {"type": "list", "len": len(body)}
+    elif isinstance(body, dict):
+        meta["raw_summary"] = {"type": "object", "keys": sorted(str(k) for k in list(body.keys())[:40])}
+    elif body is None:
+        meta["raw"] = None
+    else:
+        meta["raw_summary"] = {"type": type(body).__name__}
+    return meta
+
+
+def make_observe_group_id(match_id: str, home: Any, away: Any, event_key: str) -> str:
+    return f"{match_id}|{home}-{away}|{event_key}"
+
+
+def normalize_team(name: str) -> str:
+    s = unicodedata.normalize("NFKD", str(name or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().strip()
+    s = _PUNCT_RE.sub(" ", s)
+    s = _WS_RE.sub(" ", s).strip()
+    return s
+
+
+def team_sim(a: str, b: str) -> float:
+    na, nb = normalize_team(a), normalize_team(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    if na in nb or nb in na:
+        return 0.92
+    ta, tb = set(na.split()), set(nb.split())
+    jacc = len(ta & tb) / len(ta | tb) if ta and tb else 0.0
+    seq = SequenceMatcher(None, na, nb).ratio()
+    return max(jacc, seq)
+
+
+def _split_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not raw or not str(raw).strip():
+        return default
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    return tuple(parts) if parts else default
+
+
+def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
+    """Load enabled observe sources and API keys from environment."""
+    src = env if env is not None else os.environ
+    keys = {
+        SOURCE_ODDSPAPI: str(src.get(ENV_ODDSPAPI_KEY) or "").strip(),
+        SOURCE_ODDSAPIIO: str(src.get(ENV_ODDS_API_IO_KEY) or "").strip(),
+        SOURCE_THEODDSAPI: str(src.get(ENV_THE_ODDS_API_KEY) or "").strip(),
+    }
+    sources_raw = str(src.get(ENV_BOOK_OBSERVE_SOURCES) or "").strip().lower()
+    if sources_raw:
+        alias = {
+            SOURCE_ODDSPAPI: SOURCE_ODDSPAPI,
+            SOURCE_ODDSAPIIO: SOURCE_ODDSAPIIO,
+            "odds-api.io": SOURCE_ODDSAPIIO,
+            "odds_api_io": SOURCE_ODDSAPIIO,
+            SOURCE_THEODDSAPI: SOURCE_THEODDSAPI,
+            "the-odds-api": SOURCE_THEODDSAPI,
+            "the_odds_api": SOURCE_THEODDSAPI,
+        }
+        enabled: list[str] = []
+        for part in sources_raw.replace(" ", "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            canon = alias.get(part)
+            if canon:
+                enabled.append(canon)
+        seen: set[str] = set()
+        sources = tuple(x for x in enabled if not (x in seen or seen.add(x)))
+        if not sources:
+            sources = DEFAULT_SOURCES
+    else:
+        sources = DEFAULT_SOURCES
+
+    active = [s for s in sources if keys.get(s)]
+    return {
+        "sources": sources,
+        "active_sources": active,
+        "keys": keys,
+        "oddspapi_books": _split_csv(src.get(ENV_BOOK_ODDSPAPI_BOOKS), DEFAULT_ODDSPAPI_BOOKS),
+        "oddsapiio_books": _split_csv(src.get(ENV_BOOK_ODDS_API_IO_BOOKS), DEFAULT_ODDS_API_IO_BOOKS),
+        "theoddsapi_regions": _split_csv(src.get(ENV_BOOK_THE_ODDS_REGIONS), DEFAULT_THE_ODDS_REGIONS),
+        "theoddsapi_sport_keys": _split_csv(
+            src.get(ENV_BOOK_THE_ODDS_SPORT_KEYS), DEFAULT_THE_ODDS_SPORT_KEYS
+        ),
+    }
+
+
+def try_create_observer(
+    root: Path,
+    *,
+    delay_5_s: float = DEFAULT_DELAY_5_S,
+    delay_15_s: float = DEFAULT_DELAY_15_S,
+    delay_45_s: float = DEFAULT_DELAY_45_S,
+    env: dict[str, str] | None = None,
+    **kwargs: Any,
+) -> "BookContextObserver | None":
+    cfg = load_source_keys(env=env)
+    if not cfg.get("active_sources"):
+        return None
+    return BookContextObserver(
+        root,
+        source_cfg=cfg,
+        delay_5_s=delay_5_s,
+        delay_15_s=delay_15_s,
+        delay_45_s=delay_45_s,
+        **kwargs,
+    )
+
+
+def _http_get_json(
+    url: str,
+    *,
+    timeout_s: float,
+    headers: dict[str, str] | None = None,
+) -> tuple[int | None, dict[str, Any] | list[Any] | None, dict[str, str], str | None]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "dongqiudihook-book-observe/1",
+            **(headers or {}),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=max(0.5, float(timeout_s))) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            raw = resp.read()
+            text = raw.decode("utf-8", errors="replace")
+            try:
+                body = json.loads(text) if text else None
+            except json.JSONDecodeError:
+                return status, {"_non_json": text[:500_000]}, hdrs, "non_json_body"
+            return status, body, hdrs, None
+    except urllib.error.HTTPError as e:
+        hdrs = {k.lower(): v for k, v in e.headers.items()} if e.headers else {}
+        try:
+            text = e.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            text = ""
+        body: Any
+        try:
+            body = json.loads(text) if text else None
+        except json.JSONDecodeError:
+            body = {"_non_json": text[:500_000]} if text else None
+        return int(e.code), body, hdrs, f"http_{e.code}"
+    except Exception as e:  # noqa: BLE001
+        return None, None, {}, str(e)
+
+
+def _as_list(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "fixtures", "events", "results", "items"):
+            raw = payload.get(key)
+            if isinstance(raw, list):
+                return raw
+        if payload.get("fixtureId") or payload.get("id") or payload.get("eventId"):
+            return [payload]
+    return []
+
+
+def _team_names_from_row(row: dict[str, Any]) -> tuple[str, str]:
+    home = (
+        row.get("home")
+        or row.get("homeTeam")
+        or row.get("home_team")
+        or row.get("teamHome")
+    )
+    away = (
+        row.get("away")
+        or row.get("awayTeam")
+        or row.get("away_team")
+        or row.get("teamAway")
+    )
+    if isinstance(home, dict):
+        home = home.get("name") or home.get("team") or home.get("participantName")
+    if isinstance(away, dict):
+        away = away.get("name") or away.get("team") or away.get("participantName")
+    parts = row.get("participants")
+    if (not home or not away) and isinstance(parts, list):
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            role = str(p.get("role") or p.get("position") or p.get("type") or "").lower()
+            nm = p.get("name") or p.get("participantName") or p.get("team")
+            if role in ("home", "1", "h") and not home:
+                home = nm
+            elif role in ("away", "2", "a") and not away:
+                away = nm
+        if (not home or not away) and len(parts) >= 2:
+            if not home:
+                home = parts[0].get("name") if isinstance(parts[0], dict) else parts[0]
+            if not away:
+                away = parts[1].get("name") if isinstance(parts[1], dict) else parts[1]
+    return str(home or ""), str(away or "")
+
+
+def _row_id(row: dict[str, Any]) -> str | None:
+    for key in ("fixtureId", "fixture_id", "eventId", "event_id", "id"):
+        val = row.get(key)
+        if val is not None and str(val).strip():
+            return str(val)
+    return None
+
+
+def resolve_team_match(
+    rows: list[dict[str, Any]],
+    *,
+    home: str,
+    away: str,
+    min_side: float = DEFAULT_MIN_SIDE_SIM,
+) -> dict[str, Any]:
+    best: dict[str, Any] | None = None
+    best_score = -1.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        h_name, a_name = _team_names_from_row(row)
+        hs = team_sim(home, h_name)
+        aws = team_sim(away, a_name)
+        hs_sw = team_sim(home, a_name)
+        aws_sw = team_sim(away, h_name)
+        if min(hs_sw, aws_sw) > min(hs, aws):
+            hs, aws = hs_sw, aws_sw
+        if hs < min_side or aws < min_side:
+            continue
+        score = (hs + aws) / 2.0
+        if score > best_score:
+            rid = _row_id(row)
+            best_score = score
+            best = {
+                "ok": True,
+                "row": row,
+                "id": rid,
+                "home_sim": round(hs, 4),
+                "away_sim": round(aws, 4),
+                "candidates": len(rows),
+            }
+    if best is None or not best.get("id"):
+        return {
+            "ok": False,
+            "error": "not_mapped",
+            "id": None,
+            "row": None,
+            "candidates": len(rows),
+        }
+    return best
+
+
+def _normalize_book_key(name: str) -> str:
+    return normalize_team(name).replace(" ", "")
+
+
+def _ml_from_outcomes(
+    outcomes: list[Any],
+    *,
+    home: str,
+    away: str,
+) -> dict[str, Any] | None:
+    if not outcomes:
+        return None
+    ml: dict[str, Any] = {"h": None, "d": None, "a": None}
+    nh, na = normalize_team(home), normalize_team(away)
+    for o in outcomes:
+        if not isinstance(o, dict):
+            continue
+        label = str(o.get("name") or o.get("label") or o.get("outcome") or "")
+        nl = normalize_team(label)
+        price = o.get("price")
+        if price is None:
+            price = o.get("odds") or o.get("decimal") or o.get("value")
+        try:
+            pval = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            pval = None
+        if nl in ("draw", "x", "tie"):
+            ml["d"] = pval
+        elif nh and (nl == nh or team_sim(label, home) >= 0.85):
+            ml["h"] = pval
+        elif na and (nl == na or team_sim(label, away) >= 0.85):
+            ml["a"] = pval
+    if ml["h"] is None and ml["d"] is None and ml["a"] is None:
+        return None
+    return ml
+
+
+def _find_h2h_market(markets: list[Any]) -> dict[str, Any] | None:
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        key = str(m.get("key") or m.get("market") or m.get("name") or "").lower()
+        if key in ("h2h", "1x2", "ml", "moneyline", "match winner", "match_winner"):
+            return m
+    for m in markets:
+        if isinstance(m, dict) and m.get("outcomes"):
+            return m
+    return None
+
+
+def parse_oddspapi_books(
+    odds_payload: Any,
+    *,
+    wanted_books: tuple[str, ...],
+    home: str,
+    away: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    wanted = {_normalize_book_key(b): b for b in wanted_books}
+    found_keys: set[str] = set()
+
+    bookmakers: list[Any] = []
+    if isinstance(odds_payload, dict):
+        raw = odds_payload.get("bookmakers") or odds_payload.get("books") or odds_payload.get("data")
+        if isinstance(raw, list):
+            bookmakers = raw
+        elif isinstance(raw, dict):
+            bookmakers = [raw]
+    elif isinstance(odds_payload, list):
+        bookmakers = odds_payload
+
+    for bm in bookmakers:
+        if not isinstance(bm, dict):
+            continue
+        book_name = str(
+            bm.get("bookmaker")
+            or bm.get("bookmakerName")
+            or bm.get("name")
+            or bm.get("key")
+            or bm.get("slug")
+            or ""
+        )
+        norm = _normalize_book_key(book_name)
+        if norm not in wanted:
+            continue
+        found_keys.add(norm)
+        suspended = bm.get("suspended")
+        if suspended is None:
+            suspended = bm.get("isSuspended") or bm.get("betStop")
+        markets = bm.get("markets") or bm.get("odds") or []
+        ml = None
+        if isinstance(markets, list):
+            mkt = _find_h2h_market(markets)
+            if mkt and isinstance(mkt.get("outcomes"), list):
+                ml = _ml_from_outcomes(mkt["outcomes"], home=home, away=away)
+        status = "open"
+        if suspended is True:
+            status = "suspended"
+        elif not markets or ml is None:
+            status = "missing"
+        entry: dict[str, Any] = {
+            "book": wanted[norm],
+            "status": status,
+        }
+        if suspended is not None:
+            entry["suspended"] = bool(suspended)
+        if ml is not None:
+            entry["ml"] = ml
+        rows.append(entry)
+
+    for norm, display in wanted.items():
+        if norm in found_keys:
+            continue
+        rows.append({"book": display, "status": "missing"})
+
+    return rows
+
+
+def parse_oddsapiio_books(
+    odds_payload: Any,
+    *,
+    wanted_books: tuple[str, ...],
+    home: str,
+    away: str,
+) -> list[dict[str, Any]]:
+    if odds_payload is None or odds_payload == {}:
+        return [{"book": b, "status": "missing"} for b in wanted_books]
+
+    # Odds-API.io returns bookmakers as a dict: {"Bet365": [ {name: ML, odds: [...]}, ... ]}
+    # Older/docs shapes may use a list of {bookmaker, markets} objects.
+    bookmakers: list[Any] = []
+    if isinstance(odds_payload, dict):
+        raw = odds_payload.get("bookmakers") or odds_payload.get("books") or odds_payload.get("data")
+        if isinstance(raw, dict):
+            for book_name, markets in raw.items():
+                bookmakers.append({"bookmaker": book_name, "markets": markets})
+        elif isinstance(raw, list):
+            bookmakers = raw
+        elif raw is None and odds_payload.get("id"):
+            bookmakers = [odds_payload]
+    elif isinstance(odds_payload, list):
+        bookmakers = odds_payload
+
+    if not bookmakers:
+        return [{"book": b, "status": "missing"} for b in wanted_books]
+
+    rows: list[dict[str, Any]] = []
+    wanted = {_normalize_book_key(b): b for b in wanted_books}
+    found: set[str] = set()
+    for bm in bookmakers:
+        if not isinstance(bm, dict):
+            continue
+        book_name = str(bm.get("bookmaker") or bm.get("name") or bm.get("key") or "")
+        norm = _normalize_book_key(book_name)
+        if norm not in wanted:
+            continue
+        found.add(norm)
+        markets = bm.get("markets") or bm.get("odds") or []
+        ml = None
+        if isinstance(markets, list):
+            mkt = _find_h2h_market(markets)
+            if mkt:
+                # Odds-API.io ML shape: {"name":"ML","odds":[{"home":"..","draw":"..","away":".."}]}
+                odds_rows = mkt.get("odds")
+                if (
+                    isinstance(odds_rows, list)
+                    and odds_rows
+                    and isinstance(odds_rows[0], dict)
+                    and (
+                        "home" in odds_rows[0]
+                        or "away" in odds_rows[0]
+                        or "draw" in odds_rows[0]
+                    )
+                ):
+                    o0 = odds_rows[0]
+
+                    def _f(v: Any) -> float | None:
+                        try:
+                            return float(v) if v is not None and v != "" else None
+                        except (TypeError, ValueError):
+                            return None
+
+                    cand = {"h": _f(o0.get("home")), "d": _f(o0.get("draw")), "a": _f(o0.get("away"))}
+                    if any(x is not None for x in cand.values()):
+                        ml = cand
+                elif isinstance(mkt.get("outcomes"), list):
+                    ml = _ml_from_outcomes(mkt["outcomes"], home=home, away=away)
+        suspended = bm.get("suspended")
+        status = "open"
+        if suspended is True:
+            status = "suspended"
+        elif not markets or ml is None:
+            status = "missing"
+        entry: dict[str, Any] = {"book": wanted[norm], "status": status}
+        if suspended is not None:
+            entry["suspended"] = bool(suspended)
+        if ml is not None:
+            entry["ml"] = ml
+        # Event-level status (live/pending/settled) often sits on the odds payload root.
+        if isinstance(odds_payload, dict) and odds_payload.get("status") is not None:
+            entry["event_status"] = odds_payload.get("status")
+        rows.append(entry)
+
+    for norm, display in wanted.items():
+        if norm in found:
+            continue
+        rows.append({"book": display, "status": "missing"})
+    return rows
+
+
+def parse_theoddsapi_books(
+    odds_payload: Any,
+    *,
+    home: str,
+    away: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(odds_payload, dict):
+        return []
+    bookmakers = odds_payload.get("bookmakers")
+    if not isinstance(bookmakers, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for bm in bookmakers:
+        if not isinstance(bm, dict):
+            continue
+        book_key = str(bm.get("key") or bm.get("title") or "")
+        markets = bm.get("markets") or []
+        mkt = _find_h2h_market(markets if isinstance(markets, list) else [])
+        ml = None
+        if mkt and isinstance(mkt.get("outcomes"), list):
+            ml = _ml_from_outcomes(mkt["outcomes"], home=home, away=away)
+        status = "open" if ml is not None else "missing"
+        entry: dict[str, Any] = {"book": book_key, "status": status}
+        if ml is not None:
+            entry["ml"] = ml
+        rows.append(entry)
+    return rows
+
+
+def _source_suspended_signal(books: list[Any]) -> bool:
+    if not books:
+        return False
+    saw_book = False
+    all_missing = True
+    any_suspended = False
+    for b in books:
+        if not isinstance(b, dict):
+            continue
+        saw_book = True
+        st = b.get("status")
+        if st == "open":
+            all_missing = False
+        elif st == "suspended":
+            any_suspended = True
+            all_missing = False
+        elif st == "missing":
+            continue
+        else:
+            all_missing = False
+    if not saw_book:
+        return False
+    return any_suspended or all_missing
+
+
+def summarize_sources(sources: dict[str, Any]) -> dict[str, Any]:
+    ok_sources: list[str] = []
+    any_suspended = False
+    any_missing = False
+    any_open = False
+    suspended_votes = 0
+
+    for name, payload in sources.items():
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("ok"):
+            ok_sources.append(name)
+        books = payload.get("books")
+        if not isinstance(books, list):
+            continue
+        for b in books:
+            if not isinstance(b, dict):
+                continue
+            st = b.get("status")
+            if st == "open":
+                any_open = True
+            elif st == "suspended":
+                any_suspended = True
+            elif st == "missing":
+                any_missing = True
+        if payload.get("ok") and _source_suspended_signal(books):
+            suspended_votes += 1
+
+    quorum_suspended = len(ok_sources) >= 2 and suspended_votes >= 2
+    return {
+        "ok_sources": ok_sources,
+        "any_suspended": any_suspended,
+        "any_missing": any_missing,
+        "any_open": any_open,
+        "quorum_suspended": quorum_suspended,
+    }
+
+
+@dataclass
+class _GroupState:
+    observe_group_id: str
+    match_id: str
+    event_key: str
+    home: str
+    away: str
+    dqd_score: dict[str, Any]
+    gen: int = 0
+    timers: list[threading.Timer] = field(default_factory=list)
+
+
+class BookContextObserver:
+    """Background bookmaker suspension snapshots for AF-confirmed goals and DQD reversals."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        source_cfg: dict[str, Any] | None = None,
+        delay_5_s: float = DEFAULT_DELAY_5_S,
+        delay_15_s: float = DEFAULT_DELAY_15_S,
+        delay_45_s: float = DEFAULT_DELAY_45_S,
+        workers: int = DEFAULT_WORKERS,
+        http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
+        min_side_sim: float = DEFAULT_MIN_SIDE_SIM,
+        fetch_oddspapi: FetchBookFn | None = None,
+        fetch_oddsapiio: FetchBookFn | None = None,
+        fetch_theoddsapi: FetchBookFn | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        self.root = Path(root)
+        self.cfg = source_cfg if source_cfg is not None else load_source_keys(env=env)
+        self.active_sources: tuple[str, ...] = tuple(self.cfg.get("active_sources") or ())
+        self.keys: dict[str, str] = dict(self.cfg.get("keys") or {})
+        self.oddspapi_books: tuple[str, ...] = tuple(
+            self.cfg.get("oddspapi_books") or DEFAULT_ODDSPAPI_BOOKS
+        )
+        self.oddsapiio_books: tuple[str, ...] = tuple(
+            self.cfg.get("oddsapiio_books") or DEFAULT_ODDS_API_IO_BOOKS
+        )
+        self.theoddsapi_regions: tuple[str, ...] = tuple(
+            self.cfg.get("theoddsapi_regions") or DEFAULT_THE_ODDS_REGIONS
+        )
+        self.theoddsapi_sport_keys: tuple[str, ...] = tuple(
+            self.cfg.get("theoddsapi_sport_keys") or DEFAULT_THE_ODDS_SPORT_KEYS
+        )
+        self.delay_5_s = max(0.0, float(delay_5_s))
+        self.delay_15_s = max(0.0, float(delay_15_s))
+        self.delay_45_s = max(0.0, float(delay_45_s))
+        self.http_timeout_s = max(0.5, float(http_timeout_s))
+        self.min_side_sim = float(min_side_sim)
+        self._fetch_oddspapi = fetch_oddspapi
+        self._fetch_oddsapiio = fetch_oddsapiio
+        self._fetch_theoddsapi = fetch_theoddsapi
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._by_match: dict[str, _GroupState] = {}
+        self._fixture_cache: dict[str, Any] = {}
+        self._snap_ctx: dict[str, Any] = {}
+        self._raw_seq = 0
+        self._pool = ThreadPoolExecutor(
+            max_workers=max(1, int(workers)),
+            thread_name_prefix="book-ctx-obs",
+        )
+        self._load_fixture_cache()
+
+    def start(self) -> None:
+        self._stop.clear()
+        set_active_observer(self)
+        logger.info(
+            "book-context observe on → %s sources=%s delays=%ss/%ss/%ss",
+            observe_path(self.root),
+            ",".join(self.active_sources) or "(none)",
+            self.delay_5_s,
+            self.delay_15_s,
+            self.delay_45_s,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            for st in self._by_match.values():
+                for t in st.timers:
+                    t.cancel()
+                st.timers.clear()
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._pool.shutdown(wait=False)
+        if get_active_observer() is self:
+            set_active_observer(None)
+
+    def on_af_confirmed(
+        self,
+        root: Path | None = None,
+        *,
+        match_id: str,
+        event_key: str,
+        ev: dict[str, Any] | None = None,
+        af_gate: dict[str, Any] | None = None,
+    ) -> str | None:
+        if self._stop.is_set():
+            return None
+        mid = str(match_id or "").strip()
+        if not mid:
+            return None
+        ev = ev if isinstance(ev, dict) else {}
+        gate = af_gate if isinstance(af_gate, dict) else {}
+        home_sc = ev.get("home_score", gate.get("home_score"))
+        away_sc = ev.get("away_score", gate.get("away_score"))
+        if isinstance(gate.get("goals"), dict):
+            g = gate["goals"]
+            if home_sc is None:
+                home_sc = g.get("home")
+            if away_sc is None:
+                away_sc = g.get("away")
+        key = str(event_key or "")
+        group_id = make_observe_group_id(mid, home_sc, away_sc, key)
+        dqd_score = {"home": home_sc, "away": away_sc}
+        with self._lock:
+            prev = self._by_match.get(mid)
+            if prev is not None:
+                for t in prev.timers:
+                    t.cancel()
+                prev.timers.clear()
+                gen = prev.gen + 1
+            else:
+                gen = 1
+            state = _GroupState(
+                observe_group_id=group_id,
+                match_id=mid,
+                event_key=key,
+                home=str(ev.get("home") or gate.get("home") or ""),
+                away=str(ev.get("away") or gate.get("away") or ""),
+                dqd_score=dqd_score,
+                gen=gen,
+            )
+            self._by_match[mid] = state
+            self._arm_delayed(state)
+        self._pool.submit(
+            self._safe_snapshot,
+            PHASE_AF_CONFIRMED,
+            state.observe_group_id,
+            mid,
+            key,
+            state.home,
+            state.away,
+            dict(dqd_score),
+            None,
+            False,
+            gen,
+        )
+        return group_id
+
+    def on_dqd_reversal(
+        self,
+        root: Path | None = None,
+        *,
+        match_id: str,
+        event_key: str = "",
+        ev: dict[str, Any] | None = None,
+    ) -> str | None:
+        if self._stop.is_set():
+            return None
+        mid = str(match_id or "").strip()
+        if not mid:
+            return None
+        ev = ev if isinstance(ev, dict) else {}
+        with self._lock:
+            linked = self._by_match.get(mid)
+            if linked is not None:
+                group_id = linked.observe_group_id
+                home_name = linked.home or str(ev.get("home") or "")
+                away_name = linked.away or str(ev.get("away") or "")
+                key = linked.event_key or str(event_key or "")
+                unlinked = False
+                gen = linked.gen
+            else:
+                home_sc = ev.get("home_score")
+                away_sc = ev.get("away_score")
+                key = str(event_key or "")
+                group_id = make_observe_group_id(mid, home_sc, away_sc, key or "reversal")
+                home_name = str(ev.get("home") or "")
+                away_name = str(ev.get("away") or "")
+                unlinked = True
+                gen = 0
+        prev = ev.get("prev") if isinstance(ev.get("prev"), dict) else None
+        dqd_score = {
+            "home": ev.get(
+                "home_score",
+                (ev.get("curr") or {}).get("home") if isinstance(ev.get("curr"), dict) else None,
+            ),
+            "away": ev.get(
+                "away_score",
+                (ev.get("curr") or {}).get("away") if isinstance(ev.get("curr"), dict) else None,
+            ),
+        }
+        dqd_prev = None
+        if prev is not None:
+            dqd_prev = {"home": prev.get("home"), "away": prev.get("away")}
+        self._pool.submit(
+            self._safe_snapshot,
+            PHASE_DQD_REVERSAL,
+            group_id,
+            mid,
+            key,
+            home_name,
+            away_name,
+            dqd_score,
+            dqd_prev,
+            unlinked,
+            gen,
+        )
+        return group_id
+
+    def _arm_delayed(self, state: _GroupState) -> None:
+        for delay, phase in (
+            (self.delay_5_s, PHASE_POST_5),
+            (self.delay_15_s, PHASE_POST_15),
+            (self.delay_45_s, PHASE_POST_45),
+        ):
+            gen = state.gen
+
+            def _fire(ph: str = phase, g: int = gen, mid: str = state.match_id) -> None:
+                if self._stop.is_set():
+                    return
+                with self._lock:
+                    cur = self._by_match.get(mid)
+                    if cur is None or cur.gen != g:
+                        return
+                    snap_state = cur
+                self._pool.submit(
+                    self._safe_snapshot,
+                    ph,
+                    snap_state.observe_group_id,
+                    snap_state.match_id,
+                    snap_state.event_key,
+                    snap_state.home,
+                    snap_state.away,
+                    dict(snap_state.dqd_score),
+                    None,
+                    False,
+                    g,
+                )
+
+            t = threading.Timer(delay, _fire)
+            t.daemon = True
+            state.timers.append(t)
+            t.start()
+
+    def _load_fixture_cache(self) -> None:
+        path = fixture_cache_path(self.root)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        if isinstance(raw, dict):
+            self._fixture_cache = raw
+
+    def _persist_fixture_cache(self) -> None:
+        path = fixture_cache_path(self.root)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                payload = dict(self._fixture_cache)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as e:
+            logger.warning("book fixture cache write failed: %s", e)
+
+    def _cache_entry(self, match_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._fixture_cache.get(match_id)
+        return dict(row) if isinstance(row, dict) else {}
+
+    def _update_cache_entry(self, match_id: str, patch: dict[str, Any]) -> None:
+        with self._lock:
+            cur = self._fixture_cache.get(match_id)
+            base = dict(cur) if isinstance(cur, dict) else {}
+            base.update(patch)
+            self._fixture_cache[match_id] = base
+        self._persist_fixture_cache()
+
+    def _url_with_key(self, base: str, path: str, params: dict[str, Any], api_key: str) -> str:
+        q = {k: v for k, v in params.items() if v is not None}
+        q["apiKey"] = api_key
+        return f"{base.rstrip('/')}/{path.lstrip('/')}?{urllib.parse.urlencode(q)}"
+
+    def _begin_snap_ctx(
+        self,
+        *,
+        phase: str,
+        observe_group_id: str,
+        match_id: str,
+        event_key: str,
+    ) -> None:
+        with self._lock:
+            self._snap_ctx = {
+                "phase": phase,
+                "observe_group_id": observe_group_id,
+                "match_id": match_id,
+                "event_key": event_key,
+            }
+            self._raw_seq = 0
+
+    def _next_raw_seq(self) -> int:
+        with self._lock:
+            self._raw_seq += 1
+            return int(self._raw_seq)
+
+    def _record_http(
+        self,
+        *,
+        source: str,
+        kind: str,
+        url: str,
+        inline_raw: bool,
+    ) -> tuple[int | None, Any, dict[str, str], str | None, dict[str, Any]]:
+        """GET + always persist full body under ``book_context_raw/``."""
+        status, body, hdrs, err = _http_get_json(url, timeout_s=self.http_timeout_s)
+        headers = select_response_headers(hdrs)
+        ctx = dict(self._snap_ctx)
+        seq = self._next_raw_seq()
+        raw_path = persist_raw_blob(
+            self.root,
+            source=source,
+            kind=kind,
+            match_id=str(ctx.get("match_id") or ""),
+            phase=str(ctx.get("phase") or "unknown"),
+            observe_group_id=str(ctx.get("observe_group_id") or ""),
+            seq=seq,
+            record={
+                "event_key": ctx.get("event_key"),
+                "url": redact_url(url),
+                "http_status": status,
+                "headers": headers,
+                "error": err,
+                "body": body,
+            },
+        )
+        meta = request_meta_for_jsonl(
+            kind=kind,
+            url=url,
+            http_status=status,
+            headers=headers,
+            error=err,
+            body=body,
+            raw_path=raw_path,
+            inline_raw=inline_raw,
+        )
+        return status, body, hdrs, err, meta
+
+    def _default_fetch_oddspapi(self, match_id: str, home: str, away: str) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        key = self.keys.get(SOURCE_ODDSPAPI) or ""
+        if not key:
+            return {"ok": False, "error": "missing_key"}
+        requests_meta: list[dict[str, Any]] = []
+        cache = self._cache_entry(match_id)
+        fixture_id = cache.get("oddspapi_fixture_id")
+        mapped = bool(fixture_id)
+        if not fixture_id:
+            # OddsPapi requires sportId / from / to (not sport=football).
+            now = datetime.now(timezone.utc)
+            url = self._url_with_key(
+                ODDSPAPI_BASE,
+                "/fixtures",
+                {
+                    "sportId": 10,
+                    "from": (now - timedelta(hours=18)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": (now + timedelta(hours=18)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                key,
+            )
+            status, body, _hdrs, err, meta = self._record_http(
+                source=SOURCE_ODDSPAPI,
+                kind="fixtures",
+                url=url,
+                inline_raw=False,
+            )
+            requests_meta.append(meta)
+            if err:
+                return {
+                    "ok": False,
+                    "error": err,
+                    "http_status": status,
+                    "requests": requests_meta,
+                }
+            rows = [r for r in _as_list(body) if isinstance(r, dict)]
+            resolved = resolve_team_match(rows, home=home, away=away, min_side=self.min_side_sim)
+            if not resolved.get("ok"):
+                return {
+                    "ok": False,
+                    "error": resolved.get("error") or "not_mapped",
+                    "candidates": resolved.get("candidates"),
+                    "requests": requests_meta,
+                }
+            fixture_id = resolved.get("id")
+            self._update_cache_entry(
+                match_id,
+                {
+                    "oddspapi_fixture_id": fixture_id,
+                    "home": home,
+                    "away": away,
+                    "mapped_at": lib.now_cn_iso(),
+                },
+            )
+            mapped = False
+
+        books_param = ",".join(self.oddspapi_books)
+        odds_url = self._url_with_key(
+            ODDSPAPI_BASE,
+            "/odds",
+            {"fixtureId": fixture_id, "bookmakers": books_param},
+            key,
+        )
+        status, body, _hdrs, err, meta = self._record_http(
+            source=SOURCE_ODDSPAPI,
+            kind="odds",
+            url=odds_url,
+            inline_raw=True,
+        )
+        requests_meta.append(meta)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        if err:
+            return {
+                "ok": False,
+                "error": err,
+                "http_status": status,
+                "fixture_id": fixture_id,
+                "latency_ms": latency_ms,
+                "requests": requests_meta,
+                "raw": meta.get("raw"),
+                "raw_path": meta.get("raw_path"),
+            }
+        books = parse_oddspapi_books(body, wanted_books=self.oddspapi_books, home=home, away=away)
+        return {
+            "ok": True,
+            "fixture_id": fixture_id,
+            "from_cache": mapped,
+            "books": books,
+            "latency_ms": latency_ms,
+            "http_status": status,
+            "requests": requests_meta,
+            "raw": meta.get("raw"),
+            "raw_path": meta.get("raw_path"),
+        }
+
+    def _default_fetch_oddsapiio(self, match_id: str, home: str, away: str) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        key = self.keys.get(SOURCE_ODDSAPIIO) or ""
+        if not key:
+            return {"ok": False, "error": "missing_key"}
+        requests_meta: list[dict[str, Any]] = []
+        cache = self._cache_entry(match_id)
+        event_id = cache.get("oddsapiio_event_id")
+        from_cache = bool(event_id)
+        if not event_id:
+            url = self._url_with_key(ODDS_API_IO_BASE, "/events", {"sport": "football"}, key)
+            status, body, _hdrs, err, meta = self._record_http(
+                source=SOURCE_ODDSAPIIO,
+                kind="events",
+                url=url,
+                inline_raw=False,
+            )
+            requests_meta.append(meta)
+            if err:
+                return {
+                    "ok": False,
+                    "error": err,
+                    "http_status": status,
+                    "requests": requests_meta,
+                }
+            rows = [r for r in _as_list(body) if isinstance(r, dict)]
+            resolved = resolve_team_match(rows, home=home, away=away, min_side=self.min_side_sim)
+            if not resolved.get("ok"):
+                return {
+                    "ok": False,
+                    "error": resolved.get("error") or "not_mapped",
+                    "candidates": resolved.get("candidates"),
+                    "requests": requests_meta,
+                }
+            event_id = resolved.get("id")
+            self._update_cache_entry(
+                match_id,
+                {
+                    "oddsapiio_event_id": event_id,
+                    "home": home,
+                    "away": away,
+                    "mapped_at": lib.now_cn_iso(),
+                },
+            )
+            from_cache = False
+
+        books_param = ",".join(self.oddsapiio_books)
+        odds_url = self._url_with_key(
+            ODDS_API_IO_BASE,
+            "/odds",
+            {"eventId": event_id, "bookmakers": books_param},
+            key,
+        )
+        status, body, _hdrs, err, meta = self._record_http(
+            source=SOURCE_ODDSAPIIO,
+            kind="odds",
+            url=odds_url,
+            inline_raw=True,
+        )
+        requests_meta.append(meta)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        if err:
+            return {
+                "ok": False,
+                "error": err,
+                "http_status": status,
+                "event_id": event_id,
+                "latency_ms": latency_ms,
+                "requests": requests_meta,
+                "raw": meta.get("raw"),
+                "raw_path": meta.get("raw_path"),
+            }
+        books = parse_oddsapiio_books(body, wanted_books=self.oddsapiio_books, home=home, away=away)
+        if not books:
+            books = [{"book": b, "status": "missing"} for b in self.oddsapiio_books]
+        out = {
+            "ok": True,
+            "event_id": event_id,
+            "from_cache": from_cache,
+            "books": books,
+            "latency_ms": latency_ms,
+            "http_status": status,
+            "requests": requests_meta,
+            "raw": meta.get("raw"),
+            "raw_path": meta.get("raw_path"),
+        }
+        if isinstance(body, dict) and body.get("status") is not None:
+            out["event_status"] = body.get("status")
+        return out
+
+    def _default_fetch_theoddsapi(self, match_id: str, home: str, away: str) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        key = self.keys.get(SOURCE_THEODDSAPI) or ""
+        if not key:
+            return {"ok": False, "error": "missing_key"}
+        requests_meta: list[dict[str, Any]] = []
+        cache = self._cache_entry(match_id)
+        sport_key = cache.get("theoddsapi_sport_key")
+        event_id = cache.get("theoddsapi_event_id")
+        from_cache = bool(sport_key and event_id)
+        credits: dict[str, Any] = {}
+
+        if not (sport_key and event_id):
+            found = False
+            for sk in self.theoddsapi_sport_keys:
+                ev_url = self._url_with_key(THE_ODDS_API_BASE, f"/sports/{sk}/events", {}, key)
+                status, body, hdrs, err, meta = self._record_http(
+                    source=SOURCE_THEODDSAPI,
+                    kind=f"events:{sk}",
+                    url=ev_url,
+                    inline_raw=False,
+                )
+                requests_meta.append(meta)
+                if hdrs.get("x-requests-remaining") is not None:
+                    credits["requests_remaining"] = hdrs.get("x-requests-remaining")
+                if err:
+                    continue
+                rows = [r for r in _as_list(body) if isinstance(r, dict)]
+                resolved = resolve_team_match(rows, home=home, away=away, min_side=self.min_side_sim)
+                if resolved.get("ok") and resolved.get("id"):
+                    sport_key = sk
+                    event_id = resolved.get("id")
+                    found = True
+                    break
+            if not found:
+                out_miss: dict[str, Any] = {
+                    "ok": False,
+                    "error": "not_mapped",
+                    "requests": requests_meta,
+                }
+                if credits:
+                    out_miss["credits"] = credits
+                return out_miss
+            self._update_cache_entry(
+                match_id,
+                {
+                    "theoddsapi_sport_key": sport_key,
+                    "theoddsapi_event_id": event_id,
+                    "home": home,
+                    "away": away,
+                    "mapped_at": lib.now_cn_iso(),
+                },
+            )
+            from_cache = False
+
+        regions = ",".join(self.theoddsapi_regions)
+        odds_url = self._url_with_key(
+            THE_ODDS_API_BASE,
+            f"/sports/{sport_key}/events/{event_id}/odds",
+            {"markets": "h2h", "regions": regions},
+            key,
+        )
+        status, body, hdrs, err, meta = self._record_http(
+            source=SOURCE_THEODDSAPI,
+            kind="odds",
+            url=odds_url,
+            inline_raw=True,
+        )
+        requests_meta.append(meta)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        if hdrs.get("x-requests-remaining") is not None:
+            credits["requests_remaining"] = hdrs.get("x-requests-remaining")
+        if hdrs.get("x-requests-used") is not None:
+            credits["requests_used"] = hdrs.get("x-requests-used")
+        if hdrs.get("x-requests-last") is not None:
+            credits["requests_last"] = hdrs.get("x-requests-last")
+        if err:
+            out: dict[str, Any] = {
+                "ok": False,
+                "error": err,
+                "http_status": status,
+                "sport_key": sport_key,
+                "event_id": event_id,
+                "latency_ms": latency_ms,
+                "requests": requests_meta,
+                "raw": meta.get("raw"),
+                "raw_path": meta.get("raw_path"),
+            }
+            if credits:
+                out["credits"] = credits
+            return out
+        books = parse_theoddsapi_books(body, home=home, away=away)
+        if not books:
+            books = [{"book": "any", "status": "missing"}]
+        out = {
+            "ok": True,
+            "sport_key": sport_key,
+            "event_id": event_id,
+            "from_cache": from_cache,
+            "books": books,
+            "latency_ms": latency_ms,
+            "http_status": status,
+            "requests": requests_meta,
+            "raw": meta.get("raw"),
+            "raw_path": meta.get("raw_path"),
+        }
+        if credits:
+            out["credits"] = credits
+        return out
+
+    def _fetch_all_sources(self, match_id: str, home: str, away: str) -> dict[str, Any]:
+        tasks: dict[str, Callable[[], dict[str, Any]]] = {}
+        if SOURCE_ODDSPAPI in self.active_sources:
+            fn = self._fetch_oddspapi or self._default_fetch_oddspapi
+            tasks[SOURCE_ODDSPAPI] = lambda mid=match_id, h=home, a=away, f=fn: f(mid, h, a)
+        if SOURCE_ODDSAPIIO in self.active_sources:
+            fn = self._fetch_oddsapiio or self._default_fetch_oddsapiio
+            tasks[SOURCE_ODDSAPIIO] = lambda mid=match_id, h=home, a=away, f=fn: f(mid, h, a)
+        if SOURCE_THEODDSAPI in self.active_sources:
+            fn = self._fetch_theoddsapi or self._default_fetch_theoddsapi
+            tasks[SOURCE_THEODDSAPI] = lambda mid=match_id, h=home, a=away, f=fn: f(mid, h, a)
+
+        sources: dict[str, Any] = {}
+        if not tasks:
+            return sources
+
+        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as ex:
+            fut_map = {ex.submit(call): name for name, call in tasks.items()}
+            for fut in as_completed(fut_map):
+                name = fut_map[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    result = {"ok": False, "error": str(e)}
+                sources[name] = result
+        return sources
+
+    def _safe_snapshot(
+        self,
+        phase: str,
+        observe_group_id: str,
+        match_id: str,
+        event_key: str,
+        home: str,
+        away: str,
+        dqd_score: dict[str, Any],
+        dqd_prev: dict[str, Any] | None,
+        unlinked_reversal: bool,
+        gen: int,
+    ) -> None:
+        try:
+            self._write_snapshot(
+                phase=phase,
+                observe_group_id=observe_group_id,
+                match_id=match_id,
+                event_key=event_key,
+                home=home,
+                away=away,
+                dqd_score=dqd_score,
+                dqd_prev=dqd_prev,
+                unlinked_reversal=unlinked_reversal,
+                gen=gen,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("book-context snapshot failed phase=%s match=%s", phase, match_id)
+            try:
+                lib.append_jsonl_async(
+                    observe_path(self.root),
+                    [
+                        {
+                            "quoted_at": lib.now_cn_iso(),
+                            "phase": phase,
+                            "observe_group_id": observe_group_id,
+                            "match_id": match_id,
+                            "event_key": event_key,
+                            "home": home,
+                            "away": away,
+                            "dqd_score": dqd_score,
+                            "dqd_prev": dqd_prev,
+                            "sources": {},
+                            "summary": {},
+                            "unlinked_reversal": bool(unlinked_reversal),
+                            "error": {"fatal": str(e)},
+                        }
+                    ],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _write_snapshot(
+        self,
+        *,
+        phase: str,
+        observe_group_id: str,
+        match_id: str,
+        event_key: str,
+        home: str,
+        away: str,
+        dqd_score: dict[str, Any],
+        dqd_prev: dict[str, Any] | None,
+        unlinked_reversal: bool,
+        gen: int,
+    ) -> None:
+        if self._stop.is_set():
+            return
+        if phase in (PHASE_POST_5, PHASE_POST_15, PHASE_POST_45):
+            with self._lock:
+                cur = self._by_match.get(match_id)
+                if cur is None or cur.gen != gen:
+                    return
+
+        self._begin_snap_ctx(
+            phase=phase,
+            observe_group_id=observe_group_id,
+            match_id=match_id,
+            event_key=event_key,
+        )
+        sources = self._fetch_all_sources(match_id, home, away)
+        summary = summarize_sources(sources)
+        errors: dict[str, Any] = {}
+        for name, payload in sources.items():
+            if isinstance(payload, dict) and payload.get("error") and not payload.get("ok"):
+                errors[name] = payload.get("error")
+
+        row: dict[str, Any] = {
+            "quoted_at": lib.now_cn_iso(),
+            "phase": phase,
+            "observe_group_id": observe_group_id,
+            "match_id": match_id,
+            "event_key": event_key,
+            "home": home,
+            "away": away,
+            "dqd_score": dqd_score,
+            "sources": sources,
+            "summary": summary,
+        }
+        if dqd_prev is not None:
+            row["dqd_prev"] = dqd_prev
+        if unlinked_reversal:
+            row["unlinked_reversal"] = True
+        if errors:
+            row["error"] = errors
+        lib.append_jsonl_async(observe_path(self.root), [row])

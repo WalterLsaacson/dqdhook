@@ -2100,6 +2100,20 @@ def process_bridge_events(
                         )
                 except Exception as e:  # noqa: BLE001
                     print(f"ALERT livescore observe confirm failed: {e}", flush=True)
+                try:
+                    from book_context_observe import get_active_observer as get_book_observer
+
+                    book_obs = get_book_observer()
+                    if book_obs is not None:
+                        book_obs.on_af_confirmed(
+                            root,
+                            match_id=mid,
+                            event_key=key,
+                            ev=ev,
+                            af_gate=gate,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT book-context observe confirm failed: {e}", flush=True)
                 bundles.append(
                     {
                         "quoted_at": now_cn_iso(),
@@ -2275,6 +2289,20 @@ def process_bridge_events(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"ALERT livescore observe confirm failed: {e}", flush=True)
+        try:
+            from book_context_observe import get_active_observer as get_book_observer
+
+            book_obs = get_book_observer()
+            if book_obs is not None:
+                book_obs.on_af_confirmed(
+                    root,
+                    match_id=mid,
+                    event_key=key,
+                    ev=work_ev,
+                    af_gate=af_gate,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT book-context observe confirm failed: {e}", flush=True)
         _quote_one(work_ev, key, af_gate=af_gate)
 
     def _drain_af() -> None:
@@ -2462,6 +2490,19 @@ def process_bridge_events(
                         )
                 except Exception as e:  # noqa: BLE001
                     print(f"ALERT livescore observe reversal failed: {e}", flush=True)
+                try:
+                    from book_context_observe import get_active_observer as get_book_observer
+
+                    book_obs = get_book_observer()
+                    if book_obs is not None:
+                        book_obs.on_dqd_reversal(
+                            root,
+                            match_id=mid_rev,
+                            event_key=key,
+                            ev=ev,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT book-context observe reversal failed: {e}", flush=True)
                 _quote_one(ev, key)
                 print(
                     f"af-referee → DQD reversal flatten+quote match_id={ev.get('match_id')} "

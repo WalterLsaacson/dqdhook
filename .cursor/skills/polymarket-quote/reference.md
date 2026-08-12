@@ -23,7 +23,7 @@ Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
 | Target | Rule |
 |---|---|
 | `market_cache/*.json` | Keep only **open** paired matches still in `matches.json`; drop finished / orphan. **Skip** if matches file missing / bad / empty. |
-| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` / `goal_context_observe.jsonl` / `livescore_observe.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
+| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` / `goal_context_observe.jsonl` / `livescore_observe.jsonl` / `book_context_observe.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
 | `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
 
 Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
@@ -123,6 +123,10 @@ After AF goal confirm (gate or postcheck), watch snapshots DQD overview (`/api/d
 **Live Score API observe (trial, observe-only)**
 
 When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, the same AF-confirm / +15s / +45s / DQD-reversal phases also resolve the fixture via `scores/live.json`, then pull **raw** `matches/events.json` (GOAL/score) and `commentary/events.json` (VAR if package allows; errors kept raw) into `data/pm-quote/livescore_observe.jsonl`. DQD→LSA id map cached in `livescore_match_map.json`. Trial is not expected to expose `KICK_OFF`. Does **not** gate buys or flatten.
+
+**Book-context observe (research, observe-only)**
+
+When any of `ODDSPAPI_KEY` / `ODDS_API_IO_KEY` / `THE_ODDS_API_KEY` is set (optional `BOOK_OBSERVE_SOURCES`), the same AF-confirm / DQD-reversal hooks also snapshot moneyline availability (`open` / `suspended` / `missing`) from OddsPapi (default books `pinnacle,singbet`), Odds-API.io (default `Bet365`), and The Odds API (`h2h`, default `regions=eu`) into `data/pm-quote/book_context_observe.jsonl` at phases `af_confirmed`, `post_confirm_5s`, `post_confirm_15s`, `post_confirm_45s`, `dqd_reversal`. **Every HTTP response body** is also written under `data/pm-quote/book_context_raw/` (URLs redact `apiKey`; observe rows keep `raw`/`raw_path`/`requests`). Fixture id map cached in `book_fixture_cache.json`. Event-driven only (quota-safe). Raw dumps are **not** auto-pruned. Does **not** gate buys or flatten.
 
 **System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with these flags automatically (default dry-run + repo `.env`). Same flags on the hub CLI / `QUOTE_*` env. Logs: `data/pm-quote/watch.log`.
 

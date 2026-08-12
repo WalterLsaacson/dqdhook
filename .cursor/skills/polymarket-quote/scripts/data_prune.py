@@ -243,6 +243,12 @@ def prune_runtime_data(
             "livescore_observe.jsonl",
         ),
         (
+            lib.data_dir(root) / "book_context_observe.jsonl",
+            ("quoted_at", "ts"),
+            None,
+            "book_context_observe.jsonl",
+        ),
+        (
             lib.bridge_dir(root) / "events.jsonl",
             ("ts", "quoted_at"),
             _keep_unprocessed_bridge,
