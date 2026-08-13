@@ -621,7 +621,20 @@ def sync_fixture_cache(
             entries.pop(mid, None)
             stats["pruned"] += 1
 
+    # Drop unresolved for matches no longer on the bridge snapshot (hub noise).
+    unresolved_pruned = 0
+    for mid in list(unresolved.keys()):
+        if mid not in seen_ids:
+            unresolved.pop(mid, None)
+            unresolved_pruned += 1
+    stats["unresolved_pruned"] = unresolved_pruned
+
     stats["date_pruned"] = prune_date_fixtures(cache_dir=date_dir, now=now)
+    # Live coverage vs current bridge (not historical cache size).
+    stats["bridge_mapped"] = sum(
+        1 for mid in seen_ids if mid in entries and entries[mid].get("af_fixture_id")
+    )
+    stats["bridge_unresolved"] = sum(1 for mid in seen_ids if mid in unresolved)
 
     cache["entries"] = entries
     cache["unresolved"] = unresolved
@@ -629,6 +642,34 @@ def sync_fixture_cache(
     cache["last_sync_stats"] = stats
     cache["last_bridge_matched_at"] = bridge_matched_at
     return cache
+
+
+def bridge_coverage(
+    cache: dict[str, Any],
+    bridge_snap: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Live AF mapping rate vs current bridge matches (not historical cache size)."""
+    snap = bridge_snap if bridge_snap is not None else load_bridge_snapshot()
+    bridge_ids = {
+        str((m.get("dongqiudi") or {}).get("id") or "")
+        for m in (snap.get("matches") or [])
+        if isinstance(m, dict)
+    }
+    bridge_ids.discard("")
+    entries = cache.get("entries") or {}
+    unresolved = cache.get("unresolved") or {}
+    mapped = sum(
+        1 for mid in bridge_ids if mid in entries and (entries.get(mid) or {}).get("af_fixture_id")
+    )
+    bridge_unresolved = sum(1 for mid in bridge_ids if mid in unresolved)
+    n = len(bridge_ids)
+    return {
+        "bridge_count": n,
+        "bridge_mapped": mapped,
+        "bridge_unresolved": bridge_unresolved,
+        "bridge_mapped_rate": round(mapped / n, 4) if n else None,
+        "bridge_ids": bridge_ids,
+    }
 
 
 def cached_fixture_entry(cache: dict[str, Any], dqd_id: str) -> dict[str, Any] | None:

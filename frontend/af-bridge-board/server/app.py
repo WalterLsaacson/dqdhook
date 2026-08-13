@@ -52,6 +52,19 @@ class AfBridgeRuntime:
     def status(self) -> dict[str, Any]:
         cache = aflib.load_cache(aflib.DEFAULT_CACHE_PATH)
         bridge = aflib.load_bridge_snapshot(aflib.DEFAULT_BRIDGE_MATCHES)
+        entries = cache.get("entries") or {}
+        unresolved = cache.get("unresolved") or {}
+        bridge_ids = {
+            str((m.get("dongqiudi") or {}).get("id") or "")
+            for m in (bridge.get("matches") or [])
+            if isinstance(m, dict)
+        }
+        bridge_ids.discard("")
+        bridge_mapped = sum(
+            1 for mid in bridge_ids if mid in entries and (entries[mid] or {}).get("af_fixture_id")
+        )
+        bridge_unresolved = sum(1 for mid in bridge_ids if mid in unresolved)
+        bridge_count = len(bridge_ids)
         with self._lock:
             running = self.running
             started_at = self.started_at
@@ -64,10 +77,16 @@ class AfBridgeRuntime:
             "last_error": last_error,
             "last_sync_at": cache.get("last_sync_at"),
             "last_sync_stats": cache.get("last_sync_stats"),
-            "entry_count": len(cache.get("entries") or {}),
-            "unresolved_count": len(cache.get("unresolved") or {}),
+            # Prefer bridge-scoped coverage for hub pills (historical cache piles up).
+            "entry_count": bridge_mapped,
+            "unresolved_count": bridge_unresolved,
+            "cache_entry_count": len(entries),
+            "cache_unresolved_count": len(unresolved),
+            "bridge_mapped": bridge_mapped,
+            "bridge_unresolved": bridge_unresolved,
+            "bridge_mapped_rate": round(bridge_mapped / bridge_count, 4) if bridge_count else None,
             "bridge_matched_at": bridge.get("matched_at"),
-            "bridge_count": len(bridge.get("matches") or []),
+            "bridge_count": bridge_count,
             "cache_path": str(aflib.DEFAULT_CACHE_PATH),
             "interval_s": WATCH_INTERVAL_S,
         }
@@ -86,6 +105,8 @@ class AfBridgeRuntime:
         matches: list[dict[str, Any]] = []
         for mid, ent in (cache.get("entries") or {}).items():
             if not isinstance(ent, dict) or not ent.get("af_fixture_id"):
+                continue
+            if mid not in by_id:
                 continue
             item = dict(ent)
             item["dqd_match_id"] = str(ent.get("dqd_match_id") or mid)
@@ -110,9 +131,14 @@ class AfBridgeRuntime:
 
         unresolved = []
         for mid, u in (cache.get("unresolved") or {}).items():
-            if isinstance(u, dict):
-                unresolved.append({"dqd_match_id": str(mid), **u})
+            if not isinstance(u, dict):
+                continue
+            # Only surface unresolved rows still on the current bridge.
+            if mid not in by_id:
+                continue
+            unresolved.append({"dqd_match_id": str(mid), **u})
 
+        bridge_count = len(by_id)
         return {
             "updated_at": cache.get("updated_at"),
             "last_sync_at": cache.get("last_sync_at"),
@@ -123,7 +149,9 @@ class AfBridgeRuntime:
             "unresolved_count": len(unresolved),
             "stats": cache.get("last_sync_stats"),
             "bridge_matched_at": bridge.get("matched_at"),
-            "bridge_count": len(bridge.get("matches") or []),
+            "bridge_count": bridge_count,
+            "bridge_mapped": sum(1 for mid in by_id if mid in (cache.get("entries") or {}) and (cache.get("entries") or {}).get(mid, {}).get("af_fixture_id")),
+            "bridge_unresolved": len(unresolved),
         }
 
     def sync_once(self) -> dict[str, Any]:

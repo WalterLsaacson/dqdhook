@@ -31,9 +31,11 @@ function render(st) {
     $("pillAf").textContent = "AF board down";
     $("pillAf").className = "pill bad";
   } else if (afBoard.skill_running) {
+    const mapped = afBoard.bridge_mapped ?? afBoard.entry_count ?? "?";
+    const total = afBoard.bridge_count != null ? `/${afBoard.bridge_count}` : "";
     $("pillAf").textContent = afRef
-      ? `AF watch · referee on · ${afBoard.entry_count ?? "?"} mapped`
-      : `AF watch · referee off · ${afBoard.entry_count ?? "?"} mapped`;
+      ? `AF watch · referee on · ${mapped}${total} mapped`
+      : `AF watch · referee off · ${mapped}${total} mapped`;
     $("pillAf").className = "pill ok";
   } else {
     $("pillAf").textContent = "AF watch idle";
@@ -72,7 +74,11 @@ function render(st) {
             (b.pm_ticks != null ? ` · PM ${b.pm_ticks}` : "")
           : b.id === "af-bridge-board" && b.skill_running != null
             ? ` · af watch ${b.skill_running ? "running" : "idle"}` +
-              (b.entry_count != null ? ` · ${b.entry_count} mapped` : "") +
+              (b.bridge_mapped != null && b.bridge_count != null
+                ? ` · ${b.bridge_mapped}/${b.bridge_count} mapped`
+                : b.entry_count != null
+                  ? ` · ${b.entry_count} mapped`
+                  : "") +
               (b.unresolved_count != null ? ` · ${b.unresolved_count} unresolved` : "")
             : "";
       return `

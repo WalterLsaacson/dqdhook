@@ -163,6 +163,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     cache_path = Path(args.cache)
     cache = lib.load_cache(cache_path)
     bridge_snap = lib.load_bridge_snapshot(Path(args.bridge))
+    bridge_ids = {
+        str((m.get("dongqiudi") or {}).get("id") or "")
+        for m in (bridge_snap.get("matches") or [])
+        if isinstance(m, dict)
+    }
+    bridge_ids.discard("")
+    entries = cache.get("entries") or {}
+    unresolved = cache.get("unresolved") or {}
+    bridge_mapped = sum(
+        1 for mid in bridge_ids if mid in entries and (entries[mid] or {}).get("af_fixture_id")
+    )
+    bridge_unresolved = sum(1 for mid in bridge_ids if mid in unresolved)
+    bridge_count = len(bridge_ids)
     out: dict[str, Any] = {
         "ok": True,
         "cache_path": str(cache_path),
@@ -170,10 +183,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         "updated_at": cache.get("updated_at"),
         "last_sync_at": cache.get("last_sync_at"),
         "last_sync_stats": cache.get("last_sync_stats"),
-        "entry_count": len(cache.get("entries") or {}),
-        "unresolved_count": len(cache.get("unresolved") or {}),
+        "entry_count": len(entries),
+        "unresolved_count": len(unresolved),
         "bridge_matched_at": bridge_snap.get("matched_at"),
-        "bridge_count": len(bridge_snap.get("matches") or []),
+        "bridge_count": bridge_count,
+        "bridge_mapped": bridge_mapped,
+        "bridge_unresolved": bridge_unresolved,
+        "bridge_mapped_rate": round(bridge_mapped / bridge_count, 4) if bridge_count else None,
     }
     # AF /status is optional and burns Free-plan quota — only when explicitly requested.
     if getattr(args, "af_status", False):

@@ -609,6 +609,10 @@ def status() -> dict[str, Any]:
                     "skill_running": st.get("running"),
                     "entry_count": st.get("entry_count"),
                     "unresolved_count": st.get("unresolved_count"),
+                    "bridge_count": st.get("bridge_count"),
+                    "bridge_mapped": st.get("bridge_mapped"),
+                    "bridge_unresolved": st.get("bridge_unresolved"),
+                    "bridge_mapped_rate": st.get("bridge_mapped_rate"),
                     "sync_ticks": st.get("sync_ticks"),
                 }
         boards_st.append(
