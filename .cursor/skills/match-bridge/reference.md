@@ -5,7 +5,7 @@
 Inputs:
 
 - Dongqiudi: `data/snapshot.json` (`language=en`, default tab `full`)
-- Polymarket: `data/polymarket/snapshot.json` (default next 48h)
+- Polymarket: `data/polymarket/snapshot.json` (written by polymarket-board every 3h; bridge does not scan Gamma)
 
 Algorithm (greedy 1:1):
 
@@ -132,7 +132,7 @@ Matched rows get `finished: true` / `dongqiudi.is_finished: true` while `period`
 ## Notes
 
 - Coverage is limited to fixtures present in **both** upstream snapshots.
-- PM list needs the local proxy (`http://127.0.0.1:1082`) when Gamma is blocked.
+- PM Gamma scans are owned by polymarket-board (default **3h**). Bridge only reloads `data/polymarket/snapshot.json`. The board fetch loop needs the local proxy (`http://127.0.0.1:1082`) when Gamma is blocked.
 - Prop markets (`"A vs. B - Halftime"`) are already filtered by the Polymarket skill.
 - Dongqiudi skill uses `zh-cn` schedule + per-team `team_en_name` (cached). Bridge residual mismatches go in **[`scripts/team_aliases.py`](scripts/team_aliases.py)** (CN / abbreviations → canonical EN tokens).
 - Prefer `match_timestamp` for kickoff (DQD `start_play` string may be wrong on the EN feed).

@@ -29,6 +29,8 @@ from pm_soccer import data_dir, write_json  # noqa: E402
 HOST = "127.0.0.1"
 PORT = 8788
 MODULE_ID = "polymarket-board"
+# Gamma soccer catalog is ~169 leagues; default 3h. Bridge reads snapshot.json.
+DEFAULT_FETCH_INTERVAL = 10800
 
 
 def parse_league_arg(raw: str | None) -> list[str] | None:
@@ -45,13 +47,14 @@ class FetchState:
         self.include_closed = False
         self.within_hours = int(getattr(lib, "DEFAULT_WITHIN_HOURS", 48))
         self.max_per_league = 100
-        self.interval = 600  # 10 minutes — fixture list changes slowly
+        self.interval = DEFAULT_FETCH_INTERVAL  # 3h — fixture list changes slowly
         self.thread: threading.Thread | None = None
         self.last_result: dict[str, Any] | None = None
         self.last_error: str | None = None
         self.started_at: str | None = None
         self.ticks = 0
         self._stop = threading.Event()
+        self._fetch_lock = threading.Lock()
 
     def _status_unlocked(self) -> dict[str, Any]:
         return {
@@ -91,22 +94,23 @@ class FetchState:
         within_hours: int = 48,
     ) -> dict[str, Any]:
         leagues = parse_league_arg(league)
-        payload = lib.load_matches(
-            leagues,
-            include_closed=include_closed,
-            max_per_league=max_per_league,
-            within_hours=within_hours,
-        )
-        write_json(data_dir(str(DATA)) / "snapshot.json", payload)
-        with self.lock:
-            self.league = league or "all"
-            self.include_closed = include_closed
-            self.within_hours = int(within_hours)
-            self.max_per_league = max_per_league
-            self.last_result = payload
-            self.last_error = None
-            self.ticks += 1
-        return payload
+        with self._fetch_lock:
+            payload = lib.load_matches(
+                leagues,
+                include_closed=include_closed,
+                max_per_league=max_per_league,
+                within_hours=within_hours,
+            )
+            write_json(data_dir(str(DATA)) / "snapshot.json", payload)
+            with self.lock:
+                self.league = league or "all"
+                self.include_closed = include_closed
+                self.within_hours = int(within_hours)
+                self.max_per_league = max_per_league
+                self.last_result = payload
+                self.last_error = None
+                self.ticks += 1
+            return payload
 
     def start(
         self,
@@ -114,7 +118,7 @@ class FetchState:
         *,
         include_closed: bool = False,
         within_hours: int = 48,
-        interval: int = 600,
+        interval: int = DEFAULT_FETCH_INTERVAL,
         max_per_league: int = 100,
     ) -> dict[str, Any]:
         with self.lock:
@@ -124,7 +128,7 @@ class FetchState:
             self.include_closed = include_closed
             self.within_hours = int(within_hours)
             self.max_per_league = max_per_league
-            self.interval = max(120, interval)  # floor 2 min; default 10 min
+            self.interval = max(120, interval)  # floor 2 min; default 3h
             self._stop.clear()
             self.running = True
             self.last_error = None
@@ -146,7 +150,7 @@ class FetchState:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            interval = 600
+            interval = DEFAULT_FETCH_INTERVAL
             try:
                 with self.lock:
                     league = self.league
@@ -154,9 +158,6 @@ class FetchState:
                     within_hours = self.within_hours
                     max_per_league = self.max_per_league
                     interval = self.interval
-                # First tick already fetched in /api/fetch/start; wait then refresh.
-                if self._stop.wait(interval):
-                    break
                 self.fetch_once(
                     league,
                     include_closed=include_closed,
@@ -168,6 +169,9 @@ class FetchState:
                     self.last_error = str(e)
                 traceback.print_exc()
                 self._stop.wait(60)
+                continue
+            if self._stop.wait(interval):
+                break
         with self.lock:
             self.running = False
 
@@ -318,12 +322,27 @@ class Handler(BaseHTTPRequestHandler):
                 with FETCH.lock:
                     if FETCH.last_result:
                         cached = dict(FETCH.last_result)
+                    running = FETCH.running
                 if not cached:
                     cached = _load_stale_snapshot()
                 if cached:
                     out = dict(cached)
                     out["from_cache"] = True
                     json_response(self, 200, out)
+                    return
+                if running:
+                    # First Gamma tick in flight — do not start a second 169-league scan.
+                    json_response(
+                        self,
+                        200,
+                        {
+                            "fetched_at": None,
+                            "matches": [],
+                            "count": 0,
+                            "from_cache": True,
+                            "pending": True,
+                        },
+                    )
                     return
                 # No buffer yet — fall through to one live fetch.
             try:
@@ -382,24 +401,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/fetch/start":
             league = str(body.get("league") or "all")
             include_closed = bool(body.get("include_closed"))
-            interval = int(body.get("interval") or 600)
+            interval = int(body.get("interval") or DEFAULT_FETCH_INTERVAL)
             max_n = int(body.get("max") or 100)
             within_hours = int(
                 body.get("within_hours")
                 if body.get("within_hours") is not None
                 else getattr(lib, "DEFAULT_WITHIN_HOURS", 48)
             )
-            # Kick an immediate fetch so UI has data before the loop sleeps.
-            try:
-                FETCH.fetch_once(
-                    league,
-                    include_closed=include_closed,
-                    max_per_league=max_n,
-                    within_hours=within_hours,
-                )
-            except Exception as e:  # noqa: BLE001
-                json_response(self, 502, {"error": str(e)})
-                return
+            # Loop fetches immediately; do not block this request on a 169-league scan.
             json_response(
                 self,
                 200,
@@ -424,7 +433,14 @@ def main() -> int:
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    FETCH.start(
+        "all",
+        include_closed=False,
+        within_hours=int(getattr(lib, "DEFAULT_WITHIN_HOURS", 48)),
+        interval=DEFAULT_FETCH_INTERVAL,
+    )
     print(f"Polymarket Board → http://{HOST}:{PORT}/", flush=True)
+    print(f"Gamma fetch loop  → every {DEFAULT_FETCH_INTERVAL}s (3h)", flush=True)
     print(f"Module path       → {MODULE_DIR}", flush=True)
     print(f"Skill scripts     → {SCRIPTS}", flush=True)
     try:

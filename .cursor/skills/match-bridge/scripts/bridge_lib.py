@@ -27,6 +27,9 @@ DEFAULT_MIN_SIDE = 0.75
 DEFAULT_MAX_SKEW_MIN = 90
 DEFAULT_PM_STALE_HOURS = 6
 DEFAULT_LEAGUE_FLOOR = 0.40
+# Snapshot reload cadence. Gamma league scans are owned by polymarket-board
+# (default 3h); bridge only reads data/polymarket/snapshot.json.
+DEFAULT_PM_INTERVAL = 10800
 # After status=Played but period not yet FT, poll at this cadence (same as live default).
 PENDING_FT_POLL_SEC = 5
 
@@ -774,7 +777,7 @@ class BridgeRuntime:
         dqd_tab: str = "full",
         dqd_interval: int = 5,
         dqd_idle_interval: int = 60,
-        pm_interval: int = 600,
+        pm_interval: int = DEFAULT_PM_INTERVAL,
         pm_within_hours: int = 48,
         min_score: float = DEFAULT_MIN_SCORE,
         max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
@@ -962,11 +965,13 @@ class BridgeRuntime:
         return result
 
     def refresh_pm_once(self) -> dict[str, Any]:
-        import pm_lib as pm  # type: ignore
-        from pm_soccer import data_dir, write_json  # type: ignore
+        """Reload ``data/polymarket/snapshot.json`` written by polymarket-board.
 
-        payload = pm.load_matches(within_hours=self.pm_within_hours)
-        write_json(data_dir(str(self.pm_data)) / "snapshot.json", payload)
+        Does not call Gamma / ``pm.load_matches`` (that scan is ~169 leagues).
+        """
+        payload = load_json(self.pm_data / "snapshot.json", {}) or {}
+        if not isinstance(payload, dict):
+            payload = {}
         with self.lock:
             self.pm_ticks += 1
         return payload
@@ -1122,8 +1127,8 @@ class BridgeRuntime:
             self.running = self.running and any(t.is_alive() for t in self._threads)
 
     def _pm_loop(self) -> None:
-        # First tick runs immediately; rematch only after DQD has seeded once so
-        # a fast PM pull does not publish dqd_count=0 while EN-name cache warms.
+        # Reload snapshot.json (written by polymarket-board). Rematch only after
+        # DQD has seeded once so a fast PM read does not publish dqd_count=0.
         while not self._stop.is_set():
             try:
                 self.refresh_pm_once()

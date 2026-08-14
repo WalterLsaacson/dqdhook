@@ -1,29 +1,30 @@
 ---
 name: match-bridge
 description: >-
-  Bridges dongqiudi-match and polymarket-soccer: starts both at their default
-  refresh cadences, fuzzy-matches fixtures, and emits Polymarket market handles
-  (event id, slug, URL, condition_ids) for matched games. Use when the user
-  wants cross-skill match alignment, Polymarket markets for Dongqiudi fixtures,
-  or a joint match list for downstream odds consumers.
+  Bridges dongqiudi-match and polymarket-soccer: starts DQD at its default
+  refresh cadence, reuses data/polymarket/snapshot.json (Gamma owned by
+  polymarket-board, 3h), fuzzy-matches fixtures, and emits Polymarket market
+  handles (event id, slug, URL, condition_ids) for matched games. Use when the
+  user wants cross-skill match alignment, Polymarket markets for Dongqiudi
+  fixtures, or a joint match list for downstream odds consumers.
 ---
 
 # Match Bridge (Dongqiudi ↔ Polymarket)
 
-Orchestrates the two data skills, matches fixtures (English names + Beijing kickoff), and outputs **Polymarket handles** so other tools can load the market/odds.
+Orchestrates Dongqiudi watch plus the Polymarket **snapshot**, matches fixtures (English names + Beijing kickoff), and outputs **Polymarket handles** so other tools can load the market/odds.
 
 ## Quick start
 
 From repo root:
 
 ```bash
-# One-shot: refresh both skills + match
+# One-shot: refresh DQD + rematch against PM snapshot
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py once --json
 
 # Rematch from existing snapshots only
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py once --offline --json
 
-# Resident loops (DQD 5s/60s, Polymarket 10 min)
+# Resident loops (DQD 5s/60s, Polymarket snapshot 3h)
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py start --foreground
 
 # Last result / status
@@ -36,7 +37,7 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py status --json
 | Source | Skill | Default refresh |
 |---|---|---|
 | Dongqiudi | `dongqiudi-match` watch (`full` tab) | **5s** live / **60s** idle; **5s** while any match is `Played` but `period` ≠ `FT` |
-| Polymarket | `polymarket-soccer` list | **600s** (10 min), `within_hours=48` |
+| Polymarket | `data/polymarket/snapshot.json` (written by polymarket-board / `pm_soccer.py list`) | **10800s** (3h) snapshot reload; **does not** scan Gamma leagues |
 
 Matching defaults: `min_score=0.70`, `min_side=0.75`, `max_skew_min=90`, `pm_stale_hours=6` (see [reference.md](reference.md)).  
 Full-time: `period=FT` edge (not mere `Played`); see [reference.md](reference.md).
@@ -58,7 +59,7 @@ Full-time: `period=FT` edge (not mere `Played`); see [reference.md](reference.md
 | FT events | `data/bridge/events.jsonl` | `match_finished` when `period` → `FT` |
 | Status baseline | `data/bridge/prev_status.json` / `prev_period.json` | For FT transition detection |
 | Upstream DQD | `data/snapshot.json` | Written by embedded DQD watch |
-| Upstream PM | `data/polymarket/snapshot.json` | Written by embedded PM list |
+| Upstream PM | `data/polymarket/snapshot.json` | Written by polymarket-board (Gamma every 3h); bridge reads only |
 
 ## Related frontend
 

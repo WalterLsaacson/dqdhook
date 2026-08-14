@@ -38,7 +38,7 @@ export function startSkill({
   league = "all",
   includeClosed = false,
   withinHours = 48,
-  interval = 600,
+  interval = 10800,
 } = {}) {
   return api("/api/fetch/start", {
     method: "POST",

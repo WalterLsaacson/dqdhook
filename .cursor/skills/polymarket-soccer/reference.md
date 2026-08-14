@@ -105,4 +105,4 @@ Timezone: `Asia/Shanghai` (UTC+8). Primary display field: `kickoff_beijing`.
 
 ## Cooperation
 
-Other skills/modules should consume CLI stdout JSON or the snapshot file. Do not scrape `polymarket.com` HTML for this data.
+Other skills/modules should consume CLI stdout JSON or the snapshot file. Do not scrape `polymarket.com` HTML for this data. match-bridge reuses `snapshot.json`; it does not call Gamma. The polymarket-board fetch loop refreshes that file every **3 hours**.

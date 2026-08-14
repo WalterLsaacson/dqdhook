@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
@@ -368,6 +371,24 @@ def main() -> int:
     }
     s_den = bl.score_pair(den_dqd, den_pm)
     _assert(s_den >= bl.DEFAULT_MIN_SCORE, f"OB/Odense should match, got {s_den}")
+
+    _assert(bl.DEFAULT_PM_INTERVAL == 10800, "PM snapshot cadence is 3h")
+    tmp = Path(tempfile.mkdtemp())
+    snap_dir = tmp / "data" / "polymarket"
+    snap_dir.mkdir(parents=True)
+    snap = {
+        "fetched_at": "2026-08-14T00:00:00+08:00",
+        "count": 1,
+        "matches": [{"home": "A", "away": "B"}],
+    }
+    (snap_dir / "snapshot.json").write_text(json.dumps(snap), encoding="utf-8")
+    rt = bl.BridgeRuntime(tmp)
+    _assert(rt.pm_interval == 10800, f"runtime default pm_interval, got {rt.pm_interval}")
+    fake_load = MagicMock(side_effect=AssertionError("bridge must not call load_matches"))
+    with patch.dict("sys.modules", {"pm_lib": MagicMock(load_matches=fake_load)}):
+        got = rt.refresh_pm_once()
+    _assert(got.get("count") == 1, f"reuse snapshot count, got {got.get('count')}")
+    _assert(fake_load.call_count == 0, "Gamma load_matches must not run")
 
     print("smoke_match_hardening: ok")
     return 0

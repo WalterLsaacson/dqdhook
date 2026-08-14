@@ -55,6 +55,8 @@ python3 .cursor/skills/polymarket-soccer/scripts/pm_soccer.py list --no-proxy --
 
 Each match includes at least: `league`, `home`, `away`, `kickoff_beijing` (Asia/Shanghai), plus `time` / `local_date` for alignment with other modules.
 
+The demo board (`frontend/run_polymarket.py`) writes this snapshot on a **3h** Gamma loop. **match-bridge reads the file and does not rescan leagues.**
+
 ## Related frontend
 
 Demo board that starts this skill and renders the match list with league colors:

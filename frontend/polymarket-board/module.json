@@ -29,6 +29,6 @@
     "port": 8788,
     "league": "all",
     "within_hours": 48,
-    "interval": 600
+    "interval": 10800
   }
 }

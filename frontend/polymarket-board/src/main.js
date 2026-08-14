@@ -166,6 +166,7 @@ async function init() {
     if (st.running) {
       await refreshFromStatus();
       startPolling();
+      if (!state.matches.length) await loadMatches();
     } else {
       await loadMatches();
     }
