@@ -23,7 +23,8 @@ Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
 | Target | Rule |
 |---|---|
 | `market_cache/*.json` | Keep only **open** paired matches still in `matches.json`; drop finished / orphan. **Skip** if matches file missing / bad / empty. |
-| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` / `goal_context_observe.jsonl` / `livescore_observe.jsonl` / `book_context_observe.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
+| `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
+| `goal_context_observe.jsonl` / `livescore_observe.jsonl` / `book_context_observe.jsonl` / `book_context_raw/` | **Not pruned** (retained for multi-day book/false-goal analysis) |
 | `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
 
 Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
@@ -91,7 +92,7 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 `sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 
 Price guard: skip when best ≤0.01 or >0.992 unless `--allow-extreme-prices`.  
-`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.92**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`.
+`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.6**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`.
 
 **Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 1/25). `QUOTE_SIZE_TIERS=0.98:1` means **ask ≥ 0.98 → $1**, else **$1** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1).  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  
@@ -126,7 +127,7 @@ When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, the same AF-confir
 
 **Book-context observe (research, observe-only)**
 
-When any of `ODDSPAPI_KEY` / `ODDS_API_IO_KEY` / `THE_ODDS_API_KEY` is set (optional `BOOK_OBSERVE_SOURCES`), the same AF-confirm / DQD-reversal hooks also snapshot moneyline availability (`open` / `suspended` / `missing`) from OddsPapi (default books `pinnacle,singbet`), Odds-API.io (default `Bet365`), and The Odds API (`h2h`, default `regions=eu`) into `data/pm-quote/book_context_observe.jsonl` at phases `af_confirmed`, `post_confirm_5s`, `post_confirm_15s`, `post_confirm_45s`, `dqd_reversal`. **Every HTTP response body** is also written under `data/pm-quote/book_context_raw/` (URLs redact `apiKey`; observe rows keep `raw`/`raw_path`/`requests`). Fixture id map cached in `book_fixture_cache.json`. Event-driven only (quota-safe). Raw dumps are **not** auto-pruned. Does **not** gate buys or flatten.
+When any of `ODDSPAPI_KEY` / `ODDS_API_IO_KEY` / `THE_ODDS_API_KEY` is set (optional `BOOK_OBSERVE_SOURCES`), the same AF-confirm / DQD-reversal hooks also snapshot moneyline availability (`open` / `suspended` / `missing`) from OddsPapi (default books `pinnacle,singbet`), Odds-API.io (default `Bet365,DraftKings`; override `BOOK_ODDS_API_IO_BOOKS`), and The Odds API (`h2h`, default `regions=us,eu`) into `data/pm-quote/book_context_observe.jsonl` at phases `af_confirmed`, `post_confirm_5s`, `post_confirm_15s`, `post_confirm_45s`, `dqd_reversal`. Odds-API.io odds pulls run **in parallel** with `GET /events/{id}` so each snapshot also stores provider `score` / `clock` (failures land in `score_error`, odds still recorded). The Odds sport-key walk prefers an expanded soccer whitelist (Leagues Cup / MLS / Liga MX / Libertadores / …); on miss it optionally discovers remaining active `soccer_*` keys via `GET /sports` (`BOOK_THE_ODDS_DISCOVER_SPORTS`, default on). **Every HTTP response body** is also written under `data/pm-quote/book_context_raw/` (URLs redact `apiKey`; observe rows keep `raw`/`raw_path`/`requests`). Fixture id map cached in `book_fixture_cache.json`. Event-driven only (quota-safe). Raw dumps are **not** auto-pruned. Does **not** gate buys or flatten.
 
 **System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with these flags automatically (default dry-run + repo `.env`). Same flags on the hub CLI / `QUOTE_*` env. Logs: `data/pm-quote/watch.log`.
 

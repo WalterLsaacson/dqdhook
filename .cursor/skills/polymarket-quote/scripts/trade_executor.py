@@ -567,7 +567,7 @@ class TradeExecutor:
         return None
 
     def _min_buy_price_blocked(self, price: float | None) -> str | None:
-        """buy_win: require best_ask >= min_buy_price (default 0.92; 0=off)."""
+        """buy_win: require best_ask >= min_buy_price (default 0.6; 0=off)."""
         floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
         if floor <= 0 or price is None:
             return None

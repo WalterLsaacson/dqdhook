@@ -16,13 +16,16 @@ if str(_SCRIPTS) not in sys.path:
 
 from book_context_observe import (  # noqa: E402
     BookContextObserver,
+    DEFAULT_THE_ODDS_SPORT_KEYS,
     get_active_observer,
     load_source_keys,
     make_observe_group_id,
     observe_path,
+    parse_oddsapiio_event_meta,
     persist_raw_blob,
     raw_dir,
     redact_url,
+    soccer_sport_keys_from_sports_payload,
     summarize_sources,
     try_create_observer,
 )
@@ -53,9 +56,51 @@ def main() -> int:
     gid = make_observe_group_id("m1", 1, 0, "m1|0-0→1-0")
     assert gid == "m1|1-0|m1|0-0→1-0"
 
+    assert "soccer_concacaf_leagues_cup" in DEFAULT_THE_ODDS_SPORT_KEYS
+    assert "soccer_usa_mls" in DEFAULT_THE_ODDS_SPORT_KEYS
+    assert soccer_sport_keys_from_sports_payload(
+        [
+            {"key": "soccer_epl", "active": True},
+            {"key": "basketball_nba", "active": True},
+            {"key": "soccer_usa_mls", "active": False},
+            {"key": "soccer_concacaf_leagues_cup", "active": True},
+        ]
+    ) == ["soccer_epl", "soccer_concacaf_leagues_cup"]
+
     cfg = load_source_keys(env={})
     assert cfg["active_sources"] == []
+    assert cfg["theoddsapi_discover"] is True
     assert try_create_observer(Path("/tmp"), env={}) is None
+
+    cfg_disc = load_source_keys(
+        env={"THE_ODDS_API_KEY": "k3", "BOOK_THE_ODDS_DISCOVER_SPORTS": "0"}
+    )
+    assert cfg_disc["theoddsapi_discover"] is False
+    assert cfg_disc["active_sources"] == ["theoddsapi"]
+    assert "us" in cfg_disc["theoddsapi_regions"]
+
+    cfg_books = load_source_keys(
+        env={"ODDS_API_IO_KEY": "k2", "BOOK_ODDS_API_IO_BOOKS": "Bet365,DraftKings"}
+    )
+    assert cfg_books["oddsapiio_books"] == ("Bet365", "DraftKings")
+    assert load_source_keys(env={"ODDS_API_IO_KEY": "k2"})["oddsapiio_books"] == (
+        "Bet365",
+        "DraftKings",
+    )
+
+    meta_sc = parse_oddsapiio_event_meta(
+        {
+            "id": 99,
+            "status": "live",
+            "scores": {"home": 0, "away": 3, "periods": {"p1": {"home": 0, "away": 1}}},
+            "clock": {"minute": 88, "running": True, "statusDetail": "2nd half"},
+        }
+    )
+    assert meta_sc["score"] == {"home": 0, "away": 3}
+    assert meta_sc["clock"]["minute"] == 88
+    assert meta_sc["event_status"] == "live"
+    assert parse_oddsapiio_event_meta(None) == {}
+    assert parse_oddsapiio_event_meta({"status": "pending"})["event_status"] == "pending"
 
     cfg2 = load_source_keys(
         env={
@@ -158,6 +203,9 @@ def main() -> int:
                 "ok": True,
                 "event_id": "io-1",
                 "books": [{"book": "Bet365", "status": "missing"}],
+                "score": {"home": 1, "away": 0},
+                "clock": {"minute": 55, "running": True},
+                "event_status": "live",
                 "raw": raw,
                 "raw_path": raw_path,
                 "requests": [{"kind": "odds", "raw_path": raw_path, "raw": raw}],
@@ -226,6 +274,8 @@ def main() -> int:
         assert r0["observe_group_id"] == group
         assert r0["sources"]["oddspapi"]["books"][0]["status"] == "suspended"
         assert r0["summary"]["any_suspended"] is True
+        assert r0["sources"]["oddsapiio"]["score"] == {"home": 1, "away": 0}
+        assert r0["sources"]["oddsapiio"]["clock"]["minute"] == 55
         assert "error" not in r0
         assert r0["sources"]["oddspapi"].get("raw_path")
         assert r0["sources"]["oddspapi"].get("raw") is not None

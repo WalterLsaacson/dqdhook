@@ -45,6 +45,7 @@ ENV_BOOK_ODDSPAPI_BOOKS = "BOOK_ODDSPAPI_BOOKS"
 ENV_BOOK_ODDS_API_IO_BOOKS = "BOOK_ODDS_API_IO_BOOKS"
 ENV_BOOK_THE_ODDS_REGIONS = "BOOK_THE_ODDS_REGIONS"
 ENV_BOOK_THE_ODDS_SPORT_KEYS = "BOOK_THE_ODDS_SPORT_KEYS"
+ENV_BOOK_THE_ODDS_DISCOVER = "BOOK_THE_ODDS_DISCOVER_SPORTS"
 
 SOURCE_ODDSPAPI = "oddspapi"
 SOURCE_ODDSAPIIO = "oddsapiio"
@@ -52,21 +53,71 @@ SOURCE_THEODDSAPI = "theoddsapi"
 
 DEFAULT_SOURCES = (SOURCE_ODDSPAPI, SOURCE_ODDSAPIIO, SOURCE_THEODDSAPI)
 DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
-DEFAULT_ODDS_API_IO_BOOKS = ("Bet365",)
-DEFAULT_THE_ODDS_REGIONS = ("eu",)
+DEFAULT_ODDS_API_IO_BOOKS = ("Bet365", "DraftKings")
+# us+eu: Leagues Cup / MLS books often land in us; EU books for UEFA.
+DEFAULT_THE_ODDS_REGIONS = ("us", "eu")
+# Prefer keys that match our common PM slate first; discover fills the rest.
 DEFAULT_THE_ODDS_SPORT_KEYS = (
-    "soccer_epl",
-    "soccer_efl_champ",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_germany_bundesliga",
-    "soccer_france_ligue_one",
+    # Americas cups / leagues (frequent overnight slate)
+    "soccer_concacaf_leagues_cup",
+    "soccer_usa_mls",
+    "soccer_mexico_ligamx",
+    "soccer_conmebol_copa_libertadores",
+    "soccer_conmebol_copa_sudamericana",
+    "soccer_chile_campeonato",
+    "soccer_brazil_campeonato",
+    "soccer_brazil_serie_b",
+    "soccer_argentina_primera_division",
+    # UEFA
     "soccer_uefa_champs_league",
+    "soccer_uefa_champs_league_qualification",
     "soccer_uefa_europa_league",
     "soccer_uefa_europa_conference_league",
-    "soccer_fifa_world_cup",
+    "soccer_uefa_nations_league",
     "soccer_uefa_european_championship",
+    "soccer_fifa_world_cup",
+    # Big-5 + cups / 2nd tiers
+    "soccer_epl",
+    "soccer_efl_champ",
+    "soccer_england_efl_cup",
+    "soccer_england_league1",
+    "soccer_england_league2",
+    "soccer_spain_la_liga",
+    "soccer_spain_segunda_division",
+    "soccer_italy_serie_a",
+    "soccer_italy_serie_b",
+    "soccer_germany_bundesliga",
+    "soccer_germany_bundesliga2",
+    "soccer_germany_dfb_pokal",
+    "soccer_germany_liga3",
+    "soccer_france_ligue_one",
+    "soccer_france_ligue_two",
+    # Other active national leagues The Odds lists
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
+    "soccer_belgium_first_div",
+    "soccer_turkey_super_league",
+    "soccer_greece_super_league",
+    "soccer_scotland_spl",
+    "soccer_spl",
+    "soccer_saudi_arabia_pro_league",
+    "soccer_japan_j_league",
+    "soccer_korea_kleague1",
+    "soccer_china_superleague",
+    "soccer_australia_aleague",
+    "soccer_sweden_allsvenskan",
+    "soccer_norway_eliteserien",
+    "soccer_denmark_superliga",
+    "soccer_austria_bundesliga",
+    "soccer_switzerland_superleague",
+    "soccer_poland_ekstraklasa",
+    "soccer_russia_premier_league",
+    "soccer_finland_veikkausliiga",
+    "soccer_sweden_superettan",
 )
+# When whitelist misses, GET /sports once and retry remaining active soccer_* keys.
+DEFAULT_THE_ODDS_DISCOVER = True
+THE_ODDS_SPORTS_CACHE_TTL_S = 6 * 3600.0
 
 DEFAULT_DELAY_5_S = 5.0
 DEFAULT_DELAY_15_S = 15.0
@@ -249,6 +300,37 @@ def _split_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(parts) if parts else default
 
 
+def _env_flag(src: dict[str, str], name: str, default: bool) -> bool:
+    raw = str(src.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def soccer_sport_keys_from_sports_payload(payload: Any) -> list[str]:
+    """Extract active soccer_* keys from The Odds API ``GET /sports`` body."""
+    rows = _as_list(payload) if not isinstance(payload, list) else payload
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key") or "").strip()
+        if not key.startswith("soccer_"):
+            continue
+        if row.get("active") is False:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
     """Load enabled observe sources and API keys from environment."""
     src = env if env is not None else os.environ
@@ -293,6 +375,9 @@ def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
         "theoddsapi_regions": _split_csv(src.get(ENV_BOOK_THE_ODDS_REGIONS), DEFAULT_THE_ODDS_REGIONS),
         "theoddsapi_sport_keys": _split_csv(
             src.get(ENV_BOOK_THE_ODDS_SPORT_KEYS), DEFAULT_THE_ODDS_SPORT_KEYS
+        ),
+        "theoddsapi_discover": _env_flag(
+            src, ENV_BOOK_THE_ODDS_DISCOVER, DEFAULT_THE_ODDS_DISCOVER
         ),
     }
 
@@ -579,6 +664,49 @@ def parse_oddspapi_books(
     return rows
 
 
+def parse_oddsapiio_event_meta(payload: Any) -> dict[str, Any]:
+    """Extract live score / clock from Odds-API.io ``/events`` or ``/events/{id}``."""
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if payload.get("id") is not None:
+        out["event_id"] = payload.get("id")
+    if payload.get("status") is not None:
+        out["event_status"] = payload.get("status")
+
+    scores = payload.get("scores")
+    if isinstance(scores, dict):
+
+        def _score_int(v: Any) -> int | None:
+            if v is None or v == "":
+                return None
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    return None
+
+        home_sc = _score_int(scores.get("home"))
+        away_sc = _score_int(scores.get("away"))
+        if home_sc is not None or away_sc is not None:
+            out["score"] = {"home": home_sc, "away": away_sc}
+        periods = scores.get("periods")
+        if isinstance(periods, dict) and periods:
+            out["periods"] = periods
+
+    clock = payload.get("clock")
+    if isinstance(clock, dict) and clock:
+        clock_out: dict[str, Any] = {}
+        for k in ("minute", "playedSeconds", "period", "running", "statusDetail", "injuryTime"):
+            if clock.get(k) is not None:
+                clock_out[k] = clock.get(k)
+        if clock_out:
+            out["clock"] = clock_out
+    return out
+
+
 def parse_oddsapiio_books(
     odds_payload: Any,
     *,
@@ -810,6 +938,9 @@ class BookContextObserver:
         self.theoddsapi_sport_keys: tuple[str, ...] = tuple(
             self.cfg.get("theoddsapi_sport_keys") or DEFAULT_THE_ODDS_SPORT_KEYS
         )
+        self.theoddsapi_discover: bool = bool(
+            self.cfg.get("theoddsapi_discover", DEFAULT_THE_ODDS_DISCOVER)
+        )
         self.delay_5_s = max(0.0, float(delay_5_s))
         self.delay_15_s = max(0.0, float(delay_15_s))
         self.delay_45_s = max(0.0, float(delay_45_s))
@@ -824,6 +955,8 @@ class BookContextObserver:
         self._fixture_cache: dict[str, Any] = {}
         self._snap_ctx: dict[str, Any] = {}
         self._raw_seq = 0
+        self._theodds_sports_keys: list[str] | None = None
+        self._theodds_sports_fetched_at: float = 0.0
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, int(workers)),
             thread_name_prefix="book-ctx-obs",
@@ -1264,16 +1397,42 @@ class BookContextObserver:
             {"eventId": event_id, "bookmakers": books_param},
             key,
         )
-        status, body, _hdrs, err, meta = self._record_http(
-            source=SOURCE_ODDSAPIIO,
-            kind="odds",
-            url=odds_url,
-            inline_raw=True,
-        )
+        # Fresh score/clock live on /events/{id}; /odds has markets only.
+        event_url = self._url_with_key(ODDS_API_IO_BASE, f"/events/{event_id}", {}, key)
+
+        def _pull_odds() -> tuple[Any, ...]:
+            return self._record_http(
+                source=SOURCE_ODDSAPIIO,
+                kind="odds",
+                url=odds_url,
+                inline_raw=True,
+            )
+
+        def _pull_event() -> tuple[Any, ...]:
+            return self._record_http(
+                source=SOURCE_ODDSAPIIO,
+                kind="event",
+                url=event_url,
+                inline_raw=False,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_odds = ex.submit(_pull_odds)
+            fut_event = ex.submit(_pull_event)
+            status, body, _hdrs, err, meta = fut_odds.result()
+            try:
+                ev_status, ev_body, _ev_hdrs, ev_err, ev_meta = fut_event.result()
+            except Exception as e:  # noqa: BLE001
+                ev_status, ev_body, ev_err, ev_meta = None, None, str(e), {}
+
         requests_meta.append(meta)
+        if isinstance(ev_meta, dict) and ev_meta:
+            requests_meta.append(ev_meta)
+
+        event_meta = parse_oddsapiio_event_meta(ev_body) if not ev_err else {}
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if err:
-            return {
+            out_err: dict[str, Any] = {
                 "ok": False,
                 "error": err,
                 "http_status": status,
@@ -1283,6 +1442,19 @@ class BookContextObserver:
                 "raw": meta.get("raw"),
                 "raw_path": meta.get("raw_path"),
             }
+            if event_meta.get("score") is not None:
+                out_err["score"] = event_meta["score"]
+            if event_meta.get("clock") is not None:
+                out_err["clock"] = event_meta["clock"]
+            if event_meta.get("periods") is not None:
+                out_err["periods"] = event_meta["periods"]
+            if event_meta.get("event_status") is not None:
+                out_err["event_status"] = event_meta["event_status"]
+            if ev_err:
+                out_err["score_error"] = ev_err
+            elif ev_status is not None:
+                out_err["score_http_status"] = ev_status
+            return out_err
         books = parse_oddsapiio_books(body, wanted_books=self.oddsapiio_books, home=home, away=away)
         if not books:
             books = [{"book": b, "status": "missing"} for b in self.oddsapiio_books]
@@ -1297,9 +1469,97 @@ class BookContextObserver:
             "raw": meta.get("raw"),
             "raw_path": meta.get("raw_path"),
         }
-        if isinstance(body, dict) and body.get("status") is not None:
+        if event_meta.get("score") is not None:
+            out["score"] = event_meta["score"]
+        if event_meta.get("clock") is not None:
+            out["clock"] = event_meta["clock"]
+        if event_meta.get("periods") is not None:
+            out["periods"] = event_meta["periods"]
+        if event_meta.get("event_status") is not None:
+            out["event_status"] = event_meta["event_status"]
+        elif isinstance(body, dict) and body.get("status") is not None:
             out["event_status"] = body.get("status")
+        if ev_err:
+            out["score_error"] = ev_err
+        elif event_meta.get("score") is None and not ev_err:
+            # Event call ok but no scores object (pre-match / provider gap).
+            out["score_error"] = "score_missing"
         return out
+
+    def _theodds_note_credits(self, hdrs: dict[str, str], credits: dict[str, Any]) -> None:
+        if hdrs.get("x-requests-remaining") is not None:
+            credits["requests_remaining"] = hdrs.get("x-requests-remaining")
+        if hdrs.get("x-requests-used") is not None:
+            credits["requests_used"] = hdrs.get("x-requests-used")
+        if hdrs.get("x-requests-last") is not None:
+            credits["requests_last"] = hdrs.get("x-requests-last")
+
+    def _theodds_search_events(
+        self,
+        *,
+        api_key: str,
+        home: str,
+        away: str,
+        sport_keys: list[str],
+        requests_meta: list[dict[str, Any]],
+        credits: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        """Walk sport keys until team fuzzy match; return (sport_key, event_id)."""
+        for sk in sport_keys:
+            if not sk:
+                continue
+            ev_url = self._url_with_key(THE_ODDS_API_BASE, f"/sports/{sk}/events", {}, api_key)
+            status, body, hdrs, err, meta = self._record_http(
+                source=SOURCE_THEODDSAPI,
+                kind=f"events:{sk}",
+                url=ev_url,
+                inline_raw=False,
+            )
+            requests_meta.append(meta)
+            self._theodds_note_credits(hdrs, credits)
+            if err:
+                continue
+            rows = [r for r in _as_list(body) if isinstance(r, dict)]
+            resolved = resolve_team_match(rows, home=home, away=away, min_side=self.min_side_sim)
+            if resolved.get("ok") and resolved.get("id"):
+                return sk, str(resolved.get("id"))
+        return None, None
+
+    def _theodds_discovered_soccer_keys(
+        self,
+        *,
+        api_key: str,
+        requests_meta: list[dict[str, Any]],
+        credits: dict[str, Any],
+    ) -> list[str]:
+        """Cache active soccer_* keys from GET /sports (TTL)."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._theodds_sports_keys
+            fetched_at = self._theodds_sports_fetched_at
+            fresh = (
+                cached is not None
+                and (now - fetched_at) < THE_ODDS_SPORTS_CACHE_TTL_S
+            )
+            if fresh:
+                return list(cached or [])
+
+        sports_url = self._url_with_key(THE_ODDS_API_BASE, "/sports", {}, api_key)
+        _status, body, hdrs, err, meta = self._record_http(
+            source=SOURCE_THEODDSAPI,
+            kind="sports",
+            url=sports_url,
+            inline_raw=False,
+        )
+        requests_meta.append(meta)
+        self._theodds_note_credits(hdrs, credits)
+        if err:
+            return []
+        keys = soccer_sport_keys_from_sports_payload(body)
+        with self._lock:
+            self._theodds_sports_keys = keys
+            self._theodds_sports_fetched_at = time.monotonic()
+        return list(keys)
 
     def _default_fetch_theoddsapi(self, match_id: str, home: str, away: str) -> dict[str, Any]:
         t0 = time.perf_counter()
@@ -1314,28 +1574,33 @@ class BookContextObserver:
         credits: dict[str, Any] = {}
 
         if not (sport_key and event_id):
-            found = False
-            for sk in self.theoddsapi_sport_keys:
-                ev_url = self._url_with_key(THE_ODDS_API_BASE, f"/sports/{sk}/events", {}, key)
-                status, body, hdrs, err, meta = self._record_http(
-                    source=SOURCE_THEODDSAPI,
-                    kind=f"events:{sk}",
-                    url=ev_url,
-                    inline_raw=False,
+            preferred = [str(sk) for sk in self.theoddsapi_sport_keys if sk]
+            sport_key, event_id = self._theodds_search_events(
+                api_key=key,
+                home=home,
+                away=away,
+                sport_keys=preferred,
+                requests_meta=requests_meta,
+                credits=credits,
+            )
+            if not (sport_key and event_id) and self.theoddsapi_discover:
+                discovered = self._theodds_discovered_soccer_keys(
+                    api_key=key,
+                    requests_meta=requests_meta,
+                    credits=credits,
                 )
-                requests_meta.append(meta)
-                if hdrs.get("x-requests-remaining") is not None:
-                    credits["requests_remaining"] = hdrs.get("x-requests-remaining")
-                if err:
-                    continue
-                rows = [r for r in _as_list(body) if isinstance(r, dict)]
-                resolved = resolve_team_match(rows, home=home, away=away, min_side=self.min_side_sim)
-                if resolved.get("ok") and resolved.get("id"):
-                    sport_key = sk
-                    event_id = resolved.get("id")
-                    found = True
-                    break
-            if not found:
+                tried = set(preferred)
+                extra = [sk for sk in discovered if sk not in tried]
+                if extra:
+                    sport_key, event_id = self._theodds_search_events(
+                        api_key=key,
+                        home=home,
+                        away=away,
+                        sport_keys=extra,
+                        requests_meta=requests_meta,
+                        credits=credits,
+                    )
+            if not (sport_key and event_id):
                 out_miss: dict[str, Any] = {
                     "ok": False,
                     "error": "not_mapped",
@@ -1371,12 +1636,7 @@ class BookContextObserver:
         )
         requests_meta.append(meta)
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        if hdrs.get("x-requests-remaining") is not None:
-            credits["requests_remaining"] = hdrs.get("x-requests-remaining")
-        if hdrs.get("x-requests-used") is not None:
-            credits["requests_used"] = hdrs.get("x-requests-used")
-        if hdrs.get("x-requests-last") is not None:
-            credits["requests_last"] = hdrs.get("x-requests-last")
+        self._theodds_note_credits(hdrs, credits)
         if err:
             out: dict[str, Any] = {
                 "ok": False,

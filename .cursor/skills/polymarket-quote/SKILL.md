@@ -87,7 +87,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 10. **Post-goal samples (data only)**: when `score_change` produces a successful `buy_win` (dry or live), write that quote as sample 0 and background-requote the same tokens at +10s…+50s (6 total) into `post_goal_samples.jsonl` — no extra `maybe_trade`. Jobs run in **parallel**; follow-ups re-read score and recompute settlement.
 11. **Goal-context observe (data only)**: after AF goal confirm, snapshot DQD overview + AF live fixture status + list `team_*_event` 旁证 at confirm / +15s / +45s, and again on DQD reversal (same `observe_group_id`) into `goal_context_observe.jsonl`. Does **not** gate buys or flatten.
 12. **Live Score API observe (trial, data only)**: when `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET` are set, same phases also pull LSA live resolve + raw `matches/events` + raw `commentary/events` into `livescore_observe.jsonl` (trial: score/VAR focus, not `KICK_OFF`). Does **not** gate buys or flatten.
-13. **Book-context observe (data only)**: when any of `ODDSPAPI_KEY` / `ODDS_API_IO_KEY` / `THE_ODDS_API_KEY` is set, same AF-confirm / DQD-reversal hooks also snapshot moneyline open/suspended/missing across OddsPapi + Odds-API.io + The Odds API at confirm / +5s / +15s / +45s into `book_context_observe.jsonl` (fixture ids cached). Full HTTP bodies land in `book_context_raw/` (not auto-pruned). Does **not** gate buys or flatten.
+13. **Book-context observe (data only)**: when any of `ODDSPAPI_KEY` / `ODDS_API_IO_KEY` / `THE_ODDS_API_KEY` is set, same AF-confirm / DQD-reversal hooks also snapshot moneyline open/suspended/missing across OddsPapi + Odds-API.io + The Odds API at confirm / +5s / +15s / +45s into `book_context_observe.jsonl` (fixture ids cached). Odds-API.io additionally GETs `/events/{id}` in parallel with odds for provider `score`/`clock`. The Odds walks an expanded soccer sport-key list (Leagues Cup / MLS / …) and can discover extra active `soccer_*` keys via `/sports`. Full HTTP bodies land in `book_context_raw/` (not auto-pruned). Does **not** gate buys or flatten.
 
 ## Trading flags
 
@@ -110,7 +110,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `QUOTE_MAX_OPEN_USDC` | 1000 | Sum of open lot `usdc` budget (effectively open) |
 | `QUOTE_SIZE_FLOOR_USDC` | 1 | Skip buy if effective usdc below floor |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
-| `--min-buy-price` | 0.92 | `buy_win` only when `best_ask ≥` this; `0` = off; below → skip + still write `trades.jsonl` |
+| `--min-buy-price` | 0.6 | `buy_win` only when `best_ask ≥` this; `0` = off; below → skip + still write `trades.jsonl` |
 | `--allow-extreme-prices` | off | Allow ≤0.01 / >0.992 |
 | `sell_lose` | off | Disabled at source — `LOSE` tokens skipped before `/books`; only `buy_win` |
 
@@ -131,7 +131,7 @@ Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while post
 | Post-goal samples | `data/pm-quote/post_goal_samples.jsonl` | After buy_win on score_change: books at 0/10/20/30/40/50s (no trade) |
 | Goal-context observe | `data/pm-quote/goal_context_observe.jsonl` | AF confirm A/C (+15s/+45s) + DQD reverse B: overview + AF live + list 旁证 (observe-only) |
 | Live Score observe | `data/pm-quote/livescore_observe.jsonl` | Same phases: LSA events + commentary raw (trial; needs API key/secret) |
-| Book-context observe | `data/pm-quote/book_context_observe.jsonl` | Same hooks (+5s): OddsPapi / Odds-API.io / The Odds moneyline open|suspended|missing (observe-only) |
+| Book-context observe | `data/pm-quote/book_context_observe.jsonl` | Same hooks (+5s): OddsPapi / Odds-API.io / The Odds moneyline open|suspended|missing; Odds-API.io also pulls `/events/{id}` score+clock alongside odds (observe-only) |
 | Book-context raw | `data/pm-quote/book_context_raw/*.json` | Full HTTP bodies per request (quota-precious; not auto-pruned) |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots awaiting flatten |
 | Cursor | `data/pm-quote/cursor.json` | Processed event keys |
@@ -149,7 +149,8 @@ Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while post
 Rolling **24h** window (not calendar midnight): `watch` prunes on start and every ~10m.
 
 - Drop `market_cache/{match_id}.json` when match is finished or no longer an open paired row in `matches.json` (skip if matches snapshot empty/missing)
-- Truncate `quotes` / `opportunities` / `trades` / `post_goal_samples` / `goal_context_observe` / `livescore_observe` / `book_context_observe` / `bridge/events` by timestamp; **unprocessed** bridge events are always kept
+- Truncate `quotes` / `opportunities` / `trades` / `post_goal_samples` / `bridge/events` by timestamp; **unprocessed** bridge events are always kept
+- **Not pruned** (kept indefinitely): `book_context_observe.jsonl`, `goal_context_observe.jsonl`, `livescore_observe.jsonl`, `book_context_raw/`
 - Append/prune use `{path}.lock` so rewrite cannot race bridge/quote writers
 
 ```bash

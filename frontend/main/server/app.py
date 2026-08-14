@@ -167,7 +167,7 @@ def load_quote_trade_config(
         "min_buy_price": float(
             min_buy_price
             if min_buy_price is not None
-            else os.getenv("QUOTE_MIN_BUY_PRICE", "0.92")
+            else os.getenv("QUOTE_MIN_BUY_PRICE", "0.6")
         ),
         "interval": max(
             0.05,
@@ -888,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
         "--min-buy-price",
         type=float,
         default=None,
-        help="buy_win floor (default 0.92; 0=off; env QUOTE_MIN_BUY_PRICE)",
+        help="buy_win floor (default 0.6; 0=off; env QUOTE_MIN_BUY_PRICE)",
     )
     parser.add_argument(
         "--interval",

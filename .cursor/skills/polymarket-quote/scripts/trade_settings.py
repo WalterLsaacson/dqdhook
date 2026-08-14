@@ -90,7 +90,7 @@ def load_trade_settings(
     max_shares: float | None = None,
     max_slippage: float = 0.03,
     allow_extreme_prices: bool = False,
-    min_buy_price: float = 0.92,
+    min_buy_price: float = 0.6,
     enabled: bool = True,
     env_file: str | Path | None = None,
     require_key: bool = False,
