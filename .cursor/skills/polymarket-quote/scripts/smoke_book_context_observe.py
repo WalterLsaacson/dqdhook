@@ -69,7 +69,7 @@ def _wait(path: Path, count: int, timeout: float = 2.0) -> list[dict]:
 
 def main() -> int:
     assert DEFAULT_SOURCES == ("oddsapiio",)
-    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365",)
+    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "DraftKings")
     assert load_source_keys(env={})["active_sources"] == []
     assert try_create_observer(Path("/tmp"), env={}) is None
     cfg = load_source_keys(
@@ -78,11 +78,11 @@ def main() -> int:
             "ODDSPAPI_KEY": "ignored",
             "THE_ODDS_API_KEY": "ignored",
             "BOOK_OBSERVE_SOURCES": "oddspapi,theoddsapi",
-            "BOOK_ODDS_API_IO_BOOKS": "Bet365,DraftKings",
+            "BOOK_ODDS_API_IO_BOOKS": "Bet365,DraftKings,Pinnacle",
         }
     )
     assert cfg["active_sources"] == ["oddsapiio"]
-    assert cfg["oddsapiio_books"] == ("Bet365",)
+    assert cfg["oddsapiio_books"] == ("Bet365", "DraftKings")
 
     # Same-team catalogs may contain settled historical fixtures. Kickoff and
     # status must select the current event, and reversed provider sides are explicit.
@@ -134,8 +134,63 @@ def main() -> int:
     ]
     b = grade_oddsapiio_sample(_source((0, 0), clean), home_score=1, away_score=0)
     assert b["level"] == "B" and b["target_usdc"] == 2.0
-    a = grade_oddsapiio_sample(_source((1, 0), impossible), home_score=1, away_score=0)
+    a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
     assert a["level"] == "A" and a["target_usdc"] == 3.0
+    a_blocked = grade_oddsapiio_sample(_source((1, 0), impossible), home_score=1, away_score=0)
+    assert a_blocked["level"] == "C" and a_blocked["reason"] == "bet365_has_impossible_markets"
+    latency_raw = {"status": "live", "bookmakers": {"Bet365 (no latency)": clean}}
+    latency_books = parse_oddsapiio_books(
+        latency_raw, wanted_books=("Bet365",), home="Home", away="Away"
+    )
+    assert latency_books[0]["book"] == "Bet365" and latency_books[0]["status"] == "open"
+    latency_src = _source((1, 0), clean)
+    latency_src["books"] = latency_books
+    latency_src["raw"] = latency_raw
+    assert grade_oddsapiio_sample(latency_src, home_score=1, away_score=0)["level"] == "A"
+    spread_only = [{"name": "Spread", "odds": [{"hdp": 0.5, "home": "2.000", "away": "1.800"}]}]
+    spread_raw = {"status": "live", "bookmakers": {"Bet365 (no latency)": spread_only}}
+    spread_src = {
+        "ok": True,
+        "identity_verified": True,
+        "orientation": "same",
+        "score": {"home": 1, "away": 0},
+        "books": parse_oddsapiio_books(
+            spread_raw, wanted_books=("Bet365",), home="Home", away="Away"
+        ),
+        "raw": spread_raw,
+    }
+    spread_grade = grade_oddsapiio_sample(spread_src, home_score=1, away_score=0)
+    assert spread_src["books"][0]["status"] == "open"
+    assert spread_grade["level"] == "C"
+    assert spread_grade["reason"] == "bet365_no_score_sensitive_markets"
+    dk_only_raw = {
+        "status": "live",
+        "bookmakers": {
+            "Bet365 (no latency)": spread_only,
+            "DraftKings": [
+                {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
+                {"name": "Correct Score", "odds": [{"label": "1-0", "odds": "5"}]},
+                {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.8", "under": "2"}]},
+            ],
+        },
+    }
+    dk_books = parse_oddsapiio_books(
+        dk_only_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+    )
+    by_book = {b["book"]: b for b in dk_books}
+    assert by_book["Bet365"]["status"] == "open" and "observe_only" not in by_book["Bet365"]
+    assert by_book["DraftKings"]["status"] == "open" and by_book["DraftKings"]["observe_only"] is True
+    dk_src = {
+        "ok": True,
+        "identity_verified": True,
+        "orientation": "same",
+        "score": {"home": 1, "away": 0},
+        "books": dk_books,
+        "raw": dk_only_raw,
+    }
+    dk_grade = grade_oddsapiio_sample(dk_src, home_score=1, away_score=0)
+    assert dk_grade["level"] == "C"
+    assert dk_grade["reason"] == "bet365_no_score_sensitive_markets"
     unverified = _source((1, 0), clean)
     unverified["identity_verified"] = False
     assert grade_oddsapiio_sample(unverified, home_score=1, away_score=0)["level"] == "C"
@@ -181,7 +236,7 @@ def main() -> int:
             fetch_oddsapiio=fetch,
         )
         assert obs.active_sources == ("oddsapiio",)
-        assert obs.oddsapiio_books == ("Bet365",)
+        assert obs.oddsapiio_books == ("Bet365", "DraftKings")
         obs.start()
         obs.on_af_confirmed(
             match_id="m1",
@@ -325,6 +380,12 @@ def main() -> int:
 
         # End-to-end provider-side reversal: preserve the raw score but grade
         # against the score normalized back into the DQD home/away frame.
+        swapped_clean = [
+            {"name": "ML", "odds": [{"home": "6", "draw": "3", "away": "1.5"}]},
+            {"name": "Correct Score", "odds": [{"label": "0-1", "odds": "5"}, {"label": "0-2", "odds": "7"}]},
+            {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.8", "under": "2"}]},
+        ]
+
         def swapped_http(url: str, **_kw: object) -> tuple:
             event = {
                 "id": "sw",
@@ -337,7 +398,7 @@ def main() -> int:
             if "/events?" in url:
                 return 200, [event], {}, None
             if "/odds?" in url:
-                return 200, _odds(clean), {}, None
+                return 200, _odds(swapped_clean), {}, None
             return 200, event, {}, None
 
         bco._http_get_json = swapped_http
@@ -354,9 +415,10 @@ def main() -> int:
             assert swapped_source["orientation"] == "swapped"
             assert swapped_source["provider_score_raw"] == {"home": 0, "away": 1}
             assert swapped_source["score"] == {"home": 1, "away": 0}
-            assert grade_oddsapiio_sample(
+            swapped_grade = grade_oddsapiio_sample(
                 swapped_source, home_score=1, away_score=0
-            )["level"] == "A"
+            )
+            assert swapped_grade["level"] == "A", swapped_grade
             swapped_obs.stop()
         finally:
             bco._http_get_json = old_http

@@ -1,7 +1,7 @@
-"""Odds-API.io score + Bet365 market confirmation after AF-confirmed goals.
+"""Odds-API.io score + Bet365 gate, with DraftKings persisted observe-only.
 
 Polls immediately and every five seconds for sixty seconds.  Each sample is persisted,
-graded C/B/A, and may emit a monotonic position-target upgrade to the quote loop.
+graded C/B/A from Bet365 only, and may emit a monotonic position-target upgrade.
 
 Every actual HTTP response body is persisted under ``data/pm-quote/book_context_raw/``
 (URLs redact ``apiKey``). Observe rows keep compact request metadata and ``raw_path``;
@@ -56,7 +56,8 @@ SOURCE_THEODDSAPI = "theoddsapi"
 
 DEFAULT_SOURCES = (SOURCE_ODDSAPIIO,)
 DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
-DEFAULT_ODDS_API_IO_BOOKS = ("Bet365",)
+DEFAULT_ODDS_API_IO_GATE_BOOKS = ("Bet365",)
+DEFAULT_ODDS_API_IO_BOOKS = ("Bet365", "DraftKings")
 # us+eu: Leagues Cup / MLS books often land in us; EU books for UEFA.
 DEFAULT_THE_ODDS_REGIONS = ("us", "eu")
 # Prefer keys that match our common PM slate first; discover fills the rest.
@@ -422,7 +423,7 @@ def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
         "active_sources": active,
         "keys": keys,
         "oddspapi_books": _split_csv(src.get(ENV_BOOK_ODDSPAPI_BOOKS), DEFAULT_ODDSPAPI_BOOKS),
-        # Deliberately fixed: DraftKings and every non-Bet365 payload are out of scope.
+        # Fetch Bet365 (gate) + DraftKings (observe-only). Env cannot add gate books.
         "oddsapiio_books": DEFAULT_ODDS_API_IO_BOOKS,
         "theoddsapi_regions": _split_csv(src.get(ENV_BOOK_THE_ODDS_REGIONS), DEFAULT_THE_ODDS_REGIONS),
         "theoddsapi_sport_keys": _split_csv(
@@ -665,8 +666,29 @@ def resolve_team_match(
     return best
 
 
+_BOOK_LATENCY_RE = re.compile(
+    r"[\s_\-]*\((?:no\s*)?latency\)|\s+(?:no\s+)?latency\b",
+    re.IGNORECASE,
+)
+
+
 def _normalize_book_key(name: str) -> str:
-    return normalize_team(name).replace(" ", "")
+    # Odds-API.io may label the same shop "Bet365 (no latency)".
+    s = _BOOK_LATENCY_RE.sub(" ", str(name or ""))
+    return normalize_team(s).replace(" ", "")
+
+
+_GATE_BOOK_KEYS = frozenset(_normalize_book_key(b) for b in DEFAULT_ODDS_API_IO_GATE_BOOKS)
+
+
+def _is_gate_book(name: str) -> bool:
+    return _normalize_book_key(name) in _GATE_BOOK_KEYS
+
+
+def _with_observe_only(entry: dict[str, Any]) -> dict[str, Any]:
+    if not _is_gate_book(str(entry.get("book") or "")):
+        entry["observe_only"] = True
+    return entry
 
 
 def _ml_from_outcomes(
@@ -902,7 +924,11 @@ def grade_oddsapiio_sample(
     home_score: Any,
     away_score: Any,
 ) -> dict[str, Any]:
-    """Grade one Odds-API.io score + Bet365 snapshot as C/B/A."""
+    """Grade one Odds-API.io score + Bet365 snapshot as C/B/A.
+
+    A requires a matching provider score *and* a clean Bet365 book (open,
+    inspectable score-sensitive markets, no already-impossible offers).
+    """
     source = source_payload if isinstance(source_payload, dict) else {}
     provider_score = source.get("score") if isinstance(source.get("score"), dict) else {}
     try:
@@ -931,15 +957,16 @@ def grade_oddsapiio_sample(
         home_score=provider_target["home"],
         away_score=provider_target["away"],
     )
-    if not identity_verified:
-        level, reason = "C", "oddsapiio_event_identity_unverified"
-    elif score_match:
-        level, reason = "A", "oddsapiio_score_matches_target"
-    elif (
+    bet365_clean = (
         bet365_status == "open"
         and inspection["score_sensitive_markets"] > 0
         and not inspection["impossible_offers"]
-    ):
+    )
+    if not identity_verified:
+        level, reason = "C", "oddsapiio_event_identity_unverified"
+    elif score_match and bet365_clean:
+        level, reason = "A", "oddsapiio_score_matches_and_bet365_open"
+    elif bet365_clean:
         level, reason = "B", "bet365_open_no_impossible_markets"
     elif bet365_status != "open":
         level, reason = "C", f"bet365_{bet365_status}"
@@ -1031,7 +1058,7 @@ def parse_oddsapiio_books(
     away: str,
 ) -> list[dict[str, Any]]:
     if odds_payload is None or odds_payload == {}:
-        return [{"book": b, "status": "missing"} for b in wanted_books]
+        return [_with_observe_only({"book": b, "status": "missing"}) for b in wanted_books]
 
     # Odds-API.io returns bookmakers as a dict: {"Bet365": [ {name: ML, odds: [...]}, ... ]}
     # Older/docs shapes may use a list of {bookmaker, markets} objects.
@@ -1049,7 +1076,7 @@ def parse_oddsapiio_books(
         bookmakers = odds_payload
 
     if not bookmakers:
-        return [{"book": b, "status": "missing"} for b in wanted_books]
+        return [_with_observe_only({"book": b, "status": "missing"}) for b in wanted_books]
 
     rows: list[dict[str, Any]] = []
     wanted = {_normalize_book_key(b): b for b in wanted_books}
@@ -1106,12 +1133,12 @@ def parse_oddsapiio_books(
         # Event-level status (live/pending/settled) often sits on the odds payload root.
         if isinstance(odds_payload, dict) and odds_payload.get("status") is not None:
             entry["event_status"] = odds_payload.get("status")
-        rows.append(entry)
+        rows.append(_with_observe_only(entry))
 
     for norm, display in wanted.items():
         if norm in found:
             continue
-        rows.append({"book": display, "status": "missing"})
+        rows.append(_with_observe_only({"book": display, "status": "missing"}))
     return rows
 
 
@@ -1306,7 +1333,7 @@ class BookContextObserver:
         self._stop.clear()
         set_active_observer(self)
         logger.info(
-            "odds confirmation on → %s source=Odds-API.io book=Bet365 poll=%ss timeout=%ss",
+            "odds confirmation on → %s source=Odds-API.io gate=Bet365 observe=DraftKings poll=%ss timeout=%ss",
             observe_path(self.root),
             self.poll_interval_s,
             self.poll_timeout_s,
@@ -2044,7 +2071,10 @@ class BookContextObserver:
             return out_err
         books = parse_oddsapiio_books(body, wanted_books=self.oddsapiio_books, home=home, away=away)
         if not books:
-            books = [{"book": b, "status": "missing"} for b in self.oddsapiio_books]
+            books = [
+                _with_observe_only({"book": b, "status": "missing"})
+                for b in self.oddsapiio_books
+            ]
         out = {
             "ok": True,
             "event_id": event_id,
