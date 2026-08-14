@@ -84,7 +84,7 @@ def load_trade_settings(
     live_ft: bool | None = None,
     goals_mode: str | None = None,
     ft_mode: str | None = None,
-    take_depth: str = "top",
+    take_depth: str = "walk",
     max_levels: int = 5,
     max_usdc: float | None = None,
     max_shares: float | None = None,
@@ -115,7 +115,7 @@ def load_trade_settings(
             "(same names as simple_str) or pass --trade-env-file"
         )
 
-    depth = (take_depth or "top").strip().lower()
+    depth = (take_depth or "walk").strip().lower()
     if depth not in ("top", "walk"):
         raise ValueError(f"take_depth must be 'top' or 'walk', got {take_depth!r}")
 

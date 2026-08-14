@@ -97,7 +97,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         live=live,
         goals_mode=goals_mode,
         ft_mode=ft_mode,
-        take_depth=str(getattr(args, "take_depth", "top") or "top"),
+        take_depth=str(getattr(args, "take_depth", "walk") or "walk"),
         max_levels=int(getattr(args, "max_levels", 5)),
         max_usdc=float(getattr(args, "max_usdc", 1.0)),
         max_shares=float(getattr(args, "max_shares", 25.0)),
@@ -503,8 +503,8 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--take-depth",
         choices=("top", "walk"),
-        default="top",
-        help="top=best level only; walk=deeper into asks_top/bids_top (default top)",
+        default="walk",
+        help="top=best level only; walk=deeper into asks_top/bids_top (default walk)",
     )
     sp.add_argument(
         "--max-levels",

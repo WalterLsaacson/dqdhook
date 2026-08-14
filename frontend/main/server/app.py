@@ -116,9 +116,9 @@ def load_quote_trade_config(
     trade_env_file: str | None = None,
 ) -> dict[str, Any]:
     """Merge CLI overrides with QUOTE_* env (defaults = dry-run trade on)."""
-    depth = (take_depth or os.getenv("QUOTE_TAKE_DEPTH") or "top").strip().lower()
+    depth = (take_depth or os.getenv("QUOTE_TAKE_DEPTH") or "walk").strip().lower()
     if depth not in ("top", "walk"):
-        depth = "top"
+        depth = "walk"
 
     enabled = _env_bool("QUOTE_TRADE", True)
     if no_trade is True:
@@ -193,7 +193,7 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
     else:
         args.extend(["--goals-mode", g])
         args.extend(["--ft-mode", f])
-    args.extend(["--take-depth", str(c.get("take_depth") or "top")])
+    args.extend(["--take-depth", str(c.get("take_depth") or "walk")])
     args.extend(["--max-levels", str(int(c.get("max_levels") or 5))])
     args.extend(["--max-usdc", str(float(c.get("max_usdc") or 1))])
     args.extend(["--max-shares", str(float(c.get("max_shares") or 25))])
@@ -877,7 +877,7 @@ def main(argv: list[str] | None = None) -> int:
         "--take-depth",
         choices=("top", "walk"),
         default=None,
-        help="Fill depth (default top / QUOTE_TAKE_DEPTH)",
+        help="Fill depth (default walk / QUOTE_TAKE_DEPTH)",
     )
     parser.add_argument("--max-levels", type=int, default=None)
     parser.add_argument("--max-usdc", type=float, default=None)

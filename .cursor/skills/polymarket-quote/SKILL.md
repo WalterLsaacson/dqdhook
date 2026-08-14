@@ -103,7 +103,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--af-gate-before-trade` | off | Explicit gate (same as default) |
 | `--af-poll` | (off) | If set, fixed poll interval; otherwise **3s → every 1s → 60s → every 2s → timeout** |
 | `--af-timeout` | 90 | AF confirm deadline (gate: ignore goal; postcheck: flatten pending) |
-| `--take-depth top\|walk` | `top` | Best level vs walk book |
+| `--take-depth top\|walk` | `walk` | Walk book vs best level only |
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 1 / 25 | Hard caps; **`.env` `QUOTE_MAX_*` wins**; per-ask tiers scale both together |
 | `QUOTE_SIZE_TIERS` | `0.98:1` | ask≥threshold → usdc; below → `QUOTE_MAX_USDC` ($1) |

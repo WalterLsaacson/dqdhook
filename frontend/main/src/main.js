@@ -13,7 +13,7 @@ function render(st) {
 
   const trade = st.quote?.trade || {};
   const mode = trade.mode || "off";
-  const depth = trade.take_depth || "top";
+  const depth = trade.take_depth || "walk";
   if (mode === "off") {
     $("pillTrade").textContent = "Trade off";
     $("pillTrade").className = "pill muted";

@@ -86,8 +86,8 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 
 | `--take-depth` | Buy WIN |
 |---|---|
-| `top` (default) | Only best ask size / price; FAK |
-| `walk` | Accumulate `asks_top` until max_levels / max_usdc / max_shares / slippage; FAK |
+| `top` | Only best ask size / price; FAK |
+| `walk` (default) | Accumulate `asks_top` until max_levels / max_usdc / max_shares / slippage; FAK |
 
 `sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 

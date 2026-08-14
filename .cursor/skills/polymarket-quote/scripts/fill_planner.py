@@ -55,7 +55,7 @@ def _levels_from_top(
 def plan_buy_win(
     quote: dict[str, Any],
     *,
-    take_depth: str = "top",
+    take_depth: str = "walk",
     max_levels: int = 5,
     max_usdc: float = 5.0,
     max_shares: float = 25.0,
@@ -147,7 +147,7 @@ def plan_sell_lose(
     quote: dict[str, Any],
     *,
     available_shares: float | None,
-    take_depth: str = "top",
+    take_depth: str = "walk",
     max_levels: int = 5,
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
@@ -239,7 +239,7 @@ def plan_sell_lose(
 def plan_fill(
     quote: dict[str, Any],
     *,
-    take_depth: str = "top",
+    take_depth: str = "walk",
     max_levels: int = 5,
     max_usdc: float = 5.0,
     max_shares: float = 25.0,
