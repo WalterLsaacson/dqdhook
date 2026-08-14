@@ -11,8 +11,8 @@ a tiered schedule: **3s → every 1s until 60s → every 2s until 90s** (overrid
 with ``--af-poll`` for a fixed interval). That cadence is the contract: the
 referee does **not** insert a multi-second shared throttle between schedule
 ticks (optional ``QUOTE_AF_MIN_INTERVAL_S`` is per-worker only). Confirmations
-run on a thread pool so watch stays responsive; on confirm, burst +
-``af_confirmed_scores.json`` persist asynchronously.
+run on a thread pool so watch stays responsive; on confirm,
+``af_confirmed_scores.json`` persists asynchronously without an extra AF fetch.
 """
 
 from __future__ import annotations
@@ -755,36 +755,6 @@ class AfReferee:
             http_timeout=http_timeout,
         )
 
-    def _persist_confirm_side_effects(
-        self, match_id: str, last: dict[str, Any], truth: tuple[int, int]
-    ) -> None:
-        """Background burst artifact + fixture cache (off hot path).
-
-        Score disk write is handled by ``set_confirmed_score_async``. Burst may
-        trigger one AF HTTP here — never on the confirm return path.
-        """
-        mid = str(match_id)
-        burst = str(last.get("burst_dir") or "") or None
-        if burst is None:
-            try:
-                out = self.poll_once(mid, persist_burst=True)
-                burst = str(out.get("burst_dir") or "") or None
-                if burst:
-                    # Refresh disk row with burst_dir once available.
-                    fid = last.get("af_fixture_id") or out.get("af_fixture_id")
-                    set_confirmed_score(
-                        self.root,
-                        mid,
-                        truth[0],
-                        truth[1],
-                        af_fixture_id=int(fid) if fid is not None else None,
-                        burst_dir=burst,
-                        persist=True,
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-        # Referee is cache-only; do not overwrite sync/watch fixture_cache.json.
-
     def await_score(
         self,
         match_id: str,
@@ -802,7 +772,7 @@ class AfReferee:
         """Block until AF confirms target (or AF already covers it) / timeout.
 
         Prefer calling via ``submit`` + ``drain_done`` so watch is not blocked.
-        On confirm: return immediately (memory score); disk/burst async.
+        On confirm: return immediately (memory score); disk persistence is async.
 
         Fixture mapping is cache-only (filled by AF sync/watch). If the DQD id
         is not in ``fixture_cache.json`` entries:
@@ -1056,12 +1026,6 @@ class AfReferee:
                                 truth[1],
                                 af_fixture_id=int(fid) if fid is not None else None,
                                 burst_dir=str(last.get("burst_dir") or "") or None,
-                            )
-                            _DISK_EXEC.submit(
-                                self._persist_confirm_side_effects,
-                                mid,
-                                dict(last),
-                                truth,
                             )
                             return {
                                 "ok": True,

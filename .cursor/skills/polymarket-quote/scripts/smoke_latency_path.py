@@ -104,7 +104,7 @@ def test_bridge_event_queue_before_disk() -> None:
 
 def test_af_confirm_no_sync_second_fetch() -> None:
     print("test_af_confirm_no_sync_second_fetch")
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         calls = {"n": 0}
 

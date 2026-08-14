@@ -1580,7 +1580,7 @@ def build_bundle(
         "trigger": ev.get("type") or "manual",
         "mode": mode,
         "match_id": ev.get("match_id") or (ctx.get("dongqiudi") or {}).get("id") or "",
-        "event_key": event_key(ev),
+        "event_key": str(ev.get("_trade_event_key") or event_key(ev)),
         "home": ctx["home"],
         "away": ctx["away"],
         "home_score": ctx["home_score"],
@@ -1651,7 +1651,11 @@ def load_cursor(root: Path) -> dict[str, Any]:
 
 
 def save_cursor(root: Path, cursor: dict[str, Any]) -> None:
-    write_json(data_dir(root) / "cursor.json", cursor)
+    path = data_dir(root) / "cursor.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(cursor, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def quote_bridge_event(
@@ -1687,7 +1691,8 @@ def quote_bridge_event(
     n_before = len(tokens)
     tokens = tradeable_token_rows(tokens)
     discovery["skipped_lose_tokens"] = max(0, n_before - len(tokens))
-    ek = event_key(ev)
+    ek = str(ev.get("_trade_event_key") or event_key(ev))
+    trade_context = ev.get("_trade_context") if isinstance(ev.get("_trade_context"), dict) else None
     match_meta = {
         "match_id": ev.get("match_id") or (ctx.get("dongqiudi") or {}).get("id") or "",
         "home": ctx.get("home") or "",
@@ -1696,6 +1701,8 @@ def quote_bridge_event(
         "away_score": ctx.get("away_score"),
         "event_type": str(ev.get("type") or ""),
     }
+    if trade_context is not None:
+        match_meta["trade_context"] = dict(trade_context)
     quote_kw = dict(
         proxy=proxy,
         eps=eps,
@@ -1730,6 +1737,8 @@ def quote_bridge_event(
         latency_ms["books_and_trade"] = int((time.monotonic() - t_books) * 1000)
     discovery["latency_ms"] = latency_ms
     bundle = build_bundle(ctx, quotes, discovery)
+    if trade_context is not None:
+        bundle["trade_context"] = dict(trade_context)
     bundle["latency_ms"] = dict(latency_ms)
     if persist:
         persist_bundle(root, bundle)
@@ -1786,6 +1795,11 @@ def process_bridge_events(
     events_override: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     cursor = load_cursor(root)
+    cursor_state_before = {
+        "processed_keys": cursor.get("processed_keys"),
+        "processed_ft_match_ids": cursor.get("processed_ft_match_ids"),
+        "events_byte_offset": cursor.get("events_byte_offset"),
+    }
     seen = set(cursor.get("processed_keys") or [])
     processed_ft_ids = {
         str(x)
@@ -1802,6 +1816,28 @@ def process_bridge_events(
         mid = str(match_id or "").strip()
         if mid:
             processed_ft_ids.add(mid)
+
+    def _with_odds_grade(
+        source_ev: dict[str, Any],
+        *,
+        base_key: str,
+        level: str,
+        target_usdc: float,
+        decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        out = dict(source_ev)
+        trade_key = base_key if level == "C" else f"{base_key}|odds_grade_{level}"
+        context: dict[str, Any] = {
+            "odds_grade": level,
+            "target_usdc": float(target_usdc),
+            "base_event_key": base_key,
+            "position_semantics": "cumulative_target_per_token",
+        }
+        if decision is not None:
+            context["odds_decision"] = dict(decision)
+        out["_trade_event_key"] = trade_key
+        out["_trade_context"] = context
+        return out
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
@@ -1824,7 +1860,7 @@ def process_bridge_events(
         key: str,
         *,
         af_gate: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         nonlocal bundles, seen
         flatten_rows: list[dict[str, Any]] = []
         if trade_executor is not None:
@@ -1886,6 +1922,30 @@ def process_bridge_events(
                         market_cache.drop(mid)
                     except Exception:  # noqa: BLE001
                         pass
+            retry_needed = False
+            for q in (bundle.get("quotes") or []):
+                attempt = q.get("trade_attempt") if isinstance(q, dict) else None
+                if not isinstance(attempt, dict):
+                    continue
+                if attempt.get("status") == "error":
+                    retry_needed = True
+                    break
+                size_policy = (
+                    attempt.get("size_policy")
+                    if isinstance(attempt.get("size_policy"), dict)
+                    else {}
+                )
+                plan = attempt.get("plan") if isinstance(attempt.get("plan"), dict) else {}
+                try:
+                    target = float(size_policy.get("target_usdc"))
+                    before = float(size_policy.get("already_usdc") or 0.0)
+                    filled = float(plan.get("usdc") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if attempt.get("success") and before + filled + 1e-9 < target:
+                    retry_needed = True
+                    break
+            return not retry_needed
         except Exception as e:  # noqa: BLE001
             err_row: dict[str, Any] = {
                 "quoted_at": now_cn_iso(),
@@ -1903,6 +1963,7 @@ def process_bridge_events(
                 f"ALERT quote failed (will retry) key={key}: {e}",
                 flush=True,
             )
+            return False
 
     def _start_preconfirm_quote(work_ev: dict[str, Any], key: str) -> None:
         """CLOB quote on DQD score in parallel with AF confirm (gate mode; never trades)."""
@@ -2072,20 +2133,6 @@ def process_bridge_events(
                             flush=True,
                         )
                 goals = gate.get("goals") if isinstance(gate.get("goals"), dict) else {}
-                try:
-                    from goal_context_observe import get_active_observer
-
-                    obs = get_active_observer()
-                    if obs is not None:
-                        obs.on_af_confirmed(
-                            root,
-                            match_id=mid,
-                            event_key=key,
-                            ev=ev,
-                            af_gate=gate,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT goal-context observe confirm failed: {e}", flush=True)
                 try:
                     from livescore_observe import get_active_observer as get_lsa_observer
 
@@ -2262,20 +2309,6 @@ def process_bridge_events(
         if pre is not None:
             af_gate["preconfirm"] = pre
         try:
-            from goal_context_observe import get_active_observer
-
-            obs = get_active_observer()
-            if obs is not None:
-                obs.on_af_confirmed(
-                    root,
-                    match_id=mid,
-                    event_key=key,
-                    ev=work_ev,
-                    af_gate=af_gate,
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT goal-context observe confirm failed: {e}", flush=True)
-        try:
             from livescore_observe import get_active_observer as get_lsa_observer
 
             lsa = get_lsa_observer()
@@ -2303,7 +2336,14 @@ def process_bridge_events(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"ALERT book-context observe confirm failed: {e}", flush=True)
-        _quote_one(work_ev, key, af_gate=af_gate)
+        c_ev = _with_odds_grade(
+            work_ev,
+            base_key=key,
+            level="C",
+            target_usdc=1.0,
+            decision={"reason": "baseline_after_af_dqd_confirmation"},
+        )
+        _quote_one(c_ev, key, af_gate=af_gate)
 
     def _drain_af() -> None:
         if af_referee is None:
@@ -2313,6 +2353,58 @@ def process_bridge_events(
                 _finish_af_job(job)
         except Exception as e:  # noqa: BLE001
             print(f"ALERT af-referee drain failed: {e}", flush=True)
+
+    def _drain_odds_upgrades() -> None:
+        if trade_executor is None:
+            return
+        try:
+            from book_context_observe import get_active_observer as get_book_observer
+
+            observer = get_book_observer()
+            if observer is None:
+                return
+            for upgrade in observer.drain_upgrades():
+                grade = (
+                    upgrade.get("odds_grade")
+                    if isinstance(upgrade.get("odds_grade"), dict)
+                    else {}
+                )
+                level = str(grade.get("level") or "")
+                if level not in ("B", "A"):
+                    continue
+                base_key = str(upgrade.get("event_key") or "")
+                source_ev = upgrade.get("ev") if isinstance(upgrade.get("ev"), dict) else {}
+                if not base_key or not source_ev:
+                    continue
+                target_usdc = float(
+                    grade.get("target_usdc") or (3.0 if level == "A" else 2.0)
+                )
+                decision = {
+                    **grade,
+                    "observe_group_id": upgrade.get("observe_group_id"),
+                    "poll_offset_s": upgrade.get("poll_offset_s"),
+                    "data_changed": upgrade.get("data_changed"),
+                    "fingerprint": upgrade.get("fingerprint"),
+                }
+                work_ev = _with_odds_grade(
+                    source_ev,
+                    base_key=base_key,
+                    level=level,
+                    target_usdc=target_usdc,
+                    decision=decision,
+                )
+                trade_key = str(work_ev.get("_trade_event_key") or "")
+                af_meta = dict(upgrade.get("af_gate") or {})
+                af_meta["odds_confirmation"] = dict(work_ev["_trade_context"])
+                quoted_ok = _quote_one(work_ev, trade_key, af_gate=af_meta)
+                observer.acknowledge_upgrade(upgrade, success=quoted_ok)
+                print(
+                    f"odds-confirm → grade={level} target=${target_usdc:g} "
+                    f"match_id={upgrade.get('match_id')} poll={upgrade.get('poll_offset_s')}s",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT odds upgrade drain failed: {e}", flush=True)
 
     def _deadline_flatten() -> None:
         if mode != "postcheck" or trade_executor is None:
@@ -2465,19 +2557,6 @@ def process_bridge_events(
                             flush=True,
                         )
                 try:
-                    from goal_context_observe import get_active_observer
-
-                    obs = get_active_observer()
-                    if obs is not None:
-                        obs.on_dqd_reversal(
-                            root,
-                            match_id=mid_rev,
-                            event_key=key,
-                            ev=ev,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT goal-context observe reversal failed: {e}", flush=True)
-                try:
                     from livescore_observe import get_active_observer as get_lsa_observer
 
                     lsa = get_lsa_observer()
@@ -2571,7 +2650,14 @@ def process_bridge_events(
                         "score_source": "dongqiudi",
                         "target": {"home": target[0], "away": target[1]},
                     }
-                    _quote_one(ev, key, af_gate=af_gate)
+                    c_ev = _with_odds_grade(
+                        ev,
+                        base_key=key,
+                        level="C",
+                        target_usdc=1.0,
+                        decision={"reason": "baseline_observation_position"},
+                    )
+                    _quote_one(c_ev, key, af_gate=af_gate)
                     if key not in seen:
                         # Quote failed — retry next tick; do not park on AF pending.
                         continue
@@ -2626,12 +2712,19 @@ def process_bridge_events(
         _quote_one(ev, key)
 
     _drain_af()
+    # Bridge reversals in this batch have now cancelled their observer state,
+    # so stale queued B/A decisions cannot buy against a reverted score.
+    _drain_odds_upgrades()
     _deadline_flatten()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]
-    cursor["updated_at"] = now_cn_iso()
-    save_cursor(root, cursor)
+    cursor_changed = any(
+        cursor.get(key) != previous for key, previous in cursor_state_before.items()
+    )
+    if cursor_changed:
+        cursor["updated_at"] = now_cn_iso()
+        save_cursor(root, cursor)
     tick_ms = int((time.monotonic() - tick_t0) * 1000)
     if bundles:
         for b in bundles:

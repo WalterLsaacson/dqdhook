@@ -75,11 +75,11 @@ def _goal_ev(
     away_score: int = 0,
     prev_h: int = 0,
     prev_a: int = 0,
-    ts: str = "2026-08-01T06:00:00+08:00",
+    ts: str | None = None,
 ) -> dict[str, Any]:
     return {
         "type": "score_change",
-        "ts": ts,
+        "ts": ts or lib.now_cn_iso(),
         "match_id": match_id,
         "home": "Home FC",
         "away": "Away FC",

@@ -120,7 +120,7 @@ def main() -> int:
     from trade_settings import TradeSettings
     from trade_executor import TradeExecutor
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "data" / "pm-quote").mkdir(parents=True)
         settings = TradeSettings(

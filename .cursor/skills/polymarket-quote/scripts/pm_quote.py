@@ -28,7 +28,6 @@ import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from book_context_observe import try_create_observer as try_create_book_observer  # noqa: E402
-from goal_context_observe import GoalContextObserver  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
@@ -317,14 +316,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
         file=sys.stderr,
         flush=True,
     )
-    goal_obs = GoalContextObserver(rt)
-    goal_obs.start()
-    print(
-        f"goal-context observe → {lib.data_dir(rt) / 'goal_context_observe.jsonl'} "
-        f"(AF confirm +15s/+45s + DQD reverse · observe-only)",
-        file=sys.stderr,
-        flush=True,
-    )
     lsa_obs = try_create_lsa_observer(rt)
     if lsa_obs is not None:
         lsa_obs.start()
@@ -345,14 +336,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
         book_obs.start()
         print(
             f"book-context observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
-            f"(OddsPapi/Odds-API.io/The Odds · AF confirm/+5/+15/+45 + DQD reverse · observe-only)",
+            f"(Odds-API.io score + Bet365 full markets · every 5s through 60s · A/B upgrades)",
             file=sys.stderr,
             flush=True,
         )
     else:
         print(
-            "book-context observe skipped "
-            "(set ODDSPAPI_KEY and/or ODDS_API_IO_KEY and/or THE_ODDS_API_KEY)",
+            "odds confirmation skipped (set ODDS_API_IO_KEY)",
             file=sys.stderr,
             flush=True,
         )
@@ -456,7 +446,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print("\nbye", file=sys.stderr)
         stop_warm.set()
         sampler.stop()
-        goal_obs.stop()
         if lsa_obs is not None:
             lsa_obs.stop()
         if book_obs is not None:

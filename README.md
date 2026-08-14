@@ -66,7 +66,7 @@ Stop: `Ctrl-C` / `kill` the `run_main` process, or `POST http://127.0.0.1:8790/a
 | Hot path | Cold path (async disk) |
 |---|---|
 | DQD poll → rematch → memory `event_queue` | `data/bridge/events.jsonl`, `matches.json`, `prev_*` |
-| AF HTTP confirm (in-process lib) | AF burst dirs, `af_confirmed_scores.json` |
+| AF HTTP confirm (in-process lib) | AF watch artifacts, `af_confirmed_scores.json` (async; no confirm burst fetch) |
 | One CLOB `/books` + FAK / dry plan | `trades.jsonl`, quote snapshots |
 
 Events are appended to jsonl **before** `prev_*` so a crash cannot permanently drop a goal. Quote serializes trade/flatten with a lock.
@@ -102,7 +102,7 @@ python3 frontend/run_main.py --no-trade
 | `--no-af-referee` | Skip AF goal confirm (not for production goals) |
 | `--af-postcheck-trade` | Buy on DQD goal before AF confirm (flatten on timeout) |
 
-Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, …
+Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, `ODDS_API_IO_KEY`, … Odds third-confirmation polls only Odds-API.io score + Bet365 markets every 5s for 60s and uses cumulative C/B/A targets of $1/$2/$3. A/B require a freshly verified fixture identity; partial live fills are accumulated by actual matched USDC and retried to the target.
 
 ## Logs & data
 
@@ -129,6 +129,9 @@ python3 .cursor/skills/apifootball-bridge/scripts/smoke_af_bridge.py
 python3 .cursor/skills/match-bridge/scripts/smoke_ft_period.py
 python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_af_referee.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_odds_grade_trade.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_ft_af_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_latency_path.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_trade_modes.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_post_goal_sampler.py

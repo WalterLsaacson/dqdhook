@@ -70,7 +70,7 @@ def test_af_score_satisfies() -> None:
 
 def test_await_via_bridge_fn() -> None:
     print("test_await_via_bridge_fn")
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         seq: list[dict[str, Any]] = [
             {"ok": True, "af_fixture_id": 99, "goals": {"home": 0, "away": 0}, "events": []},
@@ -81,7 +81,7 @@ def test_await_via_bridge_fn() -> None:
                 "events": [{"type": "Goal"}],
                 "burst_dir": None,
             },
-            # persist confirm burst fetch
+            # Must remain unused: confirmation no longer performs a burst fetch.
             {
                 "ok": True,
                 "af_fixture_id": 99,
@@ -104,13 +104,13 @@ def test_await_via_bridge_fn() -> None:
         check("persist async", out.get("persist") == "async")
         stored = ref.get_confirmed_score(root, "m1")
         check("store 1-0", stored == (1, 0), str(stored))
-        # Burst may land asynchronously after confirm return.
         time.sleep(0.2)
+        check("no confirm burst fetch", len(seq) == 1, str(seq))
 
 
 def test_await_af_ahead() -> None:
     print("test_await_af_ahead")
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
 
         def events_fn(_mid: str, persist_burst: bool = False) -> dict[str, Any]:
@@ -132,7 +132,7 @@ def test_await_af_ahead() -> None:
 
 def test_async_submit_drain() -> None:
     print("test_async_submit_drain")
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         calls = {"n": 0}
 
@@ -300,7 +300,7 @@ def test_confirm_check_times() -> None:
 def test_schedule_cadence_wall_times() -> None:
     """Polls land on the tiered checkpoints (not a shared min-interval queue)."""
     print("test_schedule_cadence_wall_times")
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         hits: list[float] = []
         t_start = {"v": 0.0}
@@ -391,7 +391,7 @@ def test_transient_network_retry() -> None:
     )
     check("429 still rate", ref._is_rate_limited({"http_status": 429}))
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         calls = {"n": 0}
 
@@ -421,7 +421,7 @@ def test_transient_network_retry() -> None:
         check("recovered after ssl", out.get("confirmed") is True, str(out))
         check("retried several times", calls["n"] >= 4, str(calls))
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory() as td:
         root = Path(td)
 
         def events_fn(_mid: str, persist_burst: bool = False) -> dict[str, Any]:

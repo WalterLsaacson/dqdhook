@@ -17,6 +17,8 @@ if str(_SCRIPTS) not in sys.path:
 
 import af_referee as ref  # noqa: E402
 import quote_lib as lib  # noqa: E402
+from data_prune import prune_market_cache  # noqa: E402
+from market_cache import MarketCatalogCache  # noqa: E402
 
 TZ_CN = timezone(timedelta(hours=8))
 PASS = 0
@@ -344,6 +346,78 @@ def test_events_offset_clamps_on_shrink() -> None:
         )
 
 
+def test_cursor_writes_only_on_change() -> None:
+    print("test_cursor_writes_only_on_change")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        bridge = root / "data" / "bridge"
+        bridge.mkdir(parents=True)
+        events = bridge / "events.jsonl"
+        events.write_text("", encoding="utf-8")
+
+        lib.process_bridge_events(root, events_override=[], af_mode="off")
+        cursor_path = root / "data" / "pm-quote" / "cursor.json"
+        first_mtime = cursor_path.stat().st_mtime_ns
+        time.sleep(0.02)
+        lib.process_bridge_events(root, events_override=[], af_mode="off")
+        check("empty tick keeps cursor mtime", cursor_path.stat().st_mtime_ns == first_mtime)
+
+        with events.open("a", encoding="utf-8") as f:
+            f.write('{"type":"noop"}\n')
+        time.sleep(0.02)
+        lib.process_bridge_events(root, events_override=[], af_mode="off")
+        check("new bytes update cursor", cursor_path.stat().st_mtime_ns > first_mtime)
+        check(
+            "cursor offset advanced",
+            int(lib.load_cursor(root).get("events_byte_offset") or 0) == events.stat().st_size,
+        )
+
+
+def test_ft_market_cache_survives_until_consumed() -> None:
+    print("test_ft_market_cache_survives_until_consumed")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        bridge = root / "data" / "bridge"
+        bridge.mkdir(parents=True)
+        (bridge / "matches.json").write_text(
+            '{"matches":[{"dongqiudi":{"id":"ft-cache","is_finished":true,"status":"played"},'
+            '"polymarket":{"event_id":"pm1","slug":"home-away"}}]}',
+            encoding="utf-8",
+        )
+        cache = MarketCatalogCache(root)
+        cache.put(
+            "ft-cache",
+            {"main_event": {"id": "pm1"}, "related_complete": True},
+        )
+        cache.sync_from_bridge_matches()
+        check("warmer preserves finished cache", cache.get("ft-cache") is not None)
+        (bridge / "events.jsonl").write_text(
+            '{"type":"match_finished","match_id":"ft-cache","home_score":1,"away_score":0}\n',
+            encoding="utf-8",
+        )
+        (bridge / "matches.json").write_text(
+            '{"matches":[{"dongqiudi":{"id":"other"},'
+            '"polymarket":{"event_id":"pm-other"}}]}',
+            encoding="utf-8",
+        )
+        prune_market_cache(cache)
+        check(
+            "pruner preserves unconsumed FT absent from matches",
+            cache.get("ft-cache") is not None,
+        )
+
+        lib.save_cursor(
+            root,
+            {
+                "processed_keys": [],
+                "processed_ft_match_ids": ["ft-cache"],
+                "events_byte_offset": 0,
+            },
+        )
+        prune_market_cache(cache)
+        check("pruner drops consumed FT", cache.get("ft-cache") is None)
+
+
 def main() -> int:
     test_ft_stale_and_helpers()
     test_ft_mismatch_and_confirm()
@@ -351,6 +425,8 @@ def main() -> int:
     test_stale_skip_in_pipeline()
     test_goal_stale_skips_af()
     test_events_offset_clamps_on_shrink()
+    test_cursor_writes_only_on_change()
+    test_ft_market_cache_survives_until_consumed()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -69,6 +69,34 @@ def trade_idempotency_key(event_key: str, token_id: str, trade: str) -> str:
     return f"{event_key}|{token_id}|{trade}"
 
 
+def actual_matched_buy_plan(plan: FillPlan, response: Any) -> FillPlan:
+    """Use CLOB matched making/taking amounts instead of the requested FAK size."""
+    if not isinstance(response, dict):
+        return plan
+    status = str(response.get("status") or "").upper()
+    if status not in ("MATCHED", "FILLED", "SUCCESS"):
+        return plan
+    try:
+        shares = float(response.get("takingAmount") or 0)
+        usdc = float(response.get("makingAmount") or 0)
+    except (TypeError, ValueError):
+        return plan
+    if shares <= 0.0 or usdc <= 0.0:
+        return plan
+    return FillPlan(
+        trade=plan.trade,
+        side=plan.side,
+        take_depth=plan.take_depth,
+        order_type=plan.order_type,
+        shares=round(shares, 6),
+        usdc=round(usdc, 6),
+        worst_price=plan.worst_price,
+        levels_used=plan.levels_used,
+        levels=list(plan.levels),
+        skip_reason=plan.skip_reason,
+    )
+
+
 def floor_shares(shares: Decimal | float | str, *, decimals: int = FLATTEN_SHARE_DECIMALS) -> Decimal:
     """Round shares down to ``decimals`` (CLOB sell maker precision)."""
     q = Decimal(10) ** -int(decimals)
@@ -620,12 +648,42 @@ class TradeExecutor:
 
         key = trade_idempotency_key(event_key or "", token_id, trade)
         if key in self._done:
-            logger.debug("skip duplicate %s", key)
-            return {
-                "idempotency_key": key,
-                "status": "skipped",
-                "skip_reason": "already_done",
-            }
+            retry_graded_partial = False
+            trade_context_early = (
+                (match_meta or {}).get("trade_context")
+                if isinstance((match_meta or {}).get("trade_context"), dict)
+                else {}
+            )
+            base_early = str(trade_context_early.get("base_event_key") or "")
+            try:
+                target_early = float(trade_context_early.get("target_usdc"))
+            except (TypeError, ValueError):
+                target_early = 0.0
+            if trade == "buy_win" and base_early and target_early > 0.0:
+                mid_early = str(
+                    (match_meta or {}).get("match_id") or quote.get("match_id") or ""
+                )
+                prefix_early = base_early + "|odds_grade_"
+                actual_early = sum(
+                    float(lot.get("usdc") or 0)
+                    for lot in self.ledger.all_open()
+                    if str(lot.get("token_id") or "") == token_id
+                    and (not mid_early or str(lot.get("match_id") or "") == mid_early)
+                    and (
+                        str(lot.get("event_key") or "") == base_early
+                        or str(lot.get("event_key") or "").startswith(prefix_early)
+                    )
+                )
+                retry_graded_partial = actual_early + 1e-9 < target_early
+            if retry_graded_partial:
+                self._done.discard(key)
+            else:
+                logger.debug("skip duplicate %s", key)
+                return {
+                    "idempotency_key": key,
+                    "status": "skipped",
+                    "skip_reason": "already_done",
+                }
 
         # Price guard on the reference book price (best ask/bid)
         ref_price = quote.get("best_ask") if trade == "buy_win" else quote.get("best_bid")
@@ -719,20 +777,90 @@ class TradeExecutor:
         max_shares = float(self.settings.max_shares)
         size_meta: dict[str, Any] | None = None
         if trade == "buy_win":
+            trade_context = (
+                (match_meta or {}).get("trade_context")
+                if isinstance((match_meta or {}).get("trade_context"), dict)
+                else {}
+            )
+            target_usdc: float | None = None
+            already_usdc = 0.0
+            remaining_target: float | None = None
+            base_event_key = str(trade_context.get("base_event_key") or "")
+            try:
+                if trade_context.get("target_usdc") is not None:
+                    target_usdc = max(0.0, float(trade_context.get("target_usdc")))
+            except (TypeError, ValueError):
+                target_usdc = None
+            if target_usdc is not None and base_event_key:
+                mid_target = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
+                prefix = base_event_key + "|odds_grade_"
+                already_usdc = sum(
+                    float(lot.get("usdc") or 0)
+                    for lot in self.ledger.all_open()
+                    if str(lot.get("token_id") or "") == token_id
+                    and (not mid_target or str(lot.get("match_id") or "") == mid_target)
+                    and (
+                        str(lot.get("event_key") or "") == base_event_key
+                        or str(lot.get("event_key") or "").startswith(prefix)
+                    )
+                )
+                remaining_target = max(0.0, target_usdc - already_usdc)
+                if remaining_target <= 1e-9:
+                    size_meta = {
+                        "odds_grade": trade_context.get("odds_grade"),
+                        "target_usdc": target_usdc,
+                        "already_usdc": round(already_usdc, 6),
+                        "remaining_target_usdc": 0.0,
+                        "base_event_key": base_event_key,
+                    }
+                    self._done.add(key)
+                    return self._record(
+                        quote,
+                        event_key=event_key,
+                        match_meta=match_meta,
+                        plan=None,
+                        status="skipped",
+                        skip_reason="odds_grade_target_reached",
+                        response=None,
+                        success=False,
+                        idempotency_key=key,
+                        live=channel_live,
+                        extra={"size_policy": size_meta},
+                    )
             open_usdc = sum(
                 float(r.get("usdc") or 0)
                 for r in self.ledger.all_open()
             )
+            cap_usdc = remaining_target if remaining_target is not None else self.settings.max_usdc
+            cap_tiers = (
+                ((0.0, cap_usdc),)
+                if remaining_target is not None
+                else self.settings.size_tiers
+            )
             caps = compute_buy_size_caps(
                 ref_f,
-                max_usdc=self.settings.max_usdc,
+                max_usdc=cap_usdc,
                 max_shares=self.settings.max_shares,
-                tiers=self.settings.size_tiers,
+                tiers=cap_tiers,
                 open_usdc=open_usdc,
                 max_open_usdc=self.settings.max_open_usdc,
-                floor_usdc=self.settings.size_floor_usdc,
+                floor_usdc=(
+                    min(self.settings.size_floor_usdc, cap_usdc)
+                    if remaining_target is not None
+                    else self.settings.size_floor_usdc
+                ),
             )
             size_meta = caps.to_dict()
+            if target_usdc is not None:
+                size_meta.update(
+                    {
+                        "odds_grade": trade_context.get("odds_grade"),
+                        "target_usdc": target_usdc,
+                        "already_usdc": round(already_usdc, 6),
+                        "remaining_target_usdc": round(float(remaining_target or 0), 6),
+                        "base_event_key": base_event_key,
+                    }
+                )
             if caps.skip_reason:
                 row = self._record(
                     quote,
@@ -826,6 +954,13 @@ class TradeExecutor:
             tick = str(quote.get("tick_size") or "0.01") or "0.01"
             neg = quote.get("neg_risk")
             neg_risk = bool(neg) if neg is not None else None
+            mid_live = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
+            known_shares_before = sum(
+                float(lot.get("shares") or 0)
+                for lot in self.ledger.all_open()
+                if str(lot.get("token_id") or "") == token_id
+                and (not mid_live or str(lot.get("match_id") or "") == mid_live)
+            )
             if plan.side == "BUY":
                 response = trader.post_market_buy(
                     token_id,
@@ -851,19 +986,25 @@ class TradeExecutor:
                 else ""
             )
             # DELAYED: CLOB accepted — one quick balance peek (no multi-second wait).
-            ledger_plan = plan
+            ledger_plan = (
+                actual_matched_buy_plan(plan, response)
+                if ok and trade == "buy_win"
+                else plan
+            )
             if ok and trade == "buy_win" and resp_status == "DELAYED":
                 bal = trader.wait_conditional_balance(
                     token_id, min_shares=0.01, timeout_s=0.0, interval_s=0.05
                 )
-                if bal > 0:
+                delta_shares = max(0.0, float(bal) - known_shares_before)
+                if delta_shares > 1e-6:
+                    fill_fraction = min(1.0, delta_shares / max(plan.shares, 1e-9))
                     ledger_plan = FillPlan(
                         trade=plan.trade,
                         side=plan.side,
                         take_depth=plan.take_depth,
                         order_type=plan.order_type,
-                        shares=round(bal, 6),
-                        usdc=plan.usdc,
+                        shares=round(delta_shares, 6),
+                        usdc=round(plan.usdc * fill_fraction, 6),
                         worst_price=plan.worst_price,
                         levels_used=plan.levels_used,
                         levels=list(plan.levels),
@@ -872,7 +1013,7 @@ class TradeExecutor:
                     logger.info(
                         "delayed buy confirmed token=%s… shares=%.4f (plan=%.4f)",
                         token_id[:12],
-                        bal,
+                        delta_shares,
                         plan.shares,
                     )
                 else:
@@ -948,9 +1089,14 @@ class TradeExecutor:
             return
         neg = quote.get("neg_risk")
         sig = signal_from_event_key(event_key)
+        trade_context = meta.get("trade_context") if isinstance(meta.get("trade_context"), dict) else {}
+        odds_grade = str(trade_context.get("odds_grade") or "")
         af_status = AF_STATUS_NONE
         af_deadline = None
-        if sig == "score_change" and self.af_mode == "postcheck":
+        if sig == "score_change" and self.af_mode == "postcheck" and odds_grade in ("B", "A"):
+            # Odds upgrades are emitted only after AF has already confirmed.
+            af_status = AF_STATUS_CONFIRMED
+        elif sig == "score_change" and self.af_mode == "postcheck":
             af_status = AF_STATUS_PENDING
             af_deadline = deadline_iso(self.af_timeout_s)
         elif sig == "score_change" and self.af_mode == "gate":
@@ -1861,6 +2007,8 @@ class TradeExecutor:
             "skip_reason": skip_reason,
             "response": response,
         }
+        if isinstance(meta.get("trade_context"), dict):
+            row["trade_context"] = dict(meta["trade_context"])
         if extra:
             row.update(extra)
         lib.append_jsonl_async(self.trades_path, [row])

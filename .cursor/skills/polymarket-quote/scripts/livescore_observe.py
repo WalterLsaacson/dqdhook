@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 import quote_lib as lib
 
@@ -58,9 +58,9 @@ PHASE_DQD_REVERSAL = "dqd_reversal"
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
 
-FetchLiveFn = Callable[[], dict[str, Any]]
-FetchEventsFn = Callable[[str], dict[str, Any]]
-FetchCommentaryFn = Callable[[str], dict[str, Any]]
+FetchLiveFn = Callable[[], Dict[str, Any]]
+FetchEventsFn = Callable[[str], Dict[str, Any]]
+FetchCommentaryFn = Callable[[str], Dict[str, Any]]
 
 _active: "LiveScoreObserver | None" = None
 _active_lock = threading.Lock()

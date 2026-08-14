@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gamma market catalog cache: warm after bridge match, drop on FT."""
+"""Gamma market catalog cache: warm after bridge match, drop after FT quote."""
 
 from __future__ import annotations
 
@@ -114,8 +114,9 @@ class MarketCatalogCache:
             if catalog_complete(hit):
                 return hit
         if _match_finished_row(row):
-            self.drop(mid)
-            return None
+            # FT still waits for AF regulation confirmation. Preserve the warmed
+            # catalog until quote_lib consumes it and drops it after quoting.
+            return self.get(mid)
 
         event_id = str(pm_h.get("event_id") or "") or None
         slug = str(pm_h.get("slug") or "") or None
@@ -177,7 +178,7 @@ class MarketCatalogCache:
         proxy: str | None | object = ...,
         max_warms: int = 8,
     ) -> dict[str, int]:
-        """Warm open matched fixtures; drop finished ones.
+        """Warm open matched fixtures; preserve finished ones for FT quoting.
 
         Caps new Gamma warms per call so the background thread stays responsive
         while gradually filling ``market_cache/``.
@@ -191,9 +192,10 @@ class MarketCatalogCache:
                 skipped += 1
                 continue
             if _match_finished_row(row):
-                if self.get(mid) is not None:
-                    self.drop(mid)
-                    dropped += 1
+                # Do not race the FT AF gate by deleting its market catalog.
+                # Successful FT quoting owns the immediate drop; the pruner
+                # removes already-processed leftovers.
+                skipped += 1
                 continue
             pm_h = row.get("polymarket") or {}
             if not (pm_h.get("event_id") or pm_h.get("slug")):

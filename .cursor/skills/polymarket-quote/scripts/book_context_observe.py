@@ -1,18 +1,19 @@
-"""Observe-only multi-bookmaker odds status snapshots (OddsPapi / Odds-API.io / The Odds API).
+"""Odds-API.io score + Bet365 market confirmation after AF-confirmed goals.
 
-Event-driven phases mirror goal-context observe (``af_confirmed``, delayed follow-ups,
-``dqd_reversal``). Pulls moneyline / h2h availability and suspension signals from three
-free-tier aggregators.
+Polls immediately and every five seconds for sixty seconds.  Each sample is persisted,
+graded C/B/A, and may emit a monotonic position-target upgrade to the quote loop.
 
-Every HTTP response body is persisted under ``data/pm-quote/book_context_raw/`` (URLs
-redact ``apiKey``); observe rows also keep ``raw`` / ``raw_path`` / ``requests``.
+Every actual HTTP response body is persisted under ``data/pm-quote/book_context_raw/``
+(URLs redact ``apiKey``). Observe rows keep compact request metadata and ``raw_path``;
+the large response body is not duplicated in JSONL.
 
-Does **not** gate buys or flatten. Failures are isolated per source in ``error`` fields.
+Failures are isolated in ``error`` fields. DQD reversals cancel pending polls/upgrades.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -22,16 +23,18 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 import quote_lib as lib
 
 logger = logging.getLogger("pm_quote.book_context_observe")
+TZ_CN = timezone(timedelta(hours=8))
 
 ODDSPAPI_BASE = "https://api.oddspapi.io/v4"
 ODDS_API_IO_BASE = "https://api.odds-api.io/v3"
@@ -51,9 +54,9 @@ SOURCE_ODDSPAPI = "oddspapi"
 SOURCE_ODDSAPIIO = "oddsapiio"
 SOURCE_THEODDSAPI = "theoddsapi"
 
-DEFAULT_SOURCES = (SOURCE_ODDSPAPI, SOURCE_ODDSAPIIO, SOURCE_THEODDSAPI)
+DEFAULT_SOURCES = (SOURCE_ODDSAPIIO,)
 DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
-DEFAULT_ODDS_API_IO_BOOKS = ("Bet365", "DraftKings")
+DEFAULT_ODDS_API_IO_BOOKS = ("Bet365",)
 # us+eu: Leagues Cup / MLS books often land in us; EU books for UEFA.
 DEFAULT_THE_ODDS_REGIONS = ("us", "eu")
 # Prefer keys that match our common PM slate first; discover fills the rest.
@@ -119,23 +122,25 @@ DEFAULT_THE_ODDS_SPORT_KEYS = (
 DEFAULT_THE_ODDS_DISCOVER = True
 THE_ODDS_SPORTS_CACHE_TTL_S = 6 * 3600.0
 
-DEFAULT_DELAY_5_S = 5.0
-DEFAULT_DELAY_15_S = 15.0
-DEFAULT_DELAY_45_S = 45.0
+DEFAULT_POLL_INTERVAL_S = 5.0
+DEFAULT_POLL_TIMEOUT_S = 60.0
 DEFAULT_WORKERS = 4
 DEFAULT_HTTP_TIMEOUT_S = 12.0
 DEFAULT_MIN_SIDE_SIM = 0.72
+DEFAULT_EVENTS_CATALOG_TTL_S = 60.0
+DEFAULT_RATE_LIMIT_BACKOFF_S = 60.0
+DEFAULT_EVENT_TIME_TOLERANCE_S = 12 * 3600.0
 
 PHASE_AF_CONFIRMED = "af_confirmed"
-PHASE_POST_5 = "post_confirm_5s"
-PHASE_POST_15 = "post_confirm_15s"
-PHASE_POST_45 = "post_confirm_45s"
 PHASE_DQD_REVERSAL = "dqd_reversal"
+
+GRADE_TARGET_USDC = {"C": 1.0, "B": 2.0, "A": 3.0}
+GRADE_RANK = {"C": 0, "B": 1, "A": 2}
 
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
 
-FetchBookFn = Callable[[str, str, str], dict[str, Any]]
+FetchBookFn = Callable[[str, str, str], Dict[str, Any]]
 
 _active: "BookContextObserver | None" = None
 _active_lock = threading.Lock()
@@ -195,6 +200,53 @@ def select_response_headers(hdrs: dict[str, str] | None) -> dict[str, str]:
     return out
 
 
+def rate_limit_backoff_s(
+    headers: dict[str, str] | None,
+    *,
+    now_epoch: float | None = None,
+    default_s: float = DEFAULT_RATE_LIMIT_BACKOFF_S,
+) -> float:
+    """Return a conservative delay from Retry-After / rate-limit reset headers."""
+    hdrs = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+    now = time.time() if now_epoch is None else float(now_epoch)
+
+    retry_after = hdrs.get("retry-after")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(retry_after)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return max(0.0, dt.timestamp() - now)
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    reset = hdrs.get("x-ratelimit-reset") or hdrs.get("ratelimit-reset")
+    if reset:
+        try:
+            reset_dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+            if reset_dt.tzinfo is None:
+                reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+            delay = reset_dt.timestamp() - now
+            return delay if delay > 0.0 else max(0.0, float(default_s))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            value = float(reset)
+            if value > 10_000_000_000:  # epoch milliseconds
+                value /= 1000.0
+            if value >= 100_000_000:  # epoch seconds, including stale values
+                delay = value - now
+                return delay if delay > 0.0 else max(0.0, float(default_s))
+            if value >= 0.0:  # small values are relative seconds
+                return value
+        except ValueError:
+            pass
+    return max(0.0, float(default_s))
+
+
 def _safe_name(value: str, *, max_len: int = 80) -> str:
     s = _SAFE_NAME_RE.sub("_", str(value or "").strip()) or "na"
     return s[:max_len]
@@ -212,10 +264,12 @@ def persist_raw_blob(
     record: dict[str, Any],
 ) -> str:
     """Write one raw request/response JSON; return path relative to ``data/pm-quote``."""
-    ts = time.strftime("%Y%m%dT%H%M%S")
+    now_ns = time.time_ns()
+    ts = time.strftime("%Y%m%dT%H%M%S") + f"_{now_ns % 1_000_000_000:09d}"
+    group_tag = hashlib.sha256(str(observe_group_id).encode("utf-8")).hexdigest()[:10]
     fname = (
         f"{ts}_{_safe_name(match_id)}_{_safe_name(phase, max_len=40)}_"
-        f"{_safe_name(source)}_{_safe_name(kind)}_{int(seq):03d}.json"
+        f"{group_tag}_{_safe_name(source)}_{_safe_name(kind)}_{int(seq):06d}.json"
     )
     path = raw_dir(root) / fname
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,6 +318,30 @@ def request_meta_for_jsonl(
     else:
         meta["raw_summary"] = {"type": type(body).__name__}
     return meta
+
+
+def compact_sources_for_jsonl(sources: dict[str, Any]) -> dict[str, Any]:
+    """Drop duplicated response bodies while preserving parsed data and raw paths."""
+    compact: dict[str, Any] = {}
+    for name, payload in sources.items():
+        if not isinstance(payload, dict):
+            compact[name] = payload
+            continue
+        source_row = dict(payload)
+        source_row.pop("raw", None)
+        requests = source_row.get("requests")
+        if isinstance(requests, list):
+            compact_requests: list[Any] = []
+            for request in requests:
+                if isinstance(request, dict):
+                    request_row = dict(request)
+                    request_row.pop("raw", None)
+                    compact_requests.append(request_row)
+                else:
+                    compact_requests.append(request)
+            source_row["requests"] = compact_requests
+        compact[name] = source_row
+    return compact
 
 
 def make_observe_group_id(match_id: str, home: Any, away: Any, event_key: str) -> str:
@@ -332,46 +410,20 @@ def soccer_sport_keys_from_sports_payload(payload: Any) -> list[str]:
 
 
 def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
-    """Load enabled observe sources and API keys from environment."""
+    """Load the sole supported confirmation source: Odds-API.io / Bet365."""
     src = env if env is not None else os.environ
     keys = {
-        SOURCE_ODDSPAPI: str(src.get(ENV_ODDSPAPI_KEY) or "").strip(),
         SOURCE_ODDSAPIIO: str(src.get(ENV_ODDS_API_IO_KEY) or "").strip(),
-        SOURCE_THEODDSAPI: str(src.get(ENV_THE_ODDS_API_KEY) or "").strip(),
     }
-    sources_raw = str(src.get(ENV_BOOK_OBSERVE_SOURCES) or "").strip().lower()
-    if sources_raw:
-        alias = {
-            SOURCE_ODDSPAPI: SOURCE_ODDSPAPI,
-            SOURCE_ODDSAPIIO: SOURCE_ODDSAPIIO,
-            "odds-api.io": SOURCE_ODDSAPIIO,
-            "odds_api_io": SOURCE_ODDSAPIIO,
-            SOURCE_THEODDSAPI: SOURCE_THEODDSAPI,
-            "the-odds-api": SOURCE_THEODDSAPI,
-            "the_odds_api": SOURCE_THEODDSAPI,
-        }
-        enabled: list[str] = []
-        for part in sources_raw.replace(" ", "").split(","):
-            part = part.strip()
-            if not part:
-                continue
-            canon = alias.get(part)
-            if canon:
-                enabled.append(canon)
-        seen: set[str] = set()
-        sources = tuple(x for x in enabled if not (x in seen or seen.add(x)))
-        if not sources:
-            sources = DEFAULT_SOURCES
-    else:
-        sources = DEFAULT_SOURCES
-
+    sources = DEFAULT_SOURCES
     active = [s for s in sources if keys.get(s)]
     return {
         "sources": sources,
         "active_sources": active,
         "keys": keys,
         "oddspapi_books": _split_csv(src.get(ENV_BOOK_ODDSPAPI_BOOKS), DEFAULT_ODDSPAPI_BOOKS),
-        "oddsapiio_books": _split_csv(src.get(ENV_BOOK_ODDS_API_IO_BOOKS), DEFAULT_ODDS_API_IO_BOOKS),
+        # Deliberately fixed: DraftKings and every non-Bet365 payload are out of scope.
+        "oddsapiio_books": DEFAULT_ODDS_API_IO_BOOKS,
         "theoddsapi_regions": _split_csv(src.get(ENV_BOOK_THE_ODDS_REGIONS), DEFAULT_THE_ODDS_REGIONS),
         "theoddsapi_sport_keys": _split_csv(
             src.get(ENV_BOOK_THE_ODDS_SPORT_KEYS), DEFAULT_THE_ODDS_SPORT_KEYS
@@ -385,9 +437,8 @@ def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
 def try_create_observer(
     root: Path,
     *,
-    delay_5_s: float = DEFAULT_DELAY_5_S,
-    delay_15_s: float = DEFAULT_DELAY_15_S,
-    delay_45_s: float = DEFAULT_DELAY_45_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S,
     env: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> "BookContextObserver | None":
@@ -397,9 +448,8 @@ def try_create_observer(
     return BookContextObserver(
         root,
         source_cfg=cfg,
-        delay_5_s=delay_5_s,
-        delay_15_s=delay_15_s,
-        delay_45_s=delay_45_s,
+        poll_interval_s=poll_interval_s,
+        poll_timeout_s=poll_timeout_s,
         **kwargs,
     )
 
@@ -502,31 +552,93 @@ def _row_id(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _parse_match_datetime(value: Any, *, naive_tz: timezone) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=naive_tz)
+    return dt.astimezone(timezone.utc)
+
+
+def _event_row_datetime(row: dict[str, Any]) -> datetime | None:
+    for key in ("date", "startTime", "start_time", "kickoff", "commence_time"):
+        dt = _parse_match_datetime(row.get(key), naive_tz=timezone.utc)
+        if dt is not None:
+            return dt
+    return None
+
+
+def _event_terminal(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or row.get("state") or "").strip().casefold()
+    return status in {
+        "settled",
+        "finished",
+        "ended",
+        "cancelled",
+        "canceled",
+        "postponed",
+        "abandoned",
+    }
+
+
+def _event_league_name(row: dict[str, Any]) -> str:
+    league = row.get("league")
+    if isinstance(league, dict):
+        return str(league.get("name") or league.get("slug") or "")
+    return str(league or row.get("leagueName") or "")
+
+
 def resolve_team_match(
     rows: list[dict[str, Any]],
     *,
     home: str,
     away: str,
     min_side: float = DEFAULT_MIN_SIDE_SIM,
+    kickoff_at: Any = None,
+    league: str = "",
+    max_time_delta_s: float = DEFAULT_EVENT_TIME_TOLERANCE_S,
+    require_nonterminal: bool = False,
 ) -> dict[str, Any]:
     best: dict[str, Any] | None = None
-    best_score = -1.0
+    best_key: tuple[float, float, float] | None = None
+    kickoff = _parse_match_datetime(kickoff_at, naive_tz=TZ_CN)
+    tolerance = max(0.0, float(max_time_delta_s))
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if require_nonterminal and _event_terminal(row):
+            continue
+        row_dt = _event_row_datetime(row)
+        delta_s: float | None = None
+        if kickoff is not None:
+            if row_dt is None:
+                continue
+            delta_s = abs((row_dt - kickoff).total_seconds())
+            if delta_s > tolerance:
+                continue
         h_name, a_name = _team_names_from_row(row)
         hs = team_sim(home, h_name)
         aws = team_sim(away, a_name)
         hs_sw = team_sim(home, a_name)
         aws_sw = team_sim(away, h_name)
+        swapped = False
         if min(hs_sw, aws_sw) > min(hs, aws):
             hs, aws = hs_sw, aws_sw
+            swapped = True
         if hs < min_side or aws < min_side:
             continue
         score = (hs + aws) / 2.0
-        if score > best_score:
+        row_league = _event_league_name(row)
+        league_score = team_sim(league, row_league) if league and row_league else 0.0
+        candidate_key = (score, league_score, -(delta_s or 0.0))
+        if best_key is None or candidate_key > best_key:
             rid = _row_id(row)
-            best_score = score
+            best_key = candidate_key
             best = {
                 "ok": True,
                 "row": row,
@@ -534,6 +646,13 @@ def resolve_team_match(
                 "home_sim": round(hs, 4),
                 "away_sim": round(aws, 4),
                 "candidates": len(rows),
+                "swapped": swapped,
+                "event_home": h_name,
+                "event_away": a_name,
+                "event_date": row_dt.isoformat() if row_dt is not None else None,
+                "event_league": row_league or None,
+                "league_sim": round(league_score, 4),
+                "time_delta_s": round(delta_s, 3) if delta_s is not None else None,
             }
     if best is None or not best.get("id"):
         return {
@@ -664,6 +783,195 @@ def parse_oddspapi_books(
     return rows
 
 
+def _bet365_markets(odds_payload: Any) -> list[dict[str, Any]]:
+    """Return the complete Bet365 market list from an Odds-API.io odds body."""
+    if not isinstance(odds_payload, dict):
+        return []
+    raw = odds_payload.get("bookmakers") or odds_payload.get("books") or odds_payload.get("data")
+    if isinstance(raw, dict):
+        for name, markets in raw.items():
+            if _normalize_book_key(str(name)) == "bet365" and isinstance(markets, list):
+                return [m for m in markets if isinstance(m, dict)]
+        return []
+    if isinstance(raw, list):
+        for book in raw:
+            if not isinstance(book, dict):
+                continue
+            name = str(book.get("bookmaker") or book.get("name") or book.get("key") or "")
+            if _normalize_book_key(name) != "bet365":
+                continue
+            markets = book.get("markets") or book.get("odds") or []
+            return [m for m in markets if isinstance(m, dict)] if isinstance(markets, list) else []
+    return []
+
+
+def _offered(row: dict[str, Any], key: str) -> bool:
+    return key in row and row.get(key) not in (None, "")
+
+
+def inspect_bet365_impossible_markets(
+    odds_payload: Any,
+    *,
+    home_score: Any,
+    away_score: Any,
+) -> dict[str, Any]:
+    """Find Bet365 offers that cannot still win at the already-observed score.
+
+    Only full-match score-sensitive markets are considered.  A B grade also
+    requires at least one such market, preventing a lone moneyline from passing
+    merely because there was nothing useful to inspect.
+    """
+    try:
+        home = int(home_score)
+        away = int(away_score)
+    except (TypeError, ValueError):
+        return {
+            "score_sensitive_markets": 0,
+            "score_sensitive_market_names": [],
+            "impossible_offers": [],
+        }
+    total = home + away
+    sensitive: list[str] = []
+    impossible: list[dict[str, Any]] = []
+
+    def _line(v: Any) -> float | None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    for market in _bet365_markets(odds_payload):
+        name = str(market.get("name") or market.get("market") or "").strip()
+        key = name.casefold()
+        rows = market.get("odds") or market.get("outcomes") or []
+        if not isinstance(rows, list):
+            continue
+        kind = ""
+        threshold: int | None = None
+        if key == "correct score":
+            kind = "correct_score"
+        elif key in ("totals", "alternative goal line"):
+            kind, threshold = "totals_under", total
+        elif key == "team total goals home":
+            kind, threshold = "team_total_home_under", home
+        elif key == "team total goals away":
+            kind, threshold = "team_total_away_under", away
+        elif key == "both teams to score":
+            kind = "btts"
+        elif key == "clean sheet home":
+            kind = "clean_sheet_home"
+        elif key == "clean sheet away":
+            kind = "clean_sheet_away"
+        if not kind:
+            continue
+        sensitive.append(name)
+        for offer in rows:
+            if not isinstance(offer, dict):
+                continue
+            if kind == "correct_score":
+                label = str(offer.get("label") or offer.get("name") or "")
+                m = re.fullmatch(r"\s*(\d+)\s*[-:–—]\s*(\d+)\s*", label)
+                if m and _offered(offer, "odds"):
+                    h, a = int(m.group(1)), int(m.group(2))
+                    if h < home or a < away:
+                        impossible.append({"market": name, "offer": label, "reason": "score_below_target"})
+            elif kind in ("totals_under", "team_total_home_under", "team_total_away_under"):
+                hdp = _line(offer.get("hdp"))
+                if hdp is not None and threshold is not None and hdp < threshold and _offered(offer, "under"):
+                    impossible.append({
+                        "market": name,
+                        "offer": f"under {offer.get('hdp')}",
+                        "reason": f"line_below_observed_{threshold}",
+                    })
+            elif kind == "btts" and home > 0 and away > 0 and _offered(offer, "no"):
+                impossible.append({"market": name, "offer": "no", "reason": "both_teams_already_scored"})
+            elif kind == "clean_sheet_home" and away > 0 and _offered(offer, "yes"):
+                impossible.append({"market": name, "offer": "yes", "reason": "away_already_scored"})
+            elif kind == "clean_sheet_away" and home > 0 and _offered(offer, "yes"):
+                impossible.append({"market": name, "offer": "yes", "reason": "home_already_scored"})
+    return {
+        "score_sensitive_markets": len(sensitive),
+        "score_sensitive_market_names": sensitive,
+        "impossible_offers": impossible,
+    }
+
+
+def grade_oddsapiio_sample(
+    source_payload: Any,
+    *,
+    home_score: Any,
+    away_score: Any,
+) -> dict[str, Any]:
+    """Grade one Odds-API.io score + Bet365 snapshot as C/B/A."""
+    source = source_payload if isinstance(source_payload, dict) else {}
+    provider_score = source.get("score") if isinstance(source.get("score"), dict) else {}
+    try:
+        target = {"home": int(home_score), "away": int(away_score)}
+    except (TypeError, ValueError):
+        target = {"home": None, "away": None}
+    score_match = (
+        target["home"] is not None
+        and provider_score.get("home") == target["home"]
+        and provider_score.get("away") == target["away"]
+    )
+    bet365 = next(
+        (
+            b for b in (source.get("books") or [])
+            if isinstance(b, dict) and _normalize_book_key(str(b.get("book") or "")) == "bet365"
+        ),
+        {},
+    )
+    bet365_status = str(bet365.get("status") or "missing")
+    identity_verified = source.get("identity_verified") is True
+    provider_target = dict(target)
+    if str(source.get("orientation") or "") == "swapped":
+        provider_target = {"home": target["away"], "away": target["home"]}
+    inspection = inspect_bet365_impossible_markets(
+        source.get("raw"),
+        home_score=provider_target["home"],
+        away_score=provider_target["away"],
+    )
+    if not identity_verified:
+        level, reason = "C", "oddsapiio_event_identity_unverified"
+    elif score_match:
+        level, reason = "A", "oddsapiio_score_matches_target"
+    elif (
+        bet365_status == "open"
+        and inspection["score_sensitive_markets"] > 0
+        and not inspection["impossible_offers"]
+    ):
+        level, reason = "B", "bet365_open_no_impossible_markets"
+    elif bet365_status != "open":
+        level, reason = "C", f"bet365_{bet365_status}"
+    elif inspection["score_sensitive_markets"] <= 0:
+        level, reason = "C", "bet365_no_score_sensitive_markets"
+    else:
+        level, reason = "C", "bet365_has_impossible_markets"
+    return {
+        "level": level,
+        "target_usdc": GRADE_TARGET_USDC[level],
+        "reason": reason,
+        "target_score": target,
+        "provider_score": provider_score or None,
+        "score_match": bool(score_match),
+        "identity_verified": identity_verified,
+        "orientation": source.get("orientation"),
+        "bet365_status": bet365_status,
+        **inspection,
+    }
+
+
+def odds_sample_fingerprint(source_payload: Any) -> str:
+    source = source_payload if isinstance(source_payload, dict) else {}
+    material = {
+        "score": source.get("score"),
+        "event_status": source.get("event_status"),
+        "bet365_markets": _bet365_markets(source.get("raw")),
+    }
+    body = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def parse_oddsapiio_event_meta(payload: Any) -> dict[str, Any]:
     """Extract live score / clock from Odds-API.io ``/events`` or ``/events/{id}``."""
     if not isinstance(payload, dict):
@@ -673,6 +981,14 @@ def parse_oddsapiio_event_meta(payload: Any) -> dict[str, Any]:
         out["event_id"] = payload.get("id")
     if payload.get("status") is not None:
         out["event_status"] = payload.get("status")
+    event_home, event_away = _team_names_from_row(payload)
+    if event_home:
+        out["event_home"] = event_home
+    if event_away:
+        out["event_away"] = event_away
+    event_dt = _event_row_datetime(payload)
+    if event_dt is not None:
+        out["event_date"] = event_dt.isoformat()
 
     scores = payload.get("scores")
     if isinstance(scores, dict):
@@ -780,7 +1096,7 @@ def parse_oddsapiio_books(
         status = "open"
         if suspended is True:
             status = "suspended"
-        elif not markets or ml is None:
+        elif not markets:
             status = "missing"
         entry: dict[str, Any] = {"book": wanted[norm], "status": status}
         if suspended is not None:
@@ -899,8 +1215,13 @@ class _GroupState:
     home: str
     away: str
     dqd_score: dict[str, Any]
+    ev: dict[str, Any] = field(default_factory=dict)
+    af_gate: dict[str, Any] = field(default_factory=dict)
     gen: int = 0
     timers: list[threading.Timer] = field(default_factory=list)
+    highest_grade: str = "C"
+    last_fingerprint: str | None = None
+    reversed: bool = False
 
 
 class BookContextObserver:
@@ -911,12 +1232,12 @@ class BookContextObserver:
         root: Path,
         *,
         source_cfg: dict[str, Any] | None = None,
-        delay_5_s: float = DEFAULT_DELAY_5_S,
-        delay_15_s: float = DEFAULT_DELAY_15_S,
-        delay_45_s: float = DEFAULT_DELAY_45_S,
+        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+        poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S,
         workers: int = DEFAULT_WORKERS,
         http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
         min_side_sim: float = DEFAULT_MIN_SIDE_SIM,
+        events_catalog_ttl_s: float = DEFAULT_EVENTS_CATALOG_TTL_S,
         fetch_oddspapi: FetchBookFn | None = None,
         fetch_oddsapiio: FetchBookFn | None = None,
         fetch_theoddsapi: FetchBookFn | None = None,
@@ -924,14 +1245,14 @@ class BookContextObserver:
     ) -> None:
         self.root = Path(root)
         self.cfg = source_cfg if source_cfg is not None else load_source_keys(env=env)
-        self.active_sources: tuple[str, ...] = tuple(self.cfg.get("active_sources") or ())
+        self.active_sources: tuple[str, ...] = tuple(
+            s for s in (self.cfg.get("active_sources") or ()) if s == SOURCE_ODDSAPIIO
+        )
         self.keys: dict[str, str] = dict(self.cfg.get("keys") or {})
         self.oddspapi_books: tuple[str, ...] = tuple(
             self.cfg.get("oddspapi_books") or DEFAULT_ODDSPAPI_BOOKS
         )
-        self.oddsapiio_books: tuple[str, ...] = tuple(
-            self.cfg.get("oddsapiio_books") or DEFAULT_ODDS_API_IO_BOOKS
-        )
+        self.oddsapiio_books: tuple[str, ...] = DEFAULT_ODDS_API_IO_BOOKS
         self.theoddsapi_regions: tuple[str, ...] = tuple(
             self.cfg.get("theoddsapi_regions") or DEFAULT_THE_ODDS_REGIONS
         )
@@ -941,11 +1262,11 @@ class BookContextObserver:
         self.theoddsapi_discover: bool = bool(
             self.cfg.get("theoddsapi_discover", DEFAULT_THE_ODDS_DISCOVER)
         )
-        self.delay_5_s = max(0.0, float(delay_5_s))
-        self.delay_15_s = max(0.0, float(delay_15_s))
-        self.delay_45_s = max(0.0, float(delay_45_s))
+        self.poll_interval_s = max(0.01, float(poll_interval_s))
+        self.poll_timeout_s = max(self.poll_interval_s, float(poll_timeout_s))
         self.http_timeout_s = max(0.5, float(http_timeout_s))
         self.min_side_sim = float(min_side_sim)
+        self.events_catalog_ttl_s = max(0.0, float(events_catalog_ttl_s))
         self._fetch_oddspapi = fetch_oddspapi
         self._fetch_oddsapiio = fetch_oddsapiio
         self._fetch_theoddsapi = fetch_theoddsapi
@@ -953,13 +1274,31 @@ class BookContextObserver:
         self._lock = threading.Lock()
         self._by_match: dict[str, _GroupState] = {}
         self._fixture_cache: dict[str, Any] = {}
+        self._fixture_disk_lock = threading.Lock()
         self._snap_ctx: dict[str, Any] = {}
+        self._snap_local = threading.local()
+        self._upgrades: list[dict[str, Any]] = []
         self._raw_seq = 0
+        self._events_catalog_lock = threading.Lock()
+        self._events_catalog_body: Any = None
+        self._events_catalog_fetched_mono = 0.0
+        self._events_catalog_fetched_at: str | None = None
+        self._events_catalog_raw_path: str | None = None
+        self._events_catalog_status: int | None = None
+        self._events_catalog_generation = 0
+        self._events_negative_cache: dict[str, int] = {}
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limited_until_mono = 0.0
+        self._rate_limited_until_iso: str | None = None
         self._theodds_sports_keys: list[str] | None = None
         self._theodds_sports_fetched_at: float = 0.0
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, int(workers)),
             thread_name_prefix="book-ctx-obs",
+        )
+        self._http_pool = ThreadPoolExecutor(
+            max_workers=max(2, min(8, int(workers) * 2)),
+            thread_name_prefix="book-ctx-http",
         )
         self._load_fixture_cache()
 
@@ -967,12 +1306,10 @@ class BookContextObserver:
         self._stop.clear()
         set_active_observer(self)
         logger.info(
-            "book-context observe on → %s sources=%s delays=%ss/%ss/%ss",
+            "odds confirmation on → %s source=Odds-API.io book=Bet365 poll=%ss timeout=%ss",
             observe_path(self.root),
-            ",".join(self.active_sources) or "(none)",
-            self.delay_5_s,
-            self.delay_15_s,
-            self.delay_45_s,
+            self.poll_interval_s,
+            self.poll_timeout_s,
         )
 
     def stop(self) -> None:
@@ -986,6 +1323,10 @@ class BookContextObserver:
             self._pool.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             self._pool.shutdown(wait=False)
+        try:
+            self._http_pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._http_pool.shutdown(wait=False)
         if get_active_observer() is self:
             set_active_observer(None)
 
@@ -1032,13 +1373,15 @@ class BookContextObserver:
                 home=str(ev.get("home") or gate.get("home") or ""),
                 away=str(ev.get("away") or gate.get("away") or ""),
                 dqd_score=dqd_score,
+                ev=dict(ev),
+                af_gate=dict(gate),
                 gen=gen,
             )
             self._by_match[mid] = state
             self._arm_delayed(state)
         self._pool.submit(
             self._safe_snapshot,
-            PHASE_AF_CONFIRMED,
+            self._poll_phase(0.0),
             state.observe_group_id,
             mid,
             key,
@@ -1048,6 +1391,7 @@ class BookContextObserver:
             None,
             False,
             gen,
+            0.0,
         )
         return group_id
 
@@ -1068,6 +1412,10 @@ class BookContextObserver:
         with self._lock:
             linked = self._by_match.get(mid)
             if linked is not None:
+                linked.reversed = True
+                for t in linked.timers:
+                    t.cancel()
+                linked.timers.clear()
                 group_id = linked.observe_group_id
                 home_name = linked.home or str(ev.get("home") or "")
                 away_name = linked.away or str(ev.get("away") or "")
@@ -1109,23 +1457,37 @@ class BookContextObserver:
             dqd_prev,
             unlinked,
             gen,
+            None,
         )
         return group_id
 
+    def _poll_offsets(self) -> list[float]:
+        count = int(self.poll_timeout_s // self.poll_interval_s)
+        return [self.poll_interval_s * i for i in range(1, count + 1)]
+
+    @staticmethod
+    def _poll_phase(offset_s: float) -> str:
+        if offset_s <= 0:
+            return PHASE_AF_CONFIRMED
+        label = int(offset_s) if float(offset_s).is_integer() else round(offset_s, 3)
+        return f"odds_poll_{label}s"
+
     def _arm_delayed(self, state: _GroupState) -> None:
-        for delay, phase in (
-            (self.delay_5_s, PHASE_POST_5),
-            (self.delay_15_s, PHASE_POST_15),
-            (self.delay_45_s, PHASE_POST_45),
-        ):
+        for delay in self._poll_offsets():
+            phase = self._poll_phase(delay)
             gen = state.gen
 
-            def _fire(ph: str = phase, g: int = gen, mid: str = state.match_id) -> None:
+            def _fire(
+                ph: str = phase,
+                g: int = gen,
+                mid: str = state.match_id,
+                offset: float = delay,
+            ) -> None:
                 if self._stop.is_set():
                     return
                 with self._lock:
                     cur = self._by_match.get(mid)
-                    if cur is None or cur.gen != g:
+                    if cur is None or cur.gen != g or cur.reversed:
                         return
                     snap_state = cur
                 self._pool.submit(
@@ -1140,6 +1502,7 @@ class BookContextObserver:
                     None,
                     False,
                     g,
+                    offset,
                 )
 
             t = threading.Timer(delay, _fire)
@@ -1160,9 +1523,15 @@ class BookContextObserver:
         path = fixture_cache_path(self.root)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with self._lock:
-                payload = dict(self._fixture_cache)
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with self._fixture_disk_lock:
+                with self._lock:
+                    payload = dict(self._fixture_cache)
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                tmp.replace(path)
         except OSError as e:
             logger.warning("book fixture cache write failed: %s", e)
 
@@ -1172,12 +1541,47 @@ class BookContextObserver:
         return dict(row) if isinstance(row, dict) else {}
 
     def _update_cache_entry(self, match_id: str, patch: dict[str, Any]) -> None:
+        changed = False
         with self._lock:
             cur = self._fixture_cache.get(match_id)
             base = dict(cur) if isinstance(cur, dict) else {}
-            base.update(patch)
-            self._fixture_cache[match_id] = base
+            for key, value in patch.items():
+                if base.get(key) != value:
+                    base[key] = value
+                    changed = True
+            if changed:
+                self._fixture_cache[match_id] = base
+        if changed:
+            self._persist_fixture_cache()
+
+    def _clear_oddsapiio_mapping(self, match_id: str) -> None:
+        keys = {
+            "oddsapiio_event_id",
+            "oddsapiio_swapped",
+            "oddsapiio_event_date",
+            "oddsapiio_event_league",
+            "oddsapiio_event_home",
+            "oddsapiio_event_away",
+        }
+        with self._lock:
+            cur = self._fixture_cache.get(match_id)
+            if not isinstance(cur, dict):
+                return
+            row = {k: v for k, v in cur.items() if k not in keys}
+            self._fixture_cache[match_id] = row
         self._persist_fixture_cache()
+
+    def _mapping_context(self, match_id: str) -> dict[str, Any]:
+        with self._lock:
+            state = self._by_match.get(str(match_id))
+            ev = dict(state.ev) if state is not None else {}
+        kickoff = (
+            ev.get("kickoff_beijing")
+            or ev.get("kickoff")
+            or ev.get("start_time")
+            or ev.get("commence_time")
+        )
+        return {"kickoff_at": kickoff, "league": ev.get("league")}
 
     def _url_with_key(self, base: str, path: str, params: dict[str, Any], api_key: str) -> str:
         q = {k: v for k, v in params.items() if v is not None}
@@ -1192,19 +1596,46 @@ class BookContextObserver:
         match_id: str,
         event_key: str,
     ) -> None:
+        ctx = {
+            "phase": phase,
+            "observe_group_id": observe_group_id,
+            "match_id": match_id,
+            "event_key": event_key,
+        }
+        self._snap_local.ctx = ctx
         with self._lock:
-            self._snap_ctx = {
-                "phase": phase,
-                "observe_group_id": observe_group_id,
-                "match_id": match_id,
-                "event_key": event_key,
-            }
-            self._raw_seq = 0
+            # Kept for diagnostics/tests; request code uses thread-local context.
+            self._snap_ctx = dict(ctx)
+
+    def _current_snap_ctx(self) -> dict[str, Any]:
+        local = getattr(self._snap_local, "ctx", None)
+        if isinstance(local, dict):
+            return dict(local)
+        with self._lock:
+            return dict(self._snap_ctx)
 
     def _next_raw_seq(self) -> int:
         with self._lock:
             self._raw_seq += 1
             return int(self._raw_seq)
+
+    def _active_rate_limit(self) -> str | None:
+        with self._rate_limit_lock:
+            if time.monotonic() >= self._rate_limited_until_mono:
+                return None
+            return self._rate_limited_until_iso
+
+    def _note_rate_limit(self, headers: dict[str, str]) -> str:
+        delay = rate_limit_backoff_s(headers)
+        deadline_mono = time.monotonic() + delay
+        deadline_iso = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay)
+        ).isoformat(timespec="seconds")
+        with self._rate_limit_lock:
+            if deadline_mono >= self._rate_limited_until_mono:
+                self._rate_limited_until_mono = deadline_mono
+                self._rate_limited_until_iso = deadline_iso
+            return str(self._rate_limited_until_iso or deadline_iso)
 
     def _record_http(
         self,
@@ -1213,11 +1644,23 @@ class BookContextObserver:
         kind: str,
         url: str,
         inline_raw: bool,
+        snapshot_ctx: dict[str, Any] | None = None,
     ) -> tuple[int | None, Any, dict[str, str], str | None, dict[str, Any]]:
         """GET + always persist full body under ``book_context_raw/``."""
+        if source == SOURCE_ODDSAPIIO:
+            limited_until = self._active_rate_limit()
+            if limited_until:
+                return None, None, {}, "rate_limited", {
+                    "kind": kind,
+                    "url": redact_url(url),
+                    "http_status": None,
+                    "headers": {},
+                    "skipped": True,
+                    "rate_limited_until": limited_until,
+                }
         status, body, hdrs, err = _http_get_json(url, timeout_s=self.http_timeout_s)
         headers = select_response_headers(hdrs)
-        ctx = dict(self._snap_ctx)
+        ctx = dict(snapshot_ctx) if isinstance(snapshot_ctx, dict) else self._current_snap_ctx()
         seq = self._next_raw_seq()
         raw_path = persist_raw_blob(
             self.root,
@@ -1246,7 +1689,63 @@ class BookContextObserver:
             raw_path=raw_path,
             inline_raw=inline_raw,
         )
+        if source == SOURCE_ODDSAPIIO and status == 429:
+            meta["rate_limited_until"] = self._note_rate_limit(headers)
         return status, body, hdrs, err, meta
+
+    def _oddsapiio_events_catalog(
+        self,
+        *,
+        url: str,
+        snapshot_ctx: dict[str, Any],
+    ) -> tuple[int | None, Any, dict[str, str], str | None, dict[str, Any], int]:
+        """Return one process-shared football catalog; only one caller refreshes it."""
+        with self._events_catalog_lock:
+            now_mono = time.monotonic()
+            age = now_mono - self._events_catalog_fetched_mono
+            if (
+                self._events_catalog_body is not None
+                and age <= self.events_catalog_ttl_s
+            ):
+                meta: dict[str, Any] = {
+                    "kind": "events",
+                    "url": redact_url(url),
+                    "http_status": self._events_catalog_status,
+                    "headers": {},
+                    "cache_hit": True,
+                    "catalog_generation": self._events_catalog_generation,
+                    "catalog_fetched_at": self._events_catalog_fetched_at,
+                    "catalog_age_s": round(max(0.0, age), 3),
+                }
+                if self._events_catalog_raw_path:
+                    meta["raw_path"] = self._events_catalog_raw_path
+                return (
+                    self._events_catalog_status,
+                    self._events_catalog_body,
+                    {},
+                    None,
+                    meta,
+                    self._events_catalog_generation,
+                )
+
+            status, body, hdrs, err, meta = self._record_http(
+                source=SOURCE_ODDSAPIIO,
+                kind="events",
+                url=url,
+                inline_raw=False,
+                snapshot_ctx=snapshot_ctx,
+            )
+            if err is None and body is not None:
+                self._events_catalog_body = body
+                self._events_catalog_fetched_mono = time.monotonic()
+                self._events_catalog_fetched_at = lib.now_cn_iso()
+                self._events_catalog_raw_path = str(meta.get("raw_path") or "") or None
+                self._events_catalog_status = status
+                self._events_catalog_generation += 1
+                self._events_negative_cache.clear()
+            meta["cache_hit"] = False
+            meta["catalog_generation"] = self._events_catalog_generation
+            return status, body, hdrs, err, meta, self._events_catalog_generation
 
     def _default_fetch_oddspapi(self, match_id: str, home: str, away: str) -> dict[str, Any]:
         t0 = time.perf_counter()
@@ -1346,43 +1845,78 @@ class BookContextObserver:
 
     def _default_fetch_oddsapiio(self, match_id: str, home: str, away: str) -> dict[str, Any]:
         t0 = time.perf_counter()
+        snapshot_ctx = self._current_snap_ctx()
         key = self.keys.get(SOURCE_ODDSAPIIO) or ""
         if not key:
             return {"ok": False, "error": "missing_key"}
         requests_meta: list[dict[str, Any]] = []
         cache = self._cache_entry(match_id)
+        mapping_ctx = self._mapping_context(match_id)
         event_id = cache.get("oddsapiio_event_id")
         from_cache = bool(event_id)
+        swapped = bool(cache.get("oddsapiio_swapped"))
         if not event_id:
             url = self._url_with_key(ODDS_API_IO_BASE, "/events", {"sport": "football"}, key)
-            status, body, _hdrs, err, meta = self._record_http(
-                source=SOURCE_ODDSAPIIO,
-                kind="events",
-                url=url,
-                inline_raw=False,
+            status, body, _hdrs, err, meta, catalog_generation = (
+                self._oddsapiio_events_catalog(
+                    url=url,
+                    snapshot_ctx=snapshot_ctx,
+                )
             )
             requests_meta.append(meta)
             if err:
-                return {
+                out = {
                     "ok": False,
                     "error": err,
                     "http_status": status,
                     "requests": requests_meta,
                 }
+                if meta.get("rate_limited_until"):
+                    out["rate_limited_until"] = meta["rate_limited_until"]
+                return out
+            with self._events_catalog_lock:
+                negative_hit = (
+                    self._events_negative_cache.get(match_id) == catalog_generation
+                )
+            if negative_hit:
+                return {
+                    "ok": False,
+                    "error": "not_mapped",
+                    "mapping_cache": "negative",
+                    "catalog_generation": catalog_generation,
+                    "requests": requests_meta,
+                }
             rows = [r for r in _as_list(body) if isinstance(r, dict)]
-            resolved = resolve_team_match(rows, home=home, away=away, min_side=self.min_side_sim)
+            resolved = resolve_team_match(
+                rows,
+                home=home,
+                away=away,
+                min_side=self.min_side_sim,
+                kickoff_at=mapping_ctx.get("kickoff_at"),
+                league=str(mapping_ctx.get("league") or ""),
+                require_nonterminal=True,
+            )
             if not resolved.get("ok"):
+                with self._events_catalog_lock:
+                    self._events_negative_cache[match_id] = catalog_generation
                 return {
                     "ok": False,
                     "error": resolved.get("error") or "not_mapped",
                     "candidates": resolved.get("candidates"),
+                    "catalog_generation": catalog_generation,
                     "requests": requests_meta,
                 }
             event_id = resolved.get("id")
+            swapped = bool(resolved.get("swapped"))
             self._update_cache_entry(
                 match_id,
                 {
                     "oddsapiio_event_id": event_id,
+                    "oddsapiio_swapped": swapped,
+                    "oddsapiio_event_date": resolved.get("event_date"),
+                    "oddsapiio_event_league": resolved.get("event_league"),
+                    "oddsapiio_event_home": resolved.get("event_home"),
+                    "oddsapiio_event_away": resolved.get("event_away"),
                     "home": home,
                     "away": away,
                     "mapped_at": lib.now_cn_iso(),
@@ -1406,6 +1940,7 @@ class BookContextObserver:
                 kind="odds",
                 url=odds_url,
                 inline_raw=True,
+                snapshot_ctx=snapshot_ctx,
             )
 
         def _pull_event() -> tuple[Any, ...]:
@@ -1414,22 +1949,66 @@ class BookContextObserver:
                 kind="event",
                 url=event_url,
                 inline_raw=False,
+                snapshot_ctx=snapshot_ctx,
             )
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fut_odds = ex.submit(_pull_odds)
-            fut_event = ex.submit(_pull_event)
-            status, body, _hdrs, err, meta = fut_odds.result()
-            try:
-                ev_status, ev_body, _ev_hdrs, ev_err, ev_meta = fut_event.result()
-            except Exception as e:  # noqa: BLE001
-                ev_status, ev_body, ev_err, ev_meta = None, None, str(e), {}
+        fut_odds = self._http_pool.submit(_pull_odds)
+        fut_event = self._http_pool.submit(_pull_event)
+        status, body, _hdrs, err, meta = fut_odds.result()
+        try:
+            ev_status, ev_body, _ev_hdrs, ev_err, ev_meta = fut_event.result()
+        except Exception as e:  # noqa: BLE001
+            ev_status, ev_body, ev_err, ev_meta = None, None, str(e), {}
 
         requests_meta.append(meta)
         if isinstance(ev_meta, dict) and ev_meta:
             requests_meta.append(ev_meta)
 
         event_meta = parse_oddsapiio_event_meta(ev_body) if not ev_err else {}
+        # A cached orientation is useful for decoding the payload, but it is
+        # not proof that this poll still points at the intended live fixture.
+        # Only the fresh /events/{id} response may authorize an A/B grade.
+        identity_verified = False
+        identity_error: str | None = None
+        if isinstance(ev_body, dict) and (
+            event_meta.get("event_home") or event_meta.get("event_away")
+        ):
+            identity = resolve_team_match(
+                [ev_body],
+                home=home,
+                away=away,
+                min_side=self.min_side_sim,
+                kickoff_at=mapping_ctx.get("kickoff_at"),
+                league=str(mapping_ctx.get("league") or ""),
+                require_nonterminal=True,
+            )
+            if identity.get("ok") and str(identity.get("id") or "") == str(event_id):
+                swapped = bool(identity.get("swapped"))
+                identity_verified = True
+                self._update_cache_entry(
+                    match_id,
+                    {
+                        "oddsapiio_swapped": swapped,
+                        "oddsapiio_event_date": identity.get("event_date"),
+                        "oddsapiio_event_league": identity.get("event_league"),
+                        "oddsapiio_event_home": identity.get("event_home"),
+                        "oddsapiio_event_away": identity.get("event_away"),
+                    },
+                )
+            else:
+                identity_verified = False
+                identity_error = "event_identity_mismatch"
+                self._clear_oddsapiio_mapping(match_id)
+        raw_provider_score = (
+            dict(event_meta.get("score"))
+            if isinstance(event_meta.get("score"), dict)
+            else None
+        )
+        if raw_provider_score is not None and swapped:
+            event_meta["score"] = {
+                "home": raw_provider_score.get("away"),
+                "away": raw_provider_score.get("home"),
+            }
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if err:
             out_err: dict[str, Any] = {
@@ -1441,7 +2020,11 @@ class BookContextObserver:
                 "requests": requests_meta,
                 "raw": meta.get("raw"),
                 "raw_path": meta.get("raw_path"),
+                "identity_verified": identity_verified,
+                "orientation": "swapped" if swapped else "same",
             }
+            if raw_provider_score is not None:
+                out_err["provider_score_raw"] = raw_provider_score
             if event_meta.get("score") is not None:
                 out_err["score"] = event_meta["score"]
             if event_meta.get("clock") is not None:
@@ -1452,8 +2035,12 @@ class BookContextObserver:
                 out_err["event_status"] = event_meta["event_status"]
             if ev_err:
                 out_err["score_error"] = ev_err
+            elif identity_error:
+                out_err["score_error"] = identity_error
             elif ev_status is not None:
                 out_err["score_http_status"] = ev_status
+            if meta.get("rate_limited_until"):
+                out_err["rate_limited_until"] = meta["rate_limited_until"]
             return out_err
         books = parse_oddsapiio_books(body, wanted_books=self.oddsapiio_books, home=home, away=away)
         if not books:
@@ -1468,7 +2055,11 @@ class BookContextObserver:
             "requests": requests_meta,
             "raw": meta.get("raw"),
             "raw_path": meta.get("raw_path"),
+            "identity_verified": identity_verified,
+            "orientation": "swapped" if swapped else "same",
         }
+        if raw_provider_score is not None:
+            out["provider_score_raw"] = raw_provider_score
         if event_meta.get("score") is not None:
             out["score"] = event_meta["score"]
         if event_meta.get("clock") is not None:
@@ -1481,6 +2072,8 @@ class BookContextObserver:
             out["event_status"] = body.get("status")
         if ev_err:
             out["score_error"] = ev_err
+        elif identity_error:
+            out["score_error"] = identity_error
         elif event_meta.get("score") is None and not ev_err:
             # Event call ok but no scores object (pre-match / provider gap).
             out["score_error"] = "score_missing"
@@ -1672,31 +2265,14 @@ class BookContextObserver:
         return out
 
     def _fetch_all_sources(self, match_id: str, home: str, away: str) -> dict[str, Any]:
-        tasks: dict[str, Callable[[], dict[str, Any]]] = {}
-        if SOURCE_ODDSPAPI in self.active_sources:
-            fn = self._fetch_oddspapi or self._default_fetch_oddspapi
-            tasks[SOURCE_ODDSPAPI] = lambda mid=match_id, h=home, a=away, f=fn: f(mid, h, a)
-        if SOURCE_ODDSAPIIO in self.active_sources:
-            fn = self._fetch_oddsapiio or self._default_fetch_oddsapiio
-            tasks[SOURCE_ODDSAPIIO] = lambda mid=match_id, h=home, a=away, f=fn: f(mid, h, a)
-        if SOURCE_THEODDSAPI in self.active_sources:
-            fn = self._fetch_theoddsapi or self._default_fetch_theoddsapi
-            tasks[SOURCE_THEODDSAPI] = lambda mid=match_id, h=home, a=away, f=fn: f(mid, h, a)
-
-        sources: dict[str, Any] = {}
-        if not tasks:
-            return sources
-
-        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as ex:
-            fut_map = {ex.submit(call): name for name, call in tasks.items()}
-            for fut in as_completed(fut_map):
-                name = fut_map[fut]
-                try:
-                    result = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    result = {"ok": False, "error": str(e)}
-                sources[name] = result
-        return sources
+        if SOURCE_ODDSAPIIO not in self.active_sources:
+            return {}
+        fn = self._fetch_oddsapiio or self._default_fetch_oddsapiio
+        try:
+            result = fn(match_id, home, away)
+        except Exception as e:  # noqa: BLE001
+            result = {"ok": False, "error": str(e)}
+        return {SOURCE_ODDSAPIIO: result}
 
     def _safe_snapshot(
         self,
@@ -1710,6 +2286,7 @@ class BookContextObserver:
         dqd_prev: dict[str, Any] | None,
         unlinked_reversal: bool,
         gen: int,
+        poll_offset_s: float | None,
     ) -> None:
         try:
             self._write_snapshot(
@@ -1723,6 +2300,7 @@ class BookContextObserver:
                 dqd_prev=dqd_prev,
                 unlinked_reversal=unlinked_reversal,
                 gen=gen,
+                poll_offset_s=poll_offset_s,
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("book-context snapshot failed phase=%s match=%s", phase, match_id)
@@ -1742,6 +2320,11 @@ class BookContextObserver:
                             "dqd_prev": dqd_prev,
                             "sources": {},
                             "summary": {},
+                            "poll": {
+                                "offset_s": poll_offset_s,
+                                "interval_s": self.poll_interval_s,
+                                "timeout_s": self.poll_timeout_s,
+                            },
                             "unlinked_reversal": bool(unlinked_reversal),
                             "error": {"fatal": str(e)},
                         }
@@ -1763,13 +2346,14 @@ class BookContextObserver:
         dqd_prev: dict[str, Any] | None,
         unlinked_reversal: bool,
         gen: int,
+        poll_offset_s: float | None,
     ) -> None:
         if self._stop.is_set():
             return
-        if phase in (PHASE_POST_5, PHASE_POST_15, PHASE_POST_45):
+        if phase != PHASE_DQD_REVERSAL:
             with self._lock:
                 cur = self._by_match.get(match_id)
-                if cur is None or cur.gen != gen:
+                if cur is None or cur.gen != gen or cur.reversed:
                     return
 
         self._begin_snap_ctx(
@@ -1780,6 +2364,59 @@ class BookContextObserver:
         )
         sources = self._fetch_all_sources(match_id, home, away)
         summary = summarize_sources(sources)
+        odds_source = sources.get(SOURCE_ODDSAPIIO)
+        grade = grade_oddsapiio_sample(
+            odds_source,
+            home_score=dqd_score.get("home"),
+            away_score=dqd_score.get("away"),
+        )
+        fingerprint = odds_sample_fingerprint(odds_source)
+        data_changed = False
+        upgrade_emitted = False
+        previous_grade = "C"
+        if phase != PHASE_DQD_REVERSAL:
+            with self._lock:
+                cur = self._by_match.get(match_id)
+                if cur is None or cur.gen != gen or cur.reversed:
+                    return
+                previous_grade = cur.highest_grade
+                data_changed = (
+                    cur.last_fingerprint is not None and cur.last_fingerprint != fingerprint
+                )
+                cur.last_fingerprint = fingerprint
+                level = str(grade.get("level") or "C")
+                rank = GRADE_RANK.get(level, 0)
+                prior_rank = GRADE_RANK.get(cur.highest_grade, 0)
+                should_emit = rank > prior_rank
+                if rank > prior_rank:
+                    cur.highest_grade = level
+                if should_emit:
+                    upgrade_emitted = True
+                    self._upgrades.append(
+                        {
+                            "quoted_at": lib.now_cn_iso(),
+                            "observe_group_id": cur.observe_group_id,
+                            "generation": cur.gen,
+                            "match_id": cur.match_id,
+                            "event_key": cur.event_key,
+                            "ev": dict(cur.ev),
+                            "af_gate": dict(cur.af_gate),
+                            "odds_grade": dict(grade),
+                            "poll_offset_s": poll_offset_s,
+                            "data_changed": data_changed,
+                            "fingerprint": fingerprint,
+                        }
+                    )
+        else:
+            with self._lock:
+                cur = self._by_match.get(match_id)
+                if cur is not None and cur.gen == gen:
+                    previous_grade = cur.highest_grade
+                    data_changed = (
+                        cur.last_fingerprint is not None
+                        and cur.last_fingerprint != fingerprint
+                    )
+                    cur.last_fingerprint = fingerprint
         errors: dict[str, Any] = {}
         for name, payload in sources.items():
             if isinstance(payload, dict) and payload.get("error") and not payload.get("ok"):
@@ -1794,8 +2431,18 @@ class BookContextObserver:
             "home": home,
             "away": away,
             "dqd_score": dqd_score,
-            "sources": sources,
+            "sources": compact_sources_for_jsonl(sources),
             "summary": summary,
+            "poll": {
+                "offset_s": poll_offset_s,
+                "interval_s": self.poll_interval_s,
+                "timeout_s": self.poll_timeout_s,
+            },
+            "odds_grade": grade,
+            "previous_highest_grade": previous_grade,
+            "fingerprint": fingerprint,
+            "data_changed": data_changed,
+            "upgrade_emitted": upgrade_emitted,
         }
         if dqd_prev is not None:
             row["dqd_prev"] = dqd_prev
@@ -1804,3 +2451,43 @@ class BookContextObserver:
         if errors:
             row["error"] = errors
         lib.append_jsonl_async(observe_path(self.root), [row])
+
+    def drain_upgrades(self) -> list[dict[str, Any]]:
+        """Return only upgrades that still belong to a live, non-reversed goal."""
+        with self._lock:
+            queued, self._upgrades = self._upgrades, []
+            out: list[dict[str, Any]] = []
+            now_mono = time.monotonic()
+            for item in queued:
+                cur = self._by_match.get(str(item.get("match_id") or ""))
+                if cur is None or cur.reversed:
+                    continue
+                if cur.gen != item.get("generation"):
+                    continue
+                if cur.observe_group_id != item.get("observe_group_id"):
+                    continue
+                if float(item.get("retry_after_mono") or 0.0) > now_mono:
+                    self._upgrades.append(item)
+                    continue
+                out.append(item)
+            return out
+
+    def acknowledge_upgrade(self, item: dict[str, Any], *, success: bool) -> None:
+        """Ack a quote attempt; failed attempts are retried without a new grade edge."""
+        if success:
+            return
+        with self._lock:
+            mid = str(item.get("match_id") or "")
+            cur = self._by_match.get(mid)
+            if cur is None or cur.reversed:
+                return
+            if cur.gen != item.get("generation"):
+                return
+            if cur.observe_group_id != item.get("observe_group_id"):
+                return
+            retry = dict(item)
+            retry["retry_count"] = int(item.get("retry_count") or 0) + 1
+            retry["retry_after_mono"] = time.monotonic() + max(
+                1.0, min(5.0, self.poll_interval_s)
+            )
+            self._upgrades.append(retry)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: book-context observe group link, delayed phases, summary, error isolation."""
+"""Smoke: Odds-API.io/Bet365 polling, grading, upgrades, reversal cancellation."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import json
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
@@ -16,424 +16,387 @@ if str(_SCRIPTS) not in sys.path:
 
 from book_context_observe import (  # noqa: E402
     BookContextObserver,
-    DEFAULT_THE_ODDS_SPORT_KEYS,
-    get_active_observer,
+    DEFAULT_ODDS_API_IO_BOOKS,
+    DEFAULT_SOURCES,
+    grade_oddsapiio_sample,
+    inspect_bet365_impossible_markets,
     load_source_keys,
-    make_observe_group_id,
     observe_path,
-    parse_oddsapiio_event_meta,
-    persist_raw_blob,
+    parse_oddsapiio_books,
+    resolve_team_match,
     raw_dir,
     redact_url,
-    soccer_sport_keys_from_sports_payload,
-    summarize_sources,
     try_create_observer,
 )
 
 
-def _read_rows(path: Path) -> list[dict]:
-    if not path.is_file():
-        return []
-    out: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        out.append(json.loads(line))
+def _odds(markets: list[dict]) -> dict:
+    return {"status": "live", "bookmakers": {"Bet365": markets}}
+
+
+def _source(score: tuple[int, int] | None, markets: list[dict], *, ok: bool = True) -> dict:
+    raw = _odds(markets)
+    out = {
+        "ok": ok,
+        "identity_verified": True,
+        "orientation": "same",
+        "books": parse_oddsapiio_books(
+            raw, wanted_books=("Bet365",), home="Home", away="Away"
+        ),
+        "raw": raw,
+        "requests": [{"kind": "odds", "raw": raw, "raw_path": "fake.json"}],
+    }
+    if score is not None:
+        out["score"] = {"home": score[0], "away": score[1]}
     return out
 
 
-def _wait_rows(path: Path, n: int, timeout_s: float = 3.0) -> list[dict]:
-    deadline = time.monotonic() + timeout_s
+def _rows(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _wait(path: Path, count: int, timeout: float = 2.0) -> list[dict]:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        rows = _read_rows(path)
-        if len(rows) >= n:
+        rows = _rows(path)
+        if len(rows) >= count:
             return rows
-        time.sleep(0.02)
-    return _read_rows(path)
+        time.sleep(0.01)
+    return _rows(path)
 
 
 def main() -> int:
-    gid = make_observe_group_id("m1", 1, 0, "m1|0-0→1-0")
-    assert gid == "m1|1-0|m1|0-0→1-0"
-
-    assert "soccer_concacaf_leagues_cup" in DEFAULT_THE_ODDS_SPORT_KEYS
-    assert "soccer_usa_mls" in DEFAULT_THE_ODDS_SPORT_KEYS
-    assert soccer_sport_keys_from_sports_payload(
-        [
-            {"key": "soccer_epl", "active": True},
-            {"key": "basketball_nba", "active": True},
-            {"key": "soccer_usa_mls", "active": False},
-            {"key": "soccer_concacaf_leagues_cup", "active": True},
-        ]
-    ) == ["soccer_epl", "soccer_concacaf_leagues_cup"]
-
-    cfg = load_source_keys(env={})
-    assert cfg["active_sources"] == []
-    assert cfg["theoddsapi_discover"] is True
+    assert DEFAULT_SOURCES == ("oddsapiio",)
+    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365",)
+    assert load_source_keys(env={})["active_sources"] == []
     assert try_create_observer(Path("/tmp"), env={}) is None
-
-    cfg_disc = load_source_keys(
-        env={"THE_ODDS_API_KEY": "k3", "BOOK_THE_ODDS_DISCOVER_SPORTS": "0"}
-    )
-    assert cfg_disc["theoddsapi_discover"] is False
-    assert cfg_disc["active_sources"] == ["theoddsapi"]
-    assert "us" in cfg_disc["theoddsapi_regions"]
-
-    cfg_books = load_source_keys(
-        env={"ODDS_API_IO_KEY": "k2", "BOOK_ODDS_API_IO_BOOKS": "Bet365,DraftKings"}
-    )
-    assert cfg_books["oddsapiio_books"] == ("Bet365", "DraftKings")
-    assert load_source_keys(env={"ODDS_API_IO_KEY": "k2"})["oddsapiio_books"] == (
-        "Bet365",
-        "DraftKings",
-    )
-
-    meta_sc = parse_oddsapiio_event_meta(
-        {
-            "id": 99,
-            "status": "live",
-            "scores": {"home": 0, "away": 3, "periods": {"p1": {"home": 0, "away": 1}}},
-            "clock": {"minute": 88, "running": True, "statusDetail": "2nd half"},
-        }
-    )
-    assert meta_sc["score"] == {"home": 0, "away": 3}
-    assert meta_sc["clock"]["minute"] == 88
-    assert meta_sc["event_status"] == "live"
-    assert parse_oddsapiio_event_meta(None) == {}
-    assert parse_oddsapiio_event_meta({"status": "pending"})["event_status"] == "pending"
-
-    cfg2 = load_source_keys(
+    cfg = load_source_keys(
         env={
-            "ODDSPAPI_KEY": "k1",
-            "ODDS_API_IO_KEY": "k2",
-            "THE_ODDS_API_KEY": "k3",
-            "BOOK_OBSERVE_SOURCES": "oddspapi,oddsapiio",
+            "ODDS_API_IO_KEY": "io",
+            "ODDSPAPI_KEY": "ignored",
+            "THE_ODDS_API_KEY": "ignored",
+            "BOOK_OBSERVE_SOURCES": "oddspapi,theoddsapi",
+            "BOOK_ODDS_API_IO_BOOKS": "Bet365,DraftKings",
         }
     )
-    assert cfg2["active_sources"] == ["oddspapi", "oddsapiio"]
+    assert cfg["active_sources"] == ["oddsapiio"]
+    assert cfg["oddsapiio_books"] == ("Bet365",)
 
-    summary = summarize_sources(
+    # Same-team catalogs may contain settled historical fixtures. Kickoff and
+    # status must select the current event, and reversed provider sides are explicit.
+    mapping_rows = [
         {
-            "oddspapi": {
-                "ok": True,
-                "books": [{"book": "pinnacle", "status": "suspended"}],
-            },
-            "oddsapiio": {
-                "ok": True,
-                "books": [{"book": "Bet365", "status": "missing"}],
-            },
-            "theoddsapi": {
-                "ok": False,
-                "error": "quota",
-                "books": [{"book": "any", "status": "error"}],
-            },
-        }
+            "id": "old",
+            "home": "Home",
+            "away": "Away",
+            "date": "2026-08-12T23:00:00Z",
+            "status": "settled",
+        },
+        {
+            "id": "live",
+            "home": "Home",
+            "away": "Away",
+            "date": "2026-08-13T23:00:00Z",
+            "status": "live",
+        },
+    ]
+    mapped = resolve_team_match(
+        mapping_rows,
+        home="Home",
+        away="Away",
+        kickoff_at="2026-08-14 07:00",
+        require_nonterminal=True,
     )
-    assert summary["any_suspended"] is True
-    assert summary["any_missing"] is True
-    assert summary["quorum_suspended"] is True
-    assert set(summary["ok_sources"]) == {"oddspapi", "oddsapiio"}
+    assert mapped["id"] == "live" and mapped["time_delta_s"] == 0.0
+    swapped_map = resolve_team_match(
+        [{"id": "sw", "home": "Away", "away": "Home", "status": "live"}],
+        home="Home",
+        away="Away",
+        require_nonterminal=True,
+    )
+    assert swapped_map["ok"] and swapped_map["swapped"] is True
 
-    assert "REDACTED" in redact_url("https://api.example/v4/odds?apiKey=SECRET&x=1")
-    assert "SECRET" not in redact_url("https://api.example/v4/odds?apiKey=SECRET&x=1")
+    clean = [
+        {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
+        {"name": "Correct Score", "odds": [{"label": "1-0", "odds": "5"}, {"label": "2-0", "odds": "7"}]},
+        {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.8", "under": "2"}]},
+    ]
+    clean_changed = [
+        clean[0],
+        clean[1],
+        {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.7", "under": "2.1"}]},
+    ]
+    impossible = [
+        {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
+        {"name": "Correct Score", "odds": [{"label": "0-0", "odds": "9"}]},
+    ]
+    b = grade_oddsapiio_sample(_source((0, 0), clean), home_score=1, away_score=0)
+    assert b["level"] == "B" and b["target_usdc"] == 2.0
+    a = grade_oddsapiio_sample(_source((1, 0), impossible), home_score=1, away_score=0)
+    assert a["level"] == "A" and a["target_usdc"] == 3.0
+    unverified = _source((1, 0), clean)
+    unverified["identity_verified"] = False
+    assert grade_oddsapiio_sample(unverified, home_score=1, away_score=0)["level"] == "C"
+    c_bad = grade_oddsapiio_sample(_source((0, 0), impossible), home_score=1, away_score=0)
+    assert c_bad["level"] == "C" and c_bad["impossible_offers"]
+    c_ml = grade_oddsapiio_sample(
+        _source((0, 0), [clean[0]]), home_score=1, away_score=0
+    )
+    assert c_ml["level"] == "C" and c_ml["reason"] == "bet365_no_score_sensitive_markets"
+    btts_bad = inspect_bet365_impossible_markets(
+        _odds([{"name": "Both Teams To Score", "odds": [{"yes": "1.2", "no": "4"}]}]),
+        home_score=1,
+        away_score=1,
+    )
+    assert btts_bad["impossible_offers"][0]["offer"] == "no"
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        (root / "data" / "pm-quote").mkdir(parents=True)
         path = observe_path(root)
-        calls = {"oddspapi": 0, "oddsapiio": 0, "theoddsapi": 0}
-        obs_holder: dict[str, BookContextObserver] = {}
+        sequence = [
+            _source((0, 0), impossible),  # C
+            _source((0, 0), clean),       # B
+            _source((1, 0), clean),       # A
+            _source((1, 0), clean_changed),  # changed data, remains A
+        ]
+        calls = 0
 
-        def _persist_fake(source: str, kind: str, body: Any) -> tuple[str, dict]:
-            obs = obs_holder["obs"]
-            ctx = dict(obs._snap_ctx)
-            seq = obs._next_raw_seq()
-            raw_path = persist_raw_blob(
-                root,
-                source=source,
-                kind=kind,
-                match_id=str(ctx.get("match_id") or "m1"),
-                phase=str(ctx.get("phase") or "af_confirmed"),
-                observe_group_id=str(ctx.get("observe_group_id") or ""),
-                seq=seq,
-                record={
-                    "url": "https://example.test/odds?apiKey=REDACTED",
-                    "http_status": 200,
-                    "headers": {},
-                    "error": None,
-                    "body": body,
-                },
-            )
-            return raw_path, body
-
-        def fetch_oddspapi(mid: str, home: str, away: str) -> dict:
-            calls["oddspapi"] += 1
-            assert mid == "m1"
-            body = {
-                "bookmakers": [
-                    {"name": "pinnacle", "suspended": True},
-                    {"name": "singbet", "markets": [{"key": "h2h", "outcomes": []}]},
-                ]
-            }
-            raw_path, raw = _persist_fake("oddspapi", "odds", body)
-            return {
-                "ok": True,
-                "fixture_id": "op-1",
-                "books": [
-                    {"book": "pinnacle", "status": "suspended", "suspended": True},
-                    {"book": "singbet", "status": "open", "ml": {"home": 1.9}},
-                ],
-                "raw": raw,
-                "raw_path": raw_path,
-                "requests": [
-                    {
-                        "kind": "odds",
-                        "raw_path": raw_path,
-                        "raw": raw,
-                        "http_status": 200,
-                    }
-                ],
-            }
-
-        def fetch_oddsapiio(mid: str, home: str, away: str) -> dict:
-            calls["oddsapiio"] += 1
-            body = {"bookmakers": []}
-            raw_path, raw = _persist_fake("oddsapiio", "odds", body)
-            return {
-                "ok": True,
-                "event_id": "io-1",
-                "books": [{"book": "Bet365", "status": "missing"}],
-                "score": {"home": 1, "away": 0},
-                "clock": {"minute": 55, "running": True},
-                "event_status": "live",
-                "raw": raw,
-                "raw_path": raw_path,
-                "requests": [{"kind": "odds", "raw_path": raw_path, "raw": raw}],
-            }
-
-        def fetch_theoddsapi(mid: str, home: str, away: str) -> dict:
-            calls["theoddsapi"] += 1
-            body = {"bookmakers": [{"key": "betfair", "markets": []}]}
-            raw_path, raw = _persist_fake("theoddsapi", "odds", body)
-            return {
-                "ok": True,
-                "event_id": "toa-1",
-                "books": [{"book": "betfair", "status": "open"}],
-                "raw": raw,
-                "raw_path": raw_path,
-                "requests": [{"kind": "odds", "raw_path": raw_path, "raw": raw}],
-            }
+        def fetch(_mid: str, _home: str, _away: str) -> dict:
+            nonlocal calls
+            row = sequence[min(calls, len(sequence) - 1)]
+            calls += 1
+            return row
 
         obs = BookContextObserver(
             root,
             source_cfg={
                 "active_sources": ["oddspapi", "oddsapiio", "theoddsapi"],
-                "keys": {
-                    "oddspapi": "k1",
-                    "oddsapiio": "k2",
-                    "theoddsapi": "k3",
-                },
+                "keys": {"oddsapiio": "io"},
+                "oddsapiio_books": ("Bet365", "DraftKings"),
             },
-            delay_5_s=0.05,
-            delay_15_s=0.08,
-            delay_45_s=0.12,
-            fetch_oddspapi=fetch_oddspapi,
-            fetch_oddsapiio=fetch_oddsapiio,
-            fetch_theoddsapi=fetch_theoddsapi,
+            poll_interval_s=0.03,
+            poll_timeout_s=0.09,
+            fetch_oddsapiio=fetch,
         )
-        obs_holder["obs"] = obs
+        assert obs.active_sources == ("oddsapiio",)
+        assert obs.oddsapiio_books == ("Bet365",)
         obs.start()
-        assert get_active_observer() is obs
-
-        ev = {
-            "match_id": "m1",
-            "home": "Home FC",
-            "away": "Away FC",
-            "home_score": 1,
-            "away_score": 0,
-        }
-        gate = {
-            "confirmed": True,
-            "goals": {"home": 1, "away": 0},
-            "home_score": 1,
-            "away_score": 0,
-        }
-        group = obs.on_af_confirmed(
-            root,
+        obs.on_af_confirmed(
             match_id="m1",
-            event_key="m1|0-0→1-0",
-            ev=ev,
-            af_gate=gate,
+            event_key="score_change|m1|0-0->1-0",
+            ev={"type": "score_change", "match_id": "m1", "home": "Home", "away": "Away", "home_score": 1, "away_score": 0},
+            af_gate={"confirmed": True, "goals": {"home": 1, "away": 0}},
         )
-        assert group == "m1|1-0|m1|0-0→1-0"
-
-        rows = _wait_rows(path, 1)
-        assert len(rows) >= 1, f"expected immediate row, got {len(rows)}"
-        r0 = rows[0]
-        assert r0["phase"] == "af_confirmed"
-        assert r0["observe_group_id"] == group
-        assert r0["sources"]["oddspapi"]["books"][0]["status"] == "suspended"
-        assert r0["summary"]["any_suspended"] is True
-        assert r0["sources"]["oddsapiio"]["score"] == {"home": 1, "away": 0}
-        assert r0["sources"]["oddsapiio"]["clock"]["minute"] == 55
-        assert "error" not in r0
-        assert r0["sources"]["oddspapi"].get("raw_path")
-        assert r0["sources"]["oddspapi"].get("raw") is not None
-        raw_files = list(raw_dir(root).glob("*.json"))
-        assert len(raw_files) >= 3, f"expected raw dumps, got {len(raw_files)}"
-        sample = json.loads(raw_files[0].read_text(encoding="utf-8"))
-        assert "body" in sample
-        assert sample.get("source")
-
-        rows = _wait_rows(path, 4, timeout_s=2.0)
-        phases = {r["phase"] for r in rows}
-        assert "post_confirm_5s" in phases, phases
-        assert "post_confirm_15s" in phases, phases
-        assert "post_confirm_45s" in phases, phases
-        assert all(r["observe_group_id"] == group for r in rows)
-
-        rev_ev = {
-            "match_id": "m1",
-            "home": "Home FC",
-            "away": "Away FC",
-            "home_score": 0,
-            "away_score": 0,
-            "prev": {"home": 1, "away": 0},
-            "curr": {"home": 0, "away": 0},
-            "is_reversal": True,
-        }
-        g2 = obs.on_dqd_reversal(
-            root, match_id="m1", event_key="m1|1-0→0-0", ev=rev_ev
-        )
-        assert g2 == group
-        rows = _wait_rows(path, 5, timeout_s=2.0)
-        rev_rows = [r for r in rows if r["phase"] == "dqd_reversal"]
-        assert len(rev_rows) >= 1
-        assert rev_rows[0]["observe_group_id"] == group
-        assert rev_rows[0].get("unlinked_reversal") is not True
-        assert rev_rows[0]["dqd_prev"] == {"home": 1, "away": 0}
-        assert calls["oddspapi"] >= 4
-
+        rows = _wait(path, 4)
+        assert len(rows) == 4, len(rows)
+        assert [r["poll"]["offset_s"] for r in rows] == [0.0, 0.03, 0.06, 0.09]
+        assert [r["odds_grade"]["level"] for r in rows] == ["C", "B", "A", "A"]
+        assert rows[1]["data_changed"] is True and rows[1]["upgrade_emitted"] is True
+        assert rows[2]["upgrade_emitted"] is True
+        assert rows[3]["data_changed"] is True and rows[3]["upgrade_emitted"] is False
+        stored_source = rows[3]["sources"]["oddsapiio"]
+        assert "raw" not in stored_source
+        assert all("raw" not in req for req in stored_source["requests"])
+        upgrades = obs.drain_upgrades()
+        assert [u["odds_grade"]["level"] for u in upgrades] == ["B", "A"]
+        obs.acknowledge_upgrade(upgrades[-1], success=False)
+        with obs._lock:
+            obs._upgrades[-1]["retry_after_mono"] = 0.0
+        retried = obs.drain_upgrades()
+        assert len(retried) == 1 and retried[0]["odds_grade"]["level"] == "A"
+        assert retried[0]["retry_count"] == 1
+        obs.acknowledge_upgrade(retried[0], success=True)
+        assert obs.drain_upgrades() == []
         obs.stop()
-        assert get_active_observer() is None
 
-        # Live _record_http path (patched transport) must dump body to disk
+        # Production schedule is 0 plus twelve delayed samples: 0/5/.../60.
+        sched = BookContextObserver(
+            root,
+            source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            fetch_oddsapiio=fetch,
+        )
+        assert sched._poll_offsets() == [float(x) for x in range(5, 61, 5)]
+        sched.stop()
+
+        # A reversal cancels all remaining polls and suppresses queued upgrades.
+        rev_obs = BookContextObserver(
+            root,
+            source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            poll_interval_s=0.05,
+            poll_timeout_s=0.2,
+            fetch_oddsapiio=lambda *_: _source((1, 0), clean),
+        )
+        before = len(_rows(path))
+        rev_obs.start()
+        rev_obs.on_af_confirmed(
+            match_id="m2",
+            event_key="score_change|m2|0-0->1-0",
+            ev={"type": "score_change", "match_id": "m2", "home": "Home", "away": "Away", "home_score": 1, "away_score": 0},
+            af_gate={"confirmed": True},
+        )
+        rev_obs.on_dqd_reversal(
+            match_id="m2",
+            event_key="score_change|m2|1-0->0-0",
+            ev={"home_score": 0, "away_score": 0, "prev": {"home": 1, "away": 0}},
+        )
+        time.sleep(0.25)
+        after = _rows(path)[before:]
+        assert any(r["phase"] == "dqd_reversal" for r in after)
+        assert not any(r.get("poll", {}).get("offset_s", 0) not in (0, None) for r in after)
+        assert rev_obs.drain_upgrades() == []
+        rev_obs.stop()
+
+        # HTTP helper always persists the full body and redacts the key.
         import book_context_observe as bco
 
-        def fake_http(url: str, *, timeout_s: float = 12.0, headers=None):
-            return (
-                200,
-                {"bookmakers": [{"name": "pinnacle", "suspended": True}]},
-                {"x-requests-remaining": "42", "content-type": "application/json"},
-                None,
-            )
-
-        prev_http = bco._http_get_json
-        bco._http_get_json = fake_http  # type: ignore[assignment]
+        old_http = bco._http_get_json
+        bco._http_get_json = lambda *_args, **_kw: (200, _odds(clean), {}, None)
         try:
-            obs_http = BookContextObserver(
+            raw_obs = BookContextObserver(
                 root,
-                source_cfg={
-                    "active_sources": ["oddspapi"],
-                    "keys": {"oddspapi": "k1", "oddsapiio": "", "theoddsapi": ""},
-                },
-                delay_5_s=60.0,
-                delay_15_s=60.0,
-                delay_45_s=60.0,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+                fetch_oddsapiio=fetch,
             )
-            obs_http._begin_snap_ctx(
-                phase="af_confirmed",
-                observe_group_id="g-raw",
-                match_id="m_raw",
-                event_key="ek",
-            )
-            before_n = len(list(raw_dir(root).glob("*.json")))
-            _st, body, _h, err, meta = obs_http._record_http(
-                source="oddspapi",
+            raw_obs._begin_snap_ctx(phase="test", observe_group_id="g", match_id="raw", event_key="e")
+            _status, body, _headers, err, meta = raw_obs._record_http(
+                source="oddsapiio",
                 kind="odds",
-                url="https://api.oddspapi.io/v4/odds?apiKey=SECRET123&fixtureId=1",
+                url="https://api.odds-api.io/v3/odds?apiKey=SECRET&eventId=1",
                 inline_raw=True,
             )
-            assert err is None
-            assert body and meta["raw_path"]
-            assert "SECRET123" not in meta["url"]
-            assert meta["raw"]["bookmakers"][0]["suspended"] is True
-            after_files = list(raw_dir(root).glob("*.json"))
-            assert len(after_files) == before_n + 1
-            dumped = json.loads(
-                (root / "data" / "pm-quote" / meta["raw_path"]).read_text(encoding="utf-8")
+            assert err is None and body and meta["raw_path"]
+            assert "SECRET" not in meta["url"] and "REDACTED" in redact_url(meta["url"])
+            assert list(raw_dir(root).glob("*.json"))
+            raw_obs._begin_snap_ctx(phase="same", observe_group_id="g1", match_id="same", event_key="e1")
+            first_unique = raw_obs._record_http(
+                source="oddsapiio", kind="odds", url="https://example/odds?apiKey=x", inline_raw=False
             )
-            assert dumped["body"]["bookmakers"][0]["suspended"] is True
-            assert "SECRET123" not in dumped["url"]
-            obs_http.stop()
+            raw_obs._begin_snap_ctx(phase="same", observe_group_id="g2", match_id="same", event_key="e2")
+            second_unique = raw_obs._record_http(
+                source="oddsapiio", kind="odds", url="https://example/odds?apiKey=x", inline_raw=False
+            )
+            assert first_unique[4]["raw_path"] != second_unique[4]["raw_path"]
+            raw_obs.stop()
         finally:
-            bco._http_get_json = prev_http
+            bco._http_get_json = old_http
 
-        path2 = observe_path(root)
+        # Events catalog is shared across matches; misses are cached per catalog
+        # generation, and raw HTTP bodies remain available via raw_path only.
+        http_calls = {"catalog": 0, "odds": 0, "event": 0}
 
-        def boom_oddspapi(mid: str, home: str, away: str) -> dict:
-            return {"ok": False, "error": "oddspapi_down"}
+        def catalog_http(url: str, **_kw: object) -> tuple:
+            if "/events?" in url and "sport=football" in url:
+                http_calls["catalog"] += 1
+                return 200, [{"id": "e1", "homeTeam": "Home", "awayTeam": "Away"}], {}, None
+            if "/odds?" in url:
+                http_calls["odds"] += 1
+                return 200, _odds(clean), {}, None
+            http_calls["event"] += 1
+            return 200, {"id": "e1", "status": "live", "scores": {"home": 1, "away": 0}}, {}, None
 
-        def boom_oddsapiio(mid: str, home: str, away: str) -> dict:
-            raise RuntimeError("oddsapiio_boom")
+        bco._http_get_json = catalog_http
+        try:
+            cache_obs = BookContextObserver(
+                root,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            )
+            cache_obs._begin_snap_ctx(phase="test", observe_group_id="g1", match_id="cat1", event_key="e1")
+            first = cache_obs._default_fetch_oddsapiio("cat1", "Home", "Away")
+            cache_obs._begin_snap_ctx(phase="test", observe_group_id="g2", match_id="cat2", event_key="e2")
+            second = cache_obs._default_fetch_oddsapiio("cat2", "Home", "Away")
+            assert first["ok"] and second["ok"] and http_calls["catalog"] == 1, http_calls
+            assert second["requests"][0]["cache_hit"] is True
+            # The event response above has a score but no team identity.  A
+            # catalog/cache match alone must never authorize A/B for this poll.
+            assert first["identity_verified"] is False
+            assert grade_oddsapiio_sample(first, home_score=1, away_score=0)["level"] == "C"
 
-        def boom_theodds(mid: str, home: str, away: str) -> dict:
-            return {"ok": False, "error": "theodds_quota"}
+            cache_obs._begin_snap_ctx(phase="test", observe_group_id="g3", match_id="missing", event_key="e3")
+            miss1 = cache_obs._default_fetch_oddsapiio("missing", "Unknown", "Nobody")
+            miss2 = cache_obs._default_fetch_oddsapiio("missing", "Unknown", "Nobody")
+            assert miss1["error"] == "not_mapped"
+            assert miss2.get("mapping_cache") == "negative"
+            assert http_calls["catalog"] == 1, http_calls
+            cache_obs.stop()
+        finally:
+            bco._http_get_json = old_http
 
-        obs2 = BookContextObserver(
-            root,
-            source_cfg={
-                "active_sources": ["oddspapi", "oddsapiio", "theoddsapi"],
-                "keys": {
-                    "oddspapi": "k1",
-                    "oddsapiio": "k2",
-                    "theoddsapi": "k3",
-                },
-            },
-            delay_5_s=60.0,
-            delay_15_s=60.0,
-            delay_45_s=60.0,
-            fetch_oddspapi=boom_oddspapi,
-            fetch_oddsapiio=boom_oddsapiio,
-            fetch_theoddsapi=boom_theodds,
-        )
-        obs2.start()
-        before = len(_read_rows(path2))
-        obs2.on_af_confirmed(
-            root,
-            match_id="m2",
-            event_key="m2|0-0→1-0",
-            ev={"home_score": 1, "away_score": 0, "home": "H", "away": "A"},
-            af_gate={"goals": {"home": 1, "away": 0}},
-        )
-        rows2 = _wait_rows(path2, before + 1, timeout_s=2.0)
-        assert len(rows2) >= before + 1
-        err_row = rows2[-1]
-        assert err_row["phase"] == "af_confirmed"
-        assert "error" in err_row
-        assert "oddspapi" in err_row["error"]
-        assert "oddsapiio" in err_row["error"]
-        assert "theoddsapi" in err_row["error"]
+        # End-to-end provider-side reversal: preserve the raw score but grade
+        # against the score normalized back into the DQD home/away frame.
+        def swapped_http(url: str, **_kw: object) -> tuple:
+            event = {
+                "id": "sw",
+                "homeTeam": "Away",
+                "awayTeam": "Home",
+                "date": "2026-08-13T23:00:00Z",
+                "status": "live",
+                "scores": {"home": 0, "away": 1},
+            }
+            if "/events?" in url:
+                return 200, [event], {}, None
+            if "/odds?" in url:
+                return 200, _odds(clean), {}, None
+            return 200, event, {}, None
 
-        g_un = obs2.on_dqd_reversal(
-            root,
-            match_id="m_orphan",
-            event_key="x",
-            ev={
-                "home_score": 0,
-                "away_score": 0,
-                "prev": {"home": 1, "away": 0},
-                "home": "H",
-                "away": "A",
-            },
-        )
-        assert g_un is not None
-        rows3 = _wait_rows(path2, before + 2, timeout_s=2.0)
-        orphan = [r for r in rows3 if r.get("match_id") == "m_orphan"]
-        assert orphan and orphan[0].get("unlinked_reversal") is True
-        obs2.stop()
+        bco._http_get_json = swapped_http
+        try:
+            swapped_obs = BookContextObserver(
+                root,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            )
+            swapped_obs._begin_snap_ctx(
+                phase="test", observe_group_id="swg", match_id="swm", event_key="swe"
+            )
+            swapped_source = swapped_obs._default_fetch_oddsapiio("swm", "Home", "Away")
+            assert swapped_source["identity_verified"] is True
+            assert swapped_source["orientation"] == "swapped"
+            assert swapped_source["provider_score_raw"] == {"home": 0, "away": 1}
+            assert swapped_source["score"] == {"home": 1, "away": 0}
+            assert grade_oddsapiio_sample(
+                swapped_source, home_score=1, away_score=0
+            )["level"] == "A"
+            swapped_obs.stop()
+        finally:
+            bco._http_get_json = old_http
 
-    print("ok: book_context_observe group/phases/summary/raw/error isolation")
+        # A 429 arms one shared backoff; subsequent samples are recorded as
+        # skipped and do not perform another HTTP request.
+        rate_calls = {"n": 0}
+
+        def rate_http(*_args: object, **_kw: object) -> tuple:
+            rate_calls["n"] += 1
+            return 429, {"message": "limited"}, {"retry-after": "30"}, "http_429"
+
+        bco._http_get_json = rate_http
+        try:
+            reset_now = datetime.fromisoformat("2026-08-13T19:09:50+00:00").timestamp()
+            assert bco.rate_limit_backoff_s(
+                {"x-ratelimit-reset": "2026-08-13T19:45:57Z"}, now_epoch=reset_now
+            ) == 2167.0
+            assert bco.rate_limit_backoff_s(
+                {"x-ratelimit-reset": str(reset_now - 10)}, now_epoch=reset_now
+            ) == 60.0
+            rate_obs = BookContextObserver(
+                root,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            )
+            rate_obs._begin_snap_ctx(phase="test", observe_group_id="rg", match_id="rate", event_key="re")
+            first_http = rate_obs._record_http(
+                source="oddsapiio", kind="odds", url="https://example/odds?apiKey=x", inline_raw=False
+            )
+            second_http = rate_obs._record_http(
+                source="oddsapiio", kind="event", url="https://example/event?apiKey=x", inline_raw=False
+            )
+            assert first_http[0] == 429 and first_http[4].get("rate_limited_until")
+            assert second_http[3] == "rate_limited" and second_http[4].get("skipped") is True
+            assert rate_calls["n"] == 1
+            rate_obs.stop()
+        finally:
+            bco._http_get_json = old_http
+
+    print("ok: Odds-API.io Bet365 polling/grading/upgrades/reversal/raw")
     return 0
 
 

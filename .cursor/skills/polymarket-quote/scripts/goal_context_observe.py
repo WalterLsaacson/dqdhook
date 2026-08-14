@@ -19,7 +19,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 import quote_lib as lib
 
@@ -48,9 +48,9 @@ PHASE_POST_15 = "post_confirm_15s"
 PHASE_POST_45 = "post_confirm_45s"
 PHASE_DQD_REVERSAL = "dqd_reversal"
 
-FetchOverviewFn = Callable[[str], dict[str, Any]]
-FetchAfFn = Callable[[str], dict[str, Any]]
-FetchListFn = Callable[[str], dict[str, Any]]
+FetchOverviewFn = Callable[[str], Dict[str, Any]]
+FetchAfFn = Callable[[str], Dict[str, Any]]
+FetchListFn = Callable[[str], Dict[str, Any]]
 
 _active: "GoalContextObserver | None" = None
 _active_lock = threading.Lock()

@@ -135,7 +135,7 @@ def prune_jsonl(
 
 
 def prune_market_cache(cache: MarketCatalogCache) -> dict[str, int | str]:
-    """Drop finished / orphan catalog files not needed for open paired fixtures.
+    """Drop orphan or consumed-FT catalogs; retain unfinished FT work.
 
     Skips entirely when matches.json is missing, malformed, or has zero rows so
     a transient empty snapshot cannot wipe the whole cache.
@@ -165,7 +165,28 @@ def prune_market_cache(cache: MarketCatalogCache) -> dict[str, int | str]:
             "skipped": "empty_matches",
         }
 
-    active_open: set[str] = set()
+    cursor = lib.load_cursor(cache.root)
+    processed_ft_ids = {
+        str(x)
+        for x in (cursor.get("processed_ft_match_ids") or [])
+        if x is not None and str(x).strip()
+    }
+    unprocessed_ft_ids: set[str] = set()
+    events_path = lib.bridge_dir(cache.root) / "events.jsonl"
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "match_finished":
+                continue
+            mid = str(event.get("match_id") or "")
+            if mid and mid not in processed_ft_ids:
+                unprocessed_ft_ids.add(mid)
+    except OSError:
+        pass
+    active_needed: set[str] = set(unprocessed_ft_ids)
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -173,22 +194,26 @@ def prune_market_cache(cache: MarketCatalogCache) -> dict[str, int | str]:
         mid = str(dqd.get("id") or "")
         if not mid:
             continue
-        if _match_finished_row(row):
-            continue
         pm_h = row.get("polymarket") or {}
-        if pm_h.get("event_id") or pm_h.get("slug"):
-            active_open.add(mid)
+        if not (pm_h.get("event_id") or pm_h.get("slug")):
+            continue
+        if not _match_finished_row(row) or mid not in processed_ft_ids:
+            active_needed.add(mid)
 
     dropped = 0
     scanned = 0
     for path in list(cache.dir.glob("*.json")):
         scanned += 1
         mid = path.stem
-        if mid in active_open:
+        if mid in active_needed:
             continue
         cache.drop(mid)
         dropped += 1
-    return {"scanned": scanned, "dropped": dropped, "active_open": len(active_open)}
+    return {
+        "scanned": scanned,
+        "dropped": dropped,
+        "active_open": len(active_needed),
+    }
 
 
 def prune_runtime_data(

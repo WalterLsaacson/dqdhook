@@ -19,7 +19,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 - AF 确认目标比分（或已覆盖该次上涨）→ `_quote_one` 下单
 - 超时（默认 **90s**）→ `mode=af_unconfirmed`，**不 flatten**
-- 中间 poll **不**写 burst；确认时写一次
+- 确认 poll **不**额外写 burst；成功后只异步保存 confirmed score
 - 429 / SSL 等瞬态错误退避重试（不烧 poll 槽）
 - 懂球帝 **回撤** → 取消 pending AF + 立即 flatten + 按修正比分询价
 - 终场确认失败 → `mode=af_ft_unconfirmed` / `ft_stale`（无 flatten）
@@ -79,15 +79,15 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
    - `match_finished` — AF **regulation** fulltime gate (`score.fulltime`; ET/pen ignored), then moneyline + props + exact; stale / once-per-match skip.
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **AF referee (gate default)**: on goal-up, **async** poll AF events (**3s → every 1s until 60s → every 2s until timeout**, default 90s — schedule is the contract; no shared multi-second throttle between ticks; optional per-worker `QUOTE_AF_MIN_INTERVAL_S`). `cache_only`, `wait_cache` on late fixture mapping. Confirm → quote+trade on AF score; timeout/miss → ignore (no buy, no flatten). DQD score reversals cancel pending AF jobs + flatten + requote if a lot exists. Aggressive `--af-postcheck-trade`: buy on DQD immediately, flatten on AF timeout. Live quoting uses **one** CLOB `/books` POST then totals/BTTS before exact.
-5. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Cache drops on `match_finished`.
+5. **Latency path**: watch wakes on `events.jsonl` mtime/size (poll ~50ms; `--interval` / `QUOTE_INTERVAL` default **0.25s** max idle). After bridge match, a warmer fills `data/pm-quote/market_cache/{match_id}.json` (Gamma catalog only — not live prices). Live quote settles from cache, then CLOB books via urllib; **totals/BTTS trade first**, then exact. Finished-match cache survives the AF FT wait and drops after the FT quote is consumed.
 6. Read quote output from stdout `--json` or `data/pm-quote/latest.json`.
 7. Treat `opportunities[]` as fee-aware edges (`net_edge ≥ 0.0076` default ≈ ask≤0.992).
 8. On misprice, executor plans fills (`--take-depth top|walk`) and writes `trades.jsonl`; `--live` or per-signal `--goals-mode`/`--ft-mode` posts market **FAK** via `py-clob-client-v2`.
 9. **CLOB `delayed`**: treat as accepted fill — register open lot immediately (poll balance briefly) so later FT flatten can fire.
 10. **Post-goal samples (data only)**: when `score_change` produces a successful `buy_win` (dry or live), write that quote as sample 0 and background-requote the same tokens at +10s…+50s (6 total) into `post_goal_samples.jsonl` — no extra `maybe_trade`. Jobs run in **parallel**; follow-ups re-read score and recompute settlement.
-11. **Goal-context observe (data only)**: after AF goal confirm, snapshot DQD overview + AF live fixture status + list `team_*_event` 旁证 at confirm / +15s / +45s, and again on DQD reversal (same `observe_group_id`) into `goal_context_observe.jsonl`. Does **not** gate buys or flatten.
+11. **No post-confirm DQD/AF research polling**: AF is queried only for the required second confirmation. After confirmation, the old DQD overview + AF fixture/list sampling is disabled; `goal_context_observe.jsonl` is historical data only.
 12. **Live Score API observe (trial, data only)**: when `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET` are set, same phases also pull LSA live resolve + raw `matches/events` + raw `commentary/events` into `livescore_observe.jsonl` (trial: score/VAR focus, not `KICK_OFF`). Does **not** gate buys or flatten.
-13. **Book-context observe (data only)**: when any of `ODDSPAPI_KEY` / `ODDS_API_IO_KEY` / `THE_ODDS_API_KEY` is set, same AF-confirm / DQD-reversal hooks also snapshot moneyline open/suspended/missing across OddsPapi + Odds-API.io + The Odds API at confirm / +5s / +15s / +45s into `book_context_observe.jsonl` (fixture ids cached). Odds-API.io additionally GETs `/events/{id}` in parallel with odds for provider `score`/`clock`. The Odds walks an expanded soccer sport-key list (Leagues Cup / MLS / …) and can discover extra active `soccer_*` keys via `/sports`. Full HTTP bodies land in `book_context_raw/` (not auto-pruned). Does **not** gate buys or flatten.
+13. **Odds third confirmation + graded sizing**: with `ODDS_API_IO_KEY`, an AF-confirmed goal starts Odds-API.io `/events/{id}` score plus Bet365 full-market polling at `0/5/…/60s`. C keeps the baseline cumulative target at `$1`; B (`Bet365=open`, at least one score-sensitive market, no already-impossible offer) upgrades the target to `$2`; A (provider score exactly matches AF/DQD) upgrades it to `$3`. A/B require the current event response to revalidate teams, kickoff (±12h), non-terminal status and home/away orientation; an unverifiable or stale cached mapping is forced to C and a mismatch is remapped on the next poll. Upgrades buy only the per-token difference, never `$1+$2+$3`; live ledger sizing uses actual matched `makingAmount`/`takingAmount`, and failed/partial upgrades retry while the same goal generation remains live. Grades never downgrade/sell, and same-grade data changes are logged without creating a second upgrade edge. The football events catalog is shared for 60s with per-generation mapping misses; 429 activates shared `Retry-After`/ISO-or-epoch reset backoff. DQD reversal cancels remaining polls and queued/retry upgrades before the existing flatten path. Every raw response gets a collision-resistant filename and stays in `book_context_raw/`; parsed grade, reason, fingerprint/change, compact request metadata and upgrade decision are persisted in `book_context_observe.jsonl`. Other aggregators and DraftKings are not fetched.
 
 ## Trading flags
 
@@ -129,12 +129,12 @@ Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while post
 | Trades | `data/pm-quote/trades.jsonl` | Dry/live attempts + flatten |
 | AF confirmed scores | `data/pm-quote/af_confirmed_scores.json` | Last AF-confirmed score per DQD match_id |
 | Post-goal samples | `data/pm-quote/post_goal_samples.jsonl` | After buy_win on score_change: books at 0/10/20/30/40/50s (no trade) |
-| Goal-context observe | `data/pm-quote/goal_context_observe.jsonl` | AF confirm A/C (+15s/+45s) + DQD reverse B: overview + AF live + list 旁证 (observe-only) |
+| Historical goal-context data | `data/pm-quote/goal_context_observe.jsonl` | No longer written; retained only for prior false-goal analysis |
 | Live Score observe | `data/pm-quote/livescore_observe.jsonl` | Same phases: LSA events + commentary raw (trial; needs API key/secret) |
-| Book-context observe | `data/pm-quote/book_context_observe.jsonl` | Same hooks (+5s): OddsPapi / Odds-API.io / The Odds moneyline open|suspended|missing; Odds-API.io also pulls `/events/{id}` score+clock alongside odds (observe-only) |
+| Odds confirmation | `data/pm-quote/book_context_observe.jsonl` | AF-confirmed goals at 0/5/…/60s: Odds-API.io score + Bet365 full markets, A/B/C reason, change fingerprint and upgrade action |
 | Book-context raw | `data/pm-quote/book_context_raw/*.json` | Full HTTP bodies per request (quota-precious; not auto-pruned) |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots awaiting flatten |
-| Cursor | `data/pm-quote/cursor.json` | Processed event keys |
+| Cursor | `data/pm-quote/cursor.json` | Processed event keys / FT ids / byte offset; atomically written only on change |
 
 ## Coverage
 
@@ -148,7 +148,7 @@ Mixed example: `--goals-mode dry --ft-mode live` simulates goal fills while post
 
 Rolling **24h** window (not calendar midnight): `watch` prunes on start and every ~10m.
 
-- Drop `market_cache/{match_id}.json` when match is finished or no longer an open paired row in `matches.json` (skip if matches snapshot empty/missing)
+- Drop `market_cache/{match_id}.json` after successful FT consumption or when orphaned; retain unconsumed finished matches during the AF FT gate, including restart cases where the FT event remains in `events.jsonl` but the match has disappeared from `matches.json` (skip prune if matches snapshot empty/missing)
 - Truncate `quotes` / `opportunities` / `trades` / `post_goal_samples` / `bridge/events` by timestamp; **unprocessed** bridge events are always kept
 - **Not pruned** (kept indefinitely): `book_context_observe.jsonl`, `goal_context_observe.jsonl`, `livescore_observe.jsonl`, `book_context_raw/`
 - Append/prune use `{path}.lock` so rewrite cannot race bridge/quote writers
