@@ -155,6 +155,13 @@ def main() -> int:
     _assert(bl.normalize_league("荷乙") == "ned2", "荷乙→ned2")
     _assert(bl.normalize_league("意大利杯") == "itc", "意大利杯→itc")
     _assert(bl.normalize_league("希腊杯") == "grc", "希腊杯→grc")
+    # 2026-08-15: Community Shield / French Supercup / Saudi King Cup
+    _assert(bl.normalize_league("社区盾杯") == "ecs", "社区盾杯→ecs")
+    _assert(bl.normalize_league("ECS", "ecs") == "ecs", "ECS→ecs")
+    _assert(bl.normalize_league("法超杯") == "frtc", "法超杯→frtc")
+    _assert(bl.normalize_league("FRTC", "frtc") == "frtc", "FRTC→frtc")
+    _assert(bl.normalize_league("沙特国王杯") == "skc", "沙特国王杯→skc")
+    _assert(bl.normalize_league("SKC", "skc") == "skc", "SKC→skc")
 
     # Team aliases that were blocking PM↔DQD
     _assert(bl.normalize_team("OB") == bl.normalize_team("Odense BK"), "OB↔Odense")
@@ -273,6 +280,57 @@ def main() -> int:
         bl.normalize_team("Racing W")
         == bl.normalize_team("Racing FC Union Luxembourg"),
         "Racing W",
+    )
+    # 2026-08-15 unmatched PM near-misses
+    _assert(
+        bl.normalize_team("Go Ahead Eagles")
+        == bl.normalize_team("DVV Go Ahead"),
+        "Go Ahead",
+    )
+    _assert(
+        bl.normalize_team("Celta Fortuna")
+        == bl.normalize_team("Celta Vigo B"),
+        "Celta Fortuna↔B",
+    )
+    _assert(
+        bl.normalize_team("SCR Altach")
+        == bl.normalize_team("SC Rheindorf Altach"),
+        "Altach",
+    )
+    _assert(
+        bl.normalize_team("Real Racing Club")
+        == bl.normalize_team("Racing Santander"),
+        "Racing Santander",
+    )
+    _assert(
+        bl.normalize_team("Rams Başakşehir FK")
+        == bl.normalize_team("Başakşehir Futbol Kulübü"),
+        "Başakşehir",
+    )
+    _assert(
+        bl.normalize_team("RSC Anderlecht Futures")
+        == bl.normalize_team("Anderlecht II"),
+        "Anderlecht Futures",
+    )
+    _assert(
+        bl.normalize_team("Inter Toronto FC")
+        == bl.normalize_team("York United"),
+        "Inter Toronto↔York",
+    )
+    _assert(
+        bl.normalize_team("Jeugd KAA Gent B")
+        == bl.normalize_team("Gent reserves"),
+        "Gent B",
+    )
+    _assert(
+        bl.normalize_team("Inverness Caledonian Thistle FC")
+        == bl.normalize_team("Inverness CT"),
+        "Inverness CT",
+    )
+    _assert(
+        bl.normalize_team("FK Obolon Kyiv")
+        == bl.normalize_team("Obolon'-Brovar"),
+        "Obolon",
     )
     _assert(
         bl.normalize_team("Metalist 1925 W") == bl.normalize_team("Zhytlobud-1"),

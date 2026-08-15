@@ -12,7 +12,7 @@ from typing import Any
 
 import quote_lib as lib
 from clob_trader import ClobTrader
-from fill_planner import FillPlan, plan_fill
+from fill_planner import FillPlan, plan_fill, MIN_MARKETABLE_BUY_USDC
 from size_policy import compute_buy_size_caps
 from score_reversal import (
     AF_STATUS_CONFIRMED,
@@ -371,6 +371,10 @@ class TradeExecutor:
         """Keep buy_win row as open lot for the channel's current dry/live mode."""
         if not row.get("success"):
             return False
+        ctx = row.get("trade_context") if isinstance(row.get("trade_context"), dict) else {}
+        # Grade C is trades-only — never rebuild into open exposure.
+        if str(ctx.get("odds_grade") or "").strip().upper() == "C":
+            return False
         sig = signal_from_event_key(str(row.get("event_key") or ""))
         channel_live = self._live_for_signal(sig)
         if channel_live:
@@ -645,6 +649,15 @@ class TradeExecutor:
             match_meta=match_meta,
         )
         channel_live = self._live_for_signal(typ)
+        trade_context_grade = (
+            (match_meta or {}).get("trade_context")
+            if isinstance((match_meta or {}).get("trade_context"), dict)
+            else {}
+        )
+        odds_grade = str(trade_context_grade.get("odds_grade") or "").strip().upper()
+        # Grade C is research/ledger-only: always dry-run, never post CLOB.
+        if odds_grade == "C":
+            channel_live = False
 
         key = trade_idempotency_key(event_key or "", token_id, trade)
         if key in self._done:
@@ -832,6 +845,14 @@ class TradeExecutor:
                 for r in self.ledger.all_open()
             )
             cap_usdc = remaining_target if remaining_target is not None else self.settings.max_usdc
+            # Marketable BUY floor is $1; bump sub-$1 remainders (partial fills /
+            # upgrade dust) up to the floor rather than posting a rejected $0.98.
+            if (
+                remaining_target is not None
+                and remaining_target > 1e-9
+                and remaining_target + 1e-12 < MIN_MARKETABLE_BUY_USDC
+            ):
+                cap_usdc = MIN_MARKETABLE_BUY_USDC
             cap_tiers = (
                 ((0.0, cap_usdc),)
                 if remaining_target is not None
@@ -900,6 +921,16 @@ class TradeExecutor:
             available_shares=available,
         )
 
+        # Marketable BUY floor is $1: bump thin-book plans up so FAK can eat
+        # resting size (e.g. 0.99@$0.99) instead of CLOB rejecting $0.98.
+        if (
+            trade == "buy_win"
+            and plan.skip_reason is None
+            and float(plan.usdc or 0) > 0
+            and float(plan.usdc or 0) + 1e-12 < MIN_MARKETABLE_BUY_USDC
+        ):
+            plan.usdc = float(MIN_MARKETABLE_BUY_USDC)
+
         if plan.skip_reason:
             row = self._record(
                 quote,
@@ -941,7 +972,8 @@ class TradeExecutor:
                 plan.take_depth,
                 typ or "?",
             )
-            if trade == "buy_win":
+            if trade == "buy_win" and odds_grade != "C":
+                # C records trades.jsonl only — no open lot (so A/B size to full $2/$3).
                 self._register_open_buy(
                     quote, plan=plan, event_key=event_key, match_meta=match_meta, live=False
                 )

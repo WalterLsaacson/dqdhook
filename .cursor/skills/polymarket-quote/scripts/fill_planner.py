@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+# Polymarket marketable BUY rejects notional under $1.
+MIN_MARKETABLE_BUY_USDC = 1.0
+
 
 @dataclass
 class FillPlan:
@@ -61,6 +64,7 @@ def plan_buy_win(
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
     min_order_shares: float = 0.0,
+    min_order_usdc: float = MIN_MARKETABLE_BUY_USDC,
 ) -> FillPlan:
     """Buy WIN token into asks."""
     asks = _levels_from_top(
@@ -89,6 +93,7 @@ def plan_buy_win(
     best = asks[0][0]
     cap_price = best + float(max_slippage) if take_depth == "walk" else best
     limit_levels = 1 if take_depth == "top" else max(1, int(max_levels))
+    min_usdc = max(0.0, float(min_order_usdc))
 
     taken: list[dict[str, Any]] = []
     shares = 0.0
@@ -96,9 +101,10 @@ def plan_buy_win(
     worst = best
 
     for i, (price, size) in enumerate(asks):
-        if i >= limit_levels:
-            break
         if price > cap_price + 1e-12:
+            break
+        # Prefer configured depth; keep walking within slippage until min notional.
+        if i >= limit_levels and usdc + 1e-12 >= min_usdc:
             break
         if shares >= float(max_shares) - 1e-12:
             break
@@ -128,6 +134,11 @@ def plan_buy_win(
         empty.shares = round(shares, 6)
         empty.usdc = round(usdc, 6)
         return empty
+    # CLOB marketable BUY requires amount ≥ $1. Thin books (e.g. 0.99@$0.99)
+    # still post $1 FAK so the resting size is eaten; unmatched USDC is not spent.
+    order_usdc = usdc
+    if min_usdc > 0 and order_usdc + 1e-12 < min_usdc:
+        order_usdc = min_usdc
 
     return FillPlan(
         trade="buy_win",
@@ -135,7 +146,7 @@ def plan_buy_win(
         take_depth=take_depth,
         order_type="FAK",
         shares=round(shares, 6),
-        usdc=round(usdc, 6),
+        usdc=round(order_usdc, 6),
         worst_price=worst,
         levels_used=len(taken),
         levels=taken,
@@ -245,6 +256,7 @@ def plan_fill(
     max_shares: float = 25.0,
     max_slippage: float = 0.03,
     min_order_shares: float = 0.0,
+    min_order_usdc: float = MIN_MARKETABLE_BUY_USDC,
     available_shares: float | None = None,
 ) -> FillPlan:
     trade = str(quote.get("trade") or "")
@@ -257,6 +269,7 @@ def plan_fill(
             max_shares=max_shares,
             max_slippage=max_slippage,
             min_order_shares=min_order_shares,
+            min_order_usdc=min_order_usdc,
         )
     if trade == "sell_lose":
         return plan_sell_lose(
