@@ -102,7 +102,7 @@ python3 frontend/run_main.py --no-trade
 | `--no-af-referee` | Skip AF goal confirm (not for production goals) |
 | `--af-postcheck-trade` | Buy on DQD goal before AF confirm (flatten on timeout) |
 
-Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, `ODDS_API_IO_KEY`, … Odds third-confirmation polls only Odds-API.io score + Bet365 markets every 5s for 60s and uses cumulative C/B/A targets of $1/$2/$3. A/B require a freshly verified fixture identity; partial live fills are accumulated by actual matched USDC and retried to the target.
+Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, `ODDS_API_IO_KEY`, … Odds third-confirmation polls only Odds-API.io score + Bet365 markets every 1s for 60s and uses cumulative C/B/A targets of $1/$2/$3. A/B require a freshly verified fixture identity; partial live fills are accumulated by actual matched USDC and retried to the target.
 
 ## Logs & data
 

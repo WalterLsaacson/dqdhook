@@ -69,7 +69,7 @@ def _wait(path: Path, count: int, timeout: float = 2.0) -> list[dict]:
 
 def main() -> int:
     assert DEFAULT_SOURCES == ("oddsapiio",)
-    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "DraftKings")
+    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "Sbobet")
     assert load_source_keys(env={})["active_sources"] == []
     assert try_create_observer(Path("/tmp"), env={}) is None
     cfg = load_source_keys(
@@ -78,11 +78,11 @@ def main() -> int:
             "ODDSPAPI_KEY": "ignored",
             "THE_ODDS_API_KEY": "ignored",
             "BOOK_OBSERVE_SOURCES": "oddspapi,theoddsapi",
-            "BOOK_ODDS_API_IO_BOOKS": "Bet365,DraftKings,Pinnacle",
+            "BOOK_ODDS_API_IO_BOOKS": "Bet365,Sbobet,Pinnacle",
         }
     )
     assert cfg["active_sources"] == ["oddsapiio"]
-    assert cfg["oddsapiio_books"] == ("Bet365", "DraftKings")
+    assert cfg["oddsapiio_books"] == ("Bet365", "Sbobet")
 
     # Same-team catalogs may contain settled historical fixtures. Kickoff and
     # status must select the current event, and reversed provider sides are explicit.
@@ -163,34 +163,34 @@ def main() -> int:
     assert spread_src["books"][0]["status"] == "open"
     assert spread_grade["level"] == "C"
     assert spread_grade["reason"] == "bet365_no_score_sensitive_markets"
-    dk_only_raw = {
+    observe_raw = {
         "status": "live",
         "bookmakers": {
             "Bet365 (no latency)": spread_only,
-            "DraftKings": [
+            "Sbobet": [
                 {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
                 {"name": "Correct Score", "odds": [{"label": "1-0", "odds": "5"}]},
                 {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.8", "under": "2"}]},
             ],
         },
     }
-    dk_books = parse_oddsapiio_books(
-        dk_only_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+    obs_books = parse_oddsapiio_books(
+        observe_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
     )
-    by_book = {b["book"]: b for b in dk_books}
+    by_book = {b["book"]: b for b in obs_books}
     assert by_book["Bet365"]["status"] == "open" and "observe_only" not in by_book["Bet365"]
-    assert by_book["DraftKings"]["status"] == "open" and by_book["DraftKings"]["observe_only"] is True
-    dk_src = {
+    assert by_book["Sbobet"]["status"] == "open" and by_book["Sbobet"]["observe_only"] is True
+    obs_src = {
         "ok": True,
         "identity_verified": True,
         "orientation": "same",
         "score": {"home": 1, "away": 0},
-        "books": dk_books,
-        "raw": dk_only_raw,
+        "books": obs_books,
+        "raw": observe_raw,
     }
-    dk_grade = grade_oddsapiio_sample(dk_src, home_score=1, away_score=0)
-    assert dk_grade["level"] == "C"
-    assert dk_grade["reason"] == "bet365_no_score_sensitive_markets"
+    obs_grade = grade_oddsapiio_sample(obs_src, home_score=1, away_score=0)
+    assert obs_grade["level"] == "C"
+    assert obs_grade["reason"] == "bet365_no_score_sensitive_markets"
     unverified = _source((1, 0), clean)
     unverified["identity_verified"] = False
     assert grade_oddsapiio_sample(unverified, home_score=1, away_score=0)["level"] == "C"
@@ -229,14 +229,14 @@ def main() -> int:
             source_cfg={
                 "active_sources": ["oddspapi", "oddsapiio", "theoddsapi"],
                 "keys": {"oddsapiio": "io"},
-                "oddsapiio_books": ("Bet365", "DraftKings"),
+                "oddsapiio_books": ("Bet365", "Sbobet"),
             },
             poll_interval_s=0.03,
             poll_timeout_s=0.09,
             fetch_oddsapiio=fetch,
         )
         assert obs.active_sources == ("oddsapiio",)
-        assert obs.oddsapiio_books == ("Bet365", "DraftKings")
+        assert obs.oddsapiio_books == ("Bet365", "Sbobet")
         obs.start()
         obs.on_af_confirmed(
             match_id="m1",
@@ -266,13 +266,13 @@ def main() -> int:
         assert obs.drain_upgrades() == []
         obs.stop()
 
-        # Production schedule is 0 plus twelve delayed samples: 0/5/.../60.
+        # Production schedule is 0 plus sixty delayed samples: 0/1/.../60.
         sched = BookContextObserver(
             root,
             source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
             fetch_oddsapiio=fetch,
         )
-        assert sched._poll_offsets() == [float(x) for x in range(5, 61, 5)]
+        assert sched._poll_offsets() == [float(x) for x in range(1, 61)]
         sched.stop()
 
         # A reversal cancels all remaining polls and suppresses queued upgrades.
@@ -345,8 +345,11 @@ def main() -> int:
             if "/events?" in url and "sport=football" in url:
                 http_calls["catalog"] += 1
                 return 200, [{"id": "e1", "homeTeam": "Home", "awayTeam": "Away"}], {}, None
-            if "/odds?" in url:
+            if "/odds/multi" in url or "/odds?" in url:
                 http_calls["odds"] += 1
+                # multi returns a list of per-event odds payloads
+                if "/odds/multi" in url:
+                    return 200, [{"id": "e1", **_odds(clean)}], {}, None
                 return 200, _odds(clean), {}, None
             http_calls["event"] += 1
             return 200, {"id": "e1", "status": "live", "scores": {"home": 1, "away": 0}}, {}, None
@@ -397,6 +400,8 @@ def main() -> int:
             }
             if "/events?" in url:
                 return 200, [event], {}, None
+            if "/odds/multi" in url:
+                return 200, [{"id": "sw", **_odds(swapped_clean)}], {}, None
             if "/odds?" in url:
                 return 200, _odds(swapped_clean), {}, None
             return 200, event, {}, None
@@ -420,6 +425,95 @@ def main() -> int:
             )
             assert swapped_grade["level"] == "A", swapped_grade
             swapped_obs.stop()
+        finally:
+            bco._http_get_json = old_http
+
+        # Concurrent odds pulls for different event ids coalesce into one /odds/multi.
+        multi_calls = {"odds_multi": 0, "odds_single": 0, "event": 0}
+
+        def multi_http(url: str, **_kw: object) -> tuple:
+            if "/events?" in url:
+                return (
+                    200,
+                    [
+                        {"id": "m1", "homeTeam": "Home", "awayTeam": "Away"},
+                        {"id": "m2", "homeTeam": "Alpha", "awayTeam": "Beta"},
+                    ],
+                    {},
+                    None,
+                )
+            if "/odds/multi" in url:
+                multi_calls["odds_multi"] += 1
+                return (
+                    200,
+                    [
+                        {"id": "m1", **_odds(clean)},
+                        {"id": "m2", **_odds(clean)},
+                    ],
+                    {},
+                    None,
+                )
+            if "/odds?" in url:
+                multi_calls["odds_single"] += 1
+                return 200, _odds(clean), {}, None
+            multi_calls["event"] += 1
+            eid = "m1" if "/events/m1" in url else "m2"
+            return 200, {"id": eid, "status": "live", "scores": {"home": 1, "away": 0},
+                         "homeTeam": "Home" if eid == "m1" else "Alpha",
+                         "awayTeam": "Away" if eid == "m1" else "Beta"}, {}, None
+
+        bco._http_get_json = multi_http
+        try:
+            multi_obs = BookContextObserver(
+                root,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            )
+            multi_obs._odds_multi_window_s = 0.02
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+
+            def _one(mid: str, home: str, away: str) -> dict:
+                multi_obs._begin_snap_ctx(
+                    phase="test", observe_group_id=mid, match_id=mid, event_key=mid
+                )
+                return multi_obs._default_fetch_oddsapiio(mid, home, away)
+
+            with _TPE(max_workers=2) as pool:
+                f1 = pool.submit(_one, "mm1", "Home", "Away")
+                f2 = pool.submit(_one, "mm2", "Alpha", "Beta")
+                r1, r2 = f1.result(timeout=5), f2.result(timeout=5)
+            assert r1["ok"] and r2["ok"], (r1, r2)
+            assert multi_calls["odds_multi"] == 1, multi_calls
+            assert multi_calls["odds_single"] == 0, multi_calls
+            assert any(req.get("multi") for req in r1.get("requests") or [])
+            multi_obs.stop()
+
+            # Flush exceptions must complete the in-flight batch (not only queued).
+            boom_obs = BookContextObserver(
+                root,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+                workers=1,
+            )
+            boom_obs._odds_multi_window_s = 0.01
+            real_exec = boom_obs._execute_odds_multi_batch
+
+            def boom_exec(batch: list) -> None:
+                raise RuntimeError("multi_boom")
+
+            boom_obs._execute_odds_multi_batch = boom_exec  # type: ignore[method-assign]
+            boom_obs._begin_snap_ctx(
+                phase="test", observe_group_id="b1", match_id="b1", event_key="b1"
+            )
+            try:
+                out = boom_obs._oddsapiio_odds_coalesced(
+                    event_id="boom1",
+                    books_param="Bet365,Sbobet",
+                    snapshot_ctx={"match_id": "b1"},
+                )
+                assert False, f"expected exception, got {out}"
+            except RuntimeError as e:
+                assert "multi_boom" in str(e)
+            boom_obs._execute_odds_multi_batch = real_exec  # type: ignore[method-assign]
+            boom_obs.stop()
         finally:
             bco._http_get_json = old_http
 

@@ -1,7 +1,8 @@
-"""Odds-API.io score + Bet365 gate, with DraftKings persisted observe-only.
+"""Odds-API.io score + Bet365 gate, with Sbobet persisted observe-only.
 
-Polls immediately and every five seconds for sixty seconds.  Each sample is persisted,
+Polls immediately and every second for sixty seconds.  Each sample is persisted,
 graded C/B/A from Bet365 only, and may emit a monotonic position-target upgrade.
+Concurrent odds pulls coalesce into ``GET /odds/multi`` (up to 10 events / 1 request).
 
 Every actual HTTP response body is persisted under ``data/pm-quote/book_context_raw/``
 (URLs redact ``apiKey``). Observe rows keep compact request metadata and ``raw_path``;
@@ -23,7 +24,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -57,7 +58,10 @@ SOURCE_THEODDSAPI = "theoddsapi"
 DEFAULT_SOURCES = (SOURCE_ODDSAPIIO,)
 DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
 DEFAULT_ODDS_API_IO_GATE_BOOKS = ("Bet365",)
-DEFAULT_ODDS_API_IO_BOOKS = ("Bet365", "DraftKings")
+# Solo plan: Bet365 gates A/B; Sbobet is sharp observe-only (dashboard name is "Sbobet").
+DEFAULT_ODDS_API_IO_BOOKS = ("Bet365", "Sbobet")
+ODDS_API_IO_MULTI_MAX = 10
+ODDS_API_IO_MULTI_WINDOW_S = 0.05
 # us+eu: Leagues Cup / MLS books often land in us; EU books for UEFA.
 DEFAULT_THE_ODDS_REGIONS = ("us", "eu")
 # Prefer keys that match our common PM slate first; discover fills the rest.
@@ -123,7 +127,8 @@ DEFAULT_THE_ODDS_SPORT_KEYS = (
 DEFAULT_THE_ODDS_DISCOVER = True
 THE_ODDS_SPORTS_CACHE_TTL_S = 6 * 3600.0
 
-DEFAULT_POLL_INTERVAL_S = 5.0
+# Solo ~5k req/h: 1s cadence (0/1/…/60) catches book moves faster for A/B upgrades.
+DEFAULT_POLL_INTERVAL_S = 1.0
 DEFAULT_POLL_TIMEOUT_S = 60.0
 DEFAULT_WORKERS = 4
 DEFAULT_HTTP_TIMEOUT_S = 12.0
@@ -423,7 +428,7 @@ def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
         "active_sources": active,
         "keys": keys,
         "oddspapi_books": _split_csv(src.get(ENV_BOOK_ODDSPAPI_BOOKS), DEFAULT_ODDSPAPI_BOOKS),
-        # Fetch Bet365 (gate) + DraftKings (observe-only). Env cannot add gate books.
+        # Fetch Bet365 (gate) + Sbobet (observe-only). Env cannot change this pair.
         "oddsapiio_books": DEFAULT_ODDS_API_IO_BOOKS,
         "theoddsapi_regions": _split_csv(src.get(ENV_BOOK_THE_ODDS_REGIONS), DEFAULT_THE_ODDS_REGIONS),
         "theoddsapi_sport_keys": _split_csv(
@@ -1317,6 +1322,12 @@ class BookContextObserver:
         self._rate_limit_lock = threading.Lock()
         self._rate_limited_until_mono = 0.0
         self._rate_limited_until_iso: str | None = None
+        self._odds_multi_lock = threading.Lock()
+        self._odds_multi_pending: list[
+            tuple[str, str, dict[str, Any], Future]
+        ] = []
+        self._odds_multi_flush_scheduled = False
+        self._odds_multi_window_s = ODDS_API_IO_MULTI_WINDOW_S
         self._theodds_sports_keys: list[str] | None = None
         self._theodds_sports_fetched_at: float = 0.0
         self._pool = ThreadPoolExecutor(
@@ -1332,11 +1343,17 @@ class BookContextObserver:
     def start(self) -> None:
         self._stop.clear()
         set_active_observer(self)
+        observe_books = ",".join(
+            b for b in self.oddsapiio_books if not _is_gate_book(b)
+        ) or "none"
         logger.info(
-            "odds confirmation on → %s source=Odds-API.io gate=Bet365 observe=DraftKings poll=%ss timeout=%ss",
+            "odds confirmation on → %s source=Odds-API.io gate=Bet365 observe=%s poll=%ss timeout=%ss multi=≤%s/%.0fms",
             observe_path(self.root),
+            observe_books,
             self.poll_interval_s,
             self.poll_timeout_s,
+            ODDS_API_IO_MULTI_MAX,
+            self._odds_multi_window_s * 1000,
         )
 
     def stop(self) -> None:
@@ -1870,6 +1887,111 @@ class BookContextObserver:
             "raw_path": meta.get("raw_path"),
         }
 
+    def _oddsapiio_odds_coalesced(
+        self,
+        *,
+        event_id: str,
+        books_param: str,
+        snapshot_ctx: dict[str, Any],
+    ) -> tuple[int | None, Any, dict[str, str], str | None, dict[str, Any]]:
+        """Batch concurrent odds pulls into ``GET /odds/multi`` (≤10 = 1 request).
+
+        Callers must wait on the snapshot/worker thread — not on ``_http_pool`` —
+        so the dedicated flush thread can run ``_record_http`` without deadlocking.
+        """
+        fut: Future = Future()
+        with self._odds_multi_lock:
+            self._odds_multi_pending.append(
+                (str(event_id), books_param, dict(snapshot_ctx or {}), fut)
+            )
+            if not self._odds_multi_flush_scheduled:
+                self._odds_multi_flush_scheduled = True
+                threading.Thread(
+                    target=self._odds_multi_flush_worker,
+                    name="odds-multi-flush",
+                    daemon=True,
+                ).start()
+        return fut.result(timeout=max(5.0, self.http_timeout_s + 5.0))
+
+    def _odds_multi_flush_worker(self) -> None:
+        in_flight: list[tuple[str, str, dict[str, Any], Future]] = []
+        try:
+            while not self._stop.is_set():
+                time.sleep(self._odds_multi_window_s)
+                with self._odds_multi_lock:
+                    if not self._odds_multi_pending:
+                        self._odds_multi_flush_scheduled = False
+                        return
+                    batch = self._odds_multi_pending[:ODDS_API_IO_MULTI_MAX]
+                    del self._odds_multi_pending[:ODDS_API_IO_MULTI_MAX]
+                in_flight = batch
+                self._execute_odds_multi_batch(batch)
+                in_flight = []
+        except Exception as e:  # noqa: BLE001
+            logger.exception("odds multi flush failed: %s", e)
+            with self._odds_multi_lock:
+                self._odds_multi_flush_scheduled = False
+                stranded = list(self._odds_multi_pending)
+                self._odds_multi_pending.clear()
+            for _eid, _books, _ctx, fut in (*in_flight, *stranded):
+                if not fut.done():
+                    fut.set_exception(e)
+
+    def _execute_odds_multi_batch(
+        self,
+        batch: list[tuple[str, str, dict[str, Any], Future]],
+    ) -> None:
+        if not batch:
+            return
+        key = self.keys.get(SOURCE_ODDSAPIIO) or ""
+        books_param = batch[0][1]
+        event_ids = list(dict.fromkeys(eid for eid, _b, _c, _f in batch))
+        snapshot_ctx = next((ctx for _e, _b, ctx, _f in batch if ctx), {})
+        url = self._url_with_key(
+            ODDS_API_IO_BASE,
+            "/odds/multi",
+            {"eventIds": ",".join(event_ids), "bookmakers": books_param},
+            key,
+        )
+        status, body, hdrs, err, meta = self._record_http(
+            source=SOURCE_ODDSAPIIO,
+            kind="odds_multi",
+            url=url,
+            inline_raw=False,
+            snapshot_ctx=snapshot_ctx,
+        )
+        by_id: dict[str, Any] = {}
+        if isinstance(body, list):
+            for item in body:
+                if isinstance(item, dict) and item.get("id") is not None:
+                    by_id[str(item.get("id"))] = item
+        elif isinstance(body, dict) and body.get("id") is not None:
+            by_id[str(body.get("id"))] = body
+
+        for event_id, _books, _ctx, fut in batch:
+            if fut.done():
+                continue
+            if err:
+                fut.set_result((status, None, hdrs, err, dict(meta)))
+                continue
+            item = by_id.get(str(event_id))
+            if item is None:
+                item_meta = dict(meta)
+                item_meta["kind"] = "odds"
+                item_meta["multi"] = True
+                item_meta["event_id"] = str(event_id)
+                item_meta["error"] = "missing_in_multi"
+                fut.set_result(
+                    (status, None, hdrs, "missing_in_multi", item_meta)
+                )
+                continue
+            item_meta = dict(meta)
+            item_meta["kind"] = "odds"
+            item_meta["multi"] = True
+            item_meta["event_id"] = str(event_id)
+            item_meta["raw"] = item
+            fut.set_result((status, item, hdrs, None, item_meta))
+
     def _default_fetch_oddsapiio(self, match_id: str, home: str, away: str) -> dict[str, Any]:
         t0 = time.perf_counter()
         snapshot_ctx = self._current_snap_ctx()
@@ -1952,23 +2074,9 @@ class BookContextObserver:
             from_cache = False
 
         books_param = ",".join(self.oddsapiio_books)
-        odds_url = self._url_with_key(
-            ODDS_API_IO_BASE,
-            "/odds",
-            {"eventId": event_id, "bookmakers": books_param},
-            key,
-        )
-        # Fresh score/clock live on /events/{id}; /odds has markets only.
+        # Fresh score/clock live on /events/{id}; markets via coalesced /odds/multi.
+        # Coalesce waits on this (snapshot) thread; only the event GET uses _http_pool.
         event_url = self._url_with_key(ODDS_API_IO_BASE, f"/events/{event_id}", {}, key)
-
-        def _pull_odds() -> tuple[Any, ...]:
-            return self._record_http(
-                source=SOURCE_ODDSAPIIO,
-                kind="odds",
-                url=odds_url,
-                inline_raw=True,
-                snapshot_ctx=snapshot_ctx,
-            )
 
         def _pull_event() -> tuple[Any, ...]:
             return self._record_http(
@@ -1979,9 +2087,19 @@ class BookContextObserver:
                 snapshot_ctx=snapshot_ctx,
             )
 
-        fut_odds = self._http_pool.submit(_pull_odds)
         fut_event = self._http_pool.submit(_pull_event)
-        status, body, _hdrs, err, meta = fut_odds.result()
+        try:
+            status, body, _hdrs, err, meta = self._oddsapiio_odds_coalesced(
+                event_id=str(event_id),
+                books_param=books_param,
+                snapshot_ctx=snapshot_ctx,
+            )
+        except Exception as e:  # noqa: BLE001
+            status, body, _hdrs, err, meta = None, None, {}, str(e), {
+                "kind": "odds",
+                "multi": True,
+                "error": str(e),
+            }
         try:
             ev_status, ev_body, _ev_hdrs, ev_err, ev_meta = fut_event.result()
         except Exception as e:  # noqa: BLE001
