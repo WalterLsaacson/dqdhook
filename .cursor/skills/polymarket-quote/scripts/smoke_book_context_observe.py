@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: Odds-API.io/Bet365 polling, grading, upgrades, reversal cancellation."""
+"""Smoke: Odds-API.io Bet365 gate + Unibet observe, grading, upgrades, reversal."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def _wait(path: Path, count: int, timeout: float = 2.0) -> list[dict]:
 
 def main() -> int:
     assert DEFAULT_SOURCES == ("oddsapiio",)
-    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365",)
+    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "Unibet")
     assert load_source_keys(env={})["active_sources"] == []
     assert try_create_observer(Path("/tmp"), env={}) is None
     cfg = load_source_keys(
@@ -81,7 +81,7 @@ def main() -> int:
         }
     )
     assert cfg["active_sources"] == ["oddsapiio"]
-    assert cfg["oddsapiio_books"] == ("Bet365",)
+    assert cfg["oddsapiio_books"] == ("Bet365", "Unibet")
 
     # Same-team catalogs may contain settled historical fixtures. Kickoff and
     # status must select the current event, and reversed provider sides are explicit.
@@ -177,8 +177,10 @@ def main() -> int:
         extra_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
     )
     by_book = {b["book"]: b for b in extra_books}
-    assert list(by_book) == ["Bet365"]
+    assert list(by_book) == ["Bet365", "Unibet"]
     assert by_book["Bet365"]["status"] == "open"
+    assert "observe_only" not in by_book["Bet365"]
+    assert by_book["Unibet"]["status"] == "missing" and by_book["Unibet"]["observe_only"] is True
     extra_src = {
         "ok": True,
         "identity_verified": True,
@@ -190,6 +192,52 @@ def main() -> int:
     extra_grade = grade_oddsapiio_sample(extra_src, home_score=1, away_score=0)
     assert extra_grade["level"] == "C"
     assert extra_grade["reason"] == "bet365_no_score_sensitive_markets"
+    assert extra_grade["observe_books"][0]["book"] == "Unibet"
+    assert extra_grade["observe_books"][0]["core_clean"] is False
+    assert extra_grade["observe_books"][0]["reason"] == "unibet_missing"
+
+    unibet_dirty = {
+        "status": "live",
+        "bookmakers": {
+            "Bet365": clean,
+            "Unibet (no latency)": impossible,
+        },
+    }
+    unibet_books = parse_oddsapiio_books(
+        unibet_dirty, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+    )
+    unibet_by = {b["book"]: b for b in unibet_books}
+    assert unibet_by["Unibet"]["status"] == "open" and unibet_by["Unibet"]["observe_only"] is True
+    unibet_src = {
+        "ok": True,
+        "identity_verified": True,
+        "orientation": "same",
+        "score": {"home": 1, "away": 0},
+        "books": unibet_books,
+        "raw": unibet_dirty,
+    }
+    unibet_grade = grade_oddsapiio_sample(unibet_src, home_score=1, away_score=0)
+    assert unibet_grade["level"] == "A"
+    assert unibet_grade["observe_books"][0]["core_clean"] is False
+    assert unibet_grade["observe_books"][0]["reason"] == "unibet_has_impossible_markets"
+    unibet_clean_raw = {
+        "status": "live",
+        "bookmakers": {"Bet365": clean, "Unibet": clean},
+    }
+    unibet_clean_src = {
+        "ok": True,
+        "identity_verified": True,
+        "orientation": "same",
+        "score": {"home": 1, "away": 0},
+        "books": parse_oddsapiio_books(
+            unibet_clean_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+        ),
+        "raw": unibet_clean_raw,
+    }
+    unibet_ok = grade_oddsapiio_sample(unibet_clean_src, home_score=1, away_score=0)
+    assert unibet_ok["level"] == "A"
+    assert unibet_ok["observe_books"][0]["core_clean"] is True
+    assert unibet_ok["observe_books"][0]["reason"] == "unibet_core_clean"
     unverified = _source((1, 0), clean)
     unverified["identity_verified"] = False
     assert grade_oddsapiio_sample(unverified, home_score=1, away_score=0)["level"] == "C"
@@ -291,6 +339,8 @@ def main() -> int:
         assert len(rows) == 4, len(rows)
         assert [r["poll"]["offset_s"] for r in rows] == [0.0, 0.03, 0.06, 0.09]
         assert [r["odds_grade"]["level"] for r in rows] == ["C", "B", "A", "A"]
+        assert all(r["odds_grade"]["observe_books"][0]["book"] == "Unibet" for r in rows)
+        assert all(r["odds_grade"]["observe_books"][0]["observe_only"] is True for r in rows)
         assert rows[1]["data_changed"] is True and rows[1]["upgrade_emitted"] is True
         assert rows[2]["upgrade_emitted"] is True
         assert rows[3]["data_changed"] is True and rows[3]["upgrade_emitted"] is False
@@ -309,13 +359,13 @@ def main() -> int:
         assert obs.drain_upgrades() == []
         obs.stop()
 
-        # Production schedule is 0 plus sixty delayed samples: 0/1/.../60.
+        # Production schedule is 0 plus thirty delayed samples: 0/3/.../90.
         sched = BookContextObserver(
             root,
             source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
             fetch_oddsapiio=fetch,
         )
-        assert sched._poll_offsets() == [float(x) for x in range(1, 61)]
+        assert sched._poll_offsets() == [float(x) for x in range(3, 91, 3)]
         sched.stop()
 
         # A reversal cancels all remaining polls and suppresses queued upgrades.
@@ -682,7 +732,7 @@ def main() -> int:
         finally:
             bco._http_get_json = old_http
 
-    print("ok: Odds-API.io Bet365 polling/grading/upgrades/reversal/raw")
+    print("ok: Odds-API.io Bet365 gate + Unibet observe polling/grading/upgrades/reversal/raw")
     return 0
 
 

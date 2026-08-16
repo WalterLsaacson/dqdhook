@@ -2,7 +2,9 @@
 
 Polls immediately and every second for sixty seconds.  Each sample is persisted,
 graded C/B/A from Bet365 only, and may emit a monotonic position-target upgrade.
-Concurrent odds pulls coalesce into ``GET /odds/multi`` (up to 10 events / 1 request).
+Unibet is fetched on the same ``/odds/multi`` call and stored observe-only
+(core-clean CS/Totals research; never vetoes B/A). Concurrent odds pulls
+coalesce into ``GET /odds/multi`` (up to 10 events / 1 request).
 
 Every actual HTTP response body is persisted under ``data/pm-quote/book_context_raw/``
 (URLs redact ``apiKey``). Observe rows keep compact request metadata and ``raw_path``;
@@ -56,7 +58,9 @@ SOURCE_THEODDSAPI = "theoddsapi"
 
 DEFAULT_SOURCES = (SOURCE_ODDSAPIIO,)
 DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
-DEFAULT_ODDS_API_IO_BOOKS = ("Bet365",)
+DEFAULT_ODDS_API_IO_GATE_BOOKS = ("Bet365",)
+DEFAULT_ODDS_API_IO_OBSERVE_BOOKS = ("Unibet",)
+DEFAULT_ODDS_API_IO_BOOKS = DEFAULT_ODDS_API_IO_GATE_BOOKS + DEFAULT_ODDS_API_IO_OBSERVE_BOOKS
 ODDS_API_IO_MULTI_MAX = 10
 ODDS_API_IO_MULTI_WINDOW_S = 0.05
 # us+eu: Leagues Cup / MLS books often land in us; EU books for UEFA.
@@ -124,9 +128,9 @@ DEFAULT_THE_ODDS_SPORT_KEYS = (
 DEFAULT_THE_ODDS_DISCOVER = True
 THE_ODDS_SPORTS_CACHE_TTL_S = 6 * 3600.0
 
-# Solo ~5k req/h: 1s cadence (0/1/…/60) catches book moves faster for A/B upgrades.
-DEFAULT_POLL_INTERVAL_S = 1.0
-DEFAULT_POLL_TIMEOUT_S = 60.0
+# Solo ~5k req/h: 3s cadence (0/3/…/90) keeps A/B upgrades without burning quota.
+DEFAULT_POLL_INTERVAL_S = 3.0
+DEFAULT_POLL_TIMEOUT_S = 90.0
 DEFAULT_WORKERS = 4
 DEFAULT_HTTP_TIMEOUT_S = 12.0
 DEFAULT_MIN_SIDE_SIM = 0.72
@@ -415,7 +419,7 @@ def soccer_sport_keys_from_sports_payload(payload: Any) -> list[str]:
 
 
 def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
-    """Load the sole supported confirmation source: Odds-API.io / Bet365."""
+    """Load the sole supported confirmation source: Odds-API.io Bet365 + Unibet."""
     src = env if env is not None else os.environ
     keys = {
         SOURCE_ODDSAPIIO: str(src.get(ENV_ODDS_API_IO_KEY) or "").strip(),
@@ -681,6 +685,21 @@ def _normalize_book_key(name: str) -> str:
     return normalize_team(s).replace(" ", "")
 
 
+def _is_gate_book(name: str) -> bool:
+    gate = {_normalize_book_key(b) for b in DEFAULT_ODDS_API_IO_GATE_BOOKS}
+    return _normalize_book_key(name) in gate
+
+
+def _with_observe_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        entry = dict(row)
+        if not _is_gate_book(str(entry.get("book") or "")):
+            entry["observe_only"] = True
+        out.append(entry)
+    return out
+
+
 def _ml_from_outcomes(
     outcomes: list[Any],
     *,
@@ -795,26 +814,32 @@ def parse_oddspapi_books(
     return rows
 
 
-def _bet365_markets(odds_payload: Any) -> list[dict[str, Any]]:
-    """Return the complete Bet365 market list from an Odds-API.io odds body."""
-    if not isinstance(odds_payload, dict):
+def _book_markets(odds_payload: Any, book: str) -> list[dict[str, Any]]:
+    """Return one shop's market list from an Odds-API.io odds body."""
+    want = _normalize_book_key(book)
+    if not want or not isinstance(odds_payload, dict):
         return []
     raw = odds_payload.get("bookmakers") or odds_payload.get("books") or odds_payload.get("data")
     if isinstance(raw, dict):
         for name, markets in raw.items():
-            if _normalize_book_key(str(name)) == "bet365" and isinstance(markets, list):
+            if _normalize_book_key(str(name)) == want and isinstance(markets, list):
                 return [m for m in markets if isinstance(m, dict)]
         return []
     if isinstance(raw, list):
-        for book in raw:
-            if not isinstance(book, dict):
+        for book_row in raw:
+            if not isinstance(book_row, dict):
                 continue
-            name = str(book.get("bookmaker") or book.get("name") or book.get("key") or "")
-            if _normalize_book_key(name) != "bet365":
+            name = str(book_row.get("bookmaker") or book_row.get("name") or book_row.get("key") or "")
+            if _normalize_book_key(name) != want:
                 continue
-            markets = book.get("markets") or book.get("odds") or []
+            markets = book_row.get("markets") or book_row.get("odds") or []
             return [m for m in markets if isinstance(m, dict)] if isinstance(markets, list) else []
     return []
+
+
+def _bet365_markets(odds_payload: Any) -> list[dict[str, Any]]:
+    """Return the complete Bet365 market list from an Odds-API.io odds body."""
+    return _book_markets(odds_payload, "Bet365")
 
 
 def _offered(row: dict[str, Any], key: str) -> bool:
@@ -825,7 +850,7 @@ def _offered(row: dict[str, Any], key: str) -> bool:
 _GATE_MARKET_KEYS = frozenset({"correct score", "totals"})
 
 
-def _empty_bet365_inspection() -> dict[str, Any]:
+def _empty_book_inspection() -> dict[str, Any]:
     return {
         "score_sensitive_markets": 0,
         "score_sensitive_market_names": [],
@@ -837,23 +862,25 @@ def _empty_bet365_inspection() -> dict[str, Any]:
     }
 
 
-def inspect_bet365_impossible_markets(
+def inspect_book_impossible_markets(
     odds_payload: Any,
     *,
     home_score: Any,
     away_score: Any,
+    book: str = "Bet365",
 ) -> dict[str, Any]:
-    """Find Bet365 offers that cannot still win at the already-observed score.
+    """Find offers that cannot still win at the already-observed score.
 
     Full-match score-sensitive markets are listed for research.  B/A gating
     only inspects Correct Score and the main Totals market so alt/BTTS/clean-
-    sheet dirt does not veto a clean core book.
+    sheet dirt does not veto a clean core book.  Callers decide whether the
+    result is a veto (Bet365) or observe-only (Unibet).
     """
     try:
         home = int(home_score)
         away = int(away_score)
     except (TypeError, ValueError):
-        return _empty_bet365_inspection()
+        return _empty_book_inspection()
     total = home + away
     sensitive: list[str] = []
     gate_names: list[str] = []
@@ -866,7 +893,7 @@ def inspect_bet365_impossible_markets(
         except (TypeError, ValueError):
             return None
 
-    for market in _bet365_markets(odds_payload):
+    for market in _book_markets(odds_payload, book):
         name = str(market.get("name") or market.get("market") or "").strip()
         key = name.casefold()
         rows = market.get("odds") or market.get("outcomes") or []
@@ -938,6 +965,53 @@ def inspect_bet365_impossible_markets(
     }
 
 
+def inspect_bet365_impossible_markets(
+    odds_payload: Any,
+    *,
+    home_score: Any,
+    away_score: Any,
+) -> dict[str, Any]:
+    return inspect_book_impossible_markets(
+        odds_payload,
+        home_score=home_score,
+        away_score=away_score,
+        book="Bet365",
+    )
+
+
+def _observe_book_summary(
+    *,
+    book: str,
+    status: str,
+    inspection: dict[str, Any],
+) -> dict[str, Any]:
+    key = _normalize_book_key(book) or "book"
+    gate_n = int(inspection.get("gate_markets") or 0)
+    gate_imp = inspection.get("gate_impossible_offers") or []
+    if status != "open":
+        reason = f"{key}_{status}"
+        core_clean = False
+    elif gate_n <= 0:
+        reason = f"{key}_no_score_sensitive_markets"
+        core_clean = False
+    elif gate_imp:
+        reason = f"{key}_has_impossible_markets"
+        core_clean = False
+    else:
+        reason = f"{key}_core_clean"
+        core_clean = True
+    return {
+        "book": book,
+        "status": status,
+        "observe_only": True,
+        "core_clean": core_clean,
+        "reason": reason,
+        "gate_markets": gate_n,
+        "gate_market_names": list(inspection.get("gate_market_names") or []),
+        "gate_impossible_offers": list(gate_imp) if isinstance(gate_imp, list) else [],
+    }
+
+
 def grade_oddsapiio_sample(
     source_payload: Any,
     *,
@@ -949,7 +1023,9 @@ def grade_oddsapiio_sample(
     Core-clean = Bet365 open with inspectable Correct Score and/or main Totals
     and no impossible offers on those gate markets.  B is core-clean (score
     match not required; soft identity is enough).  A additionally needs a
-    matching provider score and hard identity_verified.
+    matching provider score and hard identity_verified.  Unibet is attached
+    as ``observe_books`` with the same core-clean fields and never changes
+    the grade.
     """
     source = source_payload if isinstance(source_payload, dict) else {}
     provider_score = source.get("score") if isinstance(source.get("score"), dict) else {}
@@ -1002,6 +1078,24 @@ def grade_oddsapiio_sample(
         level, reason = "B", "bet365_clean_identity_soft"
     else:
         level, reason = "B", "bet365_open_no_impossible_markets"
+    by_book = {
+        _normalize_book_key(str(b.get("book") or "")): b
+        for b in (source.get("books") or [])
+        if isinstance(b, dict)
+    }
+    observe_books: list[dict[str, Any]] = []
+    for display in DEFAULT_ODDS_API_IO_OBSERVE_BOOKS:
+        row = by_book.get(_normalize_book_key(display), {})
+        status = str(row.get("status") or "missing")
+        observe_insp = inspect_book_impossible_markets(
+            source.get("raw"),
+            home_score=provider_target["home"],
+            away_score=provider_target["away"],
+            book=display,
+        )
+        observe_books.append(
+            _observe_book_summary(book=display, status=status, inspection=observe_insp)
+        )
     return {
         "level": level,
         "target_usdc": GRADE_TARGET_USDC[level],
@@ -1014,6 +1108,7 @@ def grade_oddsapiio_sample(
         "identity_soft_reason": source.get("identity_soft_reason"),
         "orientation": source.get("orientation"),
         "bet365_status": bet365_status,
+        "observe_books": observe_books,
         **inspection,
     }
 
@@ -1024,6 +1119,7 @@ def odds_sample_fingerprint(source_payload: Any) -> str:
         "score": source.get("score"),
         "event_status": source.get("event_status"),
         "bet365_markets": _bet365_markets(source.get("raw")),
+        "unibet_markets": _book_markets(source.get("raw"), "Unibet"),
     }
     body = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -1088,7 +1184,7 @@ def parse_oddsapiio_books(
     away: str,
 ) -> list[dict[str, Any]]:
     if odds_payload is None or odds_payload == {}:
-        return [{"book": b, "status": "missing"} for b in wanted_books]
+        return _with_observe_only([{"book": b, "status": "missing"} for b in wanted_books])
 
     # Odds-API.io returns bookmakers as a dict: {"Bet365": [ {name: ML, odds: [...]}, ... ]}
     # Older/docs shapes may use a list of {bookmaker, markets} objects.
@@ -1106,19 +1202,17 @@ def parse_oddsapiio_books(
         bookmakers = odds_payload
 
     if not bookmakers:
-        return [{"book": b, "status": "missing"} for b in wanted_books]
+        return _with_observe_only([{"book": b, "status": "missing"} for b in wanted_books])
 
-    rows: list[dict[str, Any]] = []
     wanted = {_normalize_book_key(b): b for b in wanted_books}
-    found: set[str] = set()
+    found_rows: dict[str, dict[str, Any]] = {}
     for bm in bookmakers:
         if not isinstance(bm, dict):
             continue
         book_name = str(bm.get("bookmaker") or bm.get("name") or bm.get("key") or "")
         norm = _normalize_book_key(book_name)
-        if norm not in wanted:
+        if norm not in wanted or norm in found_rows:
             continue
-        found.add(norm)
         markets = bm.get("markets") or bm.get("odds") or []
         ml = None
         if isinstance(markets, list):
@@ -1163,13 +1257,16 @@ def parse_oddsapiio_books(
         # Event-level status (live/pending/settled) often sits on the odds payload root.
         if isinstance(odds_payload, dict) and odds_payload.get("status") is not None:
             entry["event_status"] = odds_payload.get("status")
-        rows.append(entry)
+        found_rows[norm] = entry
 
-    for norm, display in wanted.items():
-        if norm in found:
-            continue
-        rows.append({"book": display, "status": "missing"})
-    return rows
+    rows: list[dict[str, Any]] = []
+    for display in wanted_books:
+        norm = _normalize_book_key(display)
+        if norm in found_rows:
+            rows.append(found_rows[norm])
+        else:
+            rows.append({"book": display, "status": "missing"})
+    return _with_observe_only(rows)
 
 
 def parse_theoddsapi_books(
@@ -1309,7 +1406,9 @@ class BookContextObserver:
         self.oddspapi_books: tuple[str, ...] = tuple(
             self.cfg.get("oddspapi_books") or DEFAULT_ODDSPAPI_BOOKS
         )
-        self.oddsapiio_books: tuple[str, ...] = DEFAULT_ODDS_API_IO_BOOKS
+        self.oddsapiio_books: tuple[str, ...] = tuple(
+            self.cfg.get("oddsapiio_books") or DEFAULT_ODDS_API_IO_BOOKS
+        )
         self.theoddsapi_regions: tuple[str, ...] = tuple(
             self.cfg.get("theoddsapi_regions") or DEFAULT_THE_ODDS_REGIONS
         )
@@ -1369,7 +1468,7 @@ class BookContextObserver:
         self._stop.clear()
         set_active_observer(self)
         logger.info(
-            "odds confirmation on → %s source=Odds-API.io gate=Bet365 poll=%ss timeout=%ss multi=≤%s/%.0fms",
+            "odds confirmation on → %s source=Odds-API.io gate=Bet365 observe=Unibet poll=%ss timeout=%ss multi=≤%s/%.0fms",
             observe_path(self.root),
             self.poll_interval_s,
             self.poll_timeout_s,
@@ -2249,7 +2348,7 @@ class BookContextObserver:
             return out_err
         books = parse_oddsapiio_books(body, wanted_books=self.oddsapiio_books, home=home, away=away)
         if not books:
-            books = [{"book": b, "status": "missing"} for b in self.oddsapiio_books]
+            books = _with_observe_only([{"book": b, "status": "missing"} for b in self.oddsapiio_books])
         out = {
             "ok": True,
             "event_id": event_id,
