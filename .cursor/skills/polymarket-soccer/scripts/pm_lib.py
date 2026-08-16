@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -25,9 +26,21 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Default local proxy (Shadowrocket / MacPacket system HTTP on 1082).
+# Default local proxy: FlClash mixed port on Windows.
 # SOCKS5 also works on the same port when enabled; override with PM_PROXY.
-DEFAULT_PROXY = "http://127.0.0.1:1082"
+DEFAULT_PROXY_PORT = 7890
+DEFAULT_PROXY = f"http://127.0.0.1:{DEFAULT_PROXY_PORT}"
+
+# Chinese Windows defaults to GBK; Gamma JSON and logs are UTF-8.
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if callable(_reconf):
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # Some Shadowrocket rules return CONNECT 503 for the gamma hostname but allow
 # the Cloudflare anycast IPs. Keep a small fallback list + live DoH lookup.
@@ -112,7 +125,7 @@ class FetchError(RuntimeError):
 
 
 def resolve_proxy(explicit: str | None = None) -> str | None:
-    """Return proxy URL. Default socks5h://127.0.0.1:1082. Use 'none'/'off'/'direct' to disable."""
+    """Return proxy URL. Default http://127.0.0.1:7890. Use 'none'/'off'/'direct' to disable."""
     if explicit is not None:
         raw = explicit.strip()
     else:
@@ -142,13 +155,13 @@ def _apply_socks_proxy(proxy_url: str) -> None:
 
     u = urlparse(proxy_url)
     host = u.hostname or "127.0.0.1"
-    port = u.port or 1082
+    port = u.port or DEFAULT_PROXY_PORT
     scheme = (u.scheme or "socks5h").lower()
     rdns = scheme in ("socks5h", "socks5a")
     if scheme not in ("socks5", "socks5h", "socks5a", "socks4"):
         raise FetchError(
-            f"Unsupported SOCKS scheme '{u.scheme}'. Use socks5h://127.0.0.1:1082 "
-            "or set PM_PROXY=http://127.0.0.1:1082 for HTTP proxy."
+            f"Unsupported SOCKS scheme '{u.scheme}'. Use socks5h://127.0.0.1:{DEFAULT_PROXY_PORT} "
+            f"or set PM_PROXY={DEFAULT_PROXY} for HTTP proxy."
         )
     ptype = socks.SOCKS4 if scheme == "socks4" else socks.SOCKS5
     socks.set_default_proxy(ptype, host, port, rdns=rdns)
@@ -198,6 +211,17 @@ def configure_proxy(explicit: str | None = None) -> str | None:
         raise FetchError(f"Unsupported proxy URL: {proxy}")
 
 
+def _curl_run_kwargs() -> dict[str, Any]:
+    """Decode curl stdout as UTF-8. Windows locale is GBK and would break Gamma JSON."""
+    return {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+
+
 def resolve_gamma_ips(proxy: str | None = None) -> list[str]:
     """Return IPv4s for gamma-api (DoH via proxy when possible, else CF fallback)."""
     global _GAMMA_IPS_CACHE
@@ -218,7 +242,7 @@ def resolve_gamma_ips(proxy: str | None = None) -> list[str]:
         cmd.extend(["-x", proxy])
     cmd.append(doh)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, **_curl_run_kwargs())
         if proc.returncode == 0 and proc.stdout:
             data = json.loads(proc.stdout)
             for ans in data.get("Answer") or []:
@@ -269,7 +293,7 @@ def _fetch_via_curl(
             cmd.extend(["--resolve", f"{GAMMA_HOST}:443:{connect_ip}"])
     cmd.append(url)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, **_curl_run_kwargs())
     except FileNotFoundError as e:
         raise FetchError("curl not found for proxy fallback") from e
     if proc.returncode != 0:
@@ -305,7 +329,7 @@ def fetch_json(
     GET JSON from Gamma API.
 
     proxy:
-      ellipsis → use DEFAULT_PROXY / PM_PROXY (default http://127.0.0.1:1082)
+      ellipsis → use DEFAULT_PROXY / PM_PROXY (default http://127.0.0.1:7890)
       None / 'none' → direct
       str → explicit proxy URL
     """

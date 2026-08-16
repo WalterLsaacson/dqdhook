@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import queue
 import re
@@ -16,6 +15,11 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+
+_SKILLS_DIR = Path(__file__).resolve().parents[2]
+if str(_SKILLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_DIR))
+from filelock_compat import exclusive_file_lock  # noqa: E402
 
 from league_aliases import LEAGUE_ALIASES
 from team_aliases import TEAM_ALIASES
@@ -424,8 +428,8 @@ def load_json(path: Path, default: Any = None) -> Any:
     if not path.is_file():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return default
 
 
@@ -440,14 +444,10 @@ def append_events(path: Path, events: list[dict[str, Any]]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(str(path) + ".lock")
-    with lock_path.open("a+", encoding="utf-8") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        try:
-            with path.open("a", encoding="utf-8") as f:
-                for ev in events:
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        finally:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    with exclusive_file_lock(lock_path):
+        with path.open("a", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
 
 
 def status_bucket(dqd: dict[str, Any] | None) -> str:
