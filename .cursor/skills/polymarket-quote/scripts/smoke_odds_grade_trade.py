@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: C=record-only; B/A cumulative live targets $2/$3."""
+"""Smoke: C=record-only (no USDC); B/A cumulative live targets $3/$10."""
 
 from __future__ import annotations
 
@@ -100,31 +100,31 @@ def main() -> int:
     base = "score_change|m1|0-0->1-0"
     with tempfile.TemporaryDirectory() as td:
         ex = TradeExecutor(Path(td), _settings(), af_mode="gate")
-        c = _buy(ex, "token-cba", base, "C", 1.0)
+        c = _buy(ex, "token-cba", base, "C", 0.0)
         assert c["status"] == "dry_run"
         assert c.get("live") is False
-        assert c["plan"]["usdc"] == 1.0
+        assert c.get("plan") is None
         assert ex.ledger.open_for_match("m1") == []
-        b = _buy(ex, "token-cba", base, "B", 2.0)
-        a = _buy(ex, "token-cba", base, "A", 3.0)
-        assert b["plan"]["usdc"] == 2.0
-        assert a["plan"]["usdc"] == 1.0
+        b = _buy(ex, "token-cba", base, "B", 3.0)
+        a = _buy(ex, "token-cba", base, "A", 10.0)
+        assert b["plan"]["usdc"] == 3.0
+        assert a["plan"]["usdc"] == 7.0
         assert b["size_policy"]["already_usdc"] == 0.0
-        assert a["size_policy"]["already_usdc"] == 2.0
+        assert a["size_policy"]["already_usdc"] == 3.0
         lot = ex.ledger.open_for_match("m1")[0]
-        assert round(float(lot["usdc"]), 6) == 3.0
-        dup = _buy(ex, "token-cba", base, "A", 3.0)
+        assert round(float(lot["usdc"]), 6) == 10.0
+        dup = _buy(ex, "token-cba", base, "A", 10.0)
         assert dup["status"] == "skipped" and dup["skip_reason"] == "already_done"
         time.sleep(0.05)
 
     with tempfile.TemporaryDirectory() as td:
         ex = TradeExecutor(Path(td), _settings(), af_mode="gate")
-        _buy(ex, "token-ca", base, "C", 1.0)
-        direct_a = _buy(ex, "token-ca", base, "A", 3.0)
-        # C left no lot — A sizes the full $3 target.
-        assert direct_a["plan"]["usdc"] == 3.0
-        assert direct_a["size_policy"]["remaining_target_usdc"] == 3.0
-        assert round(float(ex.ledger.open_for_match("m1")[0]["usdc"]), 6) == 3.0
+        _buy(ex, "token-ca", base, "C", 0.0)
+        direct_a = _buy(ex, "token-ca", base, "A", 10.0)
+        # C left no lot — A sizes the full $10 target.
+        assert direct_a["plan"]["usdc"] == 10.0
+        assert direct_a["size_policy"]["remaining_target_usdc"] == 10.0
+        assert round(float(ex.ledger.open_for_match("m1")[0]["usdc"]), 6) == 10.0
         time.sleep(0.05)
 
     with tempfile.TemporaryDirectory() as td:
@@ -134,14 +134,14 @@ def main() -> int:
             match_id="m1",
             token_id="token-full",
             market_key="totals",
-            shares=3.0,
-            usdc=3.0,
+            shares=10.0,
+            usdc=10.0,
             home_score=1,
             away_score=0,
             live=False,
             event_key=base,
         )
-        reached = _buy(ex, "token-full", base, "A", 3.0)
+        reached = _buy(ex, "token-full", base, "A", 10.0)
         assert reached["status"] == "skipped"
         assert reached["skip_reason"] == "odds_grade_target_reached"
         time.sleep(0.05)
@@ -171,8 +171,8 @@ def main() -> int:
 
         def post_market_buy(self, *_args: object, **_kwargs: object) -> dict:
             self.calls += 1
-            making = "0.4" if self.calls == 1 else "1.6"
-            taking = "0.444444" if self.calls == 1 else "1.777778"
+            making = "0.4" if self.calls == 1 else "2.6"
+            taking = "0.444444" if self.calls == 1 else "2.888889"
             return {
                 "status": "matched",
                 "success": True,
@@ -193,25 +193,26 @@ def main() -> int:
             af_mode="gate",
         )
         # C stays dry even when goals are live — no CLOB, no open lot.
-        c_live_stack = _buy(ex, "token-partial", base, "C", 1.0)
+        c_live_stack = _buy(ex, "token-partial", base, "C", 0.0)
         assert c_live_stack["status"] == "dry_run"
         assert c_live_stack.get("live") is False
+        assert c_live_stack.get("plan") is None
         assert trader.calls == 0
         assert ex.ledger.open_for_match("m1") == []
 
-        first_partial = _buy(ex, "token-partial", base, "B", 2.0)
+        first_partial = _buy(ex, "token-partial", base, "B", 3.0)
         assert first_partial.get("live") is True
         assert first_partial["plan"]["usdc"] == 0.4
         assert round(float(ex.ledger.open_for_match("m1")[0]["usdc"]), 6) == 0.4
-        retry_partial = _buy(ex, "token-partial", base, "B", 2.0)
-        assert retry_partial["size_policy"]["remaining_target_usdc"] == 1.6
-        assert retry_partial["size_policy"]["max_usdc"] == 1.6
-        assert retry_partial["plan"]["usdc"] == 1.6
+        retry_partial = _buy(ex, "token-partial", base, "B", 3.0)
+        assert retry_partial["size_policy"]["remaining_target_usdc"] == 2.6
+        assert retry_partial["size_policy"]["max_usdc"] == 2.6
+        assert retry_partial["plan"]["usdc"] == 2.6
         assert trader.calls == 2
-        assert round(float(ex.ledger.open_for_match("m1")[0]["usdc"]), 6) == 2.0
+        assert round(float(ex.ledger.open_for_match("m1")[0]["usdc"]), 6) == 3.0
         time.sleep(0.05)
 
-    print("ok: odds grade C=record-only; B=2/A=3 live sizing")
+    print("ok: odds grade C=record-only; B=3/A=10 live sizing")
     return 0
 
 

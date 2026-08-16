@@ -320,6 +320,8 @@ class TradeExecutor:
         self._flatten_done: set[str] = set()
         # Matches with in-flight / pending exits — block new buy_win opens.
         self._buy_blocked_matches: set[str] = set()
+        self._in_flight: set[str] = set()
+        self._pending: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
         self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
@@ -615,16 +617,132 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """If quote is a misprice opportunity, plan and optionally post."""
+        """If quote is a misprice opportunity, plan and optionally post.
+
+        Prepare/reserve under the lock, CLOB HTTP off-lock, then commit.
+        """
+        if not self.settings.enabled:
+            return None
+        if not quote.get("misprice"):
+            return None
         with self._lock:
-            return self._maybe_trade_locked(
+            prepared = self._prepare_trade_locked(
                 quote,
                 event_key=event_key,
                 match_meta=match_meta,
                 event_type=event_type,
             )
+            if not (isinstance(prepared, dict) and prepared.get("_live_post")):
+                return prepared
+            ctx = prepared
+        try:
+            trader = self.ensure_trader()
+            assert trader is not None
+            token_id = str(ctx["token_id"])
+            plan: FillPlan = ctx["plan"]
+            tick = str(ctx.get("tick") or "0.01") or "0.01"
+            neg_risk = ctx.get("neg_risk")
+            if plan.side == "BUY":
+                response = trader.post_market_buy(
+                    token_id,
+                    Decimal(str(plan.usdc)),
+                    tick,
+                    Decimal(str(plan.worst_price)),
+                    order_type=plan.order_type,
+                    neg_risk=neg_risk,
+                )
+            else:
+                response = trader.post_market_sell(
+                    token_id,
+                    Decimal(str(plan.shares)),
+                    tick,
+                    min_price=Decimal(str(plan.worst_price)),
+                    order_type=plan.order_type,
+                    neg_risk=neg_risk,
+                )
+            ok = trader.is_order_success(response)
+            resp_status = (
+                str((response or {}).get("status") or "").upper()
+                if isinstance(response, dict)
+                else ""
+            )
+            delayed_shares: float | None = None
+            if ok and ctx["trade"] == "buy_win" and resp_status == "DELAYED":
+                bal = trader.wait_conditional_balance(
+                    token_id, min_shares=0.01, timeout_s=0.0, interval_s=0.05
+                )
+                delayed_shares = max(
+                    0.0, float(bal) - float(ctx.get("known_shares_before") or 0)
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("live order failed: %s", e)
+            with self._lock:
+                self._release_pending_locked(str(ctx["key"]))
+                return self._record(
+                    ctx["quote"],
+                    event_key=str(ctx.get("event_key") or ""),
+                    match_meta=ctx.get("match_meta"),
+                    plan=ctx.get("plan"),
+                    status="error",
+                    skip_reason=str(e),
+                    response=None,
+                    success=False,
+                    idempotency_key=str(ctx["key"]),
+                    live=True,
+                    extra=(
+                        {"size_policy": ctx["size_meta"]}
+                        if ctx.get("size_meta")
+                        else None
+                    ),
+                )
+        with self._lock:
+            return self._commit_live_trade_locked(
+                ctx,
+                response=response,
+                ok=ok,
+                resp_status=resp_status,
+                delayed_shares=delayed_shares,
+            )
 
-    def _maybe_trade_locked(
+    def _pending_usdc_total_locked(self) -> float:
+        return sum(float(p.get("usdc") or 0) for p in self._pending.values())
+
+    def _pending_already_usdc_locked(
+        self,
+        *,
+        token_id: str,
+        match_id: str,
+        base_event_key: str,
+    ) -> float:
+        prefix = base_event_key + "|odds_grade_"
+        total = 0.0
+        for p in self._pending.values():
+            if str(p.get("token_id") or "") != token_id:
+                continue
+            if match_id and str(p.get("match_id") or "") != match_id:
+                continue
+            ek = str(p.get("event_key") or "")
+            if ek == base_event_key or ek.startswith(prefix):
+                total += float(p.get("usdc") or 0)
+        return total
+
+    def _release_pending_locked(self, key: str) -> None:
+        self._pending.pop(key, None)
+        self._in_flight.discard(key)
+
+    def _match_buy_blocked_locked(self, mid: str) -> bool:
+        if not mid:
+            return False
+        if mid in self._buy_blocked_matches:
+            return True
+        return any(
+            r.get("pending_flatten") for r in self.ledger.open_for_match(mid)
+        )
+
+    def _match_has_in_flight_buy_locked(self, mid: str) -> bool:
+        return any(str(p.get("match_id") or "") == mid for p in self._pending.values())
+
+    def _prepare_trade_locked(
         self,
         quote: dict[str, Any],
         *,
@@ -632,12 +750,7 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """Caller must hold ``self._lock`` (serializes ledger / _done / posts)."""
-        if not self.settings.enabled:
-            return None
-        if not quote.get("misprice"):
-            return None
-
+        """Caller must hold ``self._lock``. Returns a trades row or a live-post ctx."""
         trade = str(quote.get("trade") or "")
         token_id = str(quote.get("token_id") or "")
         if not trade or not token_id:
@@ -660,6 +773,13 @@ class TradeExecutor:
             channel_live = False
 
         key = trade_idempotency_key(event_key or "", token_id, trade)
+        if key in self._in_flight:
+            logger.debug("skip in-flight %s", key)
+            return {
+                "idempotency_key": key,
+                "status": "skipped",
+                "skip_reason": "in_flight",
+            }
         if key in self._done:
             retry_graded_partial = False
             trade_context_early = (
@@ -687,6 +807,11 @@ class TradeExecutor:
                         or str(lot.get("event_key") or "").startswith(prefix_early)
                     )
                 )
+                actual_early += self._pending_already_usdc_locked(
+                    token_id=token_id,
+                    match_id=mid_early,
+                    base_event_key=base_early,
+                )
                 retry_graded_partial = actual_early + 1e-9 < target_early
             if retry_graded_partial:
                 self._done.discard(key)
@@ -697,6 +822,29 @@ class TradeExecutor:
                     "status": "skipped",
                     "skip_reason": "already_done",
                 }
+
+        if odds_grade == "C":
+            row = self._record(
+                quote,
+                event_key=event_key,
+                match_meta=match_meta,
+                plan=None,
+                status="dry_run",
+                skip_reason=None,
+                response=None,
+                success=True,
+                idempotency_key=key,
+                live=False,
+                extra={"size_policy": {"odds_grade": "C", "target_usdc": 0.0}},
+            )
+            self._done.add(key)
+            logger.info(
+                "record-only C %s %s signal=%s",
+                trade,
+                token_id[:12],
+                typ or "?",
+            )
+            return row
 
         # Price guard on the reference book price (best ask/bid)
         ref_price = quote.get("best_ask") if trade == "buy_win" else quote.get("best_bid")
@@ -726,13 +874,7 @@ class TradeExecutor:
                 or quote.get("match_id")
                 or ""
             )
-            if mid_block and (
-                mid_block in self._buy_blocked_matches
-                or any(
-                    r.get("pending_flatten")
-                    for r in self.ledger.open_for_match(mid_block)
-                )
-            ):
+            if mid_block and self._match_buy_blocked_locked(mid_block):
                 row = self._record(
                     quote,
                     event_key=event_key,
@@ -804,7 +946,7 @@ class TradeExecutor:
                     target_usdc = max(0.0, float(trade_context.get("target_usdc")))
             except (TypeError, ValueError):
                 target_usdc = None
-            if target_usdc is not None and base_event_key:
+            if target_usdc is not None and target_usdc > 1e-9 and base_event_key:
                 mid_target = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
                 prefix = base_event_key + "|odds_grade_"
                 already_usdc = sum(
@@ -816,6 +958,11 @@ class TradeExecutor:
                         str(lot.get("event_key") or "") == base_event_key
                         or str(lot.get("event_key") or "").startswith(prefix)
                     )
+                )
+                already_usdc += self._pending_already_usdc_locked(
+                    token_id=token_id,
+                    match_id=mid_target,
+                    base_event_key=base_event_key,
                 )
                 remaining_target = max(0.0, target_usdc - already_usdc)
                 if remaining_target <= 1e-9:
@@ -843,7 +990,7 @@ class TradeExecutor:
             open_usdc = sum(
                 float(r.get("usdc") or 0)
                 for r in self.ledger.all_open()
-            )
+            ) + self._pending_usdc_total_locked()
             cap_usdc = remaining_target if remaining_target is not None else self.settings.max_usdc
             # Marketable BUY floor is $1; bump sub-$1 remainders (partial fills /
             # upgrade dust) up to the floor rather than posting a rejected $0.98.
@@ -858,10 +1005,18 @@ class TradeExecutor:
                 if remaining_target is not None
                 else self.settings.size_tiers
             )
+            # Grade targets (esp. A=$10) need enough shares at this ask; the
+            # global QUOTE_MAX_SHARES floor still applies to non-graded buys.
+            grade_max_shares = float(self.settings.max_shares)
+            if remaining_target is not None and ref_f is not None and ref_f > 0:
+                grade_max_shares = max(
+                    grade_max_shares,
+                    float(remaining_target) / max(float(ref_f), 1e-9),
+                )
             caps = compute_buy_size_caps(
                 ref_f,
                 max_usdc=cap_usdc,
-                max_shares=self.settings.max_shares,
+                max_shares=grade_max_shares,
                 tiers=cap_tiers,
                 open_usdc=open_usdc,
                 max_open_usdc=self.settings.max_open_usdc,
@@ -973,137 +1128,154 @@ class TradeExecutor:
                 typ or "?",
             )
             if trade == "buy_win" and odds_grade != "C":
-                # C records trades.jsonl only — no open lot (so A/B size to full $2/$3).
+                # C records trades.jsonl only — no open lot (so A/B size to full $3/$10).
                 self._register_open_buy(
                     quote, plan=plan, event_key=event_key, match_meta=match_meta, live=False
                 )
             return row
 
-        # Live post
-        try:
-            trader = self.ensure_trader()
-            assert trader is not None
-            tick = str(quote.get("tick_size") or "0.01") or "0.01"
-            neg = quote.get("neg_risk")
-            neg_risk = bool(neg) if neg is not None else None
-            mid_live = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
-            known_shares_before = sum(
-                float(lot.get("shares") or 0)
-                for lot in self.ledger.all_open()
-                if str(lot.get("token_id") or "") == token_id
-                and (not mid_live or str(lot.get("match_id") or "") == mid_live)
-            )
-            if plan.side == "BUY":
-                response = trader.post_market_buy(
-                    token_id,
-                    Decimal(str(plan.usdc)),
-                    tick,
-                    Decimal(str(plan.worst_price)),
+        # Live post: reserve under the lock, HTTP happens in maybe_trade.
+        tick = str(quote.get("tick_size") or "0.01") or "0.01"
+        neg = quote.get("neg_risk")
+        neg_risk = bool(neg) if neg is not None else None
+        mid_live = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
+        known_shares_before = sum(
+            float(lot.get("shares") or 0)
+            for lot in self.ledger.all_open()
+            if str(lot.get("token_id") or "") == token_id
+            and (not mid_live or str(lot.get("match_id") or "") == mid_live)
+        )
+        reserved = float(plan.usdc or 0) if trade == "buy_win" else 0.0
+        self._in_flight.add(key)
+        if reserved > 0:
+            self._pending[key] = {
+                "usdc": reserved,
+                "token_id": token_id,
+                "match_id": mid_live,
+                "event_key": event_key,
+            }
+        return {
+            "_live_post": True,
+            "quote": quote,
+            "event_key": event_key,
+            "match_meta": match_meta,
+            "trade": trade,
+            "token_id": token_id,
+            "key": key,
+            "plan": plan,
+            "size_meta": size_meta,
+            "tick": tick,
+            "neg_risk": neg_risk,
+            "known_shares_before": known_shares_before,
+        }
+
+    def _commit_live_trade_locked(
+        self,
+        ctx: dict[str, Any],
+        *,
+        response: Any,
+        ok: bool,
+        resp_status: str,
+        delayed_shares: float | None,
+    ) -> dict[str, Any]:
+        """Caller must hold ``self._lock``. Apply fill, ledger, release reserve."""
+        quote = ctx["quote"]
+        event_key = str(ctx.get("event_key") or "")
+        match_meta = ctx.get("match_meta")
+        trade = str(ctx.get("trade") or "")
+        key = str(ctx["key"])
+        plan: FillPlan = ctx["plan"]
+        size_meta = ctx.get("size_meta")
+        self._release_pending_locked(key)
+        ledger_plan = (
+            actual_matched_buy_plan(plan, response)
+            if ok and trade == "buy_win"
+            else plan
+        )
+        if ok and trade == "buy_win" and resp_status == "DELAYED":
+            if delayed_shares is not None and delayed_shares > 1e-6:
+                fill_fraction = min(1.0, delayed_shares / max(plan.shares, 1e-9))
+                ledger_plan = FillPlan(
+                    trade=plan.trade,
+                    side=plan.side,
+                    take_depth=plan.take_depth,
                     order_type=plan.order_type,
-                    neg_risk=neg_risk,
+                    shares=round(delayed_shares, 6),
+                    usdc=round(plan.usdc * fill_fraction, 6),
+                    worst_price=plan.worst_price,
+                    levels_used=plan.levels_used,
+                    levels=list(plan.levels),
+                    skip_reason=plan.skip_reason,
+                )
+                logger.info(
+                    "delayed buy confirmed token=%s… shares=%.4f (plan=%.4f)",
+                    str(ctx.get("token_id") or "")[:12],
+                    delayed_shares,
+                    plan.shares,
                 )
             else:
-                response = trader.post_market_sell(
-                    token_id,
-                    Decimal(str(plan.shares)),
-                    tick,
-                    min_price=Decimal(str(plan.worst_price)),
-                    order_type=plan.order_type,
-                    neg_risk=neg_risk,
+                logger.warning(
+                    "delayed buy accepted but balance still 0 token=%s… "
+                    "registering plan shares=%.4f for flatten safety",
+                    str(ctx.get("token_id") or "")[:12],
+                    plan.shares,
                 )
-            ok = trader.is_order_success(response)
-            resp_status = (
-                str((response or {}).get("status") or "").upper()
-                if isinstance(response, dict)
-                else ""
-            )
-            # DELAYED: CLOB accepted — one quick balance peek (no multi-second wait).
-            ledger_plan = (
-                actual_matched_buy_plan(plan, response)
-                if ok and trade == "buy_win"
-                else plan
-            )
-            if ok and trade == "buy_win" and resp_status == "DELAYED":
-                bal = trader.wait_conditional_balance(
-                    token_id, min_shares=0.01, timeout_s=0.0, interval_s=0.05
+        skip_reason = (
+            f"delayed|{resp_status.lower()}" if resp_status == "DELAYED" else None
+        )
+        extra: dict[str, Any] | None = (
+            {"size_policy": size_meta} if size_meta else None
+        )
+        if ok:
+            self._done.add(key)
+            if trade == "buy_win":
+                fill_st = FILL_STATUS_OPEN
+                if resp_status == "DELAYED" and ledger_plan is plan:
+                    fill_st = FILL_STATUS_PENDING
+                self._register_open_buy(
+                    quote,
+                    plan=ledger_plan,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    live=True,
+                    fill_status=fill_st,
                 )
-                delta_shares = max(0.0, float(bal) - known_shares_before)
-                if delta_shares > 1e-6:
-                    fill_fraction = min(1.0, delta_shares / max(plan.shares, 1e-9))
-                    ledger_plan = FillPlan(
-                        trade=plan.trade,
-                        side=plan.side,
-                        take_depth=plan.take_depth,
-                        order_type=plan.order_type,
-                        shares=round(delta_shares, 6),
-                        usdc=round(plan.usdc * fill_fraction, 6),
-                        worst_price=plan.worst_price,
-                        levels_used=plan.levels_used,
-                        levels=list(plan.levels),
-                        skip_reason=plan.skip_reason,
+                mid = str(
+                    (match_meta or {}).get("match_id")
+                    or quote.get("match_id")
+                    or ""
+                )
+                # Fill landed after a reversal flatten started (CLOB HTTP was
+                # off-lock). Keep the lot so exit can see it, and flag retry.
+                if mid and self._match_buy_blocked_locked(mid):
+                    self._buy_blocked_matches.add(mid)
+                    self.ledger.mark_pending_flatten(
+                        str(quote.get("token_id") or ""),
+                        mid,
+                        reason="buy_blocked_after_post",
                     )
-                    logger.info(
-                        "delayed buy confirmed token=%s… shares=%.4f (plan=%.4f)",
-                        token_id[:12],
-                        delta_shares,
-                        plan.shares,
-                    )
-                else:
-                    logger.warning(
-                        "delayed buy accepted but balance still 0 token=%s… "
-                        "registering plan shares=%.4f for flatten safety",
-                        token_id[:12],
-                        plan.shares,
-                    )
-            row = self._record(
-                quote,
-                event_key=event_key,
-                match_meta=match_meta,
-                plan=ledger_plan,
-                status="posted",
-                skip_reason=(
-                    f"delayed|{resp_status.lower()}" if resp_status == "DELAYED" else None
-                ),
-                response=response,
-                success=ok,
-                idempotency_key=key,
-                live=True,
-                extra={"size_policy": size_meta} if size_meta else None,
-            )
-            if ok:
-                self._done.add(key)
-                if trade == "buy_win":
-                    # Must register even when delayed — otherwise score-reversal
-                    # flatten never sees the lot (Alianza Over 4.5 bug).
-                    fill_st = FILL_STATUS_OPEN
-                    if resp_status == "DELAYED" and ledger_plan is plan:
-                        # Balance still 0 — pending until shares appear / flatten sees bal.
-                        fill_st = FILL_STATUS_PENDING
-                    self._register_open_buy(
-                        quote,
-                        plan=ledger_plan,
-                        event_key=event_key,
-                        match_meta=match_meta,
-                        live=True,
-                        fill_status=fill_st,
-                    )
-            return row
-        except Exception as e:  # noqa: BLE001
-            logger.exception("live order failed: %s", e)
-            row = self._record(
-                quote,
-                event_key=event_key,
-                match_meta=match_meta,
-                plan=plan,
-                status="error",
-                skip_reason=str(e),
-                response=None,
-                success=False,
-                idempotency_key=key,
-                live=True,
-                extra={"size_policy": size_meta} if size_meta else None,
-            )
-            return row
+                    extra = dict(extra or {})
+                    extra["flatten_after_post"] = True
+                    if not skip_reason:
+                        skip_reason = "buy_blocked_after_post"
+                    else:
+                        skip_reason = flatten_reason_append(
+                            skip_reason, "buy_blocked_after_post"
+                        )
+        row = self._record(
+            quote,
+            event_key=event_key,
+            match_meta=match_meta,
+            plan=ledger_plan,
+            status="posted",
+            skip_reason=skip_reason,
+            response=response if isinstance(response, dict) else None,
+            success=ok,
+            idempotency_key=key,
+            live=True,
+            extra=extra,
+        )
+        return row
 
     def _register_open_buy(
         self,
@@ -1332,7 +1504,7 @@ class TradeExecutor:
         return out
 
     def _maybe_clear_buy_block(self, mid: str) -> None:
-        """Lift buy_win block once this match has no open / pending_flatten lots."""
+        """Lift buy_win block once this match has no open lots or in-flight buys."""
         mid = str(mid or "")
         if not mid:
             return
@@ -1341,6 +1513,8 @@ class TradeExecutor:
         if any(
             str(r.get("match_id")) == mid for r in self.ledger.pending_flatten_lots()
         ):
+            return
+        if self._match_has_in_flight_buy_locked(mid):
             return
         self._buy_blocked_matches.discard(mid)
 

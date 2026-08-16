@@ -69,7 +69,7 @@ def _wait(path: Path, count: int, timeout: float = 2.0) -> list[dict]:
 
 def main() -> int:
     assert DEFAULT_SOURCES == ("oddsapiio",)
-    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "Sbobet")
+    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365",)
     assert load_source_keys(env={})["active_sources"] == []
     assert try_create_observer(Path("/tmp"), env={}) is None
     cfg = load_source_keys(
@@ -78,11 +78,10 @@ def main() -> int:
             "ODDSPAPI_KEY": "ignored",
             "THE_ODDS_API_KEY": "ignored",
             "BOOK_OBSERVE_SOURCES": "oddspapi,theoddsapi",
-            "BOOK_ODDS_API_IO_BOOKS": "Bet365,Sbobet,Pinnacle",
         }
     )
     assert cfg["active_sources"] == ["oddsapiio"]
-    assert cfg["oddsapiio_books"] == ("Bet365", "Sbobet")
+    assert cfg["oddsapiio_books"] == ("Bet365",)
 
     # Same-team catalogs may contain settled historical fixtures. Kickoff and
     # status must select the current event, and reversed provider sides are explicit.
@@ -133,9 +132,9 @@ def main() -> int:
         {"name": "Correct Score", "odds": [{"label": "0-0", "odds": "9"}]},
     ]
     b = grade_oddsapiio_sample(_source((0, 0), clean), home_score=1, away_score=0)
-    assert b["level"] == "B" and b["target_usdc"] == 2.0
+    assert b["level"] == "B" and b["target_usdc"] == 3.0
     a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
-    assert a["level"] == "A" and a["target_usdc"] == 3.0
+    assert a["level"] == "A" and a["target_usdc"] == 10.0
     a_blocked = grade_oddsapiio_sample(_source((1, 0), impossible), home_score=1, away_score=0)
     assert a_blocked["level"] == "C" and a_blocked["reason"] == "bet365_has_impossible_markets"
     latency_raw = {"status": "live", "bookmakers": {"Bet365 (no latency)": clean}}
@@ -163,34 +162,34 @@ def main() -> int:
     assert spread_src["books"][0]["status"] == "open"
     assert spread_grade["level"] == "C"
     assert spread_grade["reason"] == "bet365_no_score_sensitive_markets"
-    observe_raw = {
+    extra_raw = {
         "status": "live",
         "bookmakers": {
             "Bet365 (no latency)": spread_only,
-            "Sbobet": [
+            "Pinnacle": [
                 {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
                 {"name": "Correct Score", "odds": [{"label": "1-0", "odds": "5"}]},
                 {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.8", "under": "2"}]},
             ],
         },
     }
-    obs_books = parse_oddsapiio_books(
-        observe_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+    extra_books = parse_oddsapiio_books(
+        extra_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
     )
-    by_book = {b["book"]: b for b in obs_books}
-    assert by_book["Bet365"]["status"] == "open" and "observe_only" not in by_book["Bet365"]
-    assert by_book["Sbobet"]["status"] == "open" and by_book["Sbobet"]["observe_only"] is True
-    obs_src = {
+    by_book = {b["book"]: b for b in extra_books}
+    assert list(by_book) == ["Bet365"]
+    assert by_book["Bet365"]["status"] == "open"
+    extra_src = {
         "ok": True,
         "identity_verified": True,
         "orientation": "same",
         "score": {"home": 1, "away": 0},
-        "books": obs_books,
-        "raw": observe_raw,
+        "books": extra_books,
+        "raw": extra_raw,
     }
-    obs_grade = grade_oddsapiio_sample(obs_src, home_score=1, away_score=0)
-    assert obs_grade["level"] == "C"
-    assert obs_grade["reason"] == "bet365_no_score_sensitive_markets"
+    extra_grade = grade_oddsapiio_sample(extra_src, home_score=1, away_score=0)
+    assert extra_grade["level"] == "C"
+    assert extra_grade["reason"] == "bet365_no_score_sensitive_markets"
     unverified = _source((1, 0), clean)
     unverified["identity_verified"] = False
     assert grade_oddsapiio_sample(unverified, home_score=1, away_score=0)["level"] == "C"
@@ -206,6 +205,50 @@ def main() -> int:
         away_score=1,
     )
     assert btts_bad["impossible_offers"][0]["offer"] == "no"
+    assert btts_bad["gate_impossible_offers"] == []
+
+    # Alt / BTTS / clean-sheet dirt must not veto core-clean CS + main Totals.
+    dirty_side = [
+        {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
+        {"name": "Correct Score", "odds": [{"label": "1-1", "odds": "5"}, {"label": "2-1", "odds": "7"}]},
+        {"name": "Totals", "odds": [{"hdp": 2.5, "over": "1.8", "under": "2"}]},
+        {"name": "Both Teams To Score", "odds": [{"yes": "1.2", "no": "4"}]},
+        {"name": "Alternative Goal Line", "odds": [{"hdp": 0.5, "over": "1.1", "under": "8"}]},
+        {"name": "Clean Sheet Home", "odds": [{"yes": "2", "no": "1.5"}]},
+    ]
+    dirty_inspect = inspect_bet365_impossible_markets(
+        _odds(dirty_side), home_score=1, away_score=1
+    )
+    assert dirty_inspect["impossible_offers"]
+    assert not dirty_inspect["gate_impossible_offers"]
+    dirty_b = grade_oddsapiio_sample(_source((0, 0), dirty_side), home_score=1, away_score=1)
+    assert dirty_b["level"] == "B" and dirty_b["reason"] == "bet365_open_no_impossible_markets"
+    dirty_a = grade_oddsapiio_sample(_source((1, 1), dirty_side), home_score=1, away_score=1)
+    assert dirty_a["level"] == "A" and dirty_a["ignored_impossible_offers"]
+
+    totals_under_dead = [
+        {"name": "ML", "odds": [{"home": "1.5", "draw": "3", "away": "6"}]},
+        {"name": "Totals", "odds": [{"hdp": 0.5, "over": "1.1", "under": "8"}]},
+    ]
+    totals_dead = grade_oddsapiio_sample(
+        _source((1, 0), totals_under_dead), home_score=1, away_score=0
+    )
+    assert totals_dead["level"] == "C"
+    assert totals_dead["reason"] == "bet365_has_impossible_markets"
+    assert totals_dead["gate_impossible_offers"]
+
+    soft_src = _source((1, 0), clean)
+    soft_src["identity_verified"] = False
+    soft_src["identity_soft_ok"] = True
+    soft_grade = grade_oddsapiio_sample(soft_src, home_score=1, away_score=0)
+    assert soft_grade["level"] == "B"
+    assert soft_grade["reason"] == "bet365_clean_identity_soft"
+    assert soft_grade["target_usdc"] == 3.0
+    assert soft_grade["score_match"] is True
+
+    hard_a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
+    assert hard_a["level"] == "A" and hard_a["identity_verified"] is True
+    assert hard_a["identity_soft_ok"] is False
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -229,14 +272,14 @@ def main() -> int:
             source_cfg={
                 "active_sources": ["oddspapi", "oddsapiio", "theoddsapi"],
                 "keys": {"oddsapiio": "io"},
-                "oddsapiio_books": ("Bet365", "Sbobet"),
+                "oddsapiio_books": ("Bet365",),
             },
             poll_interval_s=0.03,
             poll_timeout_s=0.09,
             fetch_oddsapiio=fetch,
         )
         assert obs.active_sources == ("oddsapiio",)
-        assert obs.oddsapiio_books == ("Bet365", "Sbobet")
+        assert obs.oddsapiio_books == ("Bet365",)
         obs.start()
         obs.on_af_confirmed(
             match_id="m1",
@@ -381,6 +424,93 @@ def main() -> int:
         finally:
             bco._http_get_json = old_http
 
+        # Soft identity: cached mapping + fuzzy teams (terminal status fails hard).
+        def soft_http(url: str, **_kw: object) -> tuple:
+            event = {
+                "id": "e-soft",
+                "homeTeam": "Home",
+                "awayTeam": "Away",
+                "status": "settled",
+                "scores": {"home": 1, "away": 0},
+            }
+            if "/odds/multi" in url:
+                return 200, [{"id": "e-soft", **_odds(clean)}], {}, None
+            if "/odds?" in url:
+                return 200, _odds(clean), {}, None
+            if "/events/" in url:
+                return 200, event, {}, None
+            return 200, [event], {}, None
+
+        bco._http_get_json = soft_http
+        try:
+            soft_obs = BookContextObserver(
+                root,
+                source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            )
+            soft_obs._update_cache_entry(
+                "soft1",
+                {
+                    "oddsapiio_event_id": "e-soft",
+                    "home": "Home",
+                    "away": "Away",
+                },
+            )
+            soft_obs._begin_snap_ctx(
+                phase="test", observe_group_id="gs", match_id="soft1", event_key="es"
+            )
+            soft_fetch = soft_obs._default_fetch_oddsapiio("soft1", "Home", "Away")
+            assert soft_fetch["ok"] is True
+            assert soft_fetch["identity_verified"] is False
+            assert soft_fetch["identity_soft_ok"] is True
+            assert soft_fetch["identity_soft_reason"] == "cached_event_team_fuzzy"
+            soft_g = grade_oddsapiio_sample(soft_fetch, home_score=1, away_score=0)
+            assert soft_g["level"] == "B" and soft_g["reason"] == "bet365_clean_identity_soft"
+            assert soft_obs._cache_entry("soft1").get("oddsapiio_event_id") == "e-soft"
+
+            def event_fail_http(url: str, **_kw: object) -> tuple:
+                if "/odds/multi" in url or "/odds?" in url:
+                    payload = _odds(clean)
+                    if "/odds/multi" in url:
+                        return 200, [{"id": "e-soft", **payload}], {}, None
+                    return 200, payload, {}, None
+                return None, None, {}, "timeout"
+
+            bco._http_get_json = event_fail_http
+            soft_obs._begin_snap_ctx(
+                phase="test", observe_group_id="gf", match_id="soft1", event_key="ef"
+            )
+            fail_fetch = soft_obs._default_fetch_oddsapiio("soft1", "Home", "Away")
+            assert fail_fetch["ok"] is True
+            assert fail_fetch["identity_soft_ok"] is True
+            assert fail_fetch["identity_soft_reason"] == "event_fetch_failed_cached_mapping"
+            assert grade_oddsapiio_sample(fail_fetch, home_score=1, away_score=0)["level"] == "B"
+
+            def wrong_http(url: str, **_kw: object) -> tuple:
+                event = {
+                    "id": "e-soft",
+                    "homeTeam": "Other FC",
+                    "awayTeam": "Nobody United",
+                    "status": "live",
+                    "scores": {"home": 1, "away": 0},
+                }
+                if "/odds/multi" in url:
+                    return 200, [{"id": "e-soft", **_odds(clean)}], {}, None
+                if "/odds?" in url:
+                    return 200, _odds(clean), {}, None
+                return 200, event, {}, None
+
+            bco._http_get_json = wrong_http
+            soft_obs._begin_snap_ctx(
+                phase="test", observe_group_id="gw", match_id="soft1", event_key="ew"
+            )
+            wrong_fetch = soft_obs._default_fetch_oddsapiio("soft1", "Home", "Away")
+            assert wrong_fetch.get("identity_verified") is False
+            assert wrong_fetch.get("identity_soft_ok") is not True
+            assert not soft_obs._cache_entry("soft1").get("oddsapiio_event_id")
+            soft_obs.stop()
+        finally:
+            bco._http_get_json = old_http
+
         # End-to-end provider-side reversal: preserve the raw score but grade
         # against the score normalized back into the DQD home/away frame.
         swapped_clean = [
@@ -506,7 +636,7 @@ def main() -> int:
             try:
                 out = boom_obs._oddsapiio_odds_coalesced(
                     event_id="boom1",
-                    books_param="Bet365,Sbobet",
+                    books_param="Bet365",
                     snapshot_ctx={"match_id": "b1"},
                 )
                 assert False, f"expected exception, got {out}"

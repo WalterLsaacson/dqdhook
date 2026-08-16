@@ -140,7 +140,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Limited concurrency for independent FAK posts within one quote phase.
-TRADE_POOL_WORKERS = max(1, int(os.getenv("QUOTE_TRADE_WORKERS", "2") or 2))
+TRADE_POOL_WORKERS = max(1, int(os.getenv("QUOTE_TRADE_WORKERS", "4") or 4))
 _TRADE_EXEC: ThreadPoolExecutor | None = None
 _TRADE_EXEC_LOCK = threading.Lock()
 
@@ -1462,6 +1462,23 @@ def tradeable_token_rows(token_rows: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
+def odds_grade_include_exact(level: str) -> bool:
+    """B upgrades skip Exact Score; A (and C baseline) still include it."""
+    return str(level or "").strip().upper() != "B"
+
+
+def odds_grade_skip_fine_tick_exact(level: str) -> bool:
+    """A upgrades skip exact rows whose book tick is 0.001."""
+    return str(level or "").strip().upper() == "A"
+
+
+def _is_exact_fine_tick(tick: Any) -> bool:
+    try:
+        return abs(float(tick) - 0.001) < 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
 def quote_tokens(
     token_rows: list[dict[str, Any]],
     *,
@@ -1474,6 +1491,7 @@ def quote_tokens(
     match_meta: dict[str, Any] | None = None,
     books: dict[str, dict[str, Any]] | None = None,
     trade_workers: int | None = None,
+    skip_fine_tick_exact: bool = False,
 ) -> list[dict[str, Any]]:
     token_rows = tradeable_token_rows(token_rows)
     ids = [r["token_id"] for r in token_rows if r.get("token_id")]
@@ -1518,7 +1536,19 @@ def quote_tokens(
             "net_edge": econ.get("net_edge"),
             "trade": econ.get("trade"),
         }
-        if mis and trade_executor is not None:
+        skip_fine = (
+            skip_fine_tick_exact
+            and str(row.get("family") or "") == "exact_score"
+            and _is_exact_fine_tick(book.get("tick_size") or row.get("tick_size"))
+        )
+        if skip_fine:
+            item["misprice"] = False
+            item["misprice_reason"] = "exact_tick_0_001_skip"
+            item["trade_attempt"] = {
+                "status": "skipped",
+                "skip_reason": "exact_tick_0_001",
+            }
+        elif mis and trade_executor is not None:
             trade_jobs.append((len(priced), item))
         priced.append(item)
 
@@ -1665,6 +1695,7 @@ def quote_bridge_event(
     proxy: str | None | object = ...,
     include_props: bool = True,
     include_exact: bool = True,
+    skip_fine_tick_exact: bool = False,
     eps: float = DEFAULT_EPS,
     fee_rate: float = SPORTS_TAKER_FEE_RATE,
     min_net: float = DEFAULT_MIN_NET,
@@ -1711,6 +1742,7 @@ def quote_bridge_event(
         trade_executor=trade_executor,
         event_key_str=ek,
         match_meta=match_meta,
+        skip_fine_tick_exact=skip_fine_tick_exact,
     )
     latency_ms: dict[str, int] = {}
     # Live: one books POST for all tokens, trade totals/BTTS first then exact.
@@ -1860,6 +1892,8 @@ def process_bridge_events(
         key: str,
         *,
         af_gate: dict[str, Any] | None = None,
+        include_exact_override: bool | None = None,
+        skip_fine_tick_exact: bool = False,
     ) -> bool:
         nonlocal bundles, seen
         flatten_rows: list[dict[str, Any]] = []
@@ -1886,7 +1920,12 @@ def process_bridge_events(
                 work_ev,
                 proxy=proxy,
                 include_props=include_props,
-                include_exact=include_exact,
+                include_exact=(
+                    include_exact
+                    if include_exact_override is None
+                    else include_exact_override
+                ),
+                skip_fine_tick_exact=skip_fine_tick_exact,
                 eps=eps,
                 fee_rate=fee_rate,
                 min_net=min_net,
@@ -2340,7 +2379,7 @@ def process_bridge_events(
             work_ev,
             base_key=key,
             level="C",
-            target_usdc=1.0,
+            target_usdc=0.0,
             decision={"reason": "baseline_after_af_dqd_confirmation"},
         )
         _quote_one(c_ev, key, af_gate=af_gate)
@@ -2377,7 +2416,7 @@ def process_bridge_events(
                 if not base_key or not source_ev:
                     continue
                 target_usdc = float(
-                    grade.get("target_usdc") or (3.0 if level == "A" else 2.0)
+                    grade.get("target_usdc") or (10.0 if level == "A" else 3.0)
                 )
                 decision = {
                     **grade,
@@ -2396,7 +2435,13 @@ def process_bridge_events(
                 trade_key = str(work_ev.get("_trade_event_key") or "")
                 af_meta = dict(upgrade.get("af_gate") or {})
                 af_meta["odds_confirmation"] = dict(work_ev["_trade_context"])
-                quoted_ok = _quote_one(work_ev, trade_key, af_gate=af_meta)
+                quoted_ok = _quote_one(
+                    work_ev,
+                    trade_key,
+                    af_gate=af_meta,
+                    include_exact_override=odds_grade_include_exact(level),
+                    skip_fine_tick_exact=odds_grade_skip_fine_tick_exact(level),
+                )
                 observer.acknowledge_upgrade(upgrade, success=quoted_ok)
                 print(
                     f"odds-confirm → grade={level} target=${target_usdc:g} "
@@ -2654,7 +2699,7 @@ def process_bridge_events(
                         ev,
                         base_key=key,
                         level="C",
-                        target_usdc=1.0,
+                        target_usdc=0.0,
                         decision={"reason": "baseline_observation_position"},
                     )
                     _quote_one(c_ev, key, af_gate=af_gate)
