@@ -184,9 +184,9 @@ def _load_stale_snapshot() -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 

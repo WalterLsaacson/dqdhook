@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -28,9 +27,13 @@ UA = (
 )
 
 # Import Gamma helpers from polymarket-soccer skill.
-_PM_SCRIPTS = Path(__file__).resolve().parents[2] / "polymarket-soccer" / "scripts"
+_SKILLS_DIR = Path(__file__).resolve().parents[2]
+_PM_SCRIPTS = _SKILLS_DIR / "polymarket-soccer" / "scripts"
+if str(_SKILLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_DIR))
 if str(_PM_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PM_SCRIPTS))
+from filelock_compat import exclusive_file_lock  # noqa: E402
 import pm_lib as pm  # noqa: E402
 
 WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+on\b", re.I)
@@ -85,8 +88,8 @@ def load_json(path: Path, default: Any = None) -> Any:
     if not path.is_file():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return default
 
 
@@ -101,14 +104,10 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(str(path) + ".lock")
-    with lock_path.open("a+", encoding="utf-8") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        try:
-            with path.open("a", encoding="utf-8") as f:
-                for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        finally:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    with exclusive_file_lock(lock_path):
+        with path.open("a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 _PERSIST_EXEC: ThreadPoolExecutor | None = None

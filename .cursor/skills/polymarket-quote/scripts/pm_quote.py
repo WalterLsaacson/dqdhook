@@ -456,7 +456,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _add_common_flags(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("--proxy", default=None, help="Proxy URL (default PM_PROXY / 127.0.0.1:1082)")
+    sp.add_argument("--proxy", default=None, help="Proxy URL (default PM_PROXY / 127.0.0.1:7890)")
     sp.add_argument("--no-proxy", action="store_true", help="Disable proxy")
     sp.add_argument("--eps", type=float, default=0.005, help="Min gross edge vs 0/1 before fee check")
     sp.add_argument(
