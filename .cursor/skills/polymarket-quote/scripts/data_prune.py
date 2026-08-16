@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -14,7 +14,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-import quote_lib as lib
+_SKILLS_DIR = Path(__file__).resolve().parents[2]
+if str(_SKILLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_DIR))
+from filelock_compat import exclusive_file_lock  # noqa: E402
+import quote_lib as lib  # noqa: E402
 from market_cache import MarketCatalogCache, _match_finished_row
 
 logger = logging.getLogger("pm_quote.data_prune")
@@ -36,12 +40,8 @@ def exclusive_jsonl_lock(path: Path) -> Iterator[None]:
     """Exclusive flock on ``{path}.lock`` for the duration of the block."""
     lock_path = lock_path_for(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    with exclusive_file_lock(lock_path):
+        yield
 
 
 def _row_time(

@@ -7,7 +7,7 @@ Examples:
   python3 pm_soccer.py list --league epl,ucl,mls --json
   python3 pm_soccer.py leagues --json
   python3 pm_soccer.py list --no-proxy --json
-  python3 pm_soccer.py list --proxy socks5h://127.0.0.1:1082 --json
+  python3 pm_soccer.py list --proxy socks5h://127.0.0.1:7890 --json
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--proxy",
         default=None,
         help=(
-            "Outbound proxy URL (default: http://127.0.0.1:1082). "
+            "Outbound proxy URL (default: http://127.0.0.1:7890). "
             "Also: PM_PROXY / ALL_PROXY. Bare host:port → socks5h://"
         ),
     )

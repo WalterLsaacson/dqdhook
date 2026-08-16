@@ -32,6 +32,16 @@ import analytics_lib as _ta  # noqa: E402
 HOST = "127.0.0.1"
 PORT = 8790
 
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if callable(_reconf):
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 BOARDS = (
     {
         "id": "match-board",
@@ -322,13 +332,16 @@ def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess
         log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
         stdout = log_fh
         stderr = subprocess.STDOUT
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     proc = subprocess.Popen(
         [sys.executable, str(script), *args],
         cwd=str(ROOT),
-        env=os.environ.copy(),
+        env=env,
         stdout=stdout,
         stderr=stderr,
-        start_new_session=True,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
     # Keep file handle alive on the process object so it is not GC'd closed.
     if log_fh is not None:
