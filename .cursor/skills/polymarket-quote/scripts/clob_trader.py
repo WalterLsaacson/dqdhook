@@ -141,6 +141,34 @@ class ClobTrader:
             logger.warning("cancel open orders failed token=%s…: %s", tid[:12], e2)
             return None
 
+    def get_order(self, order_id: str) -> dict[str, Any] | None:
+        """Best-effort lookup for an accepted asynchronous market order."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        getter = getattr(self.client, "get_order", None)
+        if not callable(getter):
+            return None
+        try:
+            out = getter(oid)
+            return out if isinstance(out, dict) else {"result": out}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("get order failed order=%s…: %s", oid[:14], e)
+            return None
+
+    def cancel_order(self, order_id: str) -> Any:
+        """Cancel one known order without touching unrelated asset orders."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        try:
+            from py_clob_client_v2.clob_types import OrderPayload
+
+            return self.client.cancel_order(OrderPayload(orderID=oid))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("cancel order failed order=%s…: %s", oid[:14], e)
+            return None
+
     @staticmethod
     def is_order_success(result: dict | None, *, market: bool = True) -> bool:
         """Whether a market order was accepted / filled.
@@ -194,6 +222,62 @@ class ClobTrader:
             if time.time() >= deadline:
                 return last
             time.sleep(max(0.05, float(interval_s)))
+
+    def post_limit_buy(
+        self,
+        token_id: str,
+        shares: Decimal,
+        price: Decimal,
+        tick_size: str,
+        *,
+        order_type: str = "GTD",
+        expiration: int = 0,
+        neg_risk: bool | None = None,
+    ) -> dict:
+        """Resting BUY (GTC/GTD). Size is shares; expiration unix-seconds for GTD."""
+        from py_clob_client_v2 import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+
+        ot_raw = str(order_type or "GTD").upper()
+        if ot_raw == "GTC":
+            ot = OrderType.GTC
+            exp = 0
+        else:
+            ot = OrderType.GTD
+            exp = int(expiration or 0)
+            if exp <= 0:
+                raise ValueError("GTD limit buy requires expiration > 0")
+        options = PartialCreateOrderOptions(tick_size=tick_size)
+        if neg_risk is not None:
+            options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
+        size = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if size <= 0:
+            raise ValueError(f"limit buy shares floor to 0 from {shares}")
+        px = Decimal(str(price))
+        if px <= 0 or px >= 1:
+            raise ValueError(f"limit buy price out of range: {price}")
+        args = OrderArgs(
+            token_id=token_id,
+            price=float(px),
+            size=float(size),
+            side="BUY",
+            expiration=exp,
+        )
+        result = self.client.create_and_post_order(
+            args, options=options, order_type=ot
+        )
+        out = result if isinstance(result, dict) else {"result": result}
+        ot_label = getattr(ot, "name", None) or str(ot)
+        logger.info(
+            "limit BUY %s token=%s shares=%s price=%s exp=%s ok=%s",
+            ot_label,
+            token_id[:12],
+            size,
+            px,
+            exp,
+            self.is_order_success(out, market=False),
+        )
+        return out
 
     def post_market_buy(
         self,

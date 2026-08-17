@@ -46,14 +46,14 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
     timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
     poll = getattr(args, "af_poll", None)
     af_mode = resolve_af_mode(args)
-    # Default: tiered schedule 3s → every 1s → 60s → every 2s → timeout.
+    # Default: flat schedule 2s → every 2s → timeout.
     # --af-poll N forces a fixed interval (disables the schedule).
     if poll is None:
         ref = AfReferee(rt, timeout_s=timeout, poll_schedule=True, env_path=None)
         sched = ref._schedule_desc()
         print(
             f"af-referee → on (apifootball-bridge lib · async · schedule={sched} "
-            f"timeout={timeout}s · af_mode={af_mode} · DQD reversals → flatten)",
+            f"timeout={timeout}s · af_mode={af_mode} · DQD reversal → Odds 5s×6 gate)",
             file=sys.stderr,
             flush=True,
         )
@@ -67,7 +67,7 @@ def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
         )
         print(
             f"af-referee → on (apifootball-bridge lib · async · fixed poll={poll}s "
-            f"timeout={timeout}s · af_mode={af_mode} · DQD reversals → flatten)",
+            f"timeout={timeout}s · af_mode={af_mode} · DQD reversal → Odds 5s×6 gate)",
             file=sys.stderr,
             flush=True,
         )
@@ -336,7 +336,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         book_obs.start()
         print(
             f"book-context observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
-            f"(Odds-API.io score + Bet365 gate + Unibet observe · every 3s through 90s · A/B upgrades)",
+            f"(Odds-API.io score + Bet365 gate + 1xbet observe · "
+            f"goals 3s through 90s · reversals 5s×6 · A/B upgrades)",
             file=sys.stderr,
             flush=True,
         )
@@ -545,14 +546,14 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--no-af-referee",
         action="store_true",
-        help="Disable AF confirmation (trade on DQD score_change only; reversals still flatten)",
+        help="Disable AF confirmation (DQD-only buys; reversals still require Odds 5s×6 arbitration)",
     )
     sp.add_argument(
         "--af-postcheck-trade",
         action="store_true",
         help=(
             "Aggressive: trade on DQD goal immediately, hold if AF confirms, "
-            "flatten on AF timeout/reversal"
+            "flatten on AF timeout; DQD reversal still needs Odds arbitration"
         ),
     )
     sp.add_argument(
@@ -569,7 +570,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Fixed AF events poll interval seconds (disables default schedule: "
-            "3s → every 1s → 60s → every 2s → timeout)"
+            "2s → every 2s → timeout)"
         ),
     )
     sp.add_argument(

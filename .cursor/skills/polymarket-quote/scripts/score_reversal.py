@@ -23,6 +23,22 @@ AF_STATUS_NONE = "none"
 FILL_STATUS_OPEN = "open"
 FILL_STATUS_PENDING = "pending_fill"
 
+_FLATTEN_ORDER_FIELDS = (
+    "flatten_order_id",
+    "flatten_order_status",
+    "flatten_order_submitted_at",
+    "flatten_order_balance_before",
+    "flatten_order_shares",
+    "flatten_order_event_key",
+    "flatten_order_checks",
+    "flatten_order_last_checked_at",
+)
+
+
+def _clear_flatten_order_fields(row: dict[str, Any]) -> None:
+    for key in _FLATTEN_ORDER_FIELDS:
+        row.pop(key, None)
+
 
 def score_pair(home: Any, away: Any) -> tuple[int, int] | None:
     try:
@@ -288,6 +304,8 @@ class OpenPositionLedger:
         if existing is not None and existing.get("pending_flatten"):
             row["pending_flatten"] = True
             row["pending_reason"] = existing.get("pending_reason")
+        if existing is not None and existing.get("rest_orders"):
+            row["rest_orders"] = list(existing.get("rest_orders") or [])
         self._rows.append(row)
         self._save()
         logger.info(
@@ -405,6 +423,7 @@ class OpenPositionLedger:
             # Cancel any in-flight emergency flatten from a near-timeout race.
             r.pop("pending_flatten", None)
             r.pop("pending_reason", None)
+            _clear_flatten_order_fields(r)
             n += 1
         if n:
             self._save()
@@ -456,6 +475,7 @@ class OpenPositionLedger:
                 r.pop("pending_flatten", None)
                 r.pop("pending_reason", None)
                 r.pop("flatten_attempts", None)
+                _clear_flatten_order_fields(r)
                 changed = True
         if changed:
             self._save()
@@ -466,6 +486,8 @@ class OpenPositionLedger:
         match_id: str,
         *,
         reason: str,
+        increment_attempt: bool = True,
+        order: dict[str, Any] | None = None,
     ) -> None:
         """Keep lot open but flag for retry on next watch tick."""
         mid = str(match_id)
@@ -479,7 +501,61 @@ class OpenPositionLedger:
             ):
                 r["pending_flatten"] = True
                 r["pending_reason"] = str(reason or "")[:500]
-                r["flatten_attempts"] = int(r.get("flatten_attempts") or 0) + 1
+                if increment_attempt:
+                    r["flatten_attempts"] = int(r.get("flatten_attempts") or 0) + 1
+                if order is not None:
+                    _clear_flatten_order_fields(r)
+                    for key in _FLATTEN_ORDER_FIELDS:
+                        if order.get(key) is not None:
+                            r[key] = order[key]
+                changed = True
+        if changed:
+            self._save()
+
+    def update_pending_flatten_order(
+        self,
+        token_id: str,
+        match_id: str,
+        **fields: Any,
+    ) -> None:
+        """Persist status/check metadata without counting another sell attempt."""
+        mid = str(match_id)
+        tid = str(token_id)
+        changed = False
+        allowed = set(_FLATTEN_ORDER_FIELDS)
+        for row in self._rows:
+            if (
+                row.get("status") == "open"
+                and str(row.get("match_id")) == mid
+                and str(row.get("token_id")) == tid
+            ):
+                for key, value in fields.items():
+                    if key in allowed and value is not None:
+                        row[key] = value
+                        changed = True
+        if changed:
+            self._save()
+
+    def clear_pending_flatten_order(
+        self,
+        token_id: str,
+        match_id: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Forget a terminal/expired order while keeping the lot retryable."""
+        mid = str(match_id)
+        tid = str(token_id)
+        changed = False
+        for row in self._rows:
+            if (
+                row.get("status") == "open"
+                and str(row.get("match_id")) == mid
+                and str(row.get("token_id")) == tid
+            ):
+                _clear_flatten_order_fields(row)
+                if reason is not None:
+                    row["pending_reason"] = str(reason)[:500]
                 changed = True
         if changed:
             self._save()
@@ -530,3 +606,189 @@ class OpenPositionLedger:
 
     def all_open(self) -> list[dict[str, Any]]:
         return [r for r in self._rows if r.get("status") == "open"]
+
+    def rest_reserved_usdc(
+        self,
+        *,
+        token_id: str = "",
+        match_id: str = "",
+        base_event_key: str = "",
+    ) -> float:
+        """USDC still working on live GTC/GTD bids (not yet matched)."""
+        tid = str(token_id or "")
+        mid = str(match_id or "")
+        base = str(base_event_key or "")
+        prefix = base + "|odds_grade_" if base else ""
+        total = 0.0
+        for row in self._rows:
+            if row.get("status") != "open":
+                continue
+            if tid and str(row.get("token_id") or "") != tid:
+                continue
+            if mid and str(row.get("match_id") or "") != mid:
+                continue
+            if base:
+                ek = str(row.get("event_key") or "")
+                if ek != base and not ek.startswith(prefix):
+                    continue
+            for order in row.get("rest_orders") or []:
+                if not isinstance(order, dict):
+                    continue
+                if not rest_order_is_live(order):
+                    continue
+                total += rest_order_working_usdc(order)
+        return total
+
+    def live_rest_orders(
+        self,
+        *,
+        match_id: str = "",
+        token_id: str = "",
+        keep_token_ids: set[str] | None = None,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """(lot, rest_order) pairs still working on the book."""
+        mid = str(match_id or "")
+        tid = str(token_id or "")
+        keep = keep_token_ids
+        out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in self._rows:
+            if row.get("status") != "open":
+                continue
+            if mid and str(row.get("match_id") or "") != mid:
+                continue
+            row_tid = str(row.get("token_id") or "")
+            if tid and row_tid != tid:
+                continue
+            if keep is not None and row_tid in keep:
+                continue
+            for order in row.get("rest_orders") or []:
+                if isinstance(order, dict) and rest_order_is_live(order):
+                    out.append((row, order))
+        return out
+
+    def add_rest_order(
+        self,
+        *,
+        match_id: str,
+        token_id: str,
+        order: dict[str, Any],
+        market_key: str = "",
+        family: str = "",
+        event_key: str = "",
+        home: str = "",
+        away: str = "",
+        home_score: Any = None,
+        away_score: Any = None,
+        live: bool = True,
+        tick_size: str = "0.01",
+        neg_risk: bool | None = None,
+        af_status: str = AF_STATUS_CONFIRMED,
+    ) -> None:
+        """Attach a live rest bid to the match+token lot (creates a 0-share lot)."""
+        mid, tid = str(match_id), str(token_id)
+        if not mid or not tid or not isinstance(order, dict):
+            return
+        existing = None
+        for row in self._rows:
+            if (
+                row.get("status") == "open"
+                and str(row.get("match_id")) == mid
+                and str(row.get("token_id")) == tid
+            ):
+                existing = row
+                break
+        if existing is None:
+            sc = score_pair(home_score, away_score)
+            existing = {
+                "status": "open",
+                "match_id": mid,
+                "token_id": tid,
+                "market_key": market_key,
+                "family": family,
+                "shares": 0.0,
+                "usdc": 0.0,
+                "entry_score": list(sc) if sc else None,
+                "home": home,
+                "away": away,
+                "live": bool(live),
+                "event_key": event_key,
+                "tick_size": tick_size or "0.01",
+                "neg_risk": neg_risk,
+                "af_status": af_status or AF_STATUS_CONFIRMED,
+                "af_deadline": None,
+                "fill_status": FILL_STATUS_OPEN,
+                "rest_orders": [],
+            }
+            self._rows.append(existing)
+        orders = list(existing.get("rest_orders") or [])
+        orders.append(dict(order))
+        existing["rest_orders"] = orders
+        self._save()
+
+    def update_rest_order(
+        self,
+        *,
+        match_id: str,
+        token_id: str,
+        order_id: str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        mid, tid, oid = str(match_id), str(token_id), str(order_id or "")
+        if not oid:
+            return None
+        for row in self._rows:
+            if (
+                row.get("status") != "open"
+                or str(row.get("match_id")) != mid
+                or str(row.get("token_id")) != tid
+            ):
+                continue
+            for order in row.get("rest_orders") or []:
+                if not isinstance(order, dict):
+                    continue
+                if str(order.get("order_id") or "") != oid:
+                    continue
+                order.update(fields)
+                self._save()
+                return dict(order)
+        return None
+
+    def close_empty_rest_lot(self, token_id: str, match_id: str, *, reason: str) -> bool:
+        """Close a lot that has no inventory and no live rest bids."""
+        mid, tid = str(match_id), str(token_id)
+        for row in self._rows:
+            if (
+                row.get("status") == "open"
+                and str(row.get("match_id")) == mid
+                and str(row.get("token_id")) == tid
+            ):
+                if float(row.get("shares") or 0) > 1e-9:
+                    return False
+                if any(
+                    rest_order_is_live(o)
+                    for o in (row.get("rest_orders") or [])
+                    if isinstance(o, dict)
+                ):
+                    return False
+                row["status"] = "closed"
+                row["close_reason"] = reason
+                self._save()
+                return True
+        return False
+
+
+def rest_order_is_live(order: dict[str, Any]) -> bool:
+    status = str(order.get("status") or "").upper()
+    if status in ("CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXPIRED"):
+        return False
+    working = rest_order_working_usdc(order)
+    return working > 1e-9
+
+
+def rest_order_working_usdc(order: dict[str, Any]) -> float:
+    try:
+        usdc = float(order.get("usdc") or 0)
+        filled = float(order.get("filled_usdc") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, usdc - filled)

@@ -1541,6 +1541,11 @@ def quote_tokens(
             and str(row.get("family") or "") == "exact_score"
             and _is_exact_fine_tick(book.get("tick_size") or row.get("tick_size"))
         )
+        grade = ""
+        ctx = (match_meta or {}).get("trade_context")
+        if isinstance(ctx, dict):
+            grade = str(ctx.get("odds_grade") or "").strip().upper()
+        rest_grade = grade in ("A", "B")
         if skip_fine:
             item["misprice"] = False
             item["misprice_reason"] = "exact_tick_0_001_skip"
@@ -1548,8 +1553,13 @@ def quote_tokens(
                 "status": "skipped",
                 "skip_reason": "exact_tick_0_001",
             }
-        elif mis and trade_executor is not None:
-            trade_jobs.append((len(priced), item))
+        else:
+            if str(row.get("settlement") or "") == "WIN":
+                item["trade"] = item.get("trade") or "buy_win"
+            if trade_executor is not None and (
+                mis or (rest_grade and item.get("trade") == "buy_win")
+            ):
+                trade_jobs.append((len(priced), item))
         priced.append(item)
 
     def _one_trade(item: dict[str, Any]) -> dict[str, Any]:
@@ -1722,6 +1732,22 @@ def quote_bridge_event(
     n_before = len(tokens)
     tokens = tradeable_token_rows(tokens)
     discovery["skipped_lose_tokens"] = max(0, n_before - len(tokens))
+    if trade_executor is not None and hasattr(trade_executor, "cancel_stale_rest"):
+        mid = str(
+            ev.get("match_id") or (ctx.get("dongqiudi") or {}).get("id") or ""
+        )
+        win_ids = {
+            str(t.get("token_id") or "")
+            for t in tokens
+            if t.get("token_id")
+        }
+        if mid:
+            try:
+                # Full WIN set (all families) — do not call this per quote phase
+                # or totals/BTTS would cancel exact rests and vice versa.
+                trade_executor.cancel_stale_rest(mid, keep_token_ids=win_ids)
+            except Exception as e:  # noqa: BLE001
+                print(f"ALERT stale rest cancel failed match={mid}: {e}", flush=True)
     ek = str(ev.get("_trade_event_key") or event_key(ev))
     trade_context = ev.get("_trade_context") if isinstance(ev.get("_trade_context"), dict) else None
     match_meta = {
@@ -1886,6 +1912,19 @@ def process_bridge_events(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"ALERT flatten retry sweep failed: {e}", flush=True)
+        try:
+            rested = list(trade_executor.reconcile_rest_orders() or [])
+            if rested:
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "rest_fill",
+                        "rest_fills": rested,
+                        "rest_fill_count": len(rested),
+                    }
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT rest reconcile failed: {e}", flush=True)
 
     def _quote_one(
         work_ev: dict[str, Any],
@@ -1899,8 +1938,8 @@ def process_bridge_events(
         flatten_rows: list[dict[str, Any]] = []
         if trade_executor is not None:
             try:
-                # DQD score drops (VAR / disallowed) always flatten — including
-                # when AF referee is on (AF may briefly confirm then retract).
+                # FT corrections may flatten here. DQD score drops are always
+                # deferred until the separate Odds/Bet365 arbitration confirms.
                 flatten_rows = list(
                     trade_executor.maybe_flatten_for_event(work_ev) or []
                 )
@@ -2416,7 +2455,8 @@ def process_bridge_events(
                 if not base_key or not source_ev:
                     continue
                 target_usdc = float(
-                    grade.get("target_usdc") or (10.0 if level == "A" else 3.0)
+                    grade.get("target_usdc")
+                    or (20.0 if level == "A" else 10.0 if level == "B" else 0.0)
                 )
                 decision = {
                     **grade,
@@ -2450,6 +2490,52 @@ def process_bridge_events(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"ALERT odds upgrade drain failed: {e}", flush=True)
+
+    def _drain_reversal_confirms() -> None:
+        """Flatten only DQD drops corroborated by Odds score/Bet365 markets."""
+        try:
+            from book_context_observe import get_active_observer as get_book_observer
+
+            observer = get_book_observer()
+            if observer is None:
+                return
+            for item in observer.drain_reversal_confirms():
+                ev = item.get("ev") if isinstance(item.get("ev"), dict) else {}
+                decision = (
+                    item.get("decision")
+                    if isinstance(item.get("decision"), dict)
+                    else {}
+                )
+                flatten_rows: list[dict[str, Any]] = []
+                if trade_executor is not None and ev:
+                    flatten_rows = list(
+                        trade_executor.flatten_confirmed_reversal(
+                            ev,
+                            confirmation=decision,
+                        )
+                        or []
+                    )
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "odds_reversal_confirmed",
+                        "event_key": item.get("event_key"),
+                        "match_id": item.get("match_id"),
+                        "reversal_confirmation": decision,
+                        "poll_offset_s": item.get("poll_offset_s"),
+                        "flatten_attempts": flatten_rows,
+                        "flatten_count": len(flatten_rows),
+                    }
+                )
+                print(
+                    f"odds-reversal → CONFIRMED match_id={item.get('match_id')} "
+                    f"reason={decision.get('reason')} "
+                    f"poll={item.get('poll_offset_s')}s flatten={len(flatten_rows)}",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT odds reversal drain failed: {e}", flush=True)
 
     def _deadline_flatten() -> None:
         if mode != "postcheck" or trade_executor is None:
@@ -2509,8 +2595,122 @@ def process_bridge_events(
 
         typ = str(ev.get("type") or "")
 
+        if typ == "score_change":
+            from af_referee import event_is_goal_up, event_is_reversal
+
+            if event_is_reversal(ev):
+                # DQD alone only opens a 30-second arbitration window.  It may
+                # cancel a pending buy/AF job, but it cannot sell an open lot.
+                mid_rev = str(ev.get("match_id") or "")
+                if mid_rev and af_referee is not None:
+                    try:
+                        af_referee.cancel_match(mid_rev, reason="dqd_reversal")
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT af cancel_match failed match={mid_rev}: {e}",
+                            flush=True,
+                        )
+                if mid_rev and trade_executor is not None:
+                    try:
+                        trade_executor.cancel_rest_orders_for_match(
+                            mid_rev, reason="dqd_reversal"
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT rest cancel on reversal failed match={mid_rev}: {e}",
+                            flush=True,
+                        )
+                try:
+                    from livescore_observe import get_active_observer as get_lsa_observer
+
+                    lsa = get_lsa_observer()
+                    if lsa is not None:
+                        lsa.on_dqd_reversal(
+                            root,
+                            match_id=mid_rev,
+                            event_key=key,
+                            ev=ev,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT livescore observe reversal failed: {e}", flush=True)
+                observer_started = False
+                try:
+                    from book_context_observe import get_active_observer as get_book_observer
+
+                    book_obs = get_book_observer()
+                    if book_obs is not None:
+                        observer_started = bool(
+                            book_obs.on_dqd_reversal(
+                                root,
+                                match_id=mid_rev,
+                                event_key=key,
+                                ev=ev,
+                            )
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT book-context observe reversal failed: {e}", flush=True)
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "dqd_reversal_pending_odds",
+                        "event_key": key,
+                        "match_id": mid_rev,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "odds_arbitration_started": observer_started,
+                        "poll_interval_s": 5.0,
+                        "poll_count": 6,
+                        "flatten_count": 0,
+                    }
+                )
+                seen.add(key)
+                print(
+                    f"dqd-reversal → PENDING odds arbitration match_id={mid_rev} "
+                    f"key={key} polls=5/10/15/20/25/30s",
+                    flush=True,
+                )
+                continue
+
+            if event_is_goal_up(ev):
+                # A quick DQD restoration cancels a still-pending reversal
+                # generation before any queued Odds decision can be drained.
+                mid_up = str(ev.get("match_id") or "")
+                try:
+                    from book_context_observe import get_active_observer as get_book_observer
+
+                    book_obs = get_book_observer()
+                    if book_obs is not None:
+                        book_obs.cancel_reversal_if_restored(
+                            mid_up,
+                            home_score=ev.get("home_score"),
+                            away_score=ev.get("away_score"),
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT reversal restore cancel failed: {e}", flush=True)
+                if mid_up and trade_executor is not None:
+                    try:
+                        trade_executor.clear_rest_block(mid_up)
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT rest-block clear failed match={mid_up}: {e}",
+                            flush=True,
+                        )
+
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
+            if mid and trade_executor is not None:
+                try:
+                    trade_executor.cancel_rest_orders_for_match(
+                        mid, reason="match_finished"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"ALERT rest cancel on FT failed match={mid}: {e}",
+                        flush=True,
+                    )
             if mid and mid in processed_ft_ids and not force:
                 seen.add(key)
                 continue
@@ -2589,51 +2789,6 @@ def process_bridge_events(
                 ft_event_is_stale,
                 target_score_from_event,
             )
-
-            if event_is_reversal(ev):
-                # Flatten + requote on corrected score (even with AF referee on).
-                mid_rev = str(ev.get("match_id") or "")
-                if mid_rev and af_referee is not None:
-                    try:
-                        af_referee.cancel_match(mid_rev, reason="dqd_reversal")
-                    except Exception as e:  # noqa: BLE001
-                        print(
-                            f"ALERT af cancel_match failed match={mid_rev}: {e}",
-                            flush=True,
-                        )
-                try:
-                    from livescore_observe import get_active_observer as get_lsa_observer
-
-                    lsa = get_lsa_observer()
-                    if lsa is not None:
-                        lsa.on_dqd_reversal(
-                            root,
-                            match_id=mid_rev,
-                            event_key=key,
-                            ev=ev,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT livescore observe reversal failed: {e}", flush=True)
-                try:
-                    from book_context_observe import get_active_observer as get_book_observer
-
-                    book_obs = get_book_observer()
-                    if book_obs is not None:
-                        book_obs.on_dqd_reversal(
-                            root,
-                            match_id=mid_rev,
-                            event_key=key,
-                            ev=ev,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT book-context observe reversal failed: {e}", flush=True)
-                _quote_one(ev, key)
-                print(
-                    f"af-referee → DQD reversal flatten+quote match_id={ev.get('match_id')} "
-                    f"key={key}",
-                    flush=True,
-                )
-                continue
 
             if event_is_goal_up(ev):
                 target = target_score_from_event(ev)
@@ -2731,7 +2886,7 @@ def process_bridge_events(
                         af_referee.cancel_match(mid, reason="new_goal_up")
                     except Exception:  # noqa: BLE001
                         pass
-                af_referee.submit(key, ev, target, wait_cache=True)
+                af_referee.submit(key, ev, target, wait_cache=False)
                 pending_keys.add(key)
                 print(
                     f"af-gate → awaiting AF match_id={mid} key={key} "
@@ -2757,8 +2912,9 @@ def process_bridge_events(
         _quote_one(ev, key)
 
     _drain_af()
-    # Bridge reversals in this batch have now cancelled their observer state,
-    # so stale queued B/A decisions cannot buy against a reverted score.
+    _drain_reversal_confirms()
+    # Pending/confirmed reversals cancel their observer generation, so stale
+    # queued B/A decisions cannot buy against a reverted score.
     _drain_odds_upgrades()
     _deadline_flatten()
 
