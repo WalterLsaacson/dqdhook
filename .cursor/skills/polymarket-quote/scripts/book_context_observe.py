@@ -2,7 +2,7 @@
 
 Polls immediately and every second for sixty seconds.  Each sample is persisted,
 graded C/B/A from Bet365 only, and may emit a monotonic position-target upgrade.
-Unibet is fetched on the same ``/odds/multi`` call and stored observe-only
+1xbet is fetched on the same ``/odds/multi`` call and stored observe-only
 (core-clean CS/Totals research; never vetoes B/A). Concurrent odds pulls
 coalesce into ``GET /odds/multi`` (up to 10 events / 1 request).
 
@@ -59,7 +59,7 @@ SOURCE_THEODDSAPI = "theoddsapi"
 DEFAULT_SOURCES = (SOURCE_ODDSAPIIO,)
 DEFAULT_ODDSPAPI_BOOKS = ("pinnacle", "singbet")
 DEFAULT_ODDS_API_IO_GATE_BOOKS = ("Bet365",)
-DEFAULT_ODDS_API_IO_OBSERVE_BOOKS = ("Unibet",)
+DEFAULT_ODDS_API_IO_OBSERVE_BOOKS = ("1xbet",)
 DEFAULT_ODDS_API_IO_BOOKS = DEFAULT_ODDS_API_IO_GATE_BOOKS + DEFAULT_ODDS_API_IO_OBSERVE_BOOKS
 ODDS_API_IO_MULTI_MAX = 10
 ODDS_API_IO_MULTI_WINDOW_S = 0.05
@@ -131,6 +131,11 @@ THE_ODDS_SPORTS_CACHE_TTL_S = 6 * 3600.0
 # Solo ~5k req/h: 3s cadence (0/3/…/90) keeps A/B upgrades without burning quota.
 DEFAULT_POLL_INTERVAL_S = 3.0
 DEFAULT_POLL_TIMEOUT_S = 90.0
+# DQD score drops are provisional until Odds-API.io corroborates them.  Poll
+# exactly six times at 5/10/15/20/25/30 seconds; a corroborating sample ends
+# the window early and emits one confirmed-reversal decision.
+DEFAULT_REVERSAL_POLL_INTERVAL_S = 5.0
+DEFAULT_REVERSAL_POLL_COUNT = 6
 DEFAULT_WORKERS = 4
 DEFAULT_HTTP_TIMEOUT_S = 12.0
 DEFAULT_MIN_SIDE_SIM = 0.72
@@ -143,7 +148,7 @@ DEFAULT_EVENT_TIME_TOLERANCE_S = 12 * 3600.0
 PHASE_AF_CONFIRMED = "af_confirmed"
 PHASE_DQD_REVERSAL = "dqd_reversal"
 
-GRADE_TARGET_USDC = {"C": 0.0, "B": 3.0, "A": 10.0}
+GRADE_TARGET_USDC = {"C": 0.0, "B": 10.0, "A": 20.0}
 GRADE_RANK = {"C": 0, "B": 1, "A": 2}
 
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
@@ -419,7 +424,7 @@ def soccer_sport_keys_from_sports_payload(payload: Any) -> list[str]:
 
 
 def load_source_keys(*, env: dict[str, str] | None = None) -> dict[str, Any]:
-    """Load the sole supported confirmation source: Odds-API.io Bet365 + Unibet."""
+    """Load the sole supported confirmation source: Odds-API.io Bet365 + 1xbet."""
     src = env if env is not None else os.environ
     keys = {
         SOURCE_ODDSAPIIO: str(src.get(ENV_ODDS_API_IO_KEY) or "").strip(),
@@ -874,7 +879,7 @@ def inspect_book_impossible_markets(
     Full-match score-sensitive markets are listed for research.  B/A gating
     only inspects Correct Score and the main Totals market so alt/BTTS/clean-
     sheet dirt does not veto a clean core book.  Callers decide whether the
-    result is a veto (Bet365) or observe-only (Unibet).
+    result is a veto (Bet365) or observe-only (1xbet).
     """
     try:
         home = int(home_score)
@@ -1023,7 +1028,7 @@ def grade_oddsapiio_sample(
     Core-clean = Bet365 open with inspectable Correct Score and/or main Totals
     and no impossible offers on those gate markets.  B is core-clean (score
     match not required; soft identity is enough).  A additionally needs a
-    matching provider score and hard identity_verified.  Unibet is attached
+    matching provider score and hard identity_verified.  1xbet is attached
     as ``observe_books`` with the same core-clean fields and never changes
     the grade.
     """
@@ -1113,13 +1118,104 @@ def grade_oddsapiio_sample(
     }
 
 
+def evaluate_reversal_sample(
+    source_payload: Any,
+    *,
+    pre_reversal_score: dict[str, Any],
+) -> dict[str, Any]:
+    """Corroborate a DQD score drop with Odds score or Bet365 markets.
+
+    ``pre_reversal_score`` is deliberately used for the Bet365 inspection.  An
+    offer such as Correct Score 0-0 or Under 0.5 is impossible while a 1-0 goal
+    stands; its reappearance therefore supports the score having rolled back.
+    A fresh, hard-verified fixture identity is required before either signal is
+    allowed to trigger a live flatten.
+    """
+    source = source_payload if isinstance(source_payload, dict) else {}
+    try:
+        target = {
+            "home": int(pre_reversal_score.get("home")),
+            "away": int(pre_reversal_score.get("away")),
+        }
+    except (TypeError, ValueError):
+        return {
+            "confirmed": False,
+            "reason": "missing_pre_reversal_score",
+            "pre_reversal_score": dict(pre_reversal_score or {}),
+        }
+
+    identity_verified = source.get("identity_verified") is True
+    provider_score = source.get("score") if isinstance(source.get("score"), dict) else {}
+    try:
+        provider_pair = (int(provider_score.get("home")), int(provider_score.get("away")))
+    except (TypeError, ValueError):
+        provider_pair = None
+    odds_score_reverted = bool(
+        identity_verified
+        and provider_pair is not None
+        and (
+            provider_pair[0] < target["home"]
+            or provider_pair[1] < target["away"]
+        )
+    )
+
+    bet365 = next(
+        (
+            row for row in (source.get("books") or [])
+            if isinstance(row, dict)
+            and _normalize_book_key(str(row.get("book") or "")) == "bet365"
+        ),
+        {},
+    )
+    provider_target = dict(target)
+    if str(source.get("orientation") or "") == "swapped":
+        provider_target = {"home": target["away"], "away": target["home"]}
+    inspection = inspect_bet365_impossible_markets(
+        source.get("raw"),
+        home_score=provider_target["home"],
+        away_score=provider_target["away"],
+    )
+    returned_impossible = list(inspection.get("gate_impossible_offers") or [])
+    bet365_supports_reversal = bool(
+        identity_verified
+        and str(bet365.get("status") or "missing") == "open"
+        and int(inspection.get("gate_markets") or 0) > 0
+        and returned_impossible
+    )
+    confirmed = odds_score_reverted or bet365_supports_reversal
+    if odds_score_reverted:
+        reason = "odds_score_reverted"
+    elif bet365_supports_reversal:
+        reason = "bet365_impossible_markets_returned"
+    elif not identity_verified:
+        reason = "oddsapiio_event_identity_unverified"
+    else:
+        reason = "reversal_not_corroborated"
+    return {
+        "confirmed": confirmed,
+        "reason": reason,
+        "pre_reversal_score": target,
+        "provider_pre_reversal_score": provider_target,
+        "provider_score": dict(provider_score) if provider_score else None,
+        "identity_verified": identity_verified,
+        "odds_score_reverted": odds_score_reverted,
+        "bet365_supports_reversal": bet365_supports_reversal,
+        "bet365_status": str(bet365.get("status") or "missing"),
+        "gate_markets": int(inspection.get("gate_markets") or 0),
+        "returned_impossible_offers": returned_impossible,
+    }
+
+
 def odds_sample_fingerprint(source_payload: Any) -> str:
     source = source_payload if isinstance(source_payload, dict) else {}
     material = {
         "score": source.get("score"),
         "event_status": source.get("event_status"),
         "bet365_markets": _bet365_markets(source.get("raw")),
-        "unibet_markets": _book_markets(source.get("raw"), "Unibet"),
+        "observe_markets": {
+            book: _book_markets(source.get("raw"), book)
+            for book in DEFAULT_ODDS_API_IO_OBSERVE_BOOKS
+        },
     }
     body = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -1376,6 +1472,11 @@ class _GroupState:
     highest_grade: str = "C"
     last_fingerprint: str | None = None
     reversed: bool = False
+    reversal_confirmed: bool = False
+    reversal_event_key: str = ""
+    reversal_ev: dict[str, Any] = field(default_factory=dict)
+    reversal_score: dict[str, Any] = field(default_factory=dict)
+    reversal_prev: dict[str, Any] = field(default_factory=dict)
 
 
 class BookContextObserver:
@@ -1388,6 +1489,8 @@ class BookContextObserver:
         source_cfg: dict[str, Any] | None = None,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S,
+        reversal_poll_interval_s: float = DEFAULT_REVERSAL_POLL_INTERVAL_S,
+        reversal_poll_count: int = DEFAULT_REVERSAL_POLL_COUNT,
         workers: int = DEFAULT_WORKERS,
         http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
         min_side_sim: float = DEFAULT_MIN_SIDE_SIM,
@@ -1420,6 +1523,8 @@ class BookContextObserver:
         )
         self.poll_interval_s = max(0.01, float(poll_interval_s))
         self.poll_timeout_s = max(self.poll_interval_s, float(poll_timeout_s))
+        self.reversal_poll_interval_s = max(0.01, float(reversal_poll_interval_s))
+        self.reversal_poll_count = max(1, int(reversal_poll_count))
         self.http_timeout_s = max(0.5, float(http_timeout_s))
         self.min_side_sim = float(min_side_sim)
         self.events_catalog_ttl_s = max(0.0, float(events_catalog_ttl_s))
@@ -1434,6 +1539,7 @@ class BookContextObserver:
         self._snap_ctx: dict[str, Any] = {}
         self._snap_local = threading.local()
         self._upgrades: list[dict[str, Any]] = []
+        self._reversal_confirms: list[dict[str, Any]] = []
         self._raw_seq = 0
         self._events_catalog_lock = threading.Lock()
         self._events_catalog_body: Any = None
@@ -1468,8 +1574,9 @@ class BookContextObserver:
         self._stop.clear()
         set_active_observer(self)
         logger.info(
-            "odds confirmation on → %s source=Odds-API.io gate=Bet365 observe=Unibet poll=%ss timeout=%ss multi=≤%s/%.0fms",
+            "odds confirmation on → %s source=Odds-API.io gate=Bet365 observe=%s poll=%ss timeout=%ss multi=≤%s/%.0fms",
             observe_path(self.root),
+            ",".join(DEFAULT_ODDS_API_IO_OBSERVE_BOOKS),
             self.poll_interval_s,
             self.poll_timeout_s,
             ODDS_API_IO_MULTI_MAX,
@@ -1573,29 +1680,7 @@ class BookContextObserver:
         if not mid:
             return None
         ev = ev if isinstance(ev, dict) else {}
-        with self._lock:
-            linked = self._by_match.get(mid)
-            if linked is not None:
-                linked.reversed = True
-                for t in linked.timers:
-                    t.cancel()
-                linked.timers.clear()
-                group_id = linked.observe_group_id
-                home_name = linked.home or str(ev.get("home") or "")
-                away_name = linked.away or str(ev.get("away") or "")
-                key = linked.event_key or str(event_key or "")
-                unlinked = False
-                gen = linked.gen
-            else:
-                home_sc = ev.get("home_score")
-                away_sc = ev.get("away_score")
-                key = str(event_key or "")
-                group_id = make_observe_group_id(mid, home_sc, away_sc, key or "reversal")
-                home_name = str(ev.get("home") or "")
-                away_name = str(ev.get("away") or "")
-                unlinked = True
-                gen = 0
-        prev = ev.get("prev") if isinstance(ev.get("prev"), dict) else None
+        prev = ev.get("prev") if isinstance(ev.get("prev"), dict) else {}
         dqd_score = {
             "home": ev.get(
                 "home_score",
@@ -1606,24 +1691,127 @@ class BookContextObserver:
                 (ev.get("curr") or {}).get("away") if isinstance(ev.get("curr"), dict) else None,
             ),
         }
-        dqd_prev = None
-        if prev is not None:
-            dqd_prev = {"home": prev.get("home"), "away": prev.get("away")}
-        self._pool.submit(
-            self._safe_snapshot,
-            PHASE_DQD_REVERSAL,
-            group_id,
-            mid,
-            key,
-            home_name,
-            away_name,
-            dqd_score,
-            dqd_prev,
-            unlinked,
-            gen,
-            None,
-        )
+        dqd_prev = {"home": prev.get("home"), "away": prev.get("away")}
+        with self._lock:
+            linked = self._by_match.get(mid)
+            if linked is not None:
+                for t in linked.timers:
+                    t.cancel()
+                linked.timers.clear()
+                # Advance the generation so already-running goal polls cannot
+                # emit a stale A/B upgrade after DQD has dropped the score.
+                linked.gen += 1
+                linked.reversed = True
+                linked.reversal_confirmed = False
+                linked.reversal_event_key = str(event_key or "")
+                linked.reversal_ev = dict(ev)
+                linked.reversal_score = dict(dqd_score)
+                linked.reversal_prev = dict(dqd_prev)
+                group_id = linked.observe_group_id
+                home_name = linked.home or str(ev.get("home") or "")
+                away_name = linked.away or str(ev.get("away") or "")
+                key = str(event_key or "")
+                unlinked = False
+                gen = linked.gen
+            else:
+                key = str(event_key or "")
+                group_id = make_observe_group_id(
+                    mid, dqd_prev.get("home"), dqd_prev.get("away"), key or "reversal"
+                )
+                home_name = str(ev.get("home") or "")
+                away_name = str(ev.get("away") or "")
+                unlinked = True
+                gen = 1
+                linked = _GroupState(
+                    observe_group_id=group_id,
+                    match_id=mid,
+                    event_key="",
+                    home=home_name,
+                    away=away_name,
+                    dqd_score=dict(dqd_prev),
+                    gen=gen,
+                    reversed=True,
+                    reversal_event_key=key,
+                    reversal_ev=dict(ev),
+                    reversal_score=dict(dqd_score),
+                    reversal_prev=dict(dqd_prev),
+                )
+                self._by_match[mid] = linked
+
+            # Drop a decision from an older reversal generation, if any.
+            self._reversal_confirms = [
+                item for item in self._reversal_confirms
+                if str(item.get("match_id") or "") != mid
+            ]
+            for poll_i in range(1, self.reversal_poll_count + 1):
+                delay = self.reversal_poll_interval_s * poll_i
+
+                def _fire(
+                    offset: float = delay,
+                    generation: int = gen,
+                    state: _GroupState = linked,
+                    unlinked_flag: bool = unlinked,
+                ) -> None:
+                    if self._stop.is_set():
+                        return
+                    self._pool.submit(
+                        self._safe_snapshot,
+                        PHASE_DQD_REVERSAL,
+                        state.observe_group_id,
+                        state.match_id,
+                        state.reversal_event_key,
+                        state.home,
+                        state.away,
+                        dict(state.reversal_score),
+                        dict(state.reversal_prev),
+                        unlinked_flag,
+                        generation,
+                        offset,
+                    )
+
+                timer = threading.Timer(delay, _fire)
+                timer.daemon = True
+                linked.timers.append(timer)
+                timer.start()
         return group_id
+
+    def cancel_reversal_if_restored(
+        self,
+        match_id: str,
+        *,
+        home_score: Any,
+        away_score: Any,
+    ) -> bool:
+        """Cancel a pending DQD-reversal window when DQD restores its target."""
+        mid = str(match_id or "").strip()
+        try:
+            restored = (int(home_score), int(away_score))
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            state = self._by_match.get(mid)
+            if state is None or not state.reversed:
+                return False
+            try:
+                target = (
+                    int(state.dqd_score.get("home")),
+                    int(state.dqd_score.get("away")),
+                )
+            except (TypeError, ValueError):
+                return False
+            if restored[0] < target[0] or restored[1] < target[1]:
+                return False
+            for timer in state.timers:
+                timer.cancel()
+            state.timers.clear()
+            state.gen += 1
+            state.reversed = False
+            state.reversal_confirmed = False
+            self._reversal_confirms = [
+                item for item in self._reversal_confirms
+                if str(item.get("match_id") or "") != mid
+            ]
+            return True
 
     def _poll_offsets(self) -> list[float]:
         count = int(self.poll_timeout_s // self.poll_interval_s)
@@ -2628,8 +2816,22 @@ class BookContextObserver:
                             "summary": {},
                             "poll": {
                                 "offset_s": poll_offset_s,
-                                "interval_s": self.poll_interval_s,
-                                "timeout_s": self.poll_timeout_s,
+                                "interval_s": (
+                                    self.reversal_poll_interval_s
+                                    if phase == PHASE_DQD_REVERSAL
+                                    else self.poll_interval_s
+                                ),
+                                "timeout_s": (
+                                    self.reversal_poll_interval_s
+                                    * self.reversal_poll_count
+                                    if phase == PHASE_DQD_REVERSAL
+                                    else self.poll_timeout_s
+                                ),
+                                "count": (
+                                    self.reversal_poll_count
+                                    if phase == PHASE_DQD_REVERSAL
+                                    else None
+                                ),
                             },
                             "unlinked_reversal": bool(unlinked_reversal),
                             "error": {"fatal": str(e)},
@@ -2656,11 +2858,15 @@ class BookContextObserver:
     ) -> None:
         if self._stop.is_set():
             return
-        if phase != PHASE_DQD_REVERSAL:
-            with self._lock:
-                cur = self._by_match.get(match_id)
-                if cur is None or cur.gen != gen or cur.reversed:
+        with self._lock:
+            cur = self._by_match.get(match_id)
+            if cur is None or cur.gen != gen:
+                return
+            if phase == PHASE_DQD_REVERSAL:
+                if not cur.reversed or cur.reversal_confirmed:
                     return
+            elif cur.reversed:
+                return
 
         self._begin_snap_ctx(
             phase=phase,
@@ -2677,6 +2883,37 @@ class BookContextObserver:
             away_score=dqd_score.get("away"),
         )
         fingerprint = odds_sample_fingerprint(odds_source)
+        reversal_decision: dict[str, Any] | None = None
+        if phase == PHASE_DQD_REVERSAL:
+            reversal_decision = evaluate_reversal_sample(
+                odds_source,
+                pre_reversal_score=dqd_prev or {},
+            )
+            if reversal_decision.get("confirmed"):
+                with self._lock:
+                    cur = self._by_match.get(match_id)
+                    if (
+                        cur is not None
+                        and cur.gen == gen
+                        and cur.reversed
+                        and not cur.reversal_confirmed
+                    ):
+                        cur.reversal_confirmed = True
+                        for timer in cur.timers:
+                            timer.cancel()
+                        cur.timers.clear()
+                        self._reversal_confirms.append(
+                            {
+                                "quoted_at": lib.now_cn_iso(),
+                                "observe_group_id": cur.observe_group_id,
+                                "generation": cur.gen,
+                                "match_id": cur.match_id,
+                                "event_key": cur.reversal_event_key,
+                                "ev": dict(cur.reversal_ev),
+                                "decision": dict(reversal_decision),
+                                "poll_offset_s": poll_offset_s,
+                            }
+                        )
         data_changed = False
         upgrade_emitted = False
         previous_grade = "C"
@@ -2741,8 +2978,21 @@ class BookContextObserver:
             "summary": summary,
             "poll": {
                 "offset_s": poll_offset_s,
-                "interval_s": self.poll_interval_s,
-                "timeout_s": self.poll_timeout_s,
+                "interval_s": (
+                    self.reversal_poll_interval_s
+                    if phase == PHASE_DQD_REVERSAL
+                    else self.poll_interval_s
+                ),
+                "timeout_s": (
+                    self.reversal_poll_interval_s * self.reversal_poll_count
+                    if phase == PHASE_DQD_REVERSAL
+                    else self.poll_timeout_s
+                ),
+                "count": (
+                    self.reversal_poll_count
+                    if phase == PHASE_DQD_REVERSAL
+                    else None
+                ),
             },
             "odds_grade": grade,
             "previous_highest_grade": previous_grade,
@@ -2750,6 +3000,8 @@ class BookContextObserver:
             "data_changed": data_changed,
             "upgrade_emitted": upgrade_emitted,
         }
+        if reversal_decision is not None:
+            row["reversal_decision"] = reversal_decision
         if dqd_prev is not None:
             row["dqd_prev"] = dqd_prev
         if unlinked_reversal:
@@ -2774,6 +3026,22 @@ class BookContextObserver:
                     continue
                 if float(item.get("retry_after_mono") or 0.0) > now_mono:
                     self._upgrades.append(item)
+                    continue
+                out.append(item)
+            return out
+
+    def drain_reversal_confirms(self) -> list[dict[str, Any]]:
+        """Return one still-current Odds-confirmed decision per DQD reversal."""
+        with self._lock:
+            queued, self._reversal_confirms = self._reversal_confirms, []
+            out: list[dict[str, Any]] = []
+            for item in queued:
+                cur = self._by_match.get(str(item.get("match_id") or ""))
+                if cur is None or not cur.reversed or not cur.reversal_confirmed:
+                    continue
+                if cur.gen != item.get("generation"):
+                    continue
+                if cur.observe_group_id != item.get("observe_group_id"):
                     continue
                 out.append(item)
             return out

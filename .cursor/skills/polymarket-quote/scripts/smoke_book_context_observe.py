@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: Odds-API.io Bet365 gate + Unibet observe, grading, upgrades, reversal."""
+"""Smoke: Odds-API.io Bet365 gate + 1xbet observe, grading, upgrades, reversal."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from book_context_observe import (  # noqa: E402
     BookContextObserver,
     DEFAULT_ODDS_API_IO_BOOKS,
     DEFAULT_SOURCES,
+    evaluate_reversal_sample,
     grade_oddsapiio_sample,
     inspect_bet365_impossible_markets,
     load_source_keys,
@@ -69,7 +70,7 @@ def _wait(path: Path, count: int, timeout: float = 2.0) -> list[dict]:
 
 def main() -> int:
     assert DEFAULT_SOURCES == ("oddsapiio",)
-    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "Unibet")
+    assert DEFAULT_ODDS_API_IO_BOOKS == ("Bet365", "1xbet")
     assert load_source_keys(env={})["active_sources"] == []
     assert try_create_observer(Path("/tmp"), env={}) is None
     cfg = load_source_keys(
@@ -81,7 +82,7 @@ def main() -> int:
         }
     )
     assert cfg["active_sources"] == ["oddsapiio"]
-    assert cfg["oddsapiio_books"] == ("Bet365", "Unibet")
+    assert cfg["oddsapiio_books"] == ("Bet365", "1xbet")
 
     # Same-team catalogs may contain settled historical fixtures. Kickoff and
     # status must select the current event, and reversed provider sides are explicit.
@@ -132,9 +133,9 @@ def main() -> int:
         {"name": "Correct Score", "odds": [{"label": "0-0", "odds": "9"}]},
     ]
     b = grade_oddsapiio_sample(_source((0, 0), clean), home_score=1, away_score=0)
-    assert b["level"] == "B" and b["target_usdc"] == 3.0
+    assert b["level"] == "B" and b["target_usdc"] == 10.0
     a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
-    assert a["level"] == "A" and a["target_usdc"] == 10.0
+    assert a["level"] == "A" and a["target_usdc"] == 20.0
     a_blocked = grade_oddsapiio_sample(_source((1, 0), impossible), home_score=1, away_score=0)
     assert a_blocked["level"] == "C" and a_blocked["reason"] == "bet365_has_impossible_markets"
     latency_raw = {"status": "live", "bookmakers": {"Bet365 (no latency)": clean}}
@@ -177,10 +178,10 @@ def main() -> int:
         extra_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
     )
     by_book = {b["book"]: b for b in extra_books}
-    assert list(by_book) == ["Bet365", "Unibet"]
+    assert list(by_book) == ["Bet365", "1xbet"]
     assert by_book["Bet365"]["status"] == "open"
     assert "observe_only" not in by_book["Bet365"]
-    assert by_book["Unibet"]["status"] == "missing" and by_book["Unibet"]["observe_only"] is True
+    assert by_book["1xbet"]["status"] == "missing" and by_book["1xbet"]["observe_only"] is True
     extra_src = {
         "ok": True,
         "identity_verified": True,
@@ -192,52 +193,52 @@ def main() -> int:
     extra_grade = grade_oddsapiio_sample(extra_src, home_score=1, away_score=0)
     assert extra_grade["level"] == "C"
     assert extra_grade["reason"] == "bet365_no_score_sensitive_markets"
-    assert extra_grade["observe_books"][0]["book"] == "Unibet"
+    assert extra_grade["observe_books"][0]["book"] == "1xbet"
     assert extra_grade["observe_books"][0]["core_clean"] is False
-    assert extra_grade["observe_books"][0]["reason"] == "unibet_missing"
+    assert extra_grade["observe_books"][0]["reason"] == "1xbet_missing"
 
-    unibet_dirty = {
+    xbet_dirty = {
         "status": "live",
         "bookmakers": {
             "Bet365": clean,
-            "Unibet (no latency)": impossible,
+            "1xbet (no latency)": impossible,
         },
     }
-    unibet_books = parse_oddsapiio_books(
-        unibet_dirty, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+    xbet_books = parse_oddsapiio_books(
+        xbet_dirty, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
     )
-    unibet_by = {b["book"]: b for b in unibet_books}
-    assert unibet_by["Unibet"]["status"] == "open" and unibet_by["Unibet"]["observe_only"] is True
-    unibet_src = {
+    xbet_by = {b["book"]: b for b in xbet_books}
+    assert xbet_by["1xbet"]["status"] == "open" and xbet_by["1xbet"]["observe_only"] is True
+    xbet_src = {
         "ok": True,
         "identity_verified": True,
         "orientation": "same",
         "score": {"home": 1, "away": 0},
-        "books": unibet_books,
-        "raw": unibet_dirty,
+        "books": xbet_books,
+        "raw": xbet_dirty,
     }
-    unibet_grade = grade_oddsapiio_sample(unibet_src, home_score=1, away_score=0)
-    assert unibet_grade["level"] == "A"
-    assert unibet_grade["observe_books"][0]["core_clean"] is False
-    assert unibet_grade["observe_books"][0]["reason"] == "unibet_has_impossible_markets"
-    unibet_clean_raw = {
+    xbet_grade = grade_oddsapiio_sample(xbet_src, home_score=1, away_score=0)
+    assert xbet_grade["level"] == "A"
+    assert xbet_grade["observe_books"][0]["core_clean"] is False
+    assert xbet_grade["observe_books"][0]["reason"] == "1xbet_has_impossible_markets"
+    xbet_clean_raw = {
         "status": "live",
-        "bookmakers": {"Bet365": clean, "Unibet": clean},
+        "bookmakers": {"Bet365": clean, "1xbet": clean},
     }
-    unibet_clean_src = {
+    xbet_clean_src = {
         "ok": True,
         "identity_verified": True,
         "orientation": "same",
         "score": {"home": 1, "away": 0},
         "books": parse_oddsapiio_books(
-            unibet_clean_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
+            xbet_clean_raw, wanted_books=DEFAULT_ODDS_API_IO_BOOKS, home="Home", away="Away"
         ),
-        "raw": unibet_clean_raw,
+        "raw": xbet_clean_raw,
     }
-    unibet_ok = grade_oddsapiio_sample(unibet_clean_src, home_score=1, away_score=0)
-    assert unibet_ok["level"] == "A"
-    assert unibet_ok["observe_books"][0]["core_clean"] is True
-    assert unibet_ok["observe_books"][0]["reason"] == "unibet_core_clean"
+    xbet_ok = grade_oddsapiio_sample(xbet_clean_src, home_score=1, away_score=0)
+    assert xbet_ok["level"] == "A"
+    assert xbet_ok["observe_books"][0]["core_clean"] is True
+    assert xbet_ok["observe_books"][0]["reason"] == "1xbet_core_clean"
     unverified = _source((1, 0), clean)
     unverified["identity_verified"] = False
     assert grade_oddsapiio_sample(unverified, home_score=1, away_score=0)["level"] == "C"
@@ -291,12 +292,48 @@ def main() -> int:
     soft_grade = grade_oddsapiio_sample(soft_src, home_score=1, away_score=0)
     assert soft_grade["level"] == "B"
     assert soft_grade["reason"] == "bet365_clean_identity_soft"
-    assert soft_grade["target_usdc"] == 3.0
+    assert soft_grade["target_usdc"] == 10.0
     assert soft_grade["score_match"] is True
 
     hard_a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
     assert hard_a["level"] == "A" and hard_a["identity_verified"] is True
     assert hard_a["identity_soft_ok"] is False
+    score_reversal = evaluate_reversal_sample(
+        _source((0, 0), clean),
+        pre_reversal_score={"home": 1, "away": 0},
+    )
+    assert score_reversal["confirmed"] is True
+    assert score_reversal["reason"] == "odds_score_reverted"
+    book_reversal = evaluate_reversal_sample(
+        _source((1, 0), impossible),
+        pre_reversal_score={"home": 1, "away": 0},
+    )
+    assert book_reversal["confirmed"] is True
+    assert book_reversal["reason"] == "bet365_impossible_markets_returned"
+    assert book_reversal["returned_impossible_offers"]
+    no_reversal = evaluate_reversal_sample(
+        _source((1, 0), clean),
+        pre_reversal_score={"home": 1, "away": 0},
+    )
+    assert no_reversal["confirmed"] is False
+    swapped_reversal_src = _source(
+        (1, 0),
+        [
+            {"name": "Correct Score", "odds": [{"label": "1-0", "odds": "5"}]},
+            {"name": "Totals", "odds": [{"hdp": 1.5, "over": "1.8", "under": "2"}]},
+        ],
+    )
+    swapped_reversal_src["orientation"] = "swapped"
+    swapped_book_reversal = evaluate_reversal_sample(
+        swapped_reversal_src,
+        pre_reversal_score={"home": 1, "away": 0},
+    )
+    assert swapped_book_reversal["confirmed"] is True
+    assert swapped_book_reversal["reason"] == "bet365_impossible_markets_returned"
+    assert swapped_book_reversal["provider_pre_reversal_score"] == {
+        "home": 0,
+        "away": 1,
+    }
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -339,7 +376,7 @@ def main() -> int:
         assert len(rows) == 4, len(rows)
         assert [r["poll"]["offset_s"] for r in rows] == [0.0, 0.03, 0.06, 0.09]
         assert [r["odds_grade"]["level"] for r in rows] == ["C", "B", "A", "A"]
-        assert all(r["odds_grade"]["observe_books"][0]["book"] == "Unibet" for r in rows)
+        assert all(r["odds_grade"]["observe_books"][0]["book"] == "1xbet" for r in rows)
         assert all(r["odds_grade"]["observe_books"][0]["observe_only"] is True for r in rows)
         assert rows[1]["data_changed"] is True and rows[1]["upgrade_emitted"] is True
         assert rows[2]["upgrade_emitted"] is True
@@ -368,12 +405,15 @@ def main() -> int:
         assert sched._poll_offsets() == [float(x) for x in range(3, 91, 3)]
         sched.stop()
 
-        # A reversal cancels all remaining polls and suppresses queued upgrades.
+        # A DQD reversal cancels goal polls, then runs six Odds arbitration
+        # samples.  DQD alone cannot emit a confirmed flatten decision.
         rev_obs = BookContextObserver(
             root,
             source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
             poll_interval_s=0.05,
             poll_timeout_s=0.2,
+            reversal_poll_interval_s=0.03,
+            reversal_poll_count=6,
             fetch_oddsapiio=lambda *_: _source((1, 0), clean),
         )
         before = len(_rows(path))
@@ -391,10 +431,46 @@ def main() -> int:
         )
         time.sleep(0.25)
         after = _rows(path)[before:]
-        assert any(r["phase"] == "dqd_reversal" for r in after)
-        assert not any(r.get("poll", {}).get("offset_s", 0) not in (0, None) for r in after)
+        reversal_rows = [r for r in after if r["phase"] == "dqd_reversal"]
+        assert len(reversal_rows) == 6, reversal_rows
+        assert [r["poll"]["offset_s"] for r in reversal_rows] == [
+            0.03, 0.06, 0.09, 0.12, 0.15, 0.18
+        ]
+        assert all(r["poll"]["interval_s"] == 0.03 for r in reversal_rows)
+        assert all(r["poll"]["count"] == 6 for r in reversal_rows)
+        assert all(r["poll"]["timeout_s"] == 0.18 for r in reversal_rows)
+        assert all(not r["reversal_decision"]["confirmed"] for r in reversal_rows)
+        assert rev_obs.drain_reversal_confirms() == []
         assert rev_obs.drain_upgrades() == []
         rev_obs.stop()
+
+        # First corroborating Odds score ends the window and emits exactly one
+        # decision; later timers are canceled.
+        confirm_obs = BookContextObserver(
+            root,
+            source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            reversal_poll_interval_s=0.02,
+            reversal_poll_count=6,
+            fetch_oddsapiio=lambda *_: _source((0, 0), clean),
+        )
+        confirm_obs.start()
+        confirm_obs.on_af_confirmed(
+            match_id="m3",
+            event_key="score_change|m3|0-0->1-0",
+            ev={"match_id": "m3", "home": "Home", "away": "Away", "home_score": 1, "away_score": 0},
+            af_gate={"confirmed": True},
+        )
+        confirm_obs.on_dqd_reversal(
+            match_id="m3",
+            event_key="score_change|m3|1-0->0-0",
+            ev={"match_id": "m3", "home_score": 0, "away_score": 0, "prev": {"home": 1, "away": 0}},
+        )
+        time.sleep(0.08)
+        decisions = confirm_obs.drain_reversal_confirms()
+        assert len(decisions) == 1, decisions
+        assert decisions[0]["decision"]["reason"] == "odds_score_reverted"
+        assert decisions[0]["poll_offset_s"] == 0.02
+        confirm_obs.stop()
 
         # HTTP helper always persists the full body and redacts the key.
         import book_context_observe as bco
@@ -732,7 +808,7 @@ def main() -> int:
         finally:
             bco._http_get_json = old_http
 
-    print("ok: Odds-API.io Bet365 gate + Unibet observe polling/grading/upgrades/reversal/raw")
+    print("ok: Odds-API.io Bet365 gate + 1xbet observe polling/grading/upgrades/reversal/raw")
     return 0
 
 
