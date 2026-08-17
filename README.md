@@ -59,7 +59,7 @@ Stop: `Ctrl-C` / `kill` the `run_main` process, or `POST http://127.0.0.1:8790/a
 3. AF board shows mapped fixtures after watch sync.
 4. On a DQD goal-up: `data/pm-quote/watch.log` shows `af-preconfirm` then `af-referee → CONFIRMED` before any live buy; quote lines with `books=once` / `latency_ms=…`.
 5. Planned fills land in `data/pm-quote/trades.jsonl` with `"live": false` / `status: dry_run` (no CLOB post).
-6. AF timeout → `af_unconfirmed` (no flatten). DQD reversals flatten open lots only.
+6. AF timeout → `af_unconfirmed` (no flatten). A DQD reversal starts six Odds checks at 5/10/15/20/25/30s; flatten happens only if the verified Odds score also drops or Bet365's previously impossible Correct Score / main Totals offers return.
 
 ## Latency path (hot vs cold)
 
@@ -102,7 +102,7 @@ python3 frontend/run_main.py --no-trade
 | `--no-af-referee` | Skip AF goal confirm (not for production goals) |
 | `--af-postcheck-trade` | Buy on DQD goal before AF confirm (flatten on timeout) |
 
-Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, `ODDS_API_IO_KEY`, … Odds third-confirmation polls Odds-API.io score + Bet365 (gate) + Unibet (observe-only) every 3s for 90s; C is record-only (no USDC) and B/A live toward $3/$10. A/B require a freshly verified fixture identity; partial live fills are accumulated by actual matched USDC and retried to the target.
+Env: `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE`, `QUOTE_TAKE_DEPTH`, `QUOTE_MAX_USDC`, `QUOTE_MAX_SHARES`, `QUOTE_SIZE_TIERS`, `QUOTE_MAX_OPEN_USDC`, `QUOTE_TRADE=0`, `QUOTE_AF_REFEREE`, `QUOTE_AF_POSTCHECK_TRADE`, `ODDS_API_IO_KEY`, … Odds third-confirmation polls Odds-API.io score + Bet365 (gate) + 1xbet (observe-only) every 3s for 90s; C is record-only (no USDC) and B/A live toward $10/$20. A/B require a freshly verified fixture identity; partial live fills are accumulated by actual matched USDC and retried to the target. DQD score drops use a separate 5s × 6 Odds arbitration window. An accepted asynchronous flatten sell is persisted by `orderID`, checked at a throttled cadence, and is not asset-canceled/reposted on every watch tick.
 
 ## Logs & data
 
@@ -131,6 +131,7 @@ python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_af_referee.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_odds_grade_trade.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_rest_gtc.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_trade_parallel_family.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_ft_af_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_latency_path.py
@@ -160,7 +161,7 @@ data/               # Runtime snapshots / jsonl (gitignored)
 ## Safety
 
 - Default is dry-run; `--live` / `live` modes spend real USDC.
-- Goal trades wait for API-Football confirmation; DQD reversals do not open new buys.
+- Goal trades wait for API-Football confirmation; DQD reversals do not open new buys and cannot flatten until Odds/Bet365 corroborates the rollback.
 - Do not commit `.env` or private keys.
 - Prefer small `--max-usdc` while validating.
 
