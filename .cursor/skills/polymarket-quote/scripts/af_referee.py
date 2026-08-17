@@ -7,11 +7,10 @@ never resolves DQD→AF fixtures on the quote hot path. Cache miss / unresolved
 → skip the goal immediately (no timeout spin).
 
 Score confirmation polls ``fetch_events_for_match_id(..., cache_only=True)`` on
-a tiered schedule: **3s → every 1s until 60s → every 2s until 90s** (override
-with ``--af-poll`` for a fixed interval). That cadence is the contract: the
-referee does **not** insert a multi-second shared throttle between schedule
-ticks (optional ``QUOTE_AF_MIN_INTERVAL_S`` is per-worker only). Confirmations
-run on a thread pool so watch stays responsive; on confirm,
+a flat schedule: **every 2s until 90s** (first look at 2s; override with
+``--af-poll`` for a different fixed interval). Concurrent confirms share one
+AF client paced by ``QUOTE_AF_MIN_INTERVAL_S`` (default 1s). Confirmations run
+on a thread pool so watch stays responsive; on confirm,
 ``af_confirmed_scores.json`` persists asynchronously without an extra AF fetch.
 """
 
@@ -34,17 +33,16 @@ DEFAULT_TIMEOUT_S = 90.0
 # Enough parallel confirms so new goals are not queued behind 90s jobs.
 DEFAULT_WORKERS = 8
 
-# Confirm schedule (production default):
-#   first look at 3s → every 1s until 60s → every 2s until timeout (90s).
-DEFAULT_FIRST_DELAY_S = 3.0
-DEFAULT_PERIOD_S = 1.0  # early period (alias for early_period_s)
-DEFAULT_LATE_AFTER_S = 60.0
+# Confirm schedule (production default): every 2s from 2s through timeout (90s).
+DEFAULT_FIRST_DELAY_S = 2.0
+DEFAULT_PERIOD_S = 2.0
+DEFAULT_LATE_AFTER_S = 90.0
 DEFAULT_LATE_PERIOD_S = 2.0
-# Per-worker AFClient spacing only (default off). A shared 6.5s throttle used
-# to destroy the 2s schedule when several confirms ran at once — do not restore
-# that as the default. Set QUOTE_AF_MIN_INTERVAL_S if you need free-plan pacing.
-DEFAULT_AF_MIN_INTERVAL_S = 0.0
+# Shared AFClient spacing across all confirm workers (default 1s). Override with
+# QUOTE_AF_MIN_INTERVAL_S=0 to disable.
+DEFAULT_AF_MIN_INTERVAL_S = 1.0
 # Soft coalesce: reuse last good poll for same DQD id within this window.
+# Keep below the 2s cadence so a later tick cannot reuse a stale 0-0.
 _POLL_COALESCE_S = 1.0
 # match_finished older than this → skip (restart replay / late DQD).
 DEFAULT_FT_MAX_AGE_S = 15 * 60.0
@@ -502,9 +500,9 @@ def confirm_check_times(
 ) -> list[float]:
     """Absolute seconds (from goal) at which to call AF events.
 
-    Default: ``first_delay`` (3s), every ``period_s`` (1s) while ``t < late_after``,
-    then ``late_after`` and every ``late_period_s`` (2s) until ``timeout_s``
-    inclusive. No polls after timeout.
+    Default: first look at ``first_delay`` (2s), then every ``period_s`` (2s)
+    through ``timeout_s`` (90s) inclusive. ``late_after`` / ``late_period`` remain
+    for custom tiered schedules; production keeps them equal to a flat 2s cadence.
     """
     timeout = max(0.0, float(timeout_s))
     first = max(0.0, float(first_delay_s))
@@ -555,6 +553,8 @@ def schedule_label(
     late_period_s: float = DEFAULT_LATE_PERIOD_S,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> str:
+    if abs(float(period_s) - float(late_period_s)) < 1e-9:
+        return f"{first_delay_s:g}s→every {period_s:g}s→{timeout_s:g}s"
     return (
         f"{first_delay_s:g}s→every {period_s:g}s→{late_after_s:g}s"
         f"→every {late_period_s:g}s→{timeout_s:g}s"
@@ -590,7 +590,8 @@ class AfReferee:
         self.env_path = env_path
         self._events_fn = events_fn
         self._af_key: str | None = None
-        self._tls = threading.local()
+        self._af_client: aflib.AFClient | None = None
+        self._af_client_lock = threading.Lock()
         self._cache: dict[str, Any] | None = None
         self._cache_mtime: float | None = None
         self._exec = ThreadPoolExecutor(
@@ -613,15 +614,15 @@ class AfReferee:
         return f"fixed {self.poll_s}s"
 
     def _client(self) -> aflib.AFClient:
-        # Per-worker client so optional QUOTE_AF_MIN_INTERVAL_S does not serialize
-        # unrelated confirms onto one global 2s+ queue (that broke the schedule).
-        af = getattr(self._tls, "af", None)
-        if af is None:
-            if self._af_key is None:
-                self._af_key = aflib.load_af_key(self.env_path)
-            af = aflib.AFClient(self._af_key, min_interval_s=af_min_interval_s())
-            self._tls.af = af
-        return af
+        # One shared client so QUOTE_AF_MIN_INTERVAL_S paces all confirm workers.
+        with self._af_client_lock:
+            if self._af_client is None:
+                if self._af_key is None:
+                    self._af_key = aflib.load_af_key(self.env_path)
+                self._af_client = aflib.AFClient(
+                    self._af_key, min_interval_s=af_min_interval_s()
+                )
+            return self._af_client
 
     def _reload_fixture_cache(self) -> dict[str, Any]:
         """Re-read fixture_cache.json when AF watch/sync updates it on disk."""
@@ -780,7 +781,7 @@ class AfReferee:
         - ``wait_cache=True`` (postcheck): keep polling until timeout so late
           sync/watch mappings can still confirm after a buy.
 
-        Default poll schedule: 3s → every 1s until 60s → every 2s until timeout
+        Default poll schedule: every 2s from 2s until timeout (90s)
         (override with ``poll_schedule=False`` + ``poll_s`` for fixed interval).
 
         ``event_home`` / ``event_away``: consumer-facing sides (PM labels on the

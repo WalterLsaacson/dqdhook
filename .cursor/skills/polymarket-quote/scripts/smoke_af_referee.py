@@ -254,39 +254,28 @@ def test_cache_miss_wait_until_timeout() -> None:
 def test_confirm_check_times() -> None:
     print("test_confirm_check_times")
     checks = ref.confirm_check_times(90.0)
-    check("starts at 3", checks[0] == 3.0, str(checks[:3]))
+    check("starts at 2", checks[0] == 2.0, str(checks[:3]))
     check("no immediate 0", 0.0 not in checks)
-    check("has 4", 4.0 in checks)
-    check("has 59", 59.0 in checks)
+    check("has 10", 10.0 in checks)
     check("has 60", 60.0 in checks)
-    check("has 62", 62.0 in checks)
     check("has 90", 90.0 in checks)
-    check("no 61 on late grid", 61.0 not in checks)
-    # Early phase: 1s spacing before 60
-    early = [c for c in checks if c < 60]
+    check("no odd 2s grid off", all(abs(c % 2.0) < 1e-9 for c in checks), str(checks[:8]))
     check(
-        "early spacing ~1s",
-        all(abs(early[i + 1] - early[i] - 1.0) < 0.01 for i in range(len(early) - 1)),
-        str(early[:5]),
+        "flat ~2s spacing",
+        all(abs(checks[i + 1] - checks[i] - 2.0) < 0.01 for i in range(len(checks) - 1)),
+        str(checks[:5]),
     )
-    # Late phase: 2s spacing from 60
-    late = [c for c in checks if c >= 60]
-    check(
-        "late spacing ~2s",
-        late == [60.0, 62.0, 64.0, 66.0, 68.0, 70.0, 72.0, 74.0, 76.0, 78.0, 80.0, 82.0, 84.0, 86.0, 88.0, 90.0],
-        str(late),
-    )
-    # 3..59 @1s → 57 ticks; 60..90 @2s → 16 ticks → 73
-    check("count 73", len(checks) == 73, str(len(checks)))
+    # 2,4,...,90 → 45 ticks
+    check("count 45", len(checks) == 45, str(len(checks)))
     check("last is timeout", checks[-1] == 90.0, str(checks[-1]))
     short = ref.confirm_check_times(2.5, first_delay_s=0.0, period_s=1.0, late_after_s=10.0)
     check("short ends ≤timeout", short[-1] <= 2.5 + 1e-9, str(short))
     check("short no past timeout", all(c <= 2.5 + 1e-9 for c in short), str(short))
     label = ref.schedule_label()
-    check("label mentions 3s→1s→60s→2s→90s", "3s→every 1s→60s→every 2s→90s" == label, label)
+    check("label mentions 2s→every 2s→90s", "2s→every 2s→90s" == label, label)
     check(
-        "default AF min interval off (schedule-first)",
-        abs(ref.af_min_interval_s() - 0.0) < 1e-9,
+        "default AF min interval 1s (shared)",
+        abs(ref.af_min_interval_s() - 1.0) < 1e-9,
         str(ref.af_min_interval_s()),
     )
     # Missed ticks collapse to latest overdue, then resume future cadence.
@@ -298,7 +287,7 @@ def test_confirm_check_times() -> None:
 
 
 def test_schedule_cadence_wall_times() -> None:
-    """Polls land on the tiered checkpoints (not a shared min-interval queue)."""
+    """Polls land on the flat checkpoints (not a shared min-interval queue)."""
     print("test_schedule_cadence_wall_times")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

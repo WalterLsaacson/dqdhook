@@ -378,9 +378,9 @@ def test_gate_mode_no_immediate_trade() -> None:
         )
         check("schedule default 90", ref.DEFAULT_TIMEOUT_S == 90.0)
         checks = ref.confirm_check_times(90.0)
-        check("tiered schedule starts 3", checks[0] == 3.0, str(checks[:3]))
-        check("tiered schedule count 73", len(checks) == 73, str(len(checks)))
-        check("late phase every 2s", 62.0 in checks and 61.0 not in checks)
+        check("flat schedule starts 2", checks[0] == 2.0, str(checks[:3]))
+        check("flat schedule count 45", len(checks) == 45, str(len(checks)))
+        check("2s spacing", 4.0 in checks and 90.0 in checks)
 
 
 def test_resolve_af_mode_default() -> None:
