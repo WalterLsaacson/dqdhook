@@ -29,7 +29,7 @@ from rest_ladder import (  # noqa: E402
     rest_limit_tick_size,
     select_rest_prices,
 )
-from score_reversal import AF_STATUS_CONFIRMED  # noqa: E402
+from score_reversal import AF_STATUS_CONFIRMED, AF_STATUS_PENDING  # noqa: E402
 from trade_executor import (  # noqa: E402
     TradeExecutor,
     odds_grade_from_event_key,
@@ -355,15 +355,16 @@ def test_rest_fill_keeps_b_pending() -> None:
         )
         assert row and row["status"] == "rest_posted", row
         lots = ex.ledger.open_for_match("m1")
-        assert lots, lots
+        assert lots and lots[0].get("af_status") == AF_STATUS_PENDING, lots
         filled = ex.reconcile_rest_orders()
         assert filled, filled
         lots = ex.ledger.open_for_match("m1")
         assert lots, lots
-        assert lots[0].get("af_status") == AF_STATUS_CONFIRMED, lots[0]
+        assert lots[0].get("af_status") == AF_STATUS_PENDING, lots[0]
+        assert lots[0].get("af_status") != AF_STATUS_CONFIRMED
         assert float(lots[0].get("usdc") or 0) >= 9.0, lots[0]
         time.sleep(0.15)
-        print("ok: B rest fill inherits B grade (gate still AF-confirmed)")
+        print("ok: B rest fill stays pending, not A/confirmed")
 
 
 def main() -> int:

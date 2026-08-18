@@ -907,7 +907,8 @@ class TradeExecutor:
         if sig == "score_change" and self.af_mode == "postcheck":
             return AF_STATUS_PENDING, deadline_iso(self.af_timeout_s)
         if sig == "score_change" and self.af_mode == "gate":
-            # Rest follow-up still assumes gate buys land after AF.
+            if odds_grade == "B":
+                return AF_STATUS_PENDING, None
             return AF_STATUS_CONFIRMED, None
         return AF_STATUS_NONE, None
 

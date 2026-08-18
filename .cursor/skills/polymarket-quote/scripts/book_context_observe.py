@@ -1,10 +1,11 @@
 """Odds-API.io score + Bet365 gate for C/B/A confirmation.
 
-Polls immediately and every second for sixty seconds.  Each sample is persisted,
-graded C/B/A from Bet365 only, and may emit a monotonic position-target upgrade.
-1xbet is fetched on the same ``/odds/multi`` call and stored observe-only
-(core-clean CS/Totals research; never vetoes B/A). Concurrent odds pulls
-coalesce into ``GET /odds/multi`` (up to 10 events / 1 request).
+Polls as soon as Dongqiudi prints a goal (in parallel with AF).  Each sample is
+persisted, graded C/B/A from Bet365 only, and may emit a monotonic position-target
+upgrade.  **A is capped to B until AF confirms** the same score.  1xbet is fetched
+on the same ``/odds/multi`` call and stored observe-only (core-clean CS/Totals
+research; never vetoes B/A). Concurrent odds pulls coalesce into
+``GET /odds/multi`` (up to 10 events / 1 request).
 
 Every actual HTTP response body is persisted under ``data/pm-quote/book_context_raw/``
 (URLs redact ``apiKey``). Observe rows keep compact request metadata and ``raw_path``;
@@ -146,6 +147,7 @@ DEFAULT_RATE_LIMIT_BACKOFF_S = 60.0
 DEFAULT_EVENT_TIME_TOLERANCE_S = 12 * 3600.0
 
 PHASE_AF_CONFIRMED = "af_confirmed"
+PHASE_DQD_GOAL = "dqd_goal"
 PHASE_DQD_REVERSAL = "dqd_reversal"
 
 GRADE_TARGET_USDC = {"C": 0.0, "B": 10.0, "A": 20.0}
@@ -1118,6 +1120,21 @@ def grade_oddsapiio_sample(
     }
 
 
+def cap_grade_awaiting_af(grade: dict[str, Any], *, af_confirmed: bool) -> dict[str, Any]:
+    """A requires AF hard confirm; until then a raw-A sample sizes as B."""
+    out = dict(grade) if isinstance(grade, dict) else {}
+    out["af_hard_confirm"] = bool(af_confirmed)
+    if af_confirmed:
+        return out
+    if str(out.get("level") or "C").strip().upper() == "A":
+        out["uncapped_level"] = "A"
+        out["level"] = "B"
+        out["target_usdc"] = GRADE_TARGET_USDC["B"]
+        reason = str(out.get("reason") or "").strip()
+        out["reason"] = f"{reason}|awaiting_af" if reason else "awaiting_af"
+    return out
+
+
 def evaluate_reversal_sample(
     source_payload: Any,
     *,
@@ -1472,6 +1489,7 @@ class _GroupState:
     highest_grade: str = "C"
     last_fingerprint: str | None = None
     reversed: bool = False
+    af_confirmed: bool = False
     reversal_confirmed: bool = False
     reversal_event_key: str = ""
     reversal_ev: dict[str, Any] = field(default_factory=dict)
@@ -1480,7 +1498,7 @@ class _GroupState:
 
 
 class BookContextObserver:
-    """Background bookmaker suspension snapshots for AF-confirmed goals and DQD reversals."""
+    """Background Bet365/Odds snapshots from DQD goal-up (A waits for AF) and DQD reversals."""
 
     def __init__(
         self,
@@ -1601,6 +1619,132 @@ class BookContextObserver:
         if get_active_observer() is self:
             set_active_observer(None)
 
+    @staticmethod
+    def _score_pair(home: Any, away: Any) -> tuple[int, int] | None:
+        try:
+            return (int(home), int(away))
+        except (TypeError, ValueError):
+            return None
+
+    def _cancel_group_timers_locked(self, state: _GroupState) -> None:
+        for t in state.timers:
+            t.cancel()
+        state.timers.clear()
+
+    def _fire_goal_snapshot(
+        self,
+        state: _GroupState,
+        *,
+        offset_s: float,
+        gen: int,
+    ) -> None:
+        self._pool.submit(
+            self._safe_snapshot,
+            self._poll_phase(offset_s, af_confirmed=state.af_confirmed),
+            state.observe_group_id,
+            state.match_id,
+            state.event_key,
+            state.home,
+            state.away,
+            dict(state.dqd_score),
+            None,
+            False,
+            gen,
+            offset_s,
+        )
+
+    def _replace_goal_group(
+        self,
+        *,
+        match_id: str,
+        event_key: str,
+        ev: dict[str, Any],
+        af_gate: dict[str, Any],
+        home_sc: Any,
+        away_sc: Any,
+        af_confirmed: bool,
+    ) -> str:
+        mid = match_id
+        key = str(event_key or "")
+        group_id = make_observe_group_id(mid, home_sc, away_sc, key)
+        dqd_score = {"home": home_sc, "away": away_sc}
+        with self._lock:
+            prev = self._by_match.get(mid)
+            if prev is not None:
+                self._cancel_group_timers_locked(prev)
+                gen = prev.gen + 1
+            else:
+                gen = 1
+            state = _GroupState(
+                observe_group_id=group_id,
+                match_id=mid,
+                event_key=key,
+                home=str(ev.get("home") or af_gate.get("home") or ""),
+                away=str(ev.get("away") or af_gate.get("away") or ""),
+                dqd_score=dqd_score,
+                ev=dict(ev),
+                af_gate=dict(af_gate),
+                gen=gen,
+                af_confirmed=bool(af_confirmed),
+            )
+            self._by_match[mid] = state
+            self._arm_delayed(state)
+        self._fire_goal_snapshot(state, offset_s=0.0, gen=gen)
+        return group_id
+
+    def on_dqd_goal_up(
+        self,
+        root: Path | None = None,
+        *,
+        match_id: str,
+        event_key: str,
+        ev: dict[str, Any] | None = None,
+        af_gate: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Start Odds/Bet365 polls on the DQD goal — A is capped until AF confirms."""
+        if self._stop.is_set():
+            return None
+        mid = str(match_id or "").strip()
+        if not mid:
+            return None
+        ev = ev if isinstance(ev, dict) else {}
+        gate = af_gate if isinstance(af_gate, dict) else {}
+        home_sc = ev.get("home_score", gate.get("home_score"))
+        away_sc = ev.get("away_score", gate.get("away_score"))
+        return self._replace_goal_group(
+            match_id=mid,
+            event_key=str(event_key or ""),
+            ev=ev,
+            af_gate=gate or {
+                "confirmed": False,
+                "phase": "dqd_parallel",
+                "awaiting_af": True,
+                "score_source": "dongqiudi",
+            },
+            home_sc=home_sc,
+            away_sc=away_sc,
+            af_confirmed=False,
+        )
+
+    def on_af_unconfirmed(self, match_id: str, *, reason: str = "af_timeout") -> None:
+        """AF miss: freeze A upgrades; B lots already taken stay."""
+        mid = str(match_id or "").strip()
+        if not mid:
+            return
+        with self._lock:
+            cur = self._by_match.get(mid)
+            if cur is None or cur.reversed:
+                return
+            cur.af_confirmed = False
+            cur.af_gate = {**dict(cur.af_gate), "confirmed": False, "error": reason}
+            # Keep live B; do not let a later poll promote to A.
+            self._upgrades = [
+                item
+                for item in self._upgrades
+                if str(item.get("match_id") or "") != mid
+                or str((item.get("odds_grade") or {}).get("level") or "") != "A"
+            ]
+
     def on_af_confirmed(
         self,
         root: Path | None = None,
@@ -1625,46 +1769,47 @@ class BookContextObserver:
                 home_sc = g.get("home")
             if away_sc is None:
                 away_sc = g.get("away")
-        key = str(event_key or "")
-        group_id = make_observe_group_id(mid, home_sc, away_sc, key)
-        dqd_score = {"home": home_sc, "away": away_sc}
+        af_pair = self._score_pair(home_sc, away_sc)
         with self._lock:
             prev = self._by_match.get(mid)
-            if prev is not None:
-                for t in prev.timers:
-                    t.cancel()
-                prev.timers.clear()
-                gen = prev.gen + 1
-            else:
-                gen = 1
-            state = _GroupState(
-                observe_group_id=group_id,
-                match_id=mid,
-                event_key=key,
-                home=str(ev.get("home") or gate.get("home") or ""),
-                away=str(ev.get("away") or gate.get("away") or ""),
-                dqd_score=dqd_score,
-                ev=dict(ev),
-                af_gate=dict(gate),
-                gen=gen,
+            attach = (
+                prev is not None
+                and not prev.reversed
+                and af_pair is not None
+                and self._score_pair(
+                    (prev.dqd_score or {}).get("home"),
+                    (prev.dqd_score or {}).get("away"),
+                )
+                == af_pair
             )
-            self._by_match[mid] = state
-            self._arm_delayed(state)
-        self._pool.submit(
-            self._safe_snapshot,
-            self._poll_phase(0.0),
-            state.observe_group_id,
-            mid,
-            key,
-            state.home,
-            state.away,
-            dict(dqd_score),
-            None,
-            False,
-            gen,
-            0.0,
+            if attach and prev is not None:
+                prev.af_confirmed = True
+                prev.af_gate = dict(gate) if gate else dict(prev.af_gate)
+                prev.af_gate["confirmed"] = True
+                if ev:
+                    prev.ev = dict(ev)
+                if event_key:
+                    prev.event_key = str(event_key)
+                state = prev
+                gen = prev.gen
+                group_id = prev.observe_group_id
+            else:
+                state = None
+                gen = 0
+                group_id = ""
+        if state is not None:
+            self._fire_goal_snapshot(state, offset_s=0.0, gen=gen)
+            return group_id
+        # Different AF score: new Odds generation for A. Existing B lots stay.
+        return self._replace_goal_group(
+            match_id=mid,
+            event_key=str(event_key or ""),
+            ev=ev,
+            af_gate=gate,
+            home_sc=home_sc,
+            away_sc=away_sc,
+            af_confirmed=True,
         )
-        return group_id
 
     def on_dqd_reversal(
         self,
@@ -1818,9 +1963,9 @@ class BookContextObserver:
         return [self.poll_interval_s * i for i in range(1, count + 1)]
 
     @staticmethod
-    def _poll_phase(offset_s: float) -> str:
+    def _poll_phase(offset_s: float, *, af_confirmed: bool = False) -> str:
         if offset_s <= 0:
-            return PHASE_AF_CONFIRMED
+            return PHASE_AF_CONFIRMED if af_confirmed else PHASE_DQD_GOAL
         label = int(offset_s) if float(offset_s).is_integer() else round(offset_s, 3)
         return f"odds_poll_{label}s"
 
@@ -2927,6 +3072,7 @@ class BookContextObserver:
                     cur.last_fingerprint is not None and cur.last_fingerprint != fingerprint
                 )
                 cur.last_fingerprint = fingerprint
+                grade = cap_grade_awaiting_af(grade, af_confirmed=cur.af_confirmed)
                 level = str(grade.get("level") or "C")
                 rank = GRADE_RANK.get(level, 0)
                 prior_rank = GRADE_RANK.get(cur.highest_grade, 0)

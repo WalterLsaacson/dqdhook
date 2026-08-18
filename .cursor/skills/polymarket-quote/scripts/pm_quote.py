@@ -336,8 +336,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         book_obs.start()
         print(
             f"book-context observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
-            f"(Odds-API.io score + Bet365 gate + 1xbet observe · "
-            f"goals 3s through 90s · reversals 5s×6 · A/B upgrades)",
+            f"(DQD starts Odds/Bet365 · B live · A waits for AF · "
+            f"goals 0/3/…/90s · reversals 5s×6)",
             file=sys.stderr,
             flush=True,
         )

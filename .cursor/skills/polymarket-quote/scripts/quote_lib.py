@@ -1897,6 +1897,39 @@ def process_bridge_events(
         out["_trade_context"] = context
         return out
 
+    def _start_dqd_odds(work_ev: dict[str, Any], trade_key: str) -> None:
+        """Pull Odds/Bet365 as soon as DQD prints a goal (B allowed; A waits for AF)."""
+        try:
+            from book_context_observe import get_active_observer as get_book_observer
+
+            observer = get_book_observer()
+            if observer is None:
+                return
+            observer.on_dqd_goal_up(
+                root,
+                match_id=str(work_ev.get("match_id") or ""),
+                event_key=trade_key,
+                ev=work_ev,
+                af_gate={
+                    "confirmed": False,
+                    "phase": "dqd_parallel",
+                    "awaiting_af": True,
+                    "score_source": "dongqiudi",
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT book-context observe dqd start failed: {e}", flush=True)
+
+    def _mark_odds_af_unconfirmed(match_id: str, *, reason: str) -> None:
+        try:
+            from book_context_observe import get_active_observer as get_book_observer
+
+            observer = get_book_observer()
+            if observer is not None:
+                observer.on_af_unconfirmed(match_id, reason=reason)
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT book-context observe AF miss failed: {e}", flush=True)
+
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
         try:
@@ -2319,6 +2352,7 @@ def process_bridge_events(
                 f"flatten={len(flatten_rows)}",
                 flush=True,
             )
+            _mark_odds_af_unconfirmed(mid, reason=str(gate.get("error") or "af_timeout"))
             return
 
         # gate mode (legacy: trade only after AF confirm)
@@ -2353,6 +2387,7 @@ def process_bridge_events(
                 skip["af_preconfirm"] = pre
             bundles.append(skip)
             seen.add(key)
+            _mark_odds_af_unconfirmed(mid, reason=str(gate.get("error") or "af_timeout"))
             print(
                 f"af-referee → IGNORE goal match_id={mid} "
                 f"target={target[0] if target else '?'}-"
@@ -2386,6 +2421,11 @@ def process_bridge_events(
         }
         if pre is not None:
             af_gate["preconfirm"] = pre
+        if trade_executor is not None:
+            try:
+                trade_executor.mark_af_confirmed(mid, event_key=key)
+            except Exception as e:  # noqa: BLE001
+                print(f"ALERT mark_af_confirmed failed match={mid}: {e}", flush=True)
         try:
             from livescore_observe import get_active_observer as get_lsa_observer
 
@@ -2449,6 +2489,8 @@ def process_bridge_events(
                 )
                 level = str(grade.get("level") or "")
                 if level not in ("B", "A"):
+                    continue
+                if level == "A" and grade.get("af_hard_confirm") is not True:
                     continue
                 base_key = str(upgrade.get("event_key") or "")
                 source_ev = upgrade.get("ev") if isinstance(upgrade.get("ev"), dict) else {}
@@ -2863,6 +2905,7 @@ def process_bridge_events(
                         continue
                     af_referee.submit(key, ev, target, wait_cache=True)
                     pending_keys.add(key)
+                    _start_dqd_odds(ev, key)
                     if trade_executor is not None:
                         try:
                             # Align deadline with AF poll clock (not buy clock).
@@ -2888,9 +2931,10 @@ def process_bridge_events(
                         pass
                 af_referee.submit(key, ev, target, wait_cache=False)
                 pending_keys.add(key)
+                _start_dqd_odds(ev, key)
                 print(
                     f"af-gate → awaiting AF match_id={mid} key={key} "
-                    f"(no trade until confirm)",
+                    f"(Odds B-path live; A waits for AF)",
                     flush=True,
                 )
                 continue

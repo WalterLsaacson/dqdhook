@@ -18,6 +18,7 @@ from book_context_observe import (  # noqa: E402
     BookContextObserver,
     DEFAULT_ODDS_API_IO_BOOKS,
     DEFAULT_SOURCES,
+    cap_grade_awaiting_af,
     evaluate_reversal_sample,
     grade_oddsapiio_sample,
     inspect_bet365_impossible_markets,
@@ -297,6 +298,10 @@ def main() -> int:
 
     hard_a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
     assert hard_a["level"] == "A" and hard_a["identity_verified"] is True
+    capped = cap_grade_awaiting_af(hard_a, af_confirmed=False)
+    assert capped["level"] == "B" and capped["uncapped_level"] == "A"
+    assert capped["af_hard_confirm"] is False and "|awaiting_af" in capped["reason"]
+    assert cap_grade_awaiting_af(hard_a, af_confirmed=True)["level"] == "A"
     assert hard_a["identity_soft_ok"] is False
     score_reversal = evaluate_reversal_sample(
         _source((0, 0), clean),
@@ -395,6 +400,79 @@ def main() -> int:
         obs.acknowledge_upgrade(retried[0], success=True)
         assert obs.drain_upgrades() == []
         obs.stop()
+
+        # DQD starts Odds immediately; a raw-A sample sizes B until AF confirms.
+        par_path = observe_path(root)
+        before_par = len(_rows(par_path))
+        par_calls = {"n": 0}
+
+        def fetch_a(_mid: str, _home: str, _away: str) -> dict:
+            par_calls["n"] += 1
+            return _source((1, 0), clean)
+
+        par_obs = BookContextObserver(
+            root,
+            source_cfg={"active_sources": ["oddsapiio"], "keys": {"oddsapiio": "io"}},
+            poll_interval_s=0.05,
+            poll_timeout_s=0.05,
+            fetch_oddsapiio=fetch_a,
+        )
+        par_obs.start()
+        par_obs.on_dqd_goal_up(
+            match_id="m_par",
+            event_key="score_change|m_par|0-0->1-0",
+            ev={
+                "type": "score_change",
+                "match_id": "m_par",
+                "home": "Home",
+                "away": "Away",
+                "home_score": 1,
+                "away_score": 0,
+            },
+        )
+        deadline = time.monotonic() + 2.0
+        pre_af: list[dict] = []
+        while time.monotonic() < deadline:
+            pre_af = [r for r in _rows(par_path)[before_par:] if r["match_id"] == "m_par"]
+            if pre_af:
+                break
+            time.sleep(0.01)
+        assert pre_af, pre_af
+        assert pre_af[0]["phase"] == "dqd_goal"
+        assert all(r["odds_grade"]["level"] == "B" for r in pre_af), [
+            r["odds_grade"] for r in pre_af
+        ]
+        assert all(r["odds_grade"].get("uncapped_level") == "A" for r in pre_af)
+        assert all(r["odds_grade"].get("af_hard_confirm") is False for r in pre_af)
+        ups = par_obs.drain_upgrades()
+        assert [u["odds_grade"]["level"] for u in ups] == ["B"], ups
+        par_obs.on_af_confirmed(
+            match_id="m_par",
+            event_key="score_change|m_par|0-0->1-0",
+            ev={
+                "type": "score_change",
+                "match_id": "m_par",
+                "home": "Home",
+                "away": "Away",
+                "home_score": 1,
+                "away_score": 0,
+            },
+            af_gate={"confirmed": True, "goals": {"home": 1, "away": 0}},
+        )
+        deadline = time.monotonic() + 2.0
+        post_af: list[dict] = []
+        while time.monotonic() < deadline:
+            post_af = [r for r in _rows(par_path)[before_par:] if r["match_id"] == "m_par"]
+            if any(r["odds_grade"]["level"] == "A" for r in post_af):
+                break
+            time.sleep(0.01)
+        assert any(r["odds_grade"]["level"] == "A" for r in post_af), [
+            r["odds_grade"]["level"] for r in post_af
+        ]
+        a_ups = par_obs.drain_upgrades()
+        assert any(u["odds_grade"]["level"] == "A" for u in a_ups), a_ups
+        assert all(u["odds_grade"].get("af_hard_confirm") is True for u in a_ups if u["odds_grade"]["level"] == "A")
+        par_obs.stop()
 
         # Production schedule is 0 plus thirty delayed samples: 0/3/.../90.
         sched = BookContextObserver(
