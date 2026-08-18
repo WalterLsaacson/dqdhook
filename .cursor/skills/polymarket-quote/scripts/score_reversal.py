@@ -683,6 +683,7 @@ class OpenPositionLedger:
         tick_size: str = "0.01",
         neg_risk: bool | None = None,
         af_status: str = AF_STATUS_CONFIRMED,
+        odds_grade: str = "",
     ) -> None:
         """Attach a live rest bid to the match+token lot (creates a 0-share lot)."""
         mid, tid = str(match_id), str(token_id)
@@ -719,6 +720,8 @@ class OpenPositionLedger:
                 "fill_status": FILL_STATUS_OPEN,
                 "rest_orders": [],
             }
+            if odds_grade:
+                existing["odds_grade"] = str(odds_grade).strip().upper()
             self._rows.append(existing)
         orders = list(existing.get("rest_orders") or [])
         orders.append(dict(order))

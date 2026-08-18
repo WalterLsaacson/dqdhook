@@ -15,7 +15,13 @@ from typing import Any
 import quote_lib as lib
 from clob_trader import ClobTrader
 from fill_planner import FillPlan, plan_fill, MIN_MARKETABLE_BUY_USDC
-from rest_ladder import MIN_REST_USDC, allocate_rest_ladder, rest_expire_s
+from rest_ladder import (
+    MIN_REST_USDC,
+    allocate_rest_ladder,
+    ask_in_fak_zone,
+    rest_expire_s,
+    rest_limit_tick_size,
+)
 from size_policy import compute_buy_size_caps
 from score_reversal import (
     AF_STATUS_CONFIRMED,
@@ -397,6 +403,29 @@ def signal_from_event_key(event_key: str) -> str:
     return ek.split("|", 1)[0]
 
 
+def odds_grade_from_event_key(event_key: str) -> str:
+    ek = str(event_key or "")
+    for grade in ("A", "B", "C"):
+        token = f"odds_grade_{grade}"
+        if f"|{token}" in ek or ek.endswith(token):
+            return grade
+    return ""
+
+
+def rest_fill_odds_grade(lot: dict[str, Any], order: dict[str, Any]) -> str:
+    """Grade for a rest fill — inherit the resting order, never default to A."""
+    for raw in (order.get("odds_grade"), lot.get("odds_grade")):
+        grade = str(raw or "").strip().upper()
+        if grade in REST_GRADES:
+            return grade
+    inferred = odds_grade_from_event_key(
+        str(order.get("event_key") or lot.get("event_key") or "")
+    )
+    if inferred in REST_GRADES:
+        return inferred
+    return "B"
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -720,7 +749,7 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice, then rest A/B remainder as GTD bids at 0.98/0.99."""
+        """FAK a misprice, then rest any A/B remainder as GTD bids."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
@@ -734,6 +763,25 @@ class TradeExecutor:
 
         fak_row: dict[str, Any] | None = None
         skip_rest = False
+        token_id = str(q.get("token_id") or "")
+        mid = str((match_meta or {}).get("match_id") or q.get("match_id") or "")
+        typ = self._resolve_event_type(
+            event_type=event_type, event_key=event_key, match_meta=match_meta
+        )
+        channel_live = self._live_for_signal(typ)
+        if mis and token_id and mid:
+            n = self._cancel_live_rest_for_token(
+                mid,
+                token_id,
+                reason="ask_fak",
+                live=channel_live,
+            )
+            if n:
+                print(
+                    f"rest-buy → CANCELED token={token_id[:12]}… orders={n} "
+                    f"reason=ask_fak (misprice ask)",
+                    flush=True,
+                )
         if mis:
             with self._lock:
                 prepared = self._prepare_trade_locked(
@@ -818,21 +866,27 @@ class TradeExecutor:
                         )
 
         if rest_ok and not skip_rest:
-            rest_row = self._rest_remaining_buy(
-                q,
-                event_key=event_key,
-                match_meta=match_meta,
-                event_type=event_type,
-            )
-            if fak_row is None:
-                return rest_row
-            if isinstance(fak_row, dict) and rest_row is not None:
-                fak_row = dict(fak_row)
-                fak_row["rest"] = {
-                    "status": rest_row.get("status"),
-                    "plan": rest_row.get("plan"),
-                    "success": rest_row.get("success"),
-                }
+            after_fak = bool(mis)
+            # Live ask: FAK this tick. After FAK, still rest whatever is left.
+            if ask_in_fak_zone(q.get("best_ask")) and not after_fak:
+                skip_rest = True
+            else:
+                rest_row = self._rest_remaining_buy(
+                    q,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    event_type=event_type,
+                    ignore_ask_zone=after_fak,
+                )
+                if fak_row is None:
+                    return rest_row
+                if isinstance(fak_row, dict) and rest_row is not None:
+                    fak_row = dict(fak_row)
+                    fak_row["rest"] = {
+                        "status": rest_row.get("status"),
+                        "plan": rest_row.get("plan"),
+                        "success": rest_row.get("success"),
+                    }
         return fak_row
 
     def _odds_grade(self, match_meta: dict[str, Any] | None) -> str:
@@ -842,6 +896,20 @@ class TradeExecutor:
             else {}
         )
         return str(ctx.get("odds_grade") or "").strip().upper()
+
+    def _buy_af_status(
+        self, event_key: str, match_meta: dict[str, Any] | None
+    ) -> tuple[str, Any]:
+        sig = signal_from_event_key(event_key)
+        odds_grade = self._odds_grade(match_meta)
+        if sig == "score_change" and self.af_mode == "postcheck" and odds_grade in REST_GRADES:
+            return AF_STATUS_CONFIRMED, None
+        if sig == "score_change" and self.af_mode == "postcheck":
+            return AF_STATUS_PENDING, deadline_iso(self.af_timeout_s)
+        if sig == "score_change" and self.af_mode == "gate":
+            # Rest follow-up still assumes gate buys land after AF.
+            return AF_STATUS_CONFIRMED, None
+        return AF_STATUS_NONE, None
 
     def _skip_rest_after_prepare(self, row: dict[str, Any] | None) -> bool:
         if not isinstance(row, dict):
@@ -908,6 +976,7 @@ class TradeExecutor:
         event_key: str,
         match_meta: dict[str, Any] | None,
         event_type: str,
+        ignore_ask_zone: bool = False,
     ) -> dict[str, Any] | None:
         """Post/adjust GTD bids for A/B remainder after FAK."""
         typ = self._resolve_event_type(
@@ -930,7 +999,7 @@ class TradeExecutor:
                 token_id=token_id, match_id=mid, base_event_key=base
             )
             channel_live = self._live_for_signal(typ)
-            tick = str(quote.get("tick_size") or "0.01") or "0.01"
+            tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
             floor = max(float(self.settings.size_floor_usdc or 1), MIN_REST_USDC)
             gap = remaining
             if gap + 1e-12 < floor and working <= 1e-9:
@@ -940,19 +1009,51 @@ class TradeExecutor:
             if not replace and add_usdc + 1e-12 < floor:
                 return None
             place_usdc = gap if replace else add_usdc
+            ask_for_ladder = None if ignore_ask_zone else quote.get("best_ask")
+            if ask_in_fak_zone(ask_for_ladder):
+                return None
             levels = allocate_rest_ladder(
-                place_usdc, tick_size=tick, floor_usdc=floor
+                place_usdc,
+                tick_size=tick,
+                floor_usdc=floor,
+                best_bid=quote.get("best_bid"),
+                best_ask=ask_for_ladder,
             )
             if not levels and not replace:
                 return None
             live_pairs = list(
                 self.ledger.live_rest_orders(match_id=mid, token_id=token_id)
             )
-            cancel_ids = [
-                str(order.get("order_id") or "")
+            live_prices = {
+                round(float(order.get("price") or 0), 4)
                 for _lot, order in live_pairs
-                if replace and str(order.get("order_id") or "")
-            ]
+                if order.get("price") is not None
+            }
+            desired_prices = {round(float(lvl["price"]), 4) for lvl in levels}
+            ladder_changed = bool(live_pairs) and live_prices != desired_prices
+            if ladder_changed:
+                cancel_ids = [
+                    str(order.get("order_id") or "")
+                    for _lot, order in live_pairs
+                    if str(order.get("order_id") or "")
+                ]
+                replace = True
+                place_usdc = gap
+                levels = allocate_rest_ladder(
+                    place_usdc,
+                    tick_size=tick,
+                    floor_usdc=floor,
+                    best_bid=quote.get("best_bid"),
+                    best_ask=ask_for_ladder,
+                )
+                if not levels:
+                    return None
+            else:
+                cancel_ids = [
+                    str(order.get("order_id") or "")
+                    for _lot, order in live_pairs
+                    if replace and str(order.get("order_id") or "")
+                ]
 
         if cancel_ids:
             self._cancel_rest_ids(
@@ -1049,6 +1150,14 @@ class TradeExecutor:
         if not posted:
             return None
 
+        grade = self._odds_grade(match_meta)
+        rest_af_status, _deadline = self._buy_af_status(event_key, match_meta)
+        for order in posted:
+            order["odds_grade"] = grade
+            order["base_event_key"] = base
+            order["target_usdc"] = target
+            order["event_key"] = event_key
+
         stale = False
         with self._lock:
             stale = (
@@ -1085,6 +1194,8 @@ class TradeExecutor:
                         if quote.get("neg_risk") is not None
                         else None
                     ),
+                    af_status=rest_af_status,
+                    odds_grade=grade,
                 )
             plan = FillPlan(
                 trade="buy_win",
@@ -1138,6 +1249,34 @@ class TradeExecutor:
                 flush=True,
             )
             return row
+
+    def _cancel_live_rest_for_token(
+        self,
+        match_id: str,
+        token_id: str,
+        *,
+        reason: str,
+        live: bool,
+    ) -> int:
+        """Cancel working rest bids for one token (e.g. before ask-zone FAK)."""
+        mid = str(match_id or "")
+        tid = str(token_id or "")
+        if not mid or not tid:
+            return 0
+        with self._lock:
+            pairs = list(
+                self.ledger.live_rest_orders(match_id=mid, token_id=tid)
+            )
+        if not pairs:
+            return 0
+        ids = [
+            str(order.get("order_id") or "")
+            for _lot, order in pairs
+            if str(order.get("order_id") or "")
+        ]
+        if ids:
+            self._cancel_rest_ids(mid, tid, ids, reason=reason, live=live)
+        return len(ids)
 
     def _cancel_rest_ids(
         self,
@@ -1308,6 +1447,20 @@ class TradeExecutor:
                         levels_used=1,
                         levels=[{"price": order.get("price"), "size": delta_sh}],
                     )
+                    grade = rest_fill_odds_grade(lot, order)
+                    fill_event_key = str(
+                        order.get("event_key") or lot.get("event_key") or ""
+                    )
+                    fill_ctx: dict[str, Any] = {"odds_grade": grade}
+                    if order.get("target_usdc") is not None:
+                        fill_ctx["target_usdc"] = order.get("target_usdc")
+                    elif lot.get("target_usdc") is not None:
+                        fill_ctx["target_usdc"] = lot.get("target_usdc")
+                    base_key = str(
+                        order.get("base_event_key") or lot.get("base_event_key") or ""
+                    )
+                    if base_key:
+                        fill_ctx["base_event_key"] = base_key
                     self._register_open_buy(
                         {
                             "token_id": tid,
@@ -1317,14 +1470,15 @@ class TradeExecutor:
                             "neg_risk": lot.get("neg_risk"),
                         },
                         plan=plan,
-                        event_key=str(lot.get("event_key") or ""),
+                        event_key=fill_event_key,
                         match_meta={
                             "match_id": mid,
                             "home": lot.get("home"),
                             "away": lot.get("away"),
                             "home_score": (lot.get("entry_score") or [None, None])[0],
                             "away_score": (lot.get("entry_score") or [None, None])[1],
-                            "trade_context": {"odds_grade": "A"},
+                            "event_type": "score_change",
+                            "trade_context": fill_ctx,
                         },
                         live=True,
                     )
@@ -1954,20 +2108,7 @@ class TradeExecutor:
         if not mid:
             return
         neg = quote.get("neg_risk")
-        sig = signal_from_event_key(event_key)
-        trade_context = meta.get("trade_context") if isinstance(meta.get("trade_context"), dict) else {}
-        odds_grade = str(trade_context.get("odds_grade") or "")
-        af_status = AF_STATUS_NONE
-        af_deadline = None
-        if sig == "score_change" and self.af_mode == "postcheck" and odds_grade in ("B", "A"):
-            # Odds upgrades are emitted only after AF has already confirmed.
-            af_status = AF_STATUS_CONFIRMED
-        elif sig == "score_change" and self.af_mode == "postcheck":
-            af_status = AF_STATUS_PENDING
-            af_deadline = deadline_iso(self.af_timeout_s)
-        elif sig == "score_change" and self.af_mode == "gate":
-            # Bought only after AF confirm.
-            af_status = AF_STATUS_CONFIRMED
+        af_status, af_deadline = self._buy_af_status(event_key, match_meta)
         self.ledger.register_buy(
             match_id=mid,
             token_id=str(quote.get("token_id") or ""),

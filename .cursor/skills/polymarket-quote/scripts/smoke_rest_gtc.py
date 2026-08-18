@@ -22,8 +22,19 @@ if "dotenv" not in sys.modules:
     dotenv.load_dotenv = lambda *_args, **_kwargs: False  # type: ignore[attr-defined]
     sys.modules["dotenv"] = dotenv
 
-from rest_ladder import allocate_rest_ladder, rest_expire_s  # noqa: E402
-from trade_executor import TradeExecutor  # noqa: E402
+from rest_ladder import (  # noqa: E402
+    allocate_rest_ladder,
+    ask_in_fak_zone,
+    rest_expire_s,
+    rest_limit_tick_size,
+    select_rest_prices,
+)
+from score_reversal import AF_STATUS_CONFIRMED  # noqa: E402
+from trade_executor import (  # noqa: E402
+    TradeExecutor,
+    odds_grade_from_event_key,
+    rest_fill_odds_grade,
+)
 from trade_settings import TradeSettings  # noqa: E402
 
 
@@ -102,13 +113,29 @@ def _win_quote(*, misprice: bool, token: str = "tok1") -> dict:
 
 def test_ladder() -> None:
     assert abs(rest_expire_s() - 3600.0) < 1e-9
+    assert rest_limit_tick_size("0.001") == "0.01"
+    assert rest_limit_tick_size("0.01") == "0.01"
+    assert rest_limit_tick_size(None) == "0.01"
+    assert select_rest_prices(best_ask=0.99) == ()
+    assert select_rest_prices(best_bid=0.99) == (0.99,)
+    assert select_rest_prices(best_bid=0.97) == (0.99, 0.98)
+    levels = allocate_rest_ladder(20.0, tick_size="0.001")
+    assert [round(x["price"], 2) for x in levels] == [0.99, 0.98], levels
     levels = allocate_rest_ladder(20.0, tick_size="0.01")
     assert [round(x["price"], 2) for x in levels] == [0.99, 0.98], levels
+    assert len(allocate_rest_ladder(20.0, best_bid=0.99)) == 1
+    assert allocate_rest_ladder(20.0, best_bid=0.99)[0]["price"] == 0.99
+    assert allocate_rest_ladder(20.0, best_ask=0.99) == []
+    assert ask_in_fak_zone(0.992) and not ask_in_fak_zone(0.993)
     assert abs(sum(x["usdc"] for x in levels) - 20.0) < 0.03, levels
     small = allocate_rest_ladder(1.5, tick_size="0.01")
     assert len(small) == 1 and small[0]["price"] == 0.99, small
     none = allocate_rest_ladder(0.4, tick_size="0.01")
     assert none == []
+    assert odds_grade_from_event_key("score_change|m1|0-0->1-0|odds_grade_B") == "B"
+    assert rest_fill_odds_grade({}, {"event_key": "score_change|m|odds_grade_B"}) == "B"
+    assert rest_fill_odds_grade({}, {"odds_grade": "B"}) == "B"
+    assert rest_fill_odds_grade({}, {}) == "B"
     print("ok: rest ladder 0.99/0.98")
 
 
@@ -127,7 +154,7 @@ def test_rest_only_no_ask() -> None:
         assert row["status"] == "rest_dry_run", row
         assert row["plan"]["order_type"] in ("GTD", "GTC")
         prices = [lvl["price"] for lvl in row["plan"]["levels"]]
-        assert 0.99 in prices and 0.98 in prices, prices
+        assert prices == [0.99], prices
         reserved = ex.ledger.rest_reserved_usdc(token_id="tok1", match_id="m1")
         assert reserved >= 19.0, reserved
         again = ex.maybe_trade(
@@ -138,7 +165,7 @@ def test_rest_only_no_ask() -> None:
         )
         assert again is None, again
         time.sleep(0.15)
-        print("ok: no-ask A rests once at 0.98/0.99")
+        print("ok: no-ask A rests once at 0.99 when bid>=0.99")
 
 
 def test_c_does_not_rest() -> None:
@@ -212,6 +239,67 @@ def test_reversal_cancels_rest() -> None:
         print("ok: DQD reversal cancels live rest immediately")
 
 
+def test_ask_fak_cancels_rest() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(live_goals=True), af_mode="gate")
+
+        class FakeTrader:
+            def __init__(self) -> None:
+                self.canceled: list[str] = []
+                self.market_buys = 0
+                self.n = 0
+
+            def post_limit_buy(self, *args, **kwargs):
+                self.n += 1
+                return {"success": True, "status": "LIVE", "orderID": f"rest{self.n}"}
+
+            def post_market_buy(self, *args, **kwargs):
+                self.market_buys += 1
+                return {
+                    "success": True,
+                    "status": "MATCHED",
+                    "takingAmount": "2.0",
+                    "makingAmount": "1.94",
+                }
+
+            def is_order_success(self, result, *, market=True):
+                return bool(result and result.get("success"))
+
+            def cancel_order(self, order_id: str):
+                self.canceled.append(str(order_id))
+                return {"canceled": True}
+
+        fake = FakeTrader()
+        ex.trader = fake  # type: ignore[assignment]
+        ex.ensure_trader = lambda: fake  # type: ignore[method-assign]
+        rest_row = ex.maybe_trade(
+            _win_quote(misprice=False),
+            event_key="score_change|m1|0-0->1-0|odds_grade_B",
+            match_meta=_meta("B", 10.0),
+            event_type="score_change",
+        )
+        assert rest_row and rest_row["status"] == "rest_posted", rest_row
+        mis = dict(_win_quote(misprice=True))
+        mis["best_ask"] = 0.99
+        mis["misprice"] = True
+        fak_row = ex.maybe_trade(
+            mis,
+            event_key="score_change|m1|0-0->1-0|odds_grade_B",
+            match_meta=_meta("B", 10.0),
+            event_type="score_change",
+        )
+        assert fake.canceled == ["rest1"], fake.canceled
+        assert fake.market_buys == 1, fake.market_buys
+        assert fak_row and fak_row["status"] == "posted", fak_row
+        leftover = ex.ledger.rest_reserved_usdc(match_id="m1")
+        assert leftover >= 1.0, leftover
+        assert fak_row.get("rest", {}).get("status") == "rest_posted", fak_row.get("rest")
+        time.sleep(0.15)
+        print("ok: misprice ask cancels rest, FAKs, then rests remainder")
+
+
 def test_stale_rest_keeps_other_family() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -233,12 +321,59 @@ def test_stale_rest_keeps_other_family() -> None:
         print("ok: stale rest only drops tokens outside the full WIN set")
 
 
+def test_rest_fill_keeps_b_pending() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(live_goals=True), af_mode="gate")
+
+        class FakeTrader:
+            def post_limit_buy(self, *args, **kwargs):
+                return {"success": True, "status": "LIVE", "orderID": "restb1"}
+
+            def is_order_success(self, result, *, market=True):
+                return bool(result and result.get("success"))
+
+            def get_order(self, order_id: str):
+                return {
+                    "status": "MATCHED",
+                    "size_matched": 10.0,
+                    "makingAmount": "9.9",
+                }
+
+            def cancel_order(self, order_id: str):
+                return {"canceled": True}
+
+        fake = FakeTrader()
+        ex.trader = fake  # type: ignore[assignment]
+        ex.ensure_trader = lambda: fake  # type: ignore[method-assign]
+        row = ex.maybe_trade(
+            _win_quote(misprice=False),
+            event_key="score_change|m1|0-0->1-0|odds_grade_B",
+            match_meta=_meta("B", 10.0),
+            event_type="score_change",
+        )
+        assert row and row["status"] == "rest_posted", row
+        lots = ex.ledger.open_for_match("m1")
+        assert lots, lots
+        filled = ex.reconcile_rest_orders()
+        assert filled, filled
+        lots = ex.ledger.open_for_match("m1")
+        assert lots, lots
+        assert lots[0].get("af_status") == AF_STATUS_CONFIRMED, lots[0]
+        assert float(lots[0].get("usdc") or 0) >= 9.0, lots[0]
+        time.sleep(0.15)
+        print("ok: B rest fill inherits B grade (gate still AF-confirmed)")
+
+
 def main() -> int:
     test_ladder()
     test_rest_only_no_ask()
     test_c_does_not_rest()
     test_reversal_cancels_rest()
+    test_ask_fak_cancels_rest()
     test_stale_rest_keeps_other_family()
+    test_rest_fill_keeps_b_pending()
     return 0
 
 
