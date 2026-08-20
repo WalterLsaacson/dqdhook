@@ -109,13 +109,13 @@ def main() -> int:
         == Decimal("0")
     )
 
-    # Entry−10% floor (no 0.01 panic dump).
-    assert FLATTEN_MAX_LOSS_FRAC == Decimal("0.10")
+    # Entry−20% floor (no 0.01 panic dump).
+    assert FLATTEN_MAX_LOSS_FRAC == Decimal("0.20")
     lot = {"shares": "20.618557", "usdc": "20.0", "tick_size": "0.01"}
     assert abs(lot_entry_price(lot) - Decimal("0.97")) < Decimal("0.001")
-    # 0.97 * 0.90 = 0.873 → tick floor 0.87
-    assert flatten_min_sell_price(lot) == Decimal("0.87")
-    assert flatten_min_sell_price({"ask": "0.50"}) == Decimal("0.45")
+    # 0.97 * 0.80 = 0.776 → tick floor 0.77
+    assert flatten_min_sell_price(lot) == Decimal("0.77")
+    assert flatten_min_sell_price({"ask": "0.50"}) == Decimal("0.40")
     assert flatten_min_sell_price({}) == FLATTEN_MIN_PRICE
 
     # Delayed fill: plan shares understate live bal → cheaper VWAP → lower floor.
@@ -124,7 +124,7 @@ def main() -> int:
     assert delayed["shares"] == 25.0
     assert delayed["usdc"] == 20.0
     assert abs(lot_entry_price(delayed) - Decimal("0.8")) < Decimal("0.001")
-    assert flatten_min_sell_price(delayed) == Decimal("0.72")  # 0.8*0.90=0.72
+    assert flatten_min_sell_price(delayed) == Decimal("0.64")  # 0.8*0.80=0.64
 
     # Residual after partial sell: scale usdc so VWAP (and floor) hold.
     residual = {"shares": 20.0, "usdc": 19.4}  # entry 0.97
@@ -132,7 +132,7 @@ def main() -> int:
     assert residual["shares"] == 10.0
     assert abs(float(residual["usdc"]) - 9.7) < 1e-9
     assert abs(lot_entry_price(residual) - Decimal("0.97")) < Decimal("0.001")
-    assert flatten_min_sell_price(residual) == Decimal("0.87")
+    assert flatten_min_sell_price(residual) == Decimal("0.77")
 
     # Dust/close must lift buy_blocked_pending_flatten for the match.
     import tempfile
@@ -429,7 +429,7 @@ def main() -> int:
             quote_lib.append_jsonl_async = old_append
 
     print(
-        "ok: flatten sell haircut + balance-gate parse + entry-10% floor + "
+        "ok: flatten sell haircut + balance-gate parse + entry-20% floor + "
         "buy-block clear + delayed-order reconciliation"
     )
     return 0

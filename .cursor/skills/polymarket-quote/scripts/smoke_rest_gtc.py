@@ -22,6 +22,7 @@ if "dotenv" not in sys.modules:
     dotenv.load_dotenv = lambda *_args, **_kwargs: False  # type: ignore[attr-defined]
     sys.modules["dotenv"] = dotenv
 
+from quote_lib import reversal_cushion_locked  # noqa: E402
 from rest_ladder import (  # noqa: E402
     allocate_rest_ladder,
     ask_in_fak_zone,
@@ -31,7 +32,10 @@ from rest_ladder import (  # noqa: E402
 )
 from score_reversal import AF_STATUS_CONFIRMED, AF_STATUS_PENDING  # noqa: E402
 from trade_executor import (  # noqa: E402
+    CUSHION_REST_USDC,
+    MIN_WIN_BEST_BID,
     TradeExecutor,
+    best_bid_clears_min,
     odds_grade_from_event_key,
     rest_fill_odds_grade,
 )
@@ -367,6 +371,198 @@ def test_rest_fill_keeps_b_pending() -> None:
         print("ok: B rest fill stays pending, not A/confirmed")
 
 
+def test_reversal_cushion_table() -> None:
+    over = {
+        "family": "totals",
+        "settlement": "WIN",
+        "outcome": "Over",
+        "line": 3.5,
+        "goals": 4,
+        "total_side": "match",
+        "total_period": "ft",
+    }
+    assert not reversal_cushion_locked(over, home_score=0, away_score=4)
+    over25 = dict(over, line=2.5)
+    assert reversal_cushion_locked(over25, home_score=0, away_score=4)
+    over05 = dict(over, line=0.5, goals=1)
+    assert not reversal_cushion_locked(over05, home_score=1, away_score=0)
+
+    btts = {
+        "family": "btts",
+        "settlement": "WIN",
+        "outcome": "Yes",
+        "btts_period": "ft",
+    }
+    assert not reversal_cushion_locked(btts, home_score=3, away_score=1)
+    assert reversal_cushion_locked(btts, home_score=2, away_score=2)
+
+    exact = {
+        "family": "exact_score",
+        "settlement": "WIN",
+        "outcome": "No",
+        "scoreline": "0-3",
+    }
+    assert not reversal_cushion_locked(exact, home_score=0, away_score=4)
+    exact02 = dict(exact, scoreline="0-2")
+    assert reversal_cushion_locked(exact02, home_score=0, away_score=4)
+    print("ok: reversal cushion table")
+
+
+def test_bid_floor_skips_and_allows() -> None:
+    assert MIN_WIN_BEST_BID == 0.85
+    assert not best_bid_clears_min(None)
+    assert not best_bid_clears_min("")
+    assert not best_bid_clears_min("nope")
+    assert not best_bid_clears_min(0.34)
+    assert best_bid_clears_min(0.85)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(live_goals=False), af_mode="gate")
+        thin = dict(_win_quote(misprice=False), best_bid=0.34)
+        skipped = ex.maybe_trade(
+            thin,
+            event_key="score_change|m1|0-0->1-0|odds_grade_B",
+            match_meta=_meta("B", 10.0),
+            event_type="score_change",
+        )
+        assert skipped and skipped["status"] == "skipped", skipped
+        assert skipped.get("skip_reason") == "best_bid_below_min", skipped
+        assert ex.ledger.rest_reserved_usdc(match_id="m1") < 1e-9
+
+        missing = dict(_win_quote(misprice=False))
+        missing["best_bid"] = None
+        skipped_missing = ex.maybe_trade(
+            missing,
+            event_key="score_change|m1|0-0->1-0|odds_grade_B",
+            match_meta=_meta("B", 10.0),
+            event_type="score_change",
+        )
+        assert skipped_missing and skipped_missing["skip_reason"] == "best_bid_below_min"
+
+        allowed = dict(_win_quote(misprice=False), best_bid=0.85)
+        row = ex.maybe_trade(
+            allowed,
+            event_key="score_change|m1|0-0->1-0|odds_grade_B",
+            match_meta=_meta("B", 10.0),
+            event_type="score_change",
+        )
+        assert row and row["status"] == "rest_dry_run", row
+        assert row["plan"]["order_type"] == "GTD", row["plan"]
+        prices = [lvl["price"] for lvl in row["plan"]["levels"]]
+        assert prices == [0.99, 0.98], prices
+        time.sleep(0.05)
+        print("ok: live bid floor skips <0.85 / missing, allows 0.85")
+
+
+def test_cushion_rest_gtc_caps_ten() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(live_goals=False), af_mode="gate")
+        q = dict(
+            _win_quote(misprice=False),
+            best_bid=0.90,
+            reversal_cushion=True,
+        )
+        row = ex.maybe_trade(
+            q,
+            event_key="score_change|m1|0-0->1-0|odds_grade_A",
+            match_meta=_meta("A", 20.0),
+            event_type="score_change",
+        )
+        assert row and row["status"] == "rest_dry_run", row
+        assert row["plan"]["order_type"] == "GTC", row["plan"]
+        prices = [lvl["price"] for lvl in row["plan"]["levels"]]
+        assert prices == [0.99], prices
+        reserved = ex.ledger.rest_reserved_usdc(token_id="tok1", match_id="m1")
+        assert abs(reserved - CUSHION_REST_USDC) < 0.03, reserved
+        time.sleep(0.05)
+        print("ok: cushion WIN rests $10 @ 0.99 GTC")
+
+
+def test_cushion_shrinks_prior_a_rest() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(live_goals=False), af_mode="gate")
+        just = dict(_win_quote(misprice=False), best_bid=0.90)
+        first = ex.maybe_trade(
+            just,
+            event_key="score_change|m1|0-0->1-0|odds_grade_A",
+            match_meta=_meta("A", 20.0),
+            event_type="score_change",
+        )
+        assert first and first["status"] == "rest_dry_run", first
+        assert ex.ledger.rest_reserved_usdc(token_id="tok1", match_id="m1") >= 19.0
+
+        # Ask in FAK zone but not flagged misprice: must still shrink, not skip rest.
+        cush = dict(
+            _win_quote(misprice=False),
+            best_bid=0.90,
+            best_ask=0.99,
+            reversal_cushion=True,
+        )
+        row = ex.maybe_trade(
+            cush,
+            event_key="score_change|m1|0-0->1-0|odds_grade_A",
+            match_meta=_meta("A", 20.0),
+            event_type="score_change",
+        )
+        assert row and row["status"] == "rest_dry_run", row
+        assert row["plan"]["order_type"] == "GTC", row["plan"]
+        prices = [lvl["price"] for lvl in row["plan"]["levels"]]
+        assert prices == [0.99], prices
+        reserved = ex.ledger.rest_reserved_usdc(token_id="tok1", match_id="m1")
+        assert abs(reserved - CUSHION_REST_USDC) < 0.03, reserved
+        time.sleep(0.05)
+        print("ok: cushion shrinks prior $20 rest to $10 GTC")
+
+
+def test_cushion_cancels_rest_when_lots_fill_cap() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        ex = TradeExecutor(root, _settings(live_goals=False), af_mode="gate")
+        ex.ledger.register_buy(
+            match_id="m1",
+            token_id="tok1",
+            market_key="totals:over:0.5",
+            shares=10.0,
+            usdc=10.0,
+            home_score=1,
+            away_score=0,
+            live=False,
+            event_key="score_change|m1|0-0->1-0",
+        )
+        leftover = dict(_win_quote(misprice=False), best_bid=0.90)
+        first = ex.maybe_trade(
+            leftover,
+            event_key="score_change|m1|0-0->1-0|odds_grade_A",
+            match_meta=_meta("A", 20.0),
+            event_type="score_change",
+        )
+        assert first and first["status"] == "rest_dry_run", first
+        assert ex.ledger.rest_reserved_usdc(token_id="tok1", match_id="m1") >= 9.0
+
+        cush = dict(
+            _win_quote(misprice=False),
+            best_bid=0.90,
+            reversal_cushion=True,
+        )
+        ex.maybe_trade(
+            cush,
+            event_key="score_change|m1|0-0->1-0|odds_grade_A",
+            match_meta=_meta("A", 20.0),
+            event_type="score_change",
+        )
+        assert ex.ledger.rest_reserved_usdc(token_id="tok1", match_id="m1") < 1e-9
+        lots = ex.ledger.open_for_match("m1")
+        assert lots and abs(float(lots[0].get("usdc") or 0) - 10.0) < 0.01, lots
+        time.sleep(0.05)
+        print("ok: cushion cancels leftover rest once lots already fill $10")
+
+
 def main() -> int:
     test_ladder()
     test_rest_only_no_ask()
@@ -375,6 +571,11 @@ def main() -> int:
     test_ask_fak_cancels_rest()
     test_stale_rest_keeps_other_family()
     test_rest_fill_keeps_b_pending()
+    test_reversal_cushion_table()
+    test_bid_floor_skips_and_allows()
+    test_cushion_rest_gtc_caps_ten()
+    test_cushion_shrinks_prior_a_rest()
+    test_cushion_cancels_rest_when_lots_fill_cap()
     return 0
 
 

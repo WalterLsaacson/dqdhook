@@ -32,6 +32,7 @@ _PM_SCRIPTS = Path(__file__).resolve().parents[2] / "polymarket-soccer" / "scrip
 if str(_PM_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PM_SCRIPTS))
 import pm_lib as pm  # noqa: E402
+from grade_sizing import grade_target_usdc
 
 WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+on\b", re.I)
 DRAW_RE = re.compile(r"end\s+in\s+a\s+draw", re.I)
@@ -582,6 +583,120 @@ def _goals_for_total(
     return None
 
 
+def _period_ha_goals(
+    *,
+    period: str,
+    home_score: Any,
+    away_score: Any,
+    home_half: Any = None,
+    away_half: Any = None,
+) -> tuple[int, int] | None:
+    """Home/away goals in ft / 1h / 2h, or None if the bucket is unknown."""
+    h = _parse_int_score(home_score)
+    a = _parse_int_score(away_score)
+    if h is None or a is None:
+        return None
+    key = str(period or "ft")
+    if key == "ft":
+        return h, a
+    hh = _parse_int_score(home_half)
+    ah = _parse_int_score(away_half)
+    if hh is None or ah is None:
+        return None
+    if key == "1h":
+        return hh, ah
+    if key == "2h":
+        h2, a2 = h - hh, a - ah
+        if h2 < 0 or a2 < 0:
+            return None
+        return h2, a2
+    return None
+
+
+def _exact_scoreline_dead(sh: int, sa: int, home: int, away: int) -> bool:
+    return sh < home or sa < away
+
+
+def reversal_cushion_locked(
+    row: dict[str, Any],
+    *,
+    home_score: Any = None,
+    away_score: Any = None,
+    home_half: Any = None,
+    away_half: Any = None,
+) -> bool:
+    """True when a live WIN stay locked after either side loses one goal."""
+    if str(row.get("settlement") or "") != "WIN":
+        return False
+    family = str(row.get("family") or "").lower()
+
+    if family == "totals":
+        try:
+            line = float(row.get("line"))
+        except (TypeError, ValueError):
+            return False
+        goals = row.get("goals")
+        if goals is None:
+            goals = _goals_for_total(
+                side=str(row.get("total_side") or "match"),
+                period=str(row.get("total_period") or "ft"),
+                home_score=home_score,
+                away_score=away_score,
+                home_half=home_half,
+                away_half=away_half,
+            )
+        try:
+            goals_i = int(goals)
+        except (TypeError, ValueError):
+            return False
+        outcome = str(row.get("outcome") or row.get("market_key") or "").lower()
+        if "under" in outcome:
+            return False
+        return (goals_i - 1) > line
+
+    if family == "btts":
+        outcome = str(row.get("outcome") or row.get("market_key") or "").lower()
+        if "yes" not in outcome:
+            return False
+        pair = _period_ha_goals(
+            period=str(row.get("btts_period") or "ft"),
+            home_score=home_score,
+            away_score=away_score,
+            home_half=home_half,
+            away_half=away_half,
+        )
+        if pair is None:
+            return False
+        return pair[0] >= 2 and pair[1] >= 2
+
+    if family == "exact_score":
+        outcome = str(row.get("outcome") or "").lower()
+        if outcome != "no" and "_no" not in str(row.get("market_key") or "").lower():
+            return False
+        printed = str(row.get("scoreline") or "")
+        try:
+            sh, sa = (int(x) for x in printed.split("-", 1))
+        except ValueError:
+            eh, ea = row.get("exact_home"), row.get("exact_away")
+            try:
+                sh, sa = int(eh), int(ea)
+            except (TypeError, ValueError):
+                return False
+        h = _parse_int_score(home_score)
+        a = _parse_int_score(away_score)
+        if h is None or a is None:
+            return False
+        if not _exact_scoreline_dead(sh, sa, h, a):
+            return False
+        if h > 0 and not _exact_scoreline_dead(sh, sa, h - 1, a):
+            return False
+        if a > 0 and not _exact_scoreline_dead(sh, sa, h, a - 1):
+            return False
+        return True
+
+    return False
+
+
 def totals_tokens(
     markets: list[dict[str, Any]],
     *,
@@ -630,25 +745,34 @@ def totals_tokens(
             settlement = (
                 "WIN" if (is_over and over_wins) or ((not is_over) and (not over_wins)) else "LOSE"
             )
-            rows.append(
-                {
-                    "family": "totals",
-                    "market_key": f"{side_key}{period_key}_total_{line}_{'over' if is_over else 'under'}",
-                    "role": "totals",
-                    "outcome": label,
-                    "settlement": settlement,
-                    "locked": True,
-                    "token_id": token,
-                    "market_id": m.get("market_id") or "",
-                    "condition_id": m.get("condition_id") or "",
-                    "question": q,
-                    "sports_market_type": "totals",
-                    "line": line,
-                    "goals": goals,
-                    "total_side": side,
-                    "total_period": period,
-                }
+            row = {
+                "family": "totals",
+                "market_key": f"{side_key}{period_key}_total_{line}_{'over' if is_over else 'under'}",
+                "role": "totals",
+                "outcome": label,
+                "settlement": settlement,
+                "locked": True,
+                "token_id": token,
+                "market_id": m.get("market_id") or "",
+                "condition_id": m.get("condition_id") or "",
+                "question": q,
+                "sports_market_type": "totals",
+                "line": line,
+                "goals": goals,
+                "total_side": side,
+                "total_period": period,
+            }
+            row["reversal_cushion"] = bool(
+                mode == "live"
+                and reversal_cushion_locked(
+                    row,
+                    home_score=home_score,
+                    away_score=away_score,
+                    home_half=home_half,
+                    away_half=away_half,
+                )
             )
+            rows.append(row)
     return rows
 
 
@@ -737,23 +861,32 @@ def btts_tokens(
             label = str(outcomes[i]) if i < len(outcomes) else f"outcome_{i}"
             is_yes = label.lower() == "yes"
             settlement = "WIN" if (is_yes and both) or ((not is_yes) and (not both)) else "LOSE"
-            rows.append(
-                {
-                    "family": "btts",
-                    "market_key": f"btts{period_key}_{'yes' if is_yes else 'no'}",
-                    "role": "btts",
-                    "outcome": label,
-                    "settlement": settlement,
-                    "locked": True,
-                    "token_id": token,
-                    "market_id": m.get("market_id") or "",
-                    "condition_id": m.get("condition_id") or "",
-                    "question": q_raw,
-                    "sports_market_type": "both_teams_to_score",
-                    "btts_period": period,
-                    "btts_both": both,
-                }
+            row = {
+                "family": "btts",
+                "market_key": f"btts{period_key}_{'yes' if is_yes else 'no'}",
+                "role": "btts",
+                "outcome": label,
+                "settlement": settlement,
+                "locked": True,
+                "token_id": token,
+                "market_id": m.get("market_id") or "",
+                "condition_id": m.get("condition_id") or "",
+                "question": q_raw,
+                "sports_market_type": "both_teams_to_score",
+                "btts_period": period,
+                "btts_both": both,
+            }
+            row["reversal_cushion"] = bool(
+                mode == "live"
+                and reversal_cushion_locked(
+                    row,
+                    home_score=home_score,
+                    away_score=away_score,
+                    home_half=home_half,
+                    away_half=away_half,
+                )
             )
+            rows.append(row)
     return rows
 
 
@@ -824,23 +957,32 @@ def exact_score_tokens(
         ):
             if idx >= len(tokens):
                 continue
-            rows.append(
-                {
-                    "family": "exact_score",
-                    "market_key": f"exact_{score}_{outcome.lower()}",
-                    "role": "exact_score",
-                    "outcome": outcome,
-                    "settlement": settlement,
-                    "locked": locked,
-                    "token_id": tokens[idx],
-                    "market_id": m.get("market_id") or "",
-                    "condition_id": m.get("condition_id") or "",
-                    "question": q,
-                    "sports_market_type": "exact_score",
-                    "scoreline": score,
-                    "is_correct_score": score == target,
-                }
+            row = {
+                "family": "exact_score",
+                "market_key": f"exact_{score}_{outcome.lower()}",
+                "role": "exact_score",
+                "outcome": outcome,
+                "settlement": settlement,
+                "locked": locked,
+                "token_id": tokens[idx],
+                "market_id": m.get("market_id") or "",
+                "condition_id": m.get("condition_id") or "",
+                "question": q,
+                "sports_market_type": "exact_score",
+                "scoreline": score,
+                "is_correct_score": score == target,
+                "exact_home": sh,
+                "exact_away": sa,
+            }
+            row["reversal_cushion"] = bool(
+                mode == "live"
+                and reversal_cushion_locked(
+                    row,
+                    home_score=home_score,
+                    away_score=away_score,
+                )
             )
+            rows.append(row)
     return rows
 
 
@@ -2496,10 +2638,7 @@ def process_bridge_events(
                 source_ev = upgrade.get("ev") if isinstance(upgrade.get("ev"), dict) else {}
                 if not base_key or not source_ev:
                     continue
-                target_usdc = float(
-                    grade.get("target_usdc")
-                    or (20.0 if level == "A" else 10.0 if level == "B" else 0.0)
-                )
+                target_usdc = float(grade.get("target_usdc") or grade_target_usdc(level))
                 decision = {
                     **grade,
                     "observe_group_id": upgrade.get("observe_group_id"),
@@ -2823,6 +2962,35 @@ def process_bridge_events(
             if key in seen:
                 _mark_ft_done(mid)
             continue
+
+        if typ == "score_change":
+            # DQD stream observe is observe-only and must not depend on AF
+            # being enabled. We still apply the same "stale event" gate to
+            # align with the trading pipeline's time pruning.
+            try:
+                from af_referee import event_is_goal_up, ft_event_is_stale
+
+                if event_is_goal_up(ev):
+                    stale, _age = ft_event_is_stale(ev)
+                    if not stale:
+                        try:
+                            from dqd_stream_observe import (
+                                get_active_observer as get_dqd_stream_observer,
+                            )
+
+                            dqd_stream_observer = get_dqd_stream_observer()
+                            if dqd_stream_observer is not None:
+                                dqd_stream_observer.enqueue_event(
+                                    ev, event_key=key
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            print(
+                                f"dqd-stream observe enqueue failed: {e}",
+                                flush=True,
+                            )
+            except Exception:
+                # Never let observe-only enqueue break quoting.
+                pass
 
         if typ == "score_change" and af_referee is not None:
             from af_referee import (

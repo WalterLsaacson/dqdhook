@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 import quote_lib as lib
+from grade_sizing import grade_target_usdc
 
 logger = logging.getLogger("pm_quote.book_context_observe")
 TZ_CN = timezone(timedelta(hours=8))
@@ -150,7 +151,7 @@ PHASE_AF_CONFIRMED = "af_confirmed"
 PHASE_DQD_GOAL = "dqd_goal"
 PHASE_DQD_REVERSAL = "dqd_reversal"
 
-GRADE_TARGET_USDC = {"C": 0.0, "B": 10.0, "A": 20.0}
+GRADE_TARGET_USDC = {level: grade_target_usdc(level) for level in ("C", "B", "A")}
 GRADE_RANK = {"C": 0, "B": 1, "A": 2}
 
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)

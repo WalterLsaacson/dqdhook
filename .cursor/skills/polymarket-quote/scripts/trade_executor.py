@@ -15,6 +15,7 @@ from typing import Any
 import quote_lib as lib
 from clob_trader import ClobTrader
 from fill_planner import FillPlan, plan_fill, MIN_MARKETABLE_BUY_USDC
+from grade_sizing import cushion_rest_usdc
 from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
@@ -53,7 +54,7 @@ FLATTEN_MIN_SHARES = Decimal("0.01")
 FLATTEN_MIN_PRICE = Decimal("0.5")
 # Max loss vs entry on emergency flatten: min_sell = entry * (1 - this).
 # Thin books that cannot fill leave residual for later retry ticks.
-FLATTEN_MAX_LOSS_FRAC = Decimal("0.10")
+FLATTEN_MAX_LOSS_FRAC = Decimal("0.20")
 # Polymarket matched-order cache often rejects 100% sells; keep a haircut.
 FLATTEN_SELL_HAIRCUT = Decimal("0.99")
 # Live bal vs gate bal: within this → trust gate "free"; else size from live only.
@@ -72,6 +73,9 @@ FLATTEN_ORDER_MAX_WAIT_S = 60.0
 FLATTEN_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_GRADES = frozenset({"A", "B"})
+MIN_WIN_BEST_BID = 0.85
+CUSHION_REST_USDC = cushion_rest_usdc()
+CUSHION_REST_PRICES = (0.99,)
 # Keep pending_reason bounded (append loops used to grow to 80KB+).
 FLATTEN_REASON_MAX_LEN = 400
 _TERMINAL_FLATTEN_ERR_RE = re.compile(
@@ -86,6 +90,25 @@ _NOT_ENOUGH_BAL_RE = re.compile(
     r"not enough balance\s*/\s*allowance",
     re.IGNORECASE,
 )
+
+
+def best_bid_clears_min(best_bid: Any, floor: float = MIN_WIN_BEST_BID) -> bool:
+    """Live buy_win requires a visible bid at or above the floor (missing bid fails)."""
+    if best_bid is None or best_bid == "":
+        return False
+    try:
+        return float(best_bid) + 1e-12 >= float(floor)
+    except (TypeError, ValueError):
+        return False
+
+
+def quote_reversal_cushion(quote: dict[str, Any] | None) -> bool:
+    raw = (quote or {}).get("reversal_cushion")
+    if raw is True:
+        return True
+    if raw is False or raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes"}
 
 
 def flatten_order_id(response: Any) -> str:
@@ -768,6 +791,32 @@ class TradeExecutor:
         typ = self._resolve_event_type(
             event_type=event_type, event_key=event_key, match_meta=match_meta
         )
+        if (
+            typ == "score_change"
+            and str(q.get("trade") or "") == "buy_win"
+            and rest_ok
+            and not best_bid_clears_min(q.get("best_bid"))
+        ):
+            return self._record(
+                q,
+                event_key=event_key,
+                match_meta=match_meta,
+                plan=None,
+                status="skipped",
+                skip_reason="best_bid_below_min",
+                response=None,
+                success=False,
+                idempotency_key=trade_idempotency_key(
+                    event_key or "", token_id, "buy_win"
+                ),
+                live=self._live_for_signal(typ),
+                extra={
+                    "size_policy": {
+                        "best_bid": q.get("best_bid"),
+                        "min_win_best_bid": MIN_WIN_BEST_BID,
+                    }
+                },
+            )
         channel_live = self._live_for_signal(typ)
         if mis and token_id and mid:
             n = self._cancel_live_rest_for_token(
@@ -867,26 +916,24 @@ class TradeExecutor:
 
         if rest_ok and not skip_rest:
             after_fak = bool(mis)
-            # Live ask: FAK this tick. After FAK, still rest whatever is left.
-            if ask_in_fak_zone(q.get("best_ask")) and not after_fak:
-                skip_rest = True
-            else:
-                rest_row = self._rest_remaining_buy(
-                    q,
-                    event_key=event_key,
-                    match_meta=match_meta,
-                    event_type=event_type,
-                    ignore_ask_zone=after_fak,
-                )
-                if fak_row is None:
-                    return rest_row
-                if isinstance(fak_row, dict) and rest_row is not None:
-                    fak_row = dict(fak_row)
-                    fak_row["rest"] = {
-                        "status": rest_row.get("status"),
-                        "plan": rest_row.get("plan"),
-                        "success": rest_row.get("success"),
-                    }
+            # Ask in FAK zone: do not *add* rest (handled in _rest_remaining_buy),
+            # but still run rest so a lowered cushion cap can shrink/cancel bids.
+            rest_row = self._rest_remaining_buy(
+                q,
+                event_key=event_key,
+                match_meta=match_meta,
+                event_type=event_type,
+                ignore_ask_zone=after_fak,
+            )
+            if fak_row is None:
+                return rest_row
+            if isinstance(fak_row, dict) and rest_row is not None:
+                fak_row = dict(fak_row)
+                fak_row["rest"] = {
+                    "status": rest_row.get("status"),
+                    "plan": rest_row.get("plan"),
+                    "success": rest_row.get("success"),
+                }
         return fak_row
 
     def _odds_grade(self, match_meta: dict[str, Any] | None) -> str:
@@ -896,6 +943,26 @@ class TradeExecutor:
             else {}
         )
         return str(ctx.get("odds_grade") or "").strip().upper()
+
+    def _buy_target_usdc(
+        self,
+        quote: dict[str, Any],
+        match_meta: dict[str, Any] | None,
+    ) -> tuple[float, str]:
+        """Grade A/B target, or $10 when the WIN has a two-goal reversal cushion."""
+        ctx = (
+            (match_meta or {}).get("trade_context")
+            if isinstance((match_meta or {}).get("trade_context"), dict)
+            else {}
+        )
+        base = str(ctx.get("base_event_key") or "")
+        if quote_reversal_cushion(quote):
+            return float(CUSHION_REST_USDC), base
+        try:
+            target = max(0.0, float(ctx.get("target_usdc") or 0))
+        except (TypeError, ValueError):
+            target = 0.0
+        return target, base
 
     def _buy_af_status(
         self, event_key: str, match_meta: dict[str, Any] | None
@@ -916,12 +983,14 @@ class TradeExecutor:
         if not isinstance(row, dict):
             return False
         reason = str(row.get("skip_reason") or "")
+        # odds_grade_target_reached still needs rest: a cushion cap drop must
+        # shrink/cancel working bids even when FAK has nothing left to add.
         if reason in (
-            "odds_grade_target_reached",
             "buy_blocked_pending_flatten",
             "in_flight",
             "sell_lose_disabled",
             "already_done",
+            "best_bid_below_min",
         ):
             return True
         if str(row.get("status") or "") == "record_only":
@@ -941,11 +1010,9 @@ class TradeExecutor:
             if isinstance((match_meta or {}).get("trade_context"), dict)
             else {}
         )
-        base = str(ctx.get("base_event_key") or "")
-        try:
-            target = max(0.0, float(ctx.get("target_usdc") or 0))
-        except (TypeError, ValueError):
-            target = 0.0
+        target, base = self._buy_target_usdc(quote, match_meta)
+        if not base:
+            base = str(ctx.get("base_event_key") or "")
         token_id = str(quote.get("token_id") or "")
         mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
         already = 0.0
@@ -989,6 +1056,10 @@ class TradeExecutor:
         mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
         if not token_id or not mid:
             return None
+        if not best_bid_clears_min(quote.get("best_bid")):
+            return None
+        cushion = quote_reversal_cushion(quote)
+        rest_prices = CUSHION_REST_PRICES if cushion else None
         with self._lock:
             if self._match_buy_blocked_locked(mid) or mid in self._rest_blocked_matches:
                 return None
@@ -1003,58 +1074,66 @@ class TradeExecutor:
             tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
             floor = max(float(self.settings.size_floor_usdc or 1), MIN_REST_USDC)
             gap = remaining
-            if gap + 1e-12 < floor and working <= 1e-9:
-                return None
-            replace = working + 1e-9 > gap and working > 1e-9
-            add_usdc = 0.0 if replace else max(0.0, gap - working)
-            if not replace and add_usdc + 1e-12 < floor:
-                return None
-            place_usdc = gap if replace else add_usdc
-            ask_for_ladder = None if ignore_ask_zone else quote.get("best_ask")
-            if ask_in_fak_zone(ask_for_ladder):
-                return None
-            levels = allocate_rest_ladder(
-                place_usdc,
-                tick_size=tick,
-                floor_usdc=floor,
-                best_bid=quote.get("best_bid"),
-                best_ask=ask_for_ladder,
-            )
-            if not levels and not replace:
-                return None
             live_pairs = list(
                 self.ledger.live_rest_orders(match_id=mid, token_id=token_id)
             )
-            live_prices = {
-                round(float(order.get("price") or 0), 4)
+            live_oids = [
+                str(order.get("order_id") or "")
                 for _lot, order in live_pairs
-                if order.get("price") is not None
-            }
-            desired_prices = {round(float(lvl["price"]), 4) for lvl in levels}
-            ladder_changed = bool(live_pairs) and live_prices != desired_prices
-            if ladder_changed:
-                cancel_ids = [
-                    str(order.get("order_id") or "")
-                    for _lot, order in live_pairs
-                    if str(order.get("order_id") or "")
-                ]
+                if str(order.get("order_id") or "")
+            ]
+            if gap + 1e-12 < floor and working <= 1e-9:
+                return None
+            # Lots already cover the (possibly lowered) target: drop leftover bids.
+            if gap + 1e-12 < floor:
+                cancel_ids = live_oids
+                levels = []
                 replace = True
-                place_usdc = gap
+            else:
+                replace = working + 1e-9 > gap and working > 1e-9
+                add_usdc = 0.0 if replace else max(0.0, gap - working)
+                if not replace and add_usdc + 1e-12 < floor:
+                    return None
+                place_usdc = gap if replace else add_usdc
+                ask_for_ladder = None if ignore_ask_zone else quote.get("best_ask")
+                # Adding rest while the ask is FAK-able is wrong; shrinking an
+                # oversized ladder (cushion cap drop) must still go through.
+                if ask_in_fak_zone(ask_for_ladder) and not replace:
+                    return None
                 levels = allocate_rest_ladder(
                     place_usdc,
+                    prices=rest_prices,
                     tick_size=tick,
                     floor_usdc=floor,
                     best_bid=quote.get("best_bid"),
                     best_ask=ask_for_ladder,
                 )
-                if not levels:
+                if not levels and not replace:
                     return None
-            else:
-                cancel_ids = [
-                    str(order.get("order_id") or "")
+                live_prices = {
+                    round(float(order.get("price") or 0), 4)
                     for _lot, order in live_pairs
-                    if replace and str(order.get("order_id") or "")
-                ]
+                    if order.get("price") is not None
+                }
+                desired_prices = {round(float(lvl["price"]), 4) for lvl in levels}
+                ladder_changed = bool(live_pairs) and live_prices != desired_prices
+                if ladder_changed:
+                    cancel_ids = live_oids
+                    replace = True
+                    place_usdc = gap
+                    levels = allocate_rest_ladder(
+                        place_usdc,
+                        prices=rest_prices,
+                        tick_size=tick,
+                        floor_usdc=floor,
+                        best_bid=quote.get("best_bid"),
+                        best_ask=ask_for_ladder,
+                    )
+                    if not levels:
+                        # Still cancel the old ladder (e.g. target now below floor).
+                        levels = []
+                else:
+                    cancel_ids = live_oids if replace else []
 
         if cancel_ids:
             self._cancel_rest_ids(
@@ -1064,7 +1143,7 @@ class TradeExecutor:
         if not levels:
             return None
 
-        expire_s = rest_expire_s()
+        expire_s = 0.0 if cushion else rest_expire_s()
         ot = "GTC" if expire_s <= 0 else "GTD"
         exp = int(time.time()) + int(expire_s) if ot == "GTD" else 0
         posted: list[dict[str, Any]] = []
@@ -1589,16 +1668,7 @@ class TradeExecutor:
             }
         if key in self._done:
             retry_graded_partial = False
-            trade_context_early = (
-                (match_meta or {}).get("trade_context")
-                if isinstance((match_meta or {}).get("trade_context"), dict)
-                else {}
-            )
-            base_early = str(trade_context_early.get("base_event_key") or "")
-            try:
-                target_early = float(trade_context_early.get("target_usdc"))
-            except (TypeError, ValueError):
-                target_early = 0.0
+            target_early, base_early = self._buy_target_usdc(quote, match_meta)
             if trade == "buy_win" and base_early and target_early > 0.0:
                 mid_early = str(
                     (match_meta or {}).get("match_id") or quote.get("match_id") or ""
@@ -1749,16 +1819,10 @@ class TradeExecutor:
                 if isinstance((match_meta or {}).get("trade_context"), dict)
                 else {}
             )
-            target_usdc: float | None = None
             already_usdc = 0.0
             remaining_target: float | None = None
-            base_event_key = str(trade_context.get("base_event_key") or "")
-            try:
-                if trade_context.get("target_usdc") is not None:
-                    target_usdc = max(0.0, float(trade_context.get("target_usdc")))
-            except (TypeError, ValueError):
-                target_usdc = None
-            if target_usdc is not None and target_usdc > 1e-9 and base_event_key:
+            target_usdc, base_event_key = self._buy_target_usdc(quote, match_meta)
+            if target_usdc > 1e-9 and base_event_key:
                 mid_target = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
                 prefix = base_event_key + "|odds_grade_"
                 already_usdc = sum(
@@ -1789,6 +1853,7 @@ class TradeExecutor:
                         "already_usdc": round(already_usdc, 6),
                         "remaining_target_usdc": 0.0,
                         "base_event_key": base_event_key,
+                        "reversal_cushion": quote_reversal_cushion(quote),
                     }
                     self._done.add(key)
                     return self._record(
@@ -1844,7 +1909,7 @@ class TradeExecutor:
                 ),
             )
             size_meta = caps.to_dict()
-            if target_usdc is not None:
+            if target_usdc > 1e-9 and base_event_key:
                 size_meta.update(
                     {
                         "odds_grade": trade_context.get("odds_grade"),
@@ -1852,6 +1917,7 @@ class TradeExecutor:
                         "already_usdc": round(already_usdc, 6),
                         "remaining_target_usdc": round(float(remaining_target or 0), 6),
                         "base_event_key": base_event_key,
+                        "reversal_cushion": quote_reversal_cushion(quote),
                     }
                 )
             if caps.skip_reason:
@@ -2683,7 +2749,7 @@ class TradeExecutor:
             )
             return row
 
-        # Live FAK sell: cancel locks, haircut size, min_price = entry×(1−10%).
+        # Live FAK sell: cancel locks, haircut size, min_price = entry×(1−20%).
         # No 0.01 panic dump — if the book cannot fill, residual stays for retry.
         try:
             trader = self.ensure_trader()

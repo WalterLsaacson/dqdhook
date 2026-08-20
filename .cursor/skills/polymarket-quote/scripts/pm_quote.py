@@ -28,6 +28,7 @@ import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from book_context_observe import try_create_observer as try_create_book_observer  # noqa: E402
+from dqd_stream_observe import try_create_observer as try_create_dqd_stream_observer  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
@@ -316,6 +317,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
         file=sys.stderr,
         flush=True,
     )
+    dqd_stream_obs = try_create_dqd_stream_observer(rt)
+    if dqd_stream_obs is not None:
+        dqd_stream_obs.start()
+        print(
+            f"dqd-stream observe → {lib.data_dir(rt) / 'dqd_stream_observe.jsonl'} "
+            f"(DQD goal t0/+10..50s · page/video screenshot · observe-only)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "dqd-stream observe skipped (set QUOTE_DQD_STREAM_OBSERVE=1)",
+            file=sys.stderr,
+            flush=True,
+        )
     lsa_obs = try_create_lsa_observer(rt)
     if lsa_obs is not None:
         lsa_obs.start()

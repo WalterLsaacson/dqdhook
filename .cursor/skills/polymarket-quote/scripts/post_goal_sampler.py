@@ -20,11 +20,10 @@ from pathlib import Path
 from typing import Any
 
 import quote_lib as lib
+from observe_timing import SAMPLE_COUNT, SAMPLE_INTERVAL_S
 
 logger = logging.getLogger("pm_quote.post_goal_sampler")
 
-SAMPLE_COUNT = 6
-SAMPLE_INTERVAL_S = 10.0  # samples at 0,10,20,30,40,50s
 BUY_STATUSES = frozenset({"dry_run", "posted"})
 
 _TOTAL_KEY_RE = re.compile(

@@ -30,6 +30,7 @@ from book_context_observe import (  # noqa: E402
     redact_url,
     try_create_observer,
 )
+from grade_sizing import grade_target_usdc  # noqa: E402
 
 
 def _odds(markets: list[dict]) -> dict:
@@ -134,9 +135,9 @@ def main() -> int:
         {"name": "Correct Score", "odds": [{"label": "0-0", "odds": "9"}]},
     ]
     b = grade_oddsapiio_sample(_source((0, 0), clean), home_score=1, away_score=0)
-    assert b["level"] == "B" and b["target_usdc"] == 10.0
+    assert b["level"] == "B" and b["target_usdc"] == grade_target_usdc("B")
     a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
-    assert a["level"] == "A" and a["target_usdc"] == 20.0
+    assert a["level"] == "A" and a["target_usdc"] == grade_target_usdc("A")
     a_blocked = grade_oddsapiio_sample(_source((1, 0), impossible), home_score=1, away_score=0)
     assert a_blocked["level"] == "C" and a_blocked["reason"] == "bet365_has_impossible_markets"
     latency_raw = {"status": "live", "bookmakers": {"Bet365 (no latency)": clean}}
@@ -293,7 +294,7 @@ def main() -> int:
     soft_grade = grade_oddsapiio_sample(soft_src, home_score=1, away_score=0)
     assert soft_grade["level"] == "B"
     assert soft_grade["reason"] == "bet365_clean_identity_soft"
-    assert soft_grade["target_usdc"] == 10.0
+    assert soft_grade["target_usdc"] == grade_target_usdc("B")
     assert soft_grade["score_match"] is True
 
     hard_a = grade_oddsapiio_sample(_source((1, 0), clean), home_score=1, away_score=0)
