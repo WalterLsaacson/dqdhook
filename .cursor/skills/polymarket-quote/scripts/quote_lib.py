@@ -1932,11 +1932,10 @@ def process_bridge_events(
     market_cache: Any | None = None,
     events_override: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Process bridge score_change / match_finished into dry quotes.
+    """Process bridge score_change / match_finished into quotes/trades.
 
-    Live CLOB buys are paused at the hub/settings layer; this path quotes
-    immediately on DQD events. DQD reversals cancel rest orders but do not
-    auto-flatten.
+    Goal-ups wait for pitch-state ``in_play`` (5s screenshots ≤120s) before one
+    ``_quote_one``. DQD reversals cancel rest orders and open pitch-gate sessions.
     """
     from score_events import (
         event_is_goal_up,
@@ -1944,6 +1943,7 @@ def process_bridge_events(
         ft_event_is_stale,
         target_score_from_event,
     )
+    from pitch_gate import get_coordinator
 
     cursor = load_cursor(root)
     cursor_state_before = {
@@ -1959,6 +1959,7 @@ def process_bridge_events(
     }
     bundles: list[dict[str, Any]] = []
     tick_t0 = time.monotonic()
+    gate = get_coordinator(root)
 
     def _mark_ft_done(match_id: str) -> None:
         mid = str(match_id or "").strip()
@@ -2093,6 +2094,77 @@ def process_bridge_events(
             )
             return False
 
+    def _drain_pitch_gate() -> None:
+        nonlocal bundles, seen
+        for item in gate.drain_done():
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "")
+            key = str(item.get("event_key") or "")
+            mid = str(item.get("match_id") or "")
+            ev = item.get("ev") if isinstance(item.get("ev"), dict) else {}
+            if not key:
+                continue
+            if status == "in_play":
+                work_ev = dict(ev)
+                work_ev["_trade_context"] = {
+                    "pitch_gate": True,
+                    "pitch_judge": item.get("judge"),
+                    "pitch_elapsed_s": item.get("elapsed_s"),
+                }
+                print(
+                    f"pitch-gate → BUY match_id={mid} key={key} "
+                    f"elapsed={item.get('elapsed_s')}",
+                    flush=True,
+                )
+                n_before = len(bundles)
+                _quote_one(work_ev, key)
+                # One knife only — do not retry this goal on later ticks.
+                if key not in seen:
+                    seen.add(key)
+                if len(bundles) > n_before and isinstance(bundles[-1], dict):
+                    bundles[-1]["mode"] = "pitch_gate_confirmed"
+                    bundles[-1]["pitch_gate"] = {
+                        "status": "in_play",
+                        "elapsed_s": item.get("elapsed_s"),
+                        "judge": item.get("judge"),
+                    }
+                continue
+            mode = {
+                "timeout": "pitch_gate_timeout",
+                "canceled": "pitch_gate_canceled",
+                "unavailable": "pitch_gate_unavailable",
+                "error": "pitch_gate_error",
+            }.get(status, f"pitch_gate_{status or 'unknown'}")
+            bundles.append(
+                {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "score_change",
+                    "mode": mode,
+                    "event_key": key,
+                    "match_id": mid,
+                    "home": ev.get("home"),
+                    "away": ev.get("away"),
+                    "home_score": ev.get("home_score"),
+                    "away_score": ev.get("away_score"),
+                    "count": 0,
+                    "opportunity_count": 0,
+                    "pitch_gate": {
+                        "status": status,
+                        "reason": item.get("reason"),
+                        "elapsed_s": item.get("elapsed_s"),
+                    },
+                }
+            )
+            seen.add(key)
+            print(
+                f"pitch-gate → {status.upper()} match_id={mid} key={key} "
+                f"reason={item.get('reason')}",
+                flush=True,
+            )
+
+    _drain_pitch_gate()
+
     # Memory events (in-process bridge) first; file scan for restart / board path.
     events_iter: list[dict[str, Any]] = []
     override_keys: set[str] = set()
@@ -2115,6 +2187,9 @@ def process_bridge_events(
         key = event_key(ev)
         if not force and key in seen:
             continue
+        # Gate session still running for this goal — wait for drain.
+        if not force and key in gate.pending_event_keys():
+            continue
 
         typ = str(ev.get("type") or "")
 
@@ -2132,6 +2207,13 @@ def process_bridge_events(
                             flush=True,
                         )
                 try:
+                    gate.cancel_match(mid_rev, reason="dqd_reversal")
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"ALERT pitch-gate cancel on reversal failed match={mid_rev}: {e}",
+                        flush=True,
+                    )
+                try:
                     from livescore_observe import get_active_observer as get_lsa_observer
 
                     lsa = get_lsa_observer()
@@ -2148,7 +2230,7 @@ def process_bridge_events(
                     {
                         "quoted_at": now_cn_iso(),
                         "trigger": "score_change",
-                        "mode": "dqd_reversal_no_flatten",
+                        "mode": "dqd_reversal_pitch_gate_canceled",
                         "event_key": key,
                         "match_id": mid_rev,
                         "home": ev.get("home"),
@@ -2156,12 +2238,12 @@ def process_bridge_events(
                         "home_score": ev.get("home_score"),
                         "away_score": ev.get("away_score"),
                         "flatten_count": 0,
+                        "pitch_gate": {"status": "cancel_requested"},
                     }
                 )
                 seen.add(key)
                 print(
-                    f"dqd-reversal → NO auto-flatten match_id={mid_rev} key={key} "
-                    f"(screenshot gate next round)",
+                    f"dqd-reversal → cancel pitch-gate match_id={mid_rev} key={key}",
                     flush=True,
                 )
                 continue
@@ -2212,17 +2294,32 @@ def process_bridge_events(
                     bundles.append(skip)
                     seen.add(key)
                     continue
-                try:
-                    from dqd_stream_observe import (
-                        get_active_observer as get_dqd_stream_observer,
+                pm = dict(ev.get("polymarket") or {})
+                if not pm.get("event_id") and not pm.get("slug"):
+                    try:
+                        ctx = join_ft_context(root, ev)
+                        pm = dict(ctx.get("polymarket") or {})
+                    except Exception:  # noqa: BLE001
+                        pm = {}
+                if not pm.get("event_id") and not pm.get("slug"):
+                    skip = {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "goal_skip_unpaired",
+                        "event_key": key,
+                        "match_id": mid_up,
+                        "count": 0,
+                        "opportunity_count": 0,
+                    }
+                    bundles.append(skip)
+                    seen.add(key)
+                    print(
+                        f"goal → SKIP unpaired match_id={mid_up} key={key}",
+                        flush=True,
                     )
-
-                    dqd_stream_observer = get_dqd_stream_observer()
-                    if dqd_stream_observer is not None:
-                        dqd_stream_observer.enqueue_event(ev, event_key=key)
-                except Exception as e:  # noqa: BLE001
-                    print(f"dqd-stream observe enqueue failed: {e}", flush=True)
-                _quote_one(ev, key)
+                    continue
+                # Defer _quote_one until pitch-state in_play (or timeout/cancel).
+                gate.start_gate(ev, event_key=key)
                 continue
 
             # Non goal-up / non-reversal score_change (e.g. status-only): skip.
@@ -2250,6 +2347,14 @@ def process_bridge_events(
                 except Exception as e:  # noqa: BLE001
                     print(
                         f"ALERT rest cancel on FT failed match={mid}: {e}",
+                        flush=True,
+                    )
+            if mid:
+                try:
+                    gate.cancel_match(mid, reason="match_finished")
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"ALERT pitch-gate cancel on FT failed match={mid}: {e}",
                         flush=True,
                     )
             if mid and mid in processed_ft_ids and not force:
@@ -2286,6 +2391,9 @@ def process_bridge_events(
 
         # Unknown event types: mark seen so cursor advances.
         seen.add(key)
+
+    # Same-tick unavailable / fast cancel results from start_gate / cancel_match.
+    _drain_pitch_gate()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]

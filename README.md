@@ -1,6 +1,6 @@
 # dqdhook
 
-Dongqiudi ↔ Polymarket soccer pipeline: live scores from 懂球帝, fixture pairing, CLOB quoting, and (next round) screenshot-gated trading.
+Dongqiudi ↔ Polymarket soccer pipeline: live scores from 懂球帝, fixture pairing, pitch-gated CLOB quoting/trading.
 
 ## What it does
 
@@ -11,8 +11,9 @@ polymarket-soccer ┘         │
                             ▼
               polymarket-quote watch
                     │
-                    ├── dry CLOB quote / trade plans
-                    └── optional DQD stream + pitch-state observe
+                    ├── goal → 5s pitch-gate ≤120s → in_play → one buy (goals live)
+                    ├── FT → immediate quote (default live)
+                    └── DQD stream + pitch-state frames
 ```
 
 | Skill | Role |
@@ -20,28 +21,28 @@ polymarket-soccer ┘         │
 | `dongqiudi-match` | DQD match list / scores / score-change |
 | `polymarket-soccer` | Polymarket Gamma soccer fixtures |
 | `match-bridge` | Align DQD ↔ PM; emit `score_change` / `match_finished` |
-| `polymarket-quote` | Settle markets, quote CLOB, dry-run plans (live paused) |
-| `pitch-state` | Screenshot resume-play judge (next-round gate) |
+| `polymarket-quote` | Pitch-gate goals + FT quotes/trades (default live) |
+| `pitch-state` | Screenshot resume-play judge (`in_play` gate) |
 
 **System Main** (`frontend/run_main.py`) is the **only** process you start. It boots:
 
 - Hub :8790
-- Boards (UI): Dongqiudi :8787 · Polymarket :8788 · Match Bridge :8789
-- `pm_quote watch`, which **owns in-process match-bridge** (memory `event_queue` → dry quote)
+- Boards (UI): Dongqiudi :8787 · Polymarket :8788 · Match Bridge :8789 · Pitch Gate :8791
+- `pm_quote watch`, which **owns in-process match-bridge** (memory `event_queue` → quote)
 
 Do **not** start `pm_quote`, boards as skill hosts, or a second `run_main` (hub exits if :8790 is taken). Bridge-board Start is blocked while quote owns the bridge (`data/bridge/.inproc_owner`).
 
-AF referee / Odds-Bet365 third confirmation / AF Bridge board have been **removed**. Live CLOB buys are **paused** until the DQD + screenshot two-confirm gate lands.
+AF referee / Odds-Bet365 third confirmation / AF Bridge board have been **removed**. Buys use the **DQD goal + pitch-state `in_play`** two-confirm gate.
 
-## Quick start (dry-run)
+## Quick start
 
 ```bash
 pip install -r .cursor/skills/polymarket-quote/requirements-trade.txt
 
 # Repo-root .env (never commit):
-#   PRIVATE_KEY, FUNDER, …   — only needed when live is re-enabled later
+#   PRIVATE_KEY, FUNDER, …   — required for live goals
 #   PM_PROXY (optional)      — default http://127.0.0.1:1082
-#   QUOTE_DQD_STREAM_OBSERVE=1 / QUOTE_PITCH_STATE=1  — optional observe
+#   QUOTE_DQD_STREAM_OBSERVE=1 / QUOTE_PITCH_STATE=1  — required for pitch-gate
 
 python3 frontend/run_main.py --no-browser
 
@@ -50,30 +51,32 @@ open http://127.0.0.1:8790/
 
 Stop: `Ctrl-C` / `kill` the `run_main` process, or `POST http://127.0.0.1:8790/api/stop`.
 
-### Dry-run checklist
+### Checklist
 
-1. Hub pills: Quote up · Trade dry (live paused) · Boards 3/3.
+1. Hub pills: Quote up · Trade goals:live ft:live · Boards 4/4.
 2. Bridge board shows paired matches.
-3. On a DQD goal-up: `data/pm-quote/watch.log` shows quote lines (no AF/Odds waits).
-4. Planned fills land in `data/pm-quote/trades.jsonl` with `"live": false` / `status: dry_run`.
-5. DQD reversal cancels rest orders but does **not** auto-flatten this round.
+3. Pitch Gate board (`:8791`) shows each goal’s frames + `play_state`.
+4. On a DQD goal-up: `watch.log` shows `pitch-gate → START`, then capture/judge, then `IN_PLAY` / trade (or `TIMEOUT` / `CANCEL`).
+5. Fills land in `data/pm-quote/trades.jsonl` (`live: true` when goals live and posted).
+6. DQD reversal cancels rest + pitch-gate; does **not** auto-flatten.
 
 ## Latency path (hot vs cold)
 
 | Hot path | Cold path (async disk) |
 |---|---|
 | DQD poll → rematch → memory `event_queue` | `data/bridge/events.jsonl`, `matches.json`, `prev_*` |
-| One CLOB `/books` + dry plan | `trades.jsonl`, quote snapshots |
+| Pitch-gate → one CLOB `/books` + buy | `trades.jsonl`, quote snapshots |
 
 Env: `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake (not recommended for latency).
 
 ## Trading modes
 
-**This round: live is forced off** (`--live` / `QUOTE_LIVE` / per-channel modes are ignored).
+Default: **goals=live**, **ft=live**. Override with flags / `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` / `QUOTE_LIVE`.
 
 ```bash
 python3 frontend/run_main.py --no-browser
 python3 frontend/run_main.py --take-depth walk --max-usdc 5 --no-browser
+python3 frontend/run_main.py --goals-mode dry --ft-mode dry --no-browser
 python3 frontend/run_main.py --no-trade
 ```
 
@@ -82,7 +85,7 @@ python3 frontend/run_main.py --no-trade
 | `--take-depth top\|walk` | Fill from best level or walk the book |
 | `--max-usdc` / `--max-shares` | Size caps |
 | `--no-trade` | Quote only (no executor) |
-| `--live` / `--goals-mode` / `--ft-mode` | Ignored (live paused) |
+| `--live` / `--goals-mode` / `--ft-mode` | Live CLOB per channel |
 
 ## Logs & data
 
@@ -90,9 +93,9 @@ python3 frontend/run_main.py --no-trade
 |---|---|
 | http://127.0.0.1:8790/ | System Main hub |
 | `data/pm-quote/watch.log` | Quote / trade stdout |
-| `data/pm-quote/trades.jsonl` | Dry-run plans (+ historical live) |
+| `data/pm-quote/trades.jsonl` | Dry / live attempts |
 | `data/bridge/events.jsonl` | Durable bridge events |
-| `data/pm-quote/dqd_stream_observe.jsonl` | Optional goal screenshots |
+| `data/pm-quote/dqd_stream_observe.jsonl` | Pitch-gate frame metadata |
 
 ## Static checks
 
@@ -104,6 +107,7 @@ python3 -c "from pathlib import Path; import py_compile; \
 python3 .cursor/skills/match-bridge/scripts/smoke_ft_period.py
 python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_trade_modes.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_post_goal_sampler.py
 ```
 
@@ -125,6 +129,6 @@ data/               # Runtime snapshots / jsonl (gitignored)
 
 ## Safety
 
-- Live CLOB is paused this round; dry-run only.
+- Goals+FT default live (goals still need pitch-gate in_play). Prefer small `--max-usdc`.
 - Do not commit `.env` or private keys.
-- Prefer small `--max-usdc` while validating.
+- Pitch-gate needs `QUOTE_DQD_STREAM_OBSERVE=1` and `QUOTE_PITCH_STATE=1`.

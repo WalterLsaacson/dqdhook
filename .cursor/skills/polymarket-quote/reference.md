@@ -74,11 +74,11 @@ After `flag_misprice` returns true inside `quote_tokens`, `TradeExecutor` runs *
 
 | Mode | Behavior |
 |---|---|
-| dry-run (default) | Plan fill → append `data/pm-quote/trades.jsonl`; no chain order |
+| default | **goals=live**, **ft=live** (pitch-gate buys live; FT live, ungated) |
 | `--live` | Both signal channels post `create_and_post_market_order` (**FAK**) |
 | `--goals-mode` / `--ft-mode` | Independent `dry\|live` for `score_change` vs `match_finished` (modes override `--live` per channel) |
 
-Env (System Main): `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE` (`dry`/`live`).
+Env (System Main): `QUOTE_LIVE`, `QUOTE_GOALS_MODE`, `QUOTE_FT_MODE` (`dry`/`live`). Defaults when unset: goals **live**, ft **live**.
 
 Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sessions never CLOB-sell a dry-run open lot.
 
@@ -92,20 +92,31 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 `sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 
 Price guard: skip when best ≤0.01 or >0.992 unless `--allow-extreme-prices`.  
-`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.6**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`.
+`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.6**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`. **Pitch-gate confirmed buys skip this floor.**
 
-**Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 1/25). `QUOTE_SIZE_TIERS=0.98:1` means **ask ≥ 0.98 → $1**, else **$1** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1).  
+**Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 1/25). `QUOTE_SIZE_TIERS=0.98:1` means **ask ≥ 0.98 → $1**, else **$1** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1) and the $1 marketable bump are **skipped when `trade_context.pitch_gate=true`**. Fee/`min_net` and `QUOTE_MAX_USDC` still apply.  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  
 SDK: `py-clob-client-v2` (see `requirements-trade.txt`). Env: `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAIN_ID`, `CLOB_HOST`.
 
-Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`, `score_reversal.py`.
+Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`, `score_reversal.py`, `pitch_gate.py`.
+
+**Pitch-gate buy (two-confirm)**
+
+1. DQD goal-up + Polymarket paired → `PitchGateCoordinator.start_gate` (no immediate `_quote_one`).
+2. Capture every **5s**, first frame immediately, until **120s** or cancel.
+3. Each successful JPEG → pitch-state `judge_inputs`; `play_state == "in_play"` → one `_quote_one` with `trade_context.pitch_gate=True`, then stop that session.
+4. `stopped` / `unclear` → keep capturing within the window.
+5. Timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
+6. DQD reversal → `cancel_match(match_id)` → `mode=pitch_gate_canceled`.
+7. Requires `QUOTE_DQD_STREAM_OBSERVE=1` and `QUOTE_PITCH_STATE=1`; else `pitch_gate_unavailable`.
+8. FT path remains immediate quote (default live), no screenshot gate.
 
 **Score reversal / disallowed goal**
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
-- Goal-ups and FT quote **immediately** on DQD events (dry only this round; AF/Odds gates removed). Events older than `QUOTE_FT_MAX_AGE_S` (default **900**) are skipped; FT once-per-`match_id` via `cursor.processed_ft_match_ids`.
-- DQD reversal cancels rest orders and **does not auto-flatten** (screenshot gate next round).
-- Live flatten (when re-enabled later) FAK-sells floored shares with entry×80% floor; dry lots never CLOB-sell.
+- Goal-ups wait for pitch-gate; FT quotes immediately (default live). Events older than `QUOTE_FT_MAX_AGE_S` (default **900**) are skipped; FT once-per-`match_id` via `cursor.processed_ft_match_ids`.
+- DQD reversal cancels rest orders and open pitch-gate sessions; **does not auto-flatten**.
+- Live flatten FAK-sells floored shares with entry×80% floor; dry lots never CLOB-sell.
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
 - Dry-run logs `flatten_dry_run`. Open lots: `data/pm-quote/open_positions.json`.
 
@@ -113,17 +124,21 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 
 After a `score_change` that successfully `buy_win`s (dry_run or posted), watch writes sample 0 from that quote and background-requotes **only those tokens** at +10s…+50s (6 total) into `data/pm-quote/post_goal_samples.jsonl`. Follow-up jobs run **in parallel** (wall-clock `elapsed_s`). Each follow-up re-reads the match score, recomputes settlement/lock, and sets `reversal_seen` only when a later `score_change` has `prev == score_at_t0` and a lower total. No `maybe_trade` on follow-ups.
 
-**DQD stream observe (trial, observe-only)**
+**DQD stream / pitch-state (gate + research)**
 
-When `.env` has `QUOTE_DQD_STREAM_OBSERVE=1`, every DQD goal-up also schedules **6** screenshots at **t0/+10s/+20s/+30s/+40s/+50s** into `data/pm-quote/dqd_stream_observe.jsonl`, with JPEGs under `data/pm-quote/dqd_stream_frames/`. Discovery is best-effort from Dongqiudi live hints and otherwise falls back to page screenshots, so animation-only and video pages share one path. Rows include `frame_kind` (`animation` / `video` / `page`) for downstream classification. Missing `ffmpeg` / Playwright writes `ok=false` rows but does not affect trading.
+Pitch-gate drives 5s captures for up to 120s after a paired goal. Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
 
-When `.env` has `QUOTE_PITCH_STATE=1`, the observer warms PaddleOCR at start and judges each successful screenshot immediately into `data/pm-quote/pitch_state_judge.jsonl`. Animation frames use local OCR/rules only; real video can fall back to an OpenAI-compatible vision model. Each frame also gets a sibling `.json` next to the JPEG (e.g. `00_00s.json`). This remains observe-only and does not gate trading.
+Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`.
+
+**Pitch Gate board (System Main)**
+
+`frontend/pitch-gate-board` on **:8791** (launched by `run_main`) reads `dqd_stream_observe.jsonl` + `pitch_state_judge.jsonl`, groups by goal `event_key`, and shows each frame thumbnail with `play_state` / confidence / evidence. Read-only viewer (no Start/Stop).
 
 **Live Score API observe (trial, observe-only)**
 
 When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, DQD-reversal may resolve the fixture via `scores/live.json`, then pull **raw** `matches/events.json` (GOAL/score) and `commentary/events.json` (VAR if package allows; errors kept raw) into `data/pm-quote/livescore_observe.jsonl`. DQD→LSA id map cached in `livescore_match_map.json`. Trial is not expected to expose `KICK_OFF`. Does **not** gate buys or flatten.
 
-**System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` as **forced dry** (+ repo `.env`). Live CLOB paused pending screenshot gate. Logs: `data/pm-quote/watch.log`.
+**System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with default **goals=live / ft=live** (+ repo `.env`). Pitch-gate: 5s screenshots ≤120s → `in_play` → one buy. Logs: `data/pm-quote/watch.log`.
 
 ## CLOB endpoints
 

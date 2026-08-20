@@ -5,7 +5,7 @@
   "kind": "orchestrator",
   "status": "stable",
   "skill": "polymarket-quote",
-  "description": "Master entry: quote watch (dry-run; live paused pending screenshot gate) → match-bridge → DQD + PM, plus frontend boards.",
+  "description": "Master entry: quote watch (pitch-gate goals+ft live) → match-bridge → DQD + PM, plus frontend boards.",
   "entry": {
     "html": "public/index.html",
     "js": "src/main.js",
@@ -16,10 +16,11 @@
     { "id": "match-board", "port": 8787, "skill": "dongqiudi-match" },
     { "id": "polymarket-board", "port": 8788, "skill": "polymarket-soccer" },
     { "id": "bridge-board", "port": 8789, "skill": "match-bridge" },
+    { "id": "pitch-gate-board", "port": 8791, "skill": "polymarket-quote / pitch-state" },
     {
       "id": "polymarket-quote",
       "kind": "skill",
-      "via": "pm_quote.py watch (dry-run; live paused)"
+      "via": "pm_quote.py watch (pitch-gate goals+ft live)"
     }
   ],
   "defaults": {

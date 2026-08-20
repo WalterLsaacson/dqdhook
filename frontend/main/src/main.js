@@ -20,11 +20,11 @@ function render(st) {
   } else if (trade.live_paused) {
     $("pillTrade").textContent = `Trade dry (live paused) · ${depth} · $${trade.max_usdc ?? "?"}`;
     $("pillTrade").className = "pill ok";
-  } else if (mode === "live") {
-    $("pillTrade").textContent = `Trade LIVE · ${depth} · $${trade.max_usdc ?? "?"}`;
+  } else if (String(mode).includes("live") || mode === "live") {
+    $("pillTrade").textContent = `Trade ${mode} · ${depth} · $${trade.max_usdc ?? "?"}`;
     $("pillTrade").className = "pill ok";
   } else {
-    $("pillTrade").textContent = `Trade dry-run · ${depth} · $${trade.max_usdc ?? "?"}`;
+    $("pillTrade").textContent = `Trade ${mode || "dry"} · ${depth} · $${trade.max_usdc ?? "?"}`;
     $("pillTrade").className = "pill ok";
   }
 
@@ -58,7 +58,10 @@ function render(st) {
           ? ` · bridge skill ${b.skill_running ? "running" : "idle"}` +
             (b.dqd_ticks != null ? ` · DQD ${b.dqd_ticks}` : "") +
             (b.pm_ticks != null ? ` · PM ${b.pm_ticks}` : "")
-          : "";
+          : b.id === "pitch-gate-board" && b.goal_count != null
+            ? ` · goals ${b.goal_count}` +
+              (b.in_play_count != null ? ` · in_play ${b.in_play_count}` : "")
+            : "";
       return `
       <a class="card ${b.up ? "" : "is-down"}" href="${b.url}" target="${b.id === "trades-ledger" || b.id === "main" ? "_self" : "_blank"}" rel="noreferrer">
         <div>

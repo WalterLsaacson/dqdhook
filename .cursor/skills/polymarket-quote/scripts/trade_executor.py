@@ -420,6 +420,11 @@ def signal_from_event_key(event_key: str) -> str:
     return ek.split("|", 1)[0]
 
 
+def _trade_context_pitch_gate(match_meta: dict[str, Any] | None) -> bool:
+    tc = (match_meta or {}).get("trade_context")
+    return isinstance(tc, dict) and bool(tc.get("pitch_gate"))
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -715,8 +720,18 @@ class TradeExecutor:
             return f"extreme_price={price} (>{max_ask})"
         return None
 
-    def _min_buy_price_blocked(self, price: float | None) -> str | None:
-        """buy_win: require best_ask >= min_buy_price (default 0.6; 0=off)."""
+    def _min_buy_price_blocked(
+        self,
+        price: float | None,
+        *,
+        match_meta: dict[str, Any] | None = None,
+    ) -> str | None:
+        """buy_win: require best_ask >= min_buy_price (default 0.6; 0=off).
+
+        Pitch-gate confirmed buys skip this floor (fee/min_net still apply).
+        """
+        if _trade_context_pitch_gate(match_meta):
+            return None
         floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
         if floor <= 0 or price is None:
             return None
@@ -1626,7 +1641,7 @@ class TradeExecutor:
                     live=channel_live,
                 )
                 return row
-            below_min = self._min_buy_price_blocked(ref_f)
+            below_min = self._min_buy_price_blocked(ref_f, match_meta=match_meta)
             if below_min:
                 row = self._record(
                     quote,
@@ -1674,6 +1689,10 @@ class TradeExecutor:
                 float(r.get("usdc") or 0)
                 for r in self.ledger.all_open()
             ) + self._pending_usdc_total_locked() + self.ledger.rest_reserved_usdc()
+            pitch_relaxed = _trade_context_pitch_gate(match_meta)
+            floor_usdc = (
+                0.0 if pitch_relaxed else float(self.settings.size_floor_usdc)
+            )
             caps = compute_buy_size_caps(
                 ref_f,
                 max_usdc=self.settings.max_usdc,
@@ -1681,7 +1700,7 @@ class TradeExecutor:
                 tiers=self.settings.size_tiers,
                 open_usdc=open_usdc,
                 max_open_usdc=self.settings.max_open_usdc,
-                floor_usdc=self.settings.size_floor_usdc,
+                floor_usdc=floor_usdc,
             )
             size_meta = caps.to_dict()
             if caps.skip_reason:
@@ -1725,8 +1744,10 @@ class TradeExecutor:
 
         # Marketable BUY floor is $1: bump thin-book plans up so FAK can eat
         # resting size (e.g. 0.99@$0.99) instead of CLOB rejecting $0.98.
+        # Pitch-gate path skips this floor (still capped by QUOTE_MAX_USDC).
         if (
             trade == "buy_win"
+            and not _trade_context_pitch_gate(match_meta)
             and plan.skip_reason is None
             and float(plan.usdc or 0) > 0
             and float(plan.usdc or 0) + 1e-12 < MIN_MARKETABLE_BUY_USDC

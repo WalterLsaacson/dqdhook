@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="pitch-gate-module" content="pitch-gate-board" />
+    <title>Pitch Gate Board</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Space+Grotesk:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="brand__mark">PG</span>
+        <div>
+          <h1 class="brand__title">Pitch Gate</h1>
+          <p class="brand__sub">
+            <code>dqd_stream</code> + <code>pitch-state</code> · 每球截图判定 · 北京时间
+          </p>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="actions">
+          <button id="btnRefresh" class="btn btn--ghost" type="button">Refresh</button>
+        </div>
+      </div>
+    </header>
+
+    <section class="meta" id="meta">
+      <div class="pill" id="pillStatus">Idle</div>
+      <div class="pill pill--muted" id="pillGoals">Goals —</div>
+      <div class="pill pill--muted" id="pillGate">Gate —</div>
+      <div class="pill pill--muted" id="pillInPlay">in_play —</div>
+      <div class="pill pill--muted" id="pillLatest">—</div>
+    </section>
+
+    <main class="layout">
+      <aside class="goal-rail" id="goalRail" aria-label="Goals"></aside>
+      <section class="board" id="board">
+        <div class="empty">Loading pitch-gate frames…</div>
+      </section>
+    </main>
+
+    <script src="/src/main.js" type="module"></script>
+  </body>
+</html>

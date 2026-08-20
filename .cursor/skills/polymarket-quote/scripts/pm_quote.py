@@ -29,7 +29,11 @@ from dqd_stream_observe import try_create_observer as try_create_dqd_stream_obse
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
-from trade_settings import load_trade_settings, size_tiers_label  # noqa: E402
+from trade_settings import (  # noqa: E402
+    load_trade_settings,
+    resolve_live_modes,
+    size_tiers_label,
+)
 
 
 def root() -> Path:
@@ -39,15 +43,26 @@ def root() -> Path:
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     """Build TradeExecutor when trading is enabled (default on; --no-trade disables).
 
-    Live CLOB is force-paused this round (screenshot gate lands next). Always dry.
+    Defaults: goals=live and ft=live (real CLOB). Override with --goals-mode /
+    --ft-mode / env. Goals still require pitch-gate ``in_play`` before buy.
     """
     if getattr(args, "no_trade", False):
         return None
-    # Force dry regardless of --live / --goals-mode / --ft-mode.
+    live = bool(getattr(args, "live", False))
+    goals_mode = getattr(args, "goals_mode", None)
+    ft_mode = getattr(args, "ft_mode", None)
+    # Default both channels to live when unset (unless --live already implies both).
+    if goals_mode is None and not live:
+        goals_mode = "live"
+    if ft_mode is None and not live:
+        ft_mode = "live"
+    live_goals, live_ft = resolve_live_modes(
+        live=live, goals_mode=goals_mode, ft_mode=ft_mode
+    )
     settings = load_trade_settings(
-        live=False,
-        goals_mode="dry",
-        ft_mode="dry",
+        live=live,
+        goals_mode=goals_mode,
+        ft_mode=ft_mode,
         take_depth=str(getattr(args, "take_depth", "walk") or "walk"),
         max_levels=int(getattr(args, "max_levels", 5)),
         max_usdc=float(getattr(args, "max_usdc", 1.0)),
@@ -57,25 +72,29 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         min_buy_price=float(getattr(args, "min_buy_price", 0.6)),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
-        require_key=False,
+        require_key=bool(live_goals or live_ft),
     )
     executor = TradeExecutor(rt, settings)
     if settings.private_key:
         try:
             executor.ensure_trader()
         except Exception as e:  # noqa: BLE001
+            if settings.live:
+                raise
             print(
                 f"trade → CLOB init failed (sell position checks disabled): {e}",
                 file=sys.stderr,
                 flush=True,
             )
+    g = "live" if settings.live_goals else "dry"
+    f = "live" if settings.live_ft else "dry"
     print(
-        f"trade → goals=dry ft=dry take_depth={settings.take_depth} "
+        f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
         f"max_usdc={settings.max_usdc} max_shares={settings.max_shares} "
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
         f"size_tiers={size_tiers_label(settings)} "
-        f"(live buys paused pending screenshot gate)",
+        f"(pitch-gate: 5s/120s in_play → one buy)",
         file=sys.stderr,
         flush=True,
     )
@@ -283,7 +302,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         )
     print(
         f"polymarket-quote watch (wake≤{interval}s · memory queue|file · "
-        f"market_cache · retain={retain_h}h · dry quote; live paused) → {lib.data_dir(rt)}",
+        f"market_cache · retain={retain_h}h · pitch-gate goals) → {lib.data_dir(rt)}",
         file=sys.stderr,
         flush=True,
     )
@@ -397,7 +416,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         help="Skip More Markets / Exact Score discovery",
     )
     sp.add_argument("--no-exact", action="store_true", help="Skip Exact Score only")
-    # --- in-process trading (after misprice; default dry-run; live paused) ---
+    # --- in-process trading (after misprice; default goals+ft live) ---
     sp.add_argument(
         "--no-trade",
         action="store_true",
@@ -406,19 +425,19 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--live",
         action="store_true",
-        help="Ignored this round: live CLOB buys paused pending screenshot gate",
+        help="Enable live CLOB for both goals and FT channels",
     )
     sp.add_argument(
         "--goals-mode",
         choices=("dry", "live"),
         default=None,
-        help="Ignored this round: forced dry (screenshot gate next)",
+        help="Goals channel: dry|live (default live; pitch-gate buys)",
     )
     sp.add_argument(
         "--ft-mode",
         choices=("dry", "live"),
         default=None,
-        help="Ignored this round: forced dry (screenshot gate next)",
+        help="FT channel: dry|live (default live)",
     )
     sp.add_argument(
         "--take-depth",

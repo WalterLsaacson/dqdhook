@@ -54,6 +54,13 @@ BOARDS = (
         "port": 8789,
         "skill": "match-bridge",
     },
+    {
+        "id": "pitch-gate-board",
+        "name": "Pitch Gate",
+        "script": FRONTEND / "run_pitch_gate.py",
+        "port": 8791,
+        "skill": "polymarket-quote / pitch-state",
+    },
 )
 
 QUOTE_SCRIPT = (
@@ -123,15 +130,24 @@ def load_quote_trade_config(
     if not env_file and (ROOT / ".env").is_file():
         env_file = str(ROOT / ".env")
 
-    # Live CLOB buys paused until screenshot (DQD+pitch) gate lands next round.
-    # Force dry regardless of --live / QUOTE_LIVE / QUOTE_*_MODE.
-    _ = (live, goals_mode, ft_mode)
-    g_mode = "dry"
-    f_mode = "dry"
+    # Per-channel modes from CLI/env; default both to live when unset.
+    g_mode = goals_mode if goals_mode is not None else _env_mode("QUOTE_GOALS_MODE")
+    f_mode = ft_mode if ft_mode is not None else _env_mode("QUOTE_FT_MODE")
+    if g_mode is None:
+        g_mode = "live"
+    if f_mode is None:
+        f_mode = "live"
+    # --live / QUOTE_LIVE forces both live unless a channel was set explicitly.
+    want_both_live = bool(live) if live is not None else _env_bool("QUOTE_LIVE", False)
+    if want_both_live:
+        if goals_mode is None and _env_mode("QUOTE_GOALS_MODE") is None:
+            g_mode = "live"
+        if ft_mode is None and _env_mode("QUOTE_FT_MODE") is None:
+            f_mode = "live"
 
     return {
         "enabled": enabled,
-        "live": False,
+        "live": g_mode == "live" or f_mode == "live",
         "goals_mode": g_mode,
         "ft_mode": f_mode,
         "take_depth": depth,
@@ -323,7 +339,7 @@ def _ensure_quote() -> bool:
         "main → starting polymarket-quote watch "
         f"(trade={mode} depth={trade.get('take_depth')} "
         f"max_usdc={trade.get('max_usdc')}) "
-        "(→ in-process match-bridge → DQD + PM · dry quote; live paused)",
+        "(→ in-process match-bridge → DQD + PM · pitch-gate goals)",
         flush=True,
     )
     quote_log = ROOT / "data" / "pm-quote" / "watch.log"
@@ -498,6 +514,14 @@ def status() -> dict[str, Any]:
                     "dqd_ticks": st.get("dqd_ticks"),
                     "pm_ticks": st.get("pm_ticks"),
                 }
+        if up and board["id"] == "pitch-gate-board":
+            st = _http_json(f"http://{HOST}:{port}/api/status")
+            if st:
+                extra = {
+                    "goal_count": st.get("goal_count"),
+                    "in_play_count": st.get("in_play_count"),
+                    "gate_goal_count": st.get("gate_goal_count"),
+                }
         boards_st.append(
             {
                 "id": board["id"],
@@ -531,7 +555,7 @@ def status() -> dict[str, Any]:
             "trade": {
                 **trade,
                 "mode": mode,
-                "live_paused": True,
+                "live_paused": False,
                 "trades_path": str(ROOT / "data" / "pm-quote" / "trades.jsonl"),
                 "watch_log": str(ROOT / "data" / "pm-quote" / "watch.log"),
             },
@@ -727,8 +751,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "System Main — hub + boards + quote dry-run "
-            "(live CLOB paused pending screenshot gate; do not start pm_quote / boards separately)"
+            "System Main — hub + boards + quote "
+            "(pitch-gate goals+ft live by default; do not start pm_quote / boards separately)"
         )
     )
     parser.add_argument("--no-trade", action="store_true", help="Quote only (no executor)")
@@ -741,13 +765,13 @@ def main(argv: list[str] | None = None) -> int:
         "--goals-mode",
         choices=("dry", "live"),
         default=None,
-        help="score_change dry|live (default dry; --live sets live unless overridden)",
+        help="score_change dry|live (default live; pitch-gate buys)",
     )
     parser.add_argument(
         "--ft-mode",
         choices=("dry", "live"),
         default=None,
-        help="match_finished dry|live (default dry; --live sets live unless overridden)",
+        help="match_finished dry|live (default live)",
     )
     parser.add_argument(
         "--take-depth",
@@ -825,7 +849,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(live buys paused pending screenshot gate)",
+        f"(pitch-gate: 5s/120s in_play → one buy)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

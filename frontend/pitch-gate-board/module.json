@@ -1,0 +1,28 @@
+{
+  "id": "pitch-gate-board",
+  "name": "Pitch Gate Board",
+  "version": "1.0.0",
+  "kind": "frontend",
+  "status": "stable",
+  "skill": "polymarket-quote / pitch-state",
+  "entry": {
+    "html": "public/index.html",
+    "js": "src/main.js",
+    "css": "src/styles.css",
+    "server": "server/app.py"
+  },
+  "api": {
+    "base": "/",
+    "routes": [
+      "GET /api/health",
+      "GET /api/module",
+      "GET /api/status",
+      "GET /api/goals",
+      "GET /api/frame"
+    ]
+  },
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 8791
+  }
+}
