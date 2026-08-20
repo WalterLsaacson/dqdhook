@@ -164,7 +164,7 @@ def main() -> int:
             max_open_usdc=1000.0,
             size_floor_usdc=1.0,
         )
-        ex = TradeExecutor(root, settings, af_mode="gate")
+        ex = TradeExecutor(root, settings)
         mid = "m_block"
         ex.ledger.register_buy(
             match_id=mid,
@@ -197,8 +197,8 @@ def main() -> int:
         ex._maybe_clear_buy_block(mid)
         assert mid in ex._buy_blocked_matches
 
-        # A raw DQD score drop is only provisional. The executor must leave an
-        # affected lot open until the Odds arbiter supplies explicit evidence.
+        # A raw DQD score drop is only provisional this round: no auto-flatten
+        # until the screenshot gate lands (Odds-confirmed flatten removed).
         rev_mid = "m_odds_gate"
         rev_tid = "tok_odds_gate"
         ex.ledger.register_buy(
@@ -223,13 +223,6 @@ def main() -> int:
         }
         assert ex.maybe_flatten_for_event(reversal_ev) == []
         assert len(ex.ledger.open_for_match(rev_mid)) == 1
-        confirmed = ex.flatten_confirmed_reversal(
-            reversal_ev,
-            confirmation={"reason": "odds_score_reverted"},
-        )
-        assert len(confirmed) == 1
-        assert confirmed[0]["status"] == "flatten_dry_run"
-        assert ex.ledger.open_for_match(rev_mid) == []
 
     # Accepted DELAYED sell: retry ticks reconcile the exact order instead of
     # asset-wide cancel/repost.  Once balance reaches zero, write one settlement
@@ -304,7 +297,7 @@ def main() -> int:
             max_open_usdc=1000.0,
             size_floor_usdc=1.0,
         )
-        ex = TradeExecutor(root, settings, trader=fake, af_mode="gate")
+        ex = TradeExecutor(root, settings, trader=fake)
         mid = "m_delayed_sell"
         tid = "tok_delayed_sell"
         ex.ledger.register_buy(
@@ -347,7 +340,7 @@ def main() -> int:
             assert fake.order_get_calls == 1
             assert ex.ledger.pending_flatten_lots()[0]["flatten_order_checks"] == 1
 
-            restarted = TradeExecutor(root, settings, trader=fake, af_mode="gate")
+            restarted = TradeExecutor(root, settings, trader=fake)
             assert restarted.ledger.pending_flatten_lots()[0]["flatten_order_id"] == "o1"
             assert restarted.retry_pending_flattens() == []
             assert fake.sell_calls == 1

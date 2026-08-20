@@ -54,13 +54,6 @@ BOARDS = (
         "port": 8789,
         "skill": "match-bridge",
     },
-    {
-        "id": "af-bridge-board",
-        "name": "API-Football Bridge",
-        "script": FRONTEND / "run_af_bridge.py",
-        "port": 8791,
-        "skill": "apifootball-bridge",
-    },
 )
 
 QUOTE_SCRIPT = (
@@ -130,18 +123,15 @@ def load_quote_trade_config(
     if not env_file and (ROOT / ".env").is_file():
         env_file = str(ROOT / ".env")
 
-    # --live / QUOTE_LIVE sets both channels live; per-channel modes override.
-    base_live = bool(live) if live is not None else _env_bool("QUOTE_LIVE", False)
-    g_mode = goals_mode if goals_mode is not None else _env_mode("QUOTE_GOALS_MODE")
-    f_mode = ft_mode if ft_mode is not None else _env_mode("QUOTE_FT_MODE")
-    if g_mode is None:
-        g_mode = "live" if base_live else "dry"
-    if f_mode is None:
-        f_mode = "live" if base_live else "dry"
+    # Live CLOB buys paused until screenshot (DQD+pitch) gate lands next round.
+    # Force dry regardless of --live / QUOTE_LIVE / QUOTE_*_MODE.
+    _ = (live, goals_mode, ft_mode)
+    g_mode = "dry"
+    f_mode = "dry"
 
     return {
         "enabled": enabled,
-        "live": g_mode == "live" or f_mode == "live",
+        "live": False,
         "goals_mode": g_mode,
         "ft_mode": f_mode,
         "take_depth": depth,
@@ -207,20 +197,6 @@ def quote_watch_argv(cfg: dict[str, Any] | None = None) -> list[str]:
     env_file = c.get("trade_env_file")
     if env_file:
         args.extend(["--trade-env-file", str(env_file)])
-    # AF referee default on in pm_quote; allow hub to disable via QUOTE_AF_REFEREE=0.
-    if not _env_bool("QUOTE_AF_REFEREE", True):
-        args.append("--no-af-referee")
-    else:
-        poll = os.getenv("QUOTE_AF_POLL")
-        timeout = os.getenv("QUOTE_AF_TIMEOUT")
-        if poll:
-            args.extend(["--af-poll", str(poll)])
-        if timeout:
-            args.extend(["--af-timeout", str(timeout)])
-        if _env_bool("QUOTE_AF_POSTCHECK_TRADE", False):
-            args.append("--af-postcheck-trade")
-        elif _env_bool("QUOTE_AF_GATE_BEFORE_TRADE", False):
-            args.append("--af-gate-before-trade")
     return args
 
 
@@ -252,65 +228,7 @@ def _http_json(url: str, *, timeout: float = 1.5) -> dict[str, Any] | None:
         return None
 
 
-def _http_post_json(
-    url: str,
-    payload: dict[str, Any] | None = None,
-    *,
-    timeout: float = 8.0,
-) -> dict[str, Any] | None:
-    try:
-        body = json.dumps(payload or {}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "User-Agent": "main-module/1.0",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
-    except Exception:  # noqa: BLE001
-        return None
-
-
-AF_BRIDGE_BOARD_PORT = 8791
 BRIDGE_BOARD_PORT = 8789
-
-
-def _ensure_af_bridge_watch() -> dict[str, Any]:
-    """Start apifootball-bridge watch via af-bridge-board API (fixture cache warmer).
-
-    Board process is read-only by default; System Main turns watch on so quote's
-    AF referee has warm DQD→AF mappings. Disable with MAIN_AF_WATCH=0.
-    """
-    if not _env_bool("MAIN_AF_WATCH", True):
-        return {"ok": True, "skipped": True, "reason": "MAIN_AF_WATCH=0"}
-    port = AF_BRIDGE_BOARD_PORT
-    if not _port_open(port):
-        return {"ok": False, "error": "af_bridge_board_down", "port": port}
-    st = _http_json(f"http://{HOST}:{port}/api/status", timeout=2.0)
-    if st and st.get("running"):
-        print(
-            f"main → apifootball-bridge watch already running "
-            f"(entries={st.get('entry_count')} unresolved={st.get('unresolved_count')})",
-            flush=True,
-        )
-        return {"ok": True, "already": True, "running": True, **st}
-    print("main → starting apifootball-bridge watch via af-bridge-board…", flush=True)
-    result = _http_post_json(f"http://{HOST}:{port}/api/af/start", {}, timeout=10.0)
-    if not result:
-        return {"ok": False, "error": "af_start_http_failed", "port": port}
-    print(
-        f"main → apifootball-bridge watch "
-        f"{'already' if result.get('already') else 'started'} "
-        f"(running={result.get('running')})",
-        flush=True,
-    )
-    return {"ok": True, **result}
 
 
 def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess.Popen[Any]:
@@ -405,7 +323,7 @@ def _ensure_quote() -> bool:
         "main → starting polymarket-quote watch "
         f"(trade={mode} depth={trade.get('take_depth')} "
         f"max_usdc={trade.get('max_usdc')}) "
-        "(→ in-process match-bridge → DQD + PM · AF referee)",
+        "(→ in-process match-bridge → DQD + PM · dry quote; live paused)",
         flush=True,
     )
     quote_log = ROOT / "data" / "pm-quote" / "watch.log"
@@ -415,7 +333,7 @@ def _ensure_quote() -> bool:
 
 
 def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
-    """One-shot: all boards + AF watch + quote cascade. Heals missing children."""
+    """One-shot: all boards + quote cascade. Heals missing children."""
     global _started_at
     if _shutting_down.is_set():
         return {"ok": False, "error": "hub_shutting_down"}
@@ -430,14 +348,9 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
 
     # HTTP / port waits outside _lock so /api/status stays responsive.
     if already_up:
-        af_st = _ensure_af_bridge_watch()
-        out = status()
-        out["af_bridge"] = af_st
-        return out
+        return status()
 
     _wait_port(BRIDGE_BOARD_PORT, timeout_s=20)
-    _wait_port(AF_BRIDGE_BOARD_PORT, timeout_s=20)
-    af_st = _ensure_af_bridge_watch()
 
     with _lock:
         if _shutting_down.is_set():
@@ -457,7 +370,6 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
             "ok": True,
             "started_at": _started_at,
             "boards": launched,
-            "af_bridge": af_st,
             "quote_pid": _quote_proc.pid if _quote_proc else None,
             "quote_trade": dict(trade),
             "quote_argv": quote_watch_argv(trade),
@@ -466,7 +378,7 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
 
 
 def start_stack(*, open_browser: bool = True) -> dict[str, Any]:
-    """Start all boards (incl. AF bridge UI) + AF watch + quote cascade."""
+    """Start all boards + quote cascade."""
     return ensure_stack(open_browser=open_browser)
 
 
@@ -490,22 +402,6 @@ def _supervisor_loop() -> None:
         # Port wait must not hold _lock (status / start would stall).
         if healed_boards:
             _wait_port(BRIDGE_BOARD_PORT, timeout_s=15)
-            _wait_port(AF_BRIDGE_BOARD_PORT, timeout_s=15)
-            try:
-                _ensure_af_bridge_watch()
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
-        else:
-            # Heal AF watch even when board ports are fine.
-            try:
-                st = _http_json(
-                    f"http://{HOST}:{AF_BRIDGE_BOARD_PORT}/api/status", timeout=1.0
-                )
-                if st is not None and not st.get("running") and _env_bool("MAIN_AF_WATCH", True):
-                    print("main → supervisor: AF watch idle, restarting…", flush=True)
-                    _ensure_af_bridge_watch()
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
         with _lock:
             if _started_at is None or _shutting_down.is_set():
                 continue
@@ -602,19 +498,6 @@ def status() -> dict[str, Any]:
                     "dqd_ticks": st.get("dqd_ticks"),
                     "pm_ticks": st.get("pm_ticks"),
                 }
-        elif up and board["id"] == "af-bridge-board":
-            st = _http_json(f"http://{HOST}:{port}/api/status")
-            if st:
-                extra = {
-                    "skill_running": st.get("running"),
-                    "entry_count": st.get("entry_count"),
-                    "unresolved_count": st.get("unresolved_count"),
-                    "bridge_count": st.get("bridge_count"),
-                    "bridge_mapped": st.get("bridge_mapped"),
-                    "bridge_unresolved": st.get("bridge_unresolved"),
-                    "bridge_mapped_rate": st.get("bridge_mapped_rate"),
-                    "sync_ticks": st.get("sync_ticks"),
-                }
         boards_st.append(
             {
                 "id": board["id"],
@@ -644,22 +527,15 @@ def status() -> dict[str, Any]:
                 "match-bridge",
                 "dongqiudi-match",
                 "polymarket-soccer",
-                "apifootball-bridge",
             ],
-            "af_referee": not (
-                "--no-af-referee" in quote_watch_argv(_quote_trade)
-            ),
             "trade": {
                 **trade,
                 "mode": mode,
+                "live_paused": True,
                 "trades_path": str(ROOT / "data" / "pm-quote" / "trades.jsonl"),
                 "watch_log": str(ROOT / "data" / "pm-quote" / "watch.log"),
             },
         },
-        "af_bridge": next(
-            (b for b in boards_st if b["id"] == "af-bridge-board"),
-            None,
-        ),
         "boards": boards_st,
         "ok": True,
     }
@@ -851,8 +727,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "System Main — hub + all boards (incl. AF) + AF watch + quote "
-            "(do not start pm_quote / boards separately)"
+            "System Main — hub + boards + quote dry-run "
+            "(live CLOB paused pending screenshot gate; do not start pm_quote / boards separately)"
         )
     )
     parser.add_argument("--no-trade", action="store_true", help="Quote only (no executor)")
@@ -948,7 +824,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
-        f"min_buy_price={t.get('min_buy_price', 0.0)}",
+        f"min_buy_price={t.get('min_buy_price', 0.0)} "
+        f"(live buys paused pending screenshot gate)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

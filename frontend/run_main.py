@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Launch System Main — the only process you should start.
 
-Boots hub (:8790) + all boards (UI; AF watch via board API) + pm_quote watch,
-which owns in-process match-bridge (memory event queue → AF referee → quote).
-Do not start boards or pm_quote separately; a second run_main fails if :8790 is
-already taken. Set MAIN_BRIDGE_INPROC=0 to use bridge-board as skill host.
+Boots hub (:8790) + boards (UI) + pm_quote watch, which owns in-process
+match-bridge (memory event queue → dry quote). Live CLOB buys are paused
+until the screenshot confirmation gate lands. Do not start boards or
+pm_quote separately; a second run_main fails if :8790 is already taken.
+Set MAIN_BRIDGE_INPROC=0 to use bridge-board as skill host.
 
 Examples:
   python3 frontend/run_main.py
   python3 frontend/run_main.py --take-depth walk --max-usdc 5
-  python3 frontend/run_main.py --live --max-usdc 2
-  python3 frontend/run_main.py --goals-mode dry --ft-mode live --max-usdc 1
-  python3 frontend/run_main.py --goals-mode live --ft-mode dry --max-usdc 1
   python3 frontend/run_main.py --no-trade
 """
 

@@ -1,7 +1,0 @@
-{
-  "name": "@dongqiudi/af-bridge-board",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Frontend for the apifootball-bridge Cursor skill",
-  "type": "module"
-}

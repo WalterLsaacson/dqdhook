@@ -15,7 +15,6 @@ from typing import Any
 import quote_lib as lib
 from clob_trader import ClobTrader
 from fill_planner import FillPlan, plan_fill, MIN_MARKETABLE_BUY_USDC
-from grade_sizing import cushion_rest_usdc
 from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
@@ -25,13 +24,9 @@ from rest_ladder import (
 )
 from size_policy import compute_buy_size_caps
 from score_reversal import (
-    AF_STATUS_CONFIRMED,
-    AF_STATUS_NONE,
-    AF_STATUS_PENDING,
     FILL_STATUS_OPEN,
     FILL_STATUS_PENDING,
     OpenPositionLedger,
-    deadline_iso,
     entry_tuple,
     event_signals_reversal,
     ft_reversal_vs_entry,
@@ -72,9 +67,8 @@ FLATTEN_ORDER_MAX_WAIT_S = 60.0
 # storm while waiting for the exchange's balance/order views to converge.
 FLATTEN_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_ORDER_RECHECK_INTERVAL_S = 2.0
-REST_GRADES = frozenset({"A", "B"})
 MIN_WIN_BEST_BID = 0.85
-CUSHION_REST_USDC = cushion_rest_usdc()
+CUSHION_REST_USDC = 10.0
 CUSHION_REST_PRICES = (0.99,)
 # Keep pending_reason bounded (append loops used to grow to 80KB+).
 FLATTEN_REASON_MAX_LEN = 400
@@ -426,29 +420,6 @@ def signal_from_event_key(event_key: str) -> str:
     return ek.split("|", 1)[0]
 
 
-def odds_grade_from_event_key(event_key: str) -> str:
-    ek = str(event_key or "")
-    for grade in ("A", "B", "C"):
-        token = f"odds_grade_{grade}"
-        if f"|{token}" in ek or ek.endswith(token):
-            return grade
-    return ""
-
-
-def rest_fill_odds_grade(lot: dict[str, Any], order: dict[str, Any]) -> str:
-    """Grade for a rest fill — inherit the resting order, never default to A."""
-    for raw in (order.get("odds_grade"), lot.get("odds_grade")):
-        grade = str(raw or "").strip().upper()
-        if grade in REST_GRADES:
-            return grade
-    inferred = odds_grade_from_event_key(
-        str(order.get("event_key") or lot.get("event_key") or "")
-    )
-    if inferred in REST_GRADES:
-        return inferred
-    return "B"
-
-
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -458,17 +429,10 @@ class TradeExecutor:
         settings: TradeSettings,
         *,
         trader: ClobTrader | None = None,
-        af_mode: str = "gate",
-        af_timeout_s: float = 90.0,
     ) -> None:
         self.root = Path(root)
         self.settings = settings
         self.trader = trader
-        mode = str(af_mode or "gate").strip().lower()
-        if mode not in ("postcheck", "gate", "off"):
-            mode = "gate"
-        self.af_mode = mode
-        self.af_timeout_s = max(1.0, float(af_timeout_s))
         self._done: set[str] = set()
         self._flatten_done: set[str] = set()
         # Matches with in-flight / pending exits — block new buy_win opens.
@@ -772,15 +736,15 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice, then rest any A/B remainder as GTD bids."""
+        """FAK a misprice (rest-after-FAK disabled while Odds grades are off)."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
         if str(q.get("trade") or "") != "buy_win" and str(q.get("settlement") or "") == "WIN":
             q["trade"] = "buy_win"
         mis = bool(q.get("misprice"))
-        grade = self._odds_grade(match_meta)
-        rest_ok = grade in REST_GRADES and str(q.get("trade") or "") == "buy_win"
+        # Rest ladder was Odds A/B only; grades stripped → never rest this round.
+        rest_ok = False
         if not mis and not rest_ok:
             return None
 
@@ -937,19 +901,15 @@ class TradeExecutor:
         return fak_row
 
     def _odds_grade(self, match_meta: dict[str, Any] | None) -> str:
-        ctx = (
-            (match_meta or {}).get("trade_context")
-            if isinstance((match_meta or {}).get("trade_context"), dict)
-            else {}
-        )
-        return str(ctx.get("odds_grade") or "").strip().upper()
+        # Odds A/B/C gates stripped — always empty so rest/grade paths stay inert.
+        return ""
 
     def _buy_target_usdc(
         self,
         quote: dict[str, Any],
         match_meta: dict[str, Any] | None,
     ) -> tuple[float, str]:
-        """Grade A/B target, or $10 when the WIN has a two-goal reversal cushion."""
+        """Cushion rest target, or legacy trade_context target_usdc (rest-only)."""
         ctx = (
             (match_meta or {}).get("trade_context")
             if isinstance((match_meta or {}).get("trade_context"), dict)
@@ -964,27 +924,11 @@ class TradeExecutor:
             target = 0.0
         return target, base
 
-    def _buy_af_status(
-        self, event_key: str, match_meta: dict[str, Any] | None
-    ) -> tuple[str, Any]:
-        sig = signal_from_event_key(event_key)
-        odds_grade = self._odds_grade(match_meta)
-        if sig == "score_change" and self.af_mode == "postcheck" and odds_grade in REST_GRADES:
-            return AF_STATUS_CONFIRMED, None
-        if sig == "score_change" and self.af_mode == "postcheck":
-            return AF_STATUS_PENDING, deadline_iso(self.af_timeout_s)
-        if sig == "score_change" and self.af_mode == "gate":
-            if odds_grade == "B":
-                return AF_STATUS_PENDING, None
-            return AF_STATUS_CONFIRMED, None
-        return AF_STATUS_NONE, None
-
     def _skip_rest_after_prepare(self, row: dict[str, Any] | None) -> bool:
         if not isinstance(row, dict):
             return False
         reason = str(row.get("skip_reason") or "")
-        # odds_grade_target_reached still needs rest: a cushion cap drop must
-        # shrink/cancel working bids even when FAK has nothing left to add.
+        # Hard skips should not attempt rest ladder adjustments.
         if reason in (
             "buy_blocked_pending_flatten",
             "in_flight",
@@ -1231,7 +1175,6 @@ class TradeExecutor:
             return None
 
         grade = self._odds_grade(match_meta)
-        rest_af_status, _deadline = self._buy_af_status(event_key, match_meta)
         for order in posted:
             order["odds_grade"] = grade
             order["base_event_key"] = base
@@ -1274,7 +1217,6 @@ class TradeExecutor:
                         if quote.get("neg_risk") is not None
                         else None
                     ),
-                    af_status=rest_af_status,
                     odds_grade=grade,
                 )
             plan = FillPlan(
@@ -1527,11 +1469,15 @@ class TradeExecutor:
                         levels_used=1,
                         levels=[{"price": order.get("price"), "size": delta_sh}],
                     )
-                    grade = rest_fill_odds_grade(lot, order)
+                    grade = str(
+                        order.get("odds_grade") or lot.get("odds_grade") or ""
+                    ).strip().upper()
                     fill_event_key = str(
                         order.get("event_key") or lot.get("event_key") or ""
                     )
-                    fill_ctx: dict[str, Any] = {"odds_grade": grade}
+                    fill_ctx: dict[str, Any] = {}
+                    if grade:
+                        fill_ctx["odds_grade"] = grade
                     if order.get("target_usdc") is not None:
                         fill_ctx["target_usdc"] = order.get("target_usdc")
                     elif lot.get("target_usdc") is not None:
@@ -1648,15 +1594,6 @@ class TradeExecutor:
             match_meta=match_meta,
         )
         channel_live = self._live_for_signal(typ)
-        trade_context_grade = (
-            (match_meta or {}).get("trade_context")
-            if isinstance((match_meta or {}).get("trade_context"), dict)
-            else {}
-        )
-        odds_grade = str(trade_context_grade.get("odds_grade") or "").strip().upper()
-        # Grade C is research/ledger-only: always dry-run, never post CLOB.
-        if odds_grade == "C":
-            channel_live = False
 
         key = trade_idempotency_key(event_key or "", token_id, trade)
         if key in self._in_flight:
@@ -1667,66 +1604,12 @@ class TradeExecutor:
                 "skip_reason": "in_flight",
             }
         if key in self._done:
-            retry_graded_partial = False
-            target_early, base_early = self._buy_target_usdc(quote, match_meta)
-            if trade == "buy_win" and base_early and target_early > 0.0:
-                mid_early = str(
-                    (match_meta or {}).get("match_id") or quote.get("match_id") or ""
-                )
-                prefix_early = base_early + "|odds_grade_"
-                actual_early = sum(
-                    float(lot.get("usdc") or 0)
-                    for lot in self.ledger.all_open()
-                    if str(lot.get("token_id") or "") == token_id
-                    and (not mid_early or str(lot.get("match_id") or "") == mid_early)
-                    and (
-                        str(lot.get("event_key") or "") == base_early
-                        or str(lot.get("event_key") or "").startswith(prefix_early)
-                    )
-                )
-                actual_early += self._pending_already_usdc_locked(
-                    token_id=token_id,
-                    match_id=mid_early,
-                    base_event_key=base_early,
-                )
-                actual_early += self.ledger.rest_reserved_usdc(
-                    token_id=token_id,
-                    match_id=mid_early,
-                    base_event_key=base_early,
-                )
-                retry_graded_partial = actual_early + 1e-9 < target_early
-            if retry_graded_partial:
-                self._done.discard(key)
-            else:
-                logger.debug("skip duplicate %s", key)
-                return {
-                    "idempotency_key": key,
-                    "status": "skipped",
-                    "skip_reason": "already_done",
-                }
-
-        if odds_grade == "C":
-            row = self._record(
-                quote,
-                event_key=event_key,
-                match_meta=match_meta,
-                plan=None,
-                status="dry_run",
-                skip_reason=None,
-                response=None,
-                success=True,
-                idempotency_key=key,
-                live=False,
-                extra={"size_policy": {"odds_grade": "C", "target_usdc": 0.0}},
-            )
-            self._done.add(key)
-            logger.info(
-                "record-only C %s %s signal=%s",
-                trade,
-                token_id[:12],
-                typ or "?",
-            )
-            return row
+            logger.debug("skip duplicate %s", key)
+            return {
+                "idempotency_key": key,
+                "status": "skipped",
+                "skip_reason": "already_done",
+            }
 
         # Price guard on the reference book price (best ask/bid)
         ref_price = quote.get("best_ask") if trade == "buy_win" else quote.get("best_bid")
@@ -1814,112 +1697,20 @@ class TradeExecutor:
         max_shares = float(self.settings.max_shares)
         size_meta: dict[str, Any] | None = None
         if trade == "buy_win":
-            trade_context = (
-                (match_meta or {}).get("trade_context")
-                if isinstance((match_meta or {}).get("trade_context"), dict)
-                else {}
-            )
-            already_usdc = 0.0
-            remaining_target: float | None = None
-            target_usdc, base_event_key = self._buy_target_usdc(quote, match_meta)
-            if target_usdc > 1e-9 and base_event_key:
-                mid_target = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
-                prefix = base_event_key + "|odds_grade_"
-                already_usdc = sum(
-                    float(lot.get("usdc") or 0)
-                    for lot in self.ledger.all_open()
-                    if str(lot.get("token_id") or "") == token_id
-                    and (not mid_target or str(lot.get("match_id") or "") == mid_target)
-                    and (
-                        str(lot.get("event_key") or "") == base_event_key
-                        or str(lot.get("event_key") or "").startswith(prefix)
-                    )
-                )
-                already_usdc += self._pending_already_usdc_locked(
-                    token_id=token_id,
-                    match_id=mid_target,
-                    base_event_key=base_event_key,
-                )
-                already_usdc += self.ledger.rest_reserved_usdc(
-                    token_id=token_id,
-                    match_id=mid_target,
-                    base_event_key=base_event_key,
-                )
-                remaining_target = max(0.0, target_usdc - already_usdc)
-                if remaining_target <= 1e-9:
-                    size_meta = {
-                        "odds_grade": trade_context.get("odds_grade"),
-                        "target_usdc": target_usdc,
-                        "already_usdc": round(already_usdc, 6),
-                        "remaining_target_usdc": 0.0,
-                        "base_event_key": base_event_key,
-                        "reversal_cushion": quote_reversal_cushion(quote),
-                    }
-                    self._done.add(key)
-                    return self._record(
-                        quote,
-                        event_key=event_key,
-                        match_meta=match_meta,
-                        plan=None,
-                        status="skipped",
-                        skip_reason="odds_grade_target_reached",
-                        response=None,
-                        success=False,
-                        idempotency_key=key,
-                        live=channel_live,
-                        extra={"size_policy": size_meta},
-                    )
             open_usdc = sum(
                 float(r.get("usdc") or 0)
                 for r in self.ledger.all_open()
             ) + self._pending_usdc_total_locked() + self.ledger.rest_reserved_usdc()
-            cap_usdc = remaining_target if remaining_target is not None else self.settings.max_usdc
-            # Marketable BUY floor is $1; bump sub-$1 remainders (partial fills /
-            # upgrade dust) up to the floor rather than posting a rejected $0.98.
-            if (
-                remaining_target is not None
-                and remaining_target > 1e-9
-                and remaining_target + 1e-12 < MIN_MARKETABLE_BUY_USDC
-            ):
-                cap_usdc = MIN_MARKETABLE_BUY_USDC
-            cap_tiers = (
-                ((0.0, cap_usdc),)
-                if remaining_target is not None
-                else self.settings.size_tiers
-            )
-            # Grade targets (esp. A=$20) need enough shares at this ask; the
-            # global QUOTE_MAX_SHARES floor still applies to non-graded buys.
-            grade_max_shares = float(self.settings.max_shares)
-            if remaining_target is not None and ref_f is not None and ref_f > 0:
-                grade_max_shares = max(
-                    grade_max_shares,
-                    float(remaining_target) / max(float(ref_f), 1e-9),
-                )
             caps = compute_buy_size_caps(
                 ref_f,
-                max_usdc=cap_usdc,
-                max_shares=grade_max_shares,
-                tiers=cap_tiers,
+                max_usdc=self.settings.max_usdc,
+                max_shares=self.settings.max_shares,
+                tiers=self.settings.size_tiers,
                 open_usdc=open_usdc,
                 max_open_usdc=self.settings.max_open_usdc,
-                floor_usdc=(
-                    min(self.settings.size_floor_usdc, cap_usdc)
-                    if remaining_target is not None
-                    else self.settings.size_floor_usdc
-                ),
+                floor_usdc=self.settings.size_floor_usdc,
             )
             size_meta = caps.to_dict()
-            if target_usdc > 1e-9 and base_event_key:
-                size_meta.update(
-                    {
-                        "odds_grade": trade_context.get("odds_grade"),
-                        "target_usdc": target_usdc,
-                        "already_usdc": round(already_usdc, 6),
-                        "remaining_target_usdc": round(float(remaining_target or 0), 6),
-                        "base_event_key": base_event_key,
-                        "reversal_cushion": quote_reversal_cushion(quote),
-                    }
-                )
             if caps.skip_reason:
                 row = self._record(
                     quote,
@@ -2010,8 +1801,7 @@ class TradeExecutor:
                 plan.take_depth,
                 typ or "?",
             )
-            if trade == "buy_win" and odds_grade != "C":
-                # C records trades.jsonl only — no open lot (so A/B size to full $10).
+            if trade == "buy_win":
                 self._register_open_buy(
                     quote, plan=plan, event_key=event_key, match_meta=match_meta, live=False
                 )
@@ -2175,7 +1965,6 @@ class TradeExecutor:
         if not mid:
             return
         neg = quote.get("neg_risk")
-        af_status, af_deadline = self._buy_af_status(event_key, match_meta)
         self.ledger.register_buy(
             match_id=mid,
             token_id=str(quote.get("token_id") or ""),
@@ -2191,145 +1980,13 @@ class TradeExecutor:
             family=str(quote.get("family") or ""),
             tick_size=str(quote.get("tick_size") or "0.01"),
             neg_risk=bool(neg) if neg is not None else None,
-            af_status=af_status,
-            af_deadline=af_deadline,
             fill_status=fill_status,
         )
 
-    def mark_af_confirmed(self, match_id: str, *, event_key: str = "") -> int:
-        with self._lock:
-            return self.ledger.mark_af_confirmed(match_id, event_key=event_key)
-
-    def refresh_af_deadline(
-        self,
-        match_id: str,
-        *,
-        event_key: str = "",
-        timeout_s: float | None = None,
-    ) -> int:
-        """Align lot af_deadline with AF submit time (not buy time)."""
-        with self._lock:
-            return self.ledger.refresh_af_deadline(
-                match_id,
-                event_key=event_key,
-                timeout_s=self.af_timeout_s if timeout_s is None else float(timeout_s),
-            )
-
-    def flatten_af_unconfirmed(
-        self,
-        match_id: str,
-        *,
-        event_key: str = "",
-        reason: str = "af_confirm_timeout",
-    ) -> list[dict[str, Any]]:
-        """Flatten open lots still af_pending for this goal event_key."""
-        with self._lock:
-            return self._flatten_af_pending_locked(
-                match_id=str(match_id),
-                event_key=str(event_key or ""),
-                reason=reason,
-            )
-
-    def flatten_af_deadline_lots(
-        self,
-        *,
-        exclude_event_keys: set[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Flatten af_pending lots whose af_deadline has passed (drain safety net).
-
-        Skip ``exclude_event_keys`` (typically still in-flight AF confirms) so we
-        never sell a lot that AF is about to confirm on this tick.
-        """
-        with self._lock:
-            if self.af_mode != "postcheck" or not self.settings.enabled:
-                return []
-            overdue = self.ledger.overdue_af_pending_lots(
-                exclude_event_keys=exclude_event_keys
-            )
-            if not overdue:
-                return []
-            out: list[dict[str, Any]] = []
-            # Group by match+event_key to emit stable flatten keys.
-            seen_lots: set[tuple[str, str]] = set()
-            for lot in overdue:
-                mid = str(lot.get("match_id") or "")
-                tid = str(lot.get("token_id") or "")
-                if not mid or not tid or (mid, tid) in seen_lots:
-                    continue
-                seen_lots.add((mid, tid))
-                ek = str(lot.get("event_key") or "")
-                reason = "af_confirm_timeout"
-                flatten_ek = (
-                    f"flatten_af_deadline|{mid}|{ek}|{lib.now_cn_iso()}"
-                )
-                out.append(
-                    self._flatten_lot(
-                        lot,
-                        event_key=flatten_ek,
-                        reason=reason,
-                        match_ev={"match_id": mid, "type": "score_change"},
-                    )
-                )
-            return out
-
-    def _flatten_af_pending_locked(
-        self,
-        *,
-        match_id: str,
-        event_key: str,
-        reason: str,
-    ) -> list[dict[str, Any]]:
-        if not self.settings.enabled:
-            return []
-        mid = str(match_id)
-        if not mid:
-            return []
-        lots = self.ledger.af_pending_lots(
-            match_id=mid,
-            event_key=event_key or None,
-        )
-        if not lots:
-            return []
-        logger.warning(
-            "af-unconfirmed flatten match=%s lots=%d reason=%s event_key=%s",
-            mid,
-            len(lots),
-            reason,
-            event_key or "*",
-        )
-        out: list[dict[str, Any]] = []
-        for lot in lots:
-            flatten_ek = (
-                f"flatten_af_timeout|{mid}|{lot.get('event_key') or event_key}|"
-                f"{lib.now_cn_iso()}|{reason}"
-            )
-            out.append(
-                self._flatten_lot(
-                    lot,
-                    event_key=flatten_ek,
-                    reason=reason,
-                    match_ev={"match_id": mid, "type": "score_change"},
-                )
-            )
-        return out
-
     def maybe_flatten_for_event(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
-        """Flatten FT corrections; DQD score drops require Odds confirmation."""
+        """Flatten FT corrections; score_change reversals deferred (no AF this round)."""
         with self._lock:
             return self._maybe_flatten_for_event_locked(ev)
-
-    def flatten_confirmed_reversal(
-        self,
-        ev: dict[str, Any],
-        *,
-        confirmation: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Apply one Odds/Bet365-corroborated DQD score reversal."""
-        work = dict(ev)
-        work["_reversal_confirmed"] = True
-        work["_reversal_confirmation"] = dict(confirmation or {})
-        with self._lock:
-            return self._maybe_flatten_for_event_locked(work)
 
     def _maybe_flatten_for_event_locked(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.settings.enabled:
@@ -2347,27 +2004,13 @@ class TradeExecutor:
         reason = ""
 
         if typ == "score_change" and event_signals_reversal(ev):
-            if ev.get("_reversal_confirmed") is not True:
-                logger.info(
-                    "defer unconfirmed DQD reversal match=%s score=%s-%s",
-                    mid,
-                    ev.get("home_score"),
-                    ev.get("away_score"),
-                )
-                return []
-            after = score_pair(ev.get("home_score"), ev.get("away_score"))
-            prev = ev.get("prev") or {}
-            confirmation = (
-                ev.get("_reversal_confirmation")
-                if isinstance(ev.get("_reversal_confirmation"), dict)
-                else {}
+            logger.info(
+                "defer score_change reversal flatten match=%s score=%s-%s",
+                mid,
+                ev.get("home_score"),
+                ev.get("away_score"),
             )
-            reason = (
-                f"score_reversal "
-                f"{prev.get('home')}-{prev.get('away')}→"
-                f"{ev.get('home_score')}-{ev.get('away_score')}|"
-                f"confirmed={confirmation.get('reason') or 'odds'}"
-            )
+            return []
         elif typ == "match_finished":
             after = score_pair(ev.get("home_score"), ev.get("away_score"))
             reason = (

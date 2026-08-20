@@ -32,7 +32,6 @@ _PM_SCRIPTS = Path(__file__).resolve().parents[2] / "polymarket-soccer" / "scrip
 if str(_PM_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PM_SCRIPTS))
 import pm_lib as pm  # noqa: E402
-from grade_sizing import grade_target_usdc
 
 WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+on\b", re.I)
 DRAW_RE = re.compile(r"end\s+in\s+a\s+draw", re.I)
@@ -156,48 +155,6 @@ def _trade_executor_pool() -> ThreadPoolExecutor:
             )
         return _TRADE_EXEC
 
-
-# DQD-score CLOB quote while AF confirms (no trade). Warms books + logs early edge.
-PRECONFIRM_POOL_WORKERS = max(1, int(os.getenv("QUOTE_PRECONFIRM_WORKERS", "4") or 4))
-_PRECONFIRM_EXEC: ThreadPoolExecutor | None = None
-_PRECONFIRM_LOCK = threading.Lock()
-_PRECONFIRM_FUTS: dict[str, Any] = {}
-
-
-def _preconfirm_executor() -> ThreadPoolExecutor:
-    global _PRECONFIRM_EXEC
-    with _PRECONFIRM_LOCK:
-        if _PRECONFIRM_EXEC is None:
-            _PRECONFIRM_EXEC = ThreadPoolExecutor(
-                max_workers=PRECONFIRM_POOL_WORKERS,
-                thread_name_prefix="af-preconfirm",
-            )
-        return _PRECONFIRM_EXEC
-
-
-def _preconfirm_summary(bundle: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(bundle, dict):
-        return None
-    opps = bundle.get("opportunities") or []
-    best = None
-    for o in opps:
-        if not isinstance(o, dict):
-            continue
-        edge = o.get("net_edge")
-        if edge is None:
-            continue
-        try:
-            e = float(edge)
-        except (TypeError, ValueError):
-            continue
-        if best is None or e > best:
-            best = e
-    return {
-        "quoted_at": bundle.get("quoted_at"),
-        "opportunity_count": int(bundle.get("opportunity_count") or len(opps) or 0),
-        "best_net_edge": best,
-        "error": bundle.get("error"),
-    }
 
 def _parse_list_field(raw: Any) -> list[Any]:
     if raw is None:
@@ -1604,16 +1561,6 @@ def tradeable_token_rows(token_rows: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
-def odds_grade_include_exact(level: str) -> bool:
-    """B upgrades skip Exact Score; A (and C baseline) still include it."""
-    return str(level or "").strip().upper() != "B"
-
-
-def odds_grade_skip_fine_tick_exact(level: str) -> bool:
-    """A upgrades skip exact rows whose book tick is 0.001."""
-    return str(level or "").strip().upper() == "A"
-
-
 def _is_exact_fine_tick(tick: Any) -> bool:
     try:
         return abs(float(tick) - 0.001) < 1e-9
@@ -1683,11 +1630,6 @@ def quote_tokens(
             and str(row.get("family") or "") == "exact_score"
             and _is_exact_fine_tick(book.get("tick_size") or row.get("tick_size"))
         )
-        grade = ""
-        ctx = (match_meta or {}).get("trade_context")
-        if isinstance(ctx, dict):
-            grade = str(ctx.get("odds_grade") or "").strip().upper()
-        rest_grade = grade in ("A", "B")
         if skip_fine:
             item["misprice"] = False
             item["misprice_reason"] = "exact_tick_0_001_skip"
@@ -1698,9 +1640,7 @@ def quote_tokens(
         else:
             if str(row.get("settlement") or "") == "WIN":
                 item["trade"] = item.get("trade") or "buy_win"
-            if trade_executor is not None and (
-                mis or (rest_grade and item.get("trade") == "buy_win")
-            ):
+            if trade_executor is not None and mis:
                 trade_jobs.append((len(priced), item))
         priced.append(item)
 
@@ -1990,10 +1930,21 @@ def process_bridge_events(
     force: bool = False,
     trade_executor: Any | None = None,
     market_cache: Any | None = None,
-    af_referee: Any | None = None,
-    af_mode: str = "gate",
     events_override: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Process bridge score_change / match_finished into dry quotes.
+
+    AF referee and Odds/Bet365 gates are removed. Live CLOB buys are paused
+    at the hub/settings layer; this path quotes immediately on DQD events.
+    DQD reversals cancel rest orders but do not auto-flatten.
+    """
+    from score_events import (
+        event_is_goal_up,
+        event_is_reversal,
+        ft_event_is_stale,
+        target_score_from_event,
+    )
+
     cursor = load_cursor(root)
     cursor_state_before = {
         "processed_keys": cursor.get("processed_keys"),
@@ -2008,69 +1959,11 @@ def process_bridge_events(
     }
     bundles: list[dict[str, Any]] = []
     tick_t0 = time.monotonic()
-    mode = str(af_mode or "gate").strip().lower()
-    if mode not in ("postcheck", "gate", "off"):
-        mode = "gate"
 
     def _mark_ft_done(match_id: str) -> None:
         mid = str(match_id or "").strip()
         if mid:
             processed_ft_ids.add(mid)
-
-    def _with_odds_grade(
-        source_ev: dict[str, Any],
-        *,
-        base_key: str,
-        level: str,
-        target_usdc: float,
-        decision: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        out = dict(source_ev)
-        trade_key = base_key if level == "C" else f"{base_key}|odds_grade_{level}"
-        context: dict[str, Any] = {
-            "odds_grade": level,
-            "target_usdc": float(target_usdc),
-            "base_event_key": base_key,
-            "position_semantics": "cumulative_target_per_token",
-        }
-        if decision is not None:
-            context["odds_decision"] = dict(decision)
-        out["_trade_event_key"] = trade_key
-        out["_trade_context"] = context
-        return out
-
-    def _start_dqd_odds(work_ev: dict[str, Any], trade_key: str) -> None:
-        """Pull Odds/Bet365 as soon as DQD prints a goal (B allowed; A waits for AF)."""
-        try:
-            from book_context_observe import get_active_observer as get_book_observer
-
-            observer = get_book_observer()
-            if observer is None:
-                return
-            observer.on_dqd_goal_up(
-                root,
-                match_id=str(work_ev.get("match_id") or ""),
-                event_key=trade_key,
-                ev=work_ev,
-                af_gate={
-                    "confirmed": False,
-                    "phase": "dqd_parallel",
-                    "awaiting_af": True,
-                    "score_source": "dongqiudi",
-                },
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT book-context observe dqd start failed: {e}", flush=True)
-
-    def _mark_odds_af_unconfirmed(match_id: str, *, reason: str) -> None:
-        try:
-            from book_context_observe import get_active_observer as get_book_observer
-
-            observer = get_book_observer()
-            if observer is not None:
-                observer.on_af_unconfirmed(match_id, reason=reason)
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT book-context observe AF miss failed: {e}", flush=True)
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
@@ -2101,20 +1994,11 @@ def process_bridge_events(
         except Exception as e:  # noqa: BLE001
             print(f"ALERT rest reconcile failed: {e}", flush=True)
 
-    def _quote_one(
-        work_ev: dict[str, Any],
-        key: str,
-        *,
-        af_gate: dict[str, Any] | None = None,
-        include_exact_override: bool | None = None,
-        skip_fine_tick_exact: bool = False,
-    ) -> bool:
+    def _quote_one(work_ev: dict[str, Any], key: str) -> bool:
         nonlocal bundles, seen
         flatten_rows: list[dict[str, Any]] = []
         if trade_executor is not None:
             try:
-                # FT corrections may flatten here. DQD score drops are always
-                # deferred until the separate Odds/Bet365 arbitration confirms.
                 flatten_rows = list(
                     trade_executor.maybe_flatten_for_event(work_ev) or []
                 )
@@ -2134,12 +2018,7 @@ def process_bridge_events(
                 work_ev,
                 proxy=proxy,
                 include_props=include_props,
-                include_exact=(
-                    include_exact
-                    if include_exact_override is None
-                    else include_exact_override
-                ),
-                skip_fine_tick_exact=skip_fine_tick_exact,
+                include_exact=include_exact,
                 eps=eps,
                 fee_rate=fee_rate,
                 min_net=min_net,
@@ -2150,8 +2029,6 @@ def process_bridge_events(
             if flatten_rows:
                 bundle["flatten_attempts"] = flatten_rows
                 bundle["flatten_count"] = len(flatten_rows)
-            if af_gate is not None:
-                bundle["af_referee"] = af_gate
             bundles.append(bundle)
             try:
                 from post_goal_sampler import get_active_sampler
@@ -2209,545 +2086,12 @@ def process_bridge_events(
             }
             if flatten_rows:
                 err_row["flatten_attempts"] = flatten_rows
-            if af_gate is not None:
-                err_row["af_referee"] = af_gate
             bundles.append(err_row)
             print(
                 f"ALERT quote failed (will retry) key={key}: {e}",
                 flush=True,
             )
             return False
-
-    def _start_preconfirm_quote(work_ev: dict[str, Any], key: str) -> None:
-        """CLOB quote on DQD score in parallel with AF confirm (gate mode; never trades)."""
-
-        def _run() -> dict[str, Any]:
-            try:
-                bundle = quote_bridge_event(
-                    root,
-                    work_ev,
-                    proxy=proxy,
-                    include_props=include_props,
-                    include_exact=include_exact,
-                    eps=eps,
-                    fee_rate=fee_rate,
-                    min_net=min_net,
-                    persist=False,
-                    trade_executor=None,
-                    market_cache=market_cache,
-                )
-                bundle["mode"] = "af_preconfirm"
-                bundle["af_referee"] = {
-                    "phase": "preconfirm",
-                    "awaiting_af": True,
-                    "score_source": "dongqiudi",
-                }
-                try:
-                    # Log early edge in quotes.jsonl only — do not feed trade consumers.
-                    persist_bundle(root, bundle, write_opportunities=False)
-                except Exception:  # noqa: BLE001
-                    pass
-                return bundle
-            except Exception as e:  # noqa: BLE001
-                err = {
-                    "quoted_at": now_cn_iso(),
-                    "trigger": "score_change",
-                    "mode": "af_preconfirm",
-                    "event_key": key,
-                    "match_id": work_ev.get("match_id"),
-                    "error": str(e),
-                    "af_referee": {
-                        "phase": "preconfirm",
-                        "awaiting_af": True,
-                        "error": str(e),
-                    },
-                }
-                try:
-                    persist_bundle(root, err, write_opportunities=False)
-                except Exception:  # noqa: BLE001
-                    pass
-                return err
-
-        fut = _preconfirm_executor().submit(_run)
-        with _PRECONFIRM_LOCK:
-            old = _PRECONFIRM_FUTS.pop(key, None)
-            _PRECONFIRM_FUTS[key] = fut
-        if old is not None and not old.done():
-            try:
-                old.cancel()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _take_preconfirm_summary(key: str) -> dict[str, Any] | None:
-        with _PRECONFIRM_LOCK:
-            fut = _PRECONFIRM_FUTS.pop(key, None)
-        if fut is None:
-            return None
-        if not fut.done():
-            return {"pending": True}
-        try:
-            return _preconfirm_summary(fut.result(timeout=0))
-        except Exception as e:  # noqa: BLE001
-            return {"error": str(e)}
-
-    def _finish_af_job(job: dict[str, Any]) -> None:
-        from af_referee import apply_af_score_to_event
-
-        key = str(job.get("event_key") or "")
-        ev = job.get("ev") or {}
-        gate = job.get("gate") or {}
-        mid = str(job.get("match_id") or ev.get("match_id") or "")
-        target = job.get("target") or (None, None)
-        job_kind = str(job.get("kind") or gate.get("kind") or "goal").strip().lower()
-        is_ft = job_kind == "ft" or str(ev.get("type") or "") == "match_finished"
-
-        if is_ft:
-            # FT always gates: never bought before AF; mismatch/timeout → skip.
-            if key in seen and not force:
-                _mark_ft_done(mid)
-                return
-            if not gate.get("confirmed"):
-                if str(gate.get("error") or "") == "aborted":
-                    seen.add(key)
-                    _mark_ft_done(mid)
-                    print(
-                        f"af-ft-gate → ABORTED FT match_id={mid} "
-                        f"reason={gate.get('reason') or 'cancelled'} key={key}",
-                        flush=True,
-                    )
-                    return
-                skip = {
-                    "quoted_at": now_cn_iso(),
-                    "trigger": "match_finished",
-                    "mode": "af_ft_unconfirmed",
-                    "event_key": key,
-                    "match_id": mid,
-                    "home": ev.get("home"),
-                    "away": ev.get("away"),
-                    "home_score": target[0] if target else ev.get("home_score"),
-                    "away_score": target[1] if target else ev.get("away_score"),
-                    "count": 0,
-                    "opportunity_count": 0,
-                    "af_referee": gate,
-                }
-                bundles.append(skip)
-                seen.add(key)
-                _mark_ft_done(mid)
-                print(
-                    f"af-ft-gate → IGNORE FT match_id={mid} "
-                    f"target={target[0] if target else '?'}-"
-                    f"{target[1] if target else '?'} "
-                    f"af={gate.get('goals')} err={gate.get('error')} "
-                    f"(regulation=score.fulltime)",
-                    flush=True,
-                )
-                return
-            work_ev = apply_af_score_to_event(
-                ev,
-                home=int(gate["goals"]["home"]),
-                away=int(gate["goals"]["away"]),
-            )
-            print(
-                f"af-ft-gate → CONFIRMED {mid} "
-                f"{gate['goals']['home']}-{gate['goals']['away']} "
-                f"in {gate.get('elapsed_ms')}ms polls={gate.get('polls')} "
-                f"status={gate.get('status_short')} (regulation=fulltime)",
-                flush=True,
-            )
-            af_gate: dict[str, Any] = {
-                "confirmed": True,
-                "kind": "ft",
-                "score_source": "score.fulltime",
-                "home_score": work_ev.get("home_score"),
-                "away_score": work_ev.get("away_score"),
-                "status_short": gate.get("status_short"),
-                "polls": gate.get("polls"),
-                "elapsed_ms": gate.get("elapsed_ms"),
-                "via": gate.get("via"),
-            }
-            _quote_one(work_ev, key, af_gate=af_gate)
-            if key in seen:
-                _mark_ft_done(mid)
-            return
-
-        if mode == "postcheck":
-            err = gate.get("error")
-            reason = str(err or "af_confirm_timeout")
-            if gate.get("confirmed"):
-                marked = 0
-                if trade_executor is not None:
-                    try:
-                        marked = int(
-                            trade_executor.mark_af_confirmed(mid, event_key=key) or 0
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        print(
-                            f"ALERT mark_af_confirmed failed match={mid}: {e}",
-                            flush=True,
-                        )
-                goals = gate.get("goals") if isinstance(gate.get("goals"), dict) else {}
-                try:
-                    from livescore_observe import get_active_observer as get_lsa_observer
-
-                    lsa = get_lsa_observer()
-                    if lsa is not None:
-                        lsa.on_af_confirmed(
-                            root,
-                            match_id=mid,
-                            event_key=key,
-                            ev=ev,
-                            af_gate=gate,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT livescore observe confirm failed: {e}", flush=True)
-                try:
-                    from book_context_observe import get_active_observer as get_book_observer
-
-                    book_obs = get_book_observer()
-                    if book_obs is not None:
-                        book_obs.on_af_confirmed(
-                            root,
-                            match_id=mid,
-                            event_key=key,
-                            ev=ev,
-                            af_gate=gate,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT book-context observe confirm failed: {e}", flush=True)
-                bundles.append(
-                    {
-                        "quoted_at": now_cn_iso(),
-                        "trigger": "score_change",
-                        "mode": "af_confirmed_hold",
-                        "event_key": key,
-                        "match_id": mid,
-                        "home": ev.get("home"),
-                        "away": ev.get("away"),
-                        "home_score": goals.get("home", target[0] if target else ev.get("home_score")),
-                        "away_score": goals.get("away", target[1] if target else ev.get("away_score")),
-                        "count": 0,
-                        "opportunity_count": 0,
-                        "lots_marked": marked,
-                        "af_referee": {
-                            "confirmed": True,
-                            "phase": "postcheck_hold",
-                            "score_source": "api_football",
-                            "polls": gate.get("polls"),
-                            "elapsed_ms": gate.get("elapsed_ms"),
-                            "burst_dir": gate.get("burst_dir"),
-                            "via": gate.get("via"),
-                        },
-                    }
-                )
-                seen.add(key)
-                print(
-                    f"af-referee → CONFIRMED {mid} "
-                    f"{goals.get('home')}-{goals.get('away')} "
-                    f"in {gate.get('elapsed_ms')}ms polls={gate.get('polls')} "
-                    f"(hold · no re-trade) burst={gate.get('burst_dir')}",
-                    flush=True,
-                )
-                return
-
-            flatten_rows: list[dict[str, Any]] = []
-            if trade_executor is not None:
-                try:
-                    flatten_rows = list(
-                        trade_executor.flatten_af_unconfirmed(
-                            mid, event_key=key, reason=reason
-                        )
-                        or []
-                    )
-                except Exception as e:  # noqa: BLE001
-                    flatten_rows = [
-                        {
-                            "quoted_at": now_cn_iso(),
-                            "status": "flatten_error",
-                            "error": str(e),
-                            "match_id": mid,
-                            "event_key": key,
-                        }
-                    ]
-            skip = {
-                "quoted_at": now_cn_iso(),
-                "trigger": "score_change",
-                "mode": "af_unconfirmed",
-                "event_key": key,
-                "match_id": mid,
-                "home": ev.get("home"),
-                "away": ev.get("away"),
-                "home_score": target[0] if target else ev.get("home_score"),
-                "away_score": target[1] if target else ev.get("away_score"),
-                "count": 0,
-                "opportunity_count": 0,
-                "af_referee": gate,
-                "flatten_attempts": flatten_rows,
-                "flatten_count": len(flatten_rows),
-            }
-            bundles.append(skip)
-            seen.add(key)
-            print(
-                f"af-referee → IGNORE goal match_id={mid} "
-                f"target={target[0] if target else '?'}-"
-                f"{target[1] if target else '?'} "
-                f"polls={gate.get('polls')} err={gate.get('error')} "
-                f"flatten={len(flatten_rows)}",
-                flush=True,
-            )
-            _mark_odds_af_unconfirmed(mid, reason=str(gate.get("error") or "af_timeout"))
-            return
-
-        # gate mode (legacy: trade only after AF confirm)
-        pre = _take_preconfirm_summary(key)
-        if key in seen and not force:
-            return
-        if not gate.get("confirmed"):
-            # Aborted by reverse / cancel — silent skip (no buy).
-            if str(gate.get("error") or "") == "aborted":
-                seen.add(key)
-                print(
-                    f"af-referee → ABORTED goal match_id={mid} "
-                    f"reason={gate.get('reason') or 'cancelled'} key={key}",
-                    flush=True,
-                )
-                return
-            skip = {
-                "quoted_at": now_cn_iso(),
-                "trigger": "score_change",
-                "mode": "af_unconfirmed",
-                "event_key": key,
-                "match_id": mid,
-                "home": ev.get("home"),
-                "away": ev.get("away"),
-                "home_score": target[0] if target else ev.get("home_score"),
-                "away_score": target[1] if target else ev.get("away_score"),
-                "count": 0,
-                "opportunity_count": 0,
-                "af_referee": gate,
-            }
-            if pre is not None:
-                skip["af_preconfirm"] = pre
-            bundles.append(skip)
-            seen.add(key)
-            _mark_odds_af_unconfirmed(mid, reason=str(gate.get("error") or "af_timeout"))
-            print(
-                f"af-referee → IGNORE goal match_id={mid} "
-                f"target={target[0] if target else '?'}-"
-                f"{target[1] if target else '?'} "
-                f"polls={gate.get('polls')} err={gate.get('error')}",
-                flush=True,
-            )
-            return
-        work_ev = apply_af_score_to_event(
-            ev,
-            home=int(gate["goals"]["home"]),
-            away=int(gate["goals"]["away"]),
-        )
-        print(
-            f"af-referee → CONFIRMED {mid} "
-            f"{gate['goals']['home']}-{gate['goals']['away']} "
-            f"in {gate.get('elapsed_ms')}ms polls={gate.get('polls')} "
-            f"burst={gate.get('burst_dir')}",
-            flush=True,
-        )
-        af_gate: dict[str, Any] = {
-            "confirmed": True,
-            "score_source": "api_football",
-            "home_score": work_ev.get("home_score"),
-            "away_score": work_ev.get("away_score"),
-            "burst_dir": gate.get("burst_dir"),
-            "polls": gate.get("polls"),
-            "elapsed_ms": gate.get("elapsed_ms"),
-            "via": gate.get("via"),
-            "goals": gate.get("goals"),
-        }
-        if pre is not None:
-            af_gate["preconfirm"] = pre
-        if trade_executor is not None:
-            try:
-                trade_executor.mark_af_confirmed(mid, event_key=key)
-            except Exception as e:  # noqa: BLE001
-                print(f"ALERT mark_af_confirmed failed match={mid}: {e}", flush=True)
-        try:
-            from livescore_observe import get_active_observer as get_lsa_observer
-
-            lsa = get_lsa_observer()
-            if lsa is not None:
-                lsa.on_af_confirmed(
-                    root,
-                    match_id=mid,
-                    event_key=key,
-                    ev=work_ev,
-                    af_gate=af_gate,
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT livescore observe confirm failed: {e}", flush=True)
-        try:
-            from book_context_observe import get_active_observer as get_book_observer
-
-            book_obs = get_book_observer()
-            if book_obs is not None:
-                book_obs.on_af_confirmed(
-                    root,
-                    match_id=mid,
-                    event_key=key,
-                    ev=work_ev,
-                    af_gate=af_gate,
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT book-context observe confirm failed: {e}", flush=True)
-        c_ev = _with_odds_grade(
-            work_ev,
-            base_key=key,
-            level="C",
-            target_usdc=0.0,
-            decision={"reason": "baseline_after_af_dqd_confirmation"},
-        )
-        _quote_one(c_ev, key, af_gate=af_gate)
-
-    def _drain_af() -> None:
-        if af_referee is None:
-            return
-        try:
-            for job in af_referee.drain_done():
-                _finish_af_job(job)
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT af-referee drain failed: {e}", flush=True)
-
-    def _drain_odds_upgrades() -> None:
-        if trade_executor is None:
-            return
-        try:
-            from book_context_observe import get_active_observer as get_book_observer
-
-            observer = get_book_observer()
-            if observer is None:
-                return
-            for upgrade in observer.drain_upgrades():
-                grade = (
-                    upgrade.get("odds_grade")
-                    if isinstance(upgrade.get("odds_grade"), dict)
-                    else {}
-                )
-                level = str(grade.get("level") or "")
-                if level not in ("B", "A"):
-                    continue
-                if level == "A" and grade.get("af_hard_confirm") is not True:
-                    continue
-                base_key = str(upgrade.get("event_key") or "")
-                source_ev = upgrade.get("ev") if isinstance(upgrade.get("ev"), dict) else {}
-                if not base_key or not source_ev:
-                    continue
-                target_usdc = float(grade.get("target_usdc") or grade_target_usdc(level))
-                decision = {
-                    **grade,
-                    "observe_group_id": upgrade.get("observe_group_id"),
-                    "poll_offset_s": upgrade.get("poll_offset_s"),
-                    "data_changed": upgrade.get("data_changed"),
-                    "fingerprint": upgrade.get("fingerprint"),
-                }
-                work_ev = _with_odds_grade(
-                    source_ev,
-                    base_key=base_key,
-                    level=level,
-                    target_usdc=target_usdc,
-                    decision=decision,
-                )
-                trade_key = str(work_ev.get("_trade_event_key") or "")
-                af_meta = dict(upgrade.get("af_gate") or {})
-                af_meta["odds_confirmation"] = dict(work_ev["_trade_context"])
-                quoted_ok = _quote_one(
-                    work_ev,
-                    trade_key,
-                    af_gate=af_meta,
-                    include_exact_override=odds_grade_include_exact(level),
-                    skip_fine_tick_exact=odds_grade_skip_fine_tick_exact(level),
-                )
-                observer.acknowledge_upgrade(upgrade, success=quoted_ok)
-                print(
-                    f"odds-confirm → grade={level} target=${target_usdc:g} "
-                    f"match_id={upgrade.get('match_id')} poll={upgrade.get('poll_offset_s')}s",
-                    flush=True,
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT odds upgrade drain failed: {e}", flush=True)
-
-    def _drain_reversal_confirms() -> None:
-        """Flatten only DQD drops corroborated by Odds score/Bet365 markets."""
-        try:
-            from book_context_observe import get_active_observer as get_book_observer
-
-            observer = get_book_observer()
-            if observer is None:
-                return
-            for item in observer.drain_reversal_confirms():
-                ev = item.get("ev") if isinstance(item.get("ev"), dict) else {}
-                decision = (
-                    item.get("decision")
-                    if isinstance(item.get("decision"), dict)
-                    else {}
-                )
-                flatten_rows: list[dict[str, Any]] = []
-                if trade_executor is not None and ev:
-                    flatten_rows = list(
-                        trade_executor.flatten_confirmed_reversal(
-                            ev,
-                            confirmation=decision,
-                        )
-                        or []
-                    )
-                bundles.append(
-                    {
-                        "quoted_at": now_cn_iso(),
-                        "trigger": "score_change",
-                        "mode": "odds_reversal_confirmed",
-                        "event_key": item.get("event_key"),
-                        "match_id": item.get("match_id"),
-                        "reversal_confirmation": decision,
-                        "poll_offset_s": item.get("poll_offset_s"),
-                        "flatten_attempts": flatten_rows,
-                        "flatten_count": len(flatten_rows),
-                    }
-                )
-                print(
-                    f"odds-reversal → CONFIRMED match_id={item.get('match_id')} "
-                    f"reason={decision.get('reason')} "
-                    f"poll={item.get('poll_offset_s')}s flatten={len(flatten_rows)}",
-                    flush=True,
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT odds reversal drain failed: {e}", flush=True)
-
-    def _deadline_flatten() -> None:
-        if mode != "postcheck" or trade_executor is None:
-            return
-        try:
-            pending = (
-                af_referee.pending_event_keys() if af_referee is not None else set()
-            )
-            overdue = list(
-                trade_executor.flatten_af_deadline_lots(exclude_event_keys=pending)
-                or []
-            )
-            if overdue:
-                bundles.append(
-                    {
-                        "quoted_at": now_cn_iso(),
-                        "trigger": "af_deadline_flatten",
-                        "mode": "af_confirm_timeout",
-                        "flatten_attempts": overdue,
-                        "flatten_count": len(overdue),
-                    }
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"ALERT af deadline flatten failed: {e}", flush=True)
-
-    _drain_af()
-    _deadline_flatten()
-
-    pending_keys = (
-        af_referee.pending_event_keys() if af_referee is not None else set()
-    )
 
     # Memory events (in-process bridge) first; file scan for restart / board path.
     events_iter: list[dict[str, Any]] = []
@@ -2771,26 +2115,12 @@ def process_bridge_events(
         key = event_key(ev)
         if not force and key in seen:
             continue
-        if key in pending_keys:
-            continue
 
         typ = str(ev.get("type") or "")
 
         if typ == "score_change":
-            from af_referee import event_is_goal_up, event_is_reversal
-
             if event_is_reversal(ev):
-                # DQD alone only opens a 30-second arbitration window.  It may
-                # cancel a pending buy/AF job, but it cannot sell an open lot.
                 mid_rev = str(ev.get("match_id") or "")
-                if mid_rev and af_referee is not None:
-                    try:
-                        af_referee.cancel_match(mid_rev, reason="dqd_reversal")
-                    except Exception as e:  # noqa: BLE001
-                        print(
-                            f"ALERT af cancel_match failed match={mid_rev}: {e}",
-                            flush=True,
-                        )
                 if mid_rev and trade_executor is not None:
                     try:
                         trade_executor.cancel_rest_orders_for_match(
@@ -2814,63 +2144,30 @@ def process_bridge_events(
                         )
                 except Exception as e:  # noqa: BLE001
                     print(f"ALERT livescore observe reversal failed: {e}", flush=True)
-                observer_started = False
-                try:
-                    from book_context_observe import get_active_observer as get_book_observer
-
-                    book_obs = get_book_observer()
-                    if book_obs is not None:
-                        observer_started = bool(
-                            book_obs.on_dqd_reversal(
-                                root,
-                                match_id=mid_rev,
-                                event_key=key,
-                                ev=ev,
-                            )
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT book-context observe reversal failed: {e}", flush=True)
                 bundles.append(
                     {
                         "quoted_at": now_cn_iso(),
                         "trigger": "score_change",
-                        "mode": "dqd_reversal_pending_odds",
+                        "mode": "dqd_reversal_no_flatten",
                         "event_key": key,
                         "match_id": mid_rev,
                         "home": ev.get("home"),
                         "away": ev.get("away"),
                         "home_score": ev.get("home_score"),
                         "away_score": ev.get("away_score"),
-                        "odds_arbitration_started": observer_started,
-                        "poll_interval_s": 5.0,
-                        "poll_count": 6,
                         "flatten_count": 0,
                     }
                 )
                 seen.add(key)
                 print(
-                    f"dqd-reversal → PENDING odds arbitration match_id={mid_rev} "
-                    f"key={key} polls=5/10/15/20/25/30s",
+                    f"dqd-reversal → NO auto-flatten match_id={mid_rev} key={key} "
+                    f"(screenshot gate next round)",
                     flush=True,
                 )
                 continue
 
             if event_is_goal_up(ev):
-                # A quick DQD restoration cancels a still-pending reversal
-                # generation before any queued Odds decision can be drained.
                 mid_up = str(ev.get("match_id") or "")
-                try:
-                    from book_context_observe import get_active_observer as get_book_observer
-
-                    book_obs = get_book_observer()
-                    if book_obs is not None:
-                        book_obs.cancel_reversal_if_restored(
-                            mid_up,
-                            home_score=ev.get("home_score"),
-                            away_score=ev.get("away_score"),
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT reversal restore cancel failed: {e}", flush=True)
                 if mid_up and trade_executor is not None:
                     try:
                         trade_executor.clear_rest_block(mid_up)
@@ -2879,6 +2176,69 @@ def process_bridge_events(
                             f"ALERT rest-block clear failed match={mid_up}: {e}",
                             flush=True,
                         )
+                stale, age = ft_event_is_stale(ev)
+                if stale:
+                    skip = {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "goal_stale",
+                        "event_key": key,
+                        "match_id": mid_up,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "stale_age_s": age,
+                    }
+                    bundles.append(skip)
+                    seen.add(key)
+                    print(
+                        f"goal → SKIP stale match_id={mid_up} age_s={age} key={key}",
+                        flush=True,
+                    )
+                    continue
+                if target_score_from_event(ev) is None:
+                    skip = {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "goal_skip_bad_event",
+                        "event_key": key,
+                        "match_id": mid_up,
+                        "count": 0,
+                        "opportunity_count": 0,
+                    }
+                    bundles.append(skip)
+                    seen.add(key)
+                    continue
+                try:
+                    from dqd_stream_observe import (
+                        get_active_observer as get_dqd_stream_observer,
+                    )
+
+                    dqd_stream_observer = get_dqd_stream_observer()
+                    if dqd_stream_observer is not None:
+                        dqd_stream_observer.enqueue_event(ev, event_key=key)
+                except Exception as e:  # noqa: BLE001
+                    print(f"dqd-stream observe enqueue failed: {e}", flush=True)
+                _quote_one(ev, key)
+                continue
+
+            # Non goal-up / non-reversal score_change (e.g. status-only): skip.
+            bundles.append(
+                {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "score_change",
+                    "mode": "score_change_skip",
+                    "event_key": key,
+                    "match_id": ev.get("match_id"),
+                    "count": 0,
+                    "opportunity_count": 0,
+                }
+            )
+            seen.add(key)
+            continue
 
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
@@ -2895,8 +2255,6 @@ def process_bridge_events(
             if mid and mid in processed_ft_ids and not force:
                 seen.add(key)
                 continue
-            from af_referee import ft_event_is_stale, target_score_from_event
-
             stale, age = ft_event_is_stale(ev)
             if stale:
                 skip = {
@@ -2911,224 +2269,23 @@ def process_bridge_events(
                     "away_score": ev.get("away_score"),
                     "count": 0,
                     "opportunity_count": 0,
-                    "af_referee": {
-                        "skipped": True,
-                        "reason": "ft_stale",
-                        "age_s": age,
-                    },
+                    "stale_age_s": age,
                 }
                 bundles.append(skip)
                 seen.add(key)
                 _mark_ft_done(mid)
                 print(
-                    f"ft-gate → SKIP stale match_id={mid} age_s={age} key={key}",
+                    f"ft → SKIP stale match_id={mid} age_s={age} key={key}",
                     flush=True,
                 )
                 continue
-
-            if af_referee is not None:
-                target = target_score_from_event(ev)
-                if not mid or target is None:
-                    skip = {
-                        "quoted_at": now_cn_iso(),
-                        "trigger": "match_finished",
-                        "mode": "af_ft_skip_bad_event",
-                        "event_key": key,
-                        "match_id": mid,
-                        "count": 0,
-                        "opportunity_count": 0,
-                        "af_referee": {
-                            "skipped": True,
-                            "reason": "missing_match_id_or_score",
-                        },
-                    }
-                    bundles.append(skip)
-                    seen.add(key)
-                    _mark_ft_done(mid)
-                    continue
-                # Always gate FT (even when goals use postcheck): wait for
-                # AF regulation fulltime to match DQD before any FT trade.
-                af_referee.submit_ft(key, ev, target, wait_cache=True)
-                pending_keys.add(key)
-                print(
-                    f"af-ft-gate → awaiting AF regulation match_id={mid} "
-                    f"key={key} target={target[0]}-{target[1]} "
-                    f"(score.fulltime; ET/pen ignored)",
-                    flush=True,
-                )
-                continue
-
             _quote_one(ev, key)
             if key in seen:
                 _mark_ft_done(mid)
             continue
 
-        if typ == "score_change":
-            # DQD stream observe is observe-only and must not depend on AF
-            # being enabled. We still apply the same "stale event" gate to
-            # align with the trading pipeline's time pruning.
-            try:
-                from af_referee import event_is_goal_up, ft_event_is_stale
-
-                if event_is_goal_up(ev):
-                    stale, _age = ft_event_is_stale(ev)
-                    if not stale:
-                        try:
-                            from dqd_stream_observe import (
-                                get_active_observer as get_dqd_stream_observer,
-                            )
-
-                            dqd_stream_observer = get_dqd_stream_observer()
-                            if dqd_stream_observer is not None:
-                                dqd_stream_observer.enqueue_event(
-                                    ev, event_key=key
-                                )
-                        except Exception as e:  # noqa: BLE001
-                            print(
-                                f"dqd-stream observe enqueue failed: {e}",
-                                flush=True,
-                            )
-            except Exception:
-                # Never let observe-only enqueue break quoting.
-                pass
-
-        if typ == "score_change" and af_referee is not None:
-            from af_referee import (
-                event_is_goal_up,
-                event_is_reversal,
-                ft_event_is_stale,
-                target_score_from_event,
-            )
-
-            if event_is_goal_up(ev):
-                target = target_score_from_event(ev)
-                mid = str(ev.get("match_id") or "")
-                if not mid or target is None:
-                    skip = {
-                        "quoted_at": now_cn_iso(),
-                        "trigger": "score_change",
-                        "mode": "af_skip_bad_event",
-                        "event_key": key,
-                        "match_id": mid,
-                        "count": 0,
-                        "opportunity_count": 0,
-                        "af_referee": {
-                            "skipped": True,
-                            "reason": "missing_match_id_or_score",
-                        },
-                    }
-                    bundles.append(skip)
-                    seen.add(key)
-                    continue
-
-                # Same age gate as FT: historical goals after prune/cursor reset
-                # must not open AF confirm jobs (was burning API-Football quota).
-                stale, age = ft_event_is_stale(ev)
-                if stale:
-                    skip = {
-                        "quoted_at": now_cn_iso(),
-                        "trigger": "score_change",
-                        "mode": "af_goal_stale",
-                        "event_key": key,
-                        "match_id": mid,
-                        "home": ev.get("home"),
-                        "away": ev.get("away"),
-                        "home_score": target[0],
-                        "away_score": target[1],
-                        "count": 0,
-                        "opportunity_count": 0,
-                        "af_referee": {
-                            "skipped": True,
-                            "reason": "goal_stale",
-                            "age_s": age,
-                        },
-                    }
-                    bundles.append(skip)
-                    seen.add(key)
-                    print(
-                        f"af-gate → SKIP stale goal match_id={mid} "
-                        f"age_s={age} key={key}",
-                        flush=True,
-                    )
-                    continue
-
-                if mode == "postcheck":
-                    # Trade immediately on DQD goal; AF only confirms / times out.
-                    af_gate = {
-                        "phase": "postcheck_trade",
-                        "awaiting_af": True,
-                        "score_source": "dongqiudi",
-                        "target": {"home": target[0], "away": target[1]},
-                    }
-                    c_ev = _with_odds_grade(
-                        ev,
-                        base_key=key,
-                        level="C",
-                        target_usdc=0.0,
-                        decision={"reason": "baseline_observation_position"},
-                    )
-                    _quote_one(c_ev, key, af_gate=af_gate)
-                    if key not in seen:
-                        # Quote failed — retry next tick; do not park on AF pending.
-                        continue
-                    af_referee.submit(key, ev, target, wait_cache=True)
-                    pending_keys.add(key)
-                    _start_dqd_odds(ev, key)
-                    if trade_executor is not None:
-                        try:
-                            # Align deadline with AF poll clock (not buy clock).
-                            trade_executor.refresh_af_deadline(mid, event_key=key)
-                        except Exception as e:  # noqa: BLE001
-                            print(
-                                f"ALERT refresh_af_deadline failed match={mid}: {e}",
-                                flush=True,
-                            )
-                    print(
-                        f"af-postcheck → traded match_id={mid} key={key} "
-                        f"target={target[0]}-{target[1]} (awaiting AF confirm)",
-                        flush=True,
-                    )
-                    continue
-
-                # gate mode: wait for AF; no preconfirm CLOB quote (saves a books round-trip)
-                # Supersede any prior AF wait for this match (new goal target).
-                if af_referee is not None:
-                    try:
-                        af_referee.cancel_match(mid, reason="new_goal_up")
-                    except Exception:  # noqa: BLE001
-                        pass
-                af_referee.submit(key, ev, target, wait_cache=False)
-                pending_keys.add(key)
-                _start_dqd_odds(ev, key)
-                print(
-                    f"af-gate → awaiting AF match_id={mid} key={key} "
-                    f"(Odds B-path live; A waits for AF)",
-                    flush=True,
-                )
-                continue
-
-            skip = {
-                "quoted_at": now_cn_iso(),
-                "trigger": "score_change",
-                "mode": "af_skip_non_goal",
-                "event_key": key,
-                "match_id": ev.get("match_id"),
-                "count": 0,
-                "opportunity_count": 0,
-                "af_referee": {"skipped": True, "reason": "not_goal_up"},
-            }
-            bundles.append(skip)
-            seen.add(key)
-            continue
-
-        _quote_one(ev, key)
-
-    _drain_af()
-    _drain_reversal_confirms()
-    # Pending/confirmed reversals cancel their observer generation, so stale
-    # queued B/A decisions cannot buy against a reverted score.
-    _drain_odds_upgrades()
-    _deadline_flatten()
+        # Unknown event types: mark seen so cursor advances.
+        seen.add(key)
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]
@@ -3148,6 +2305,7 @@ def process_bridge_events(
                     lat["events_via"] = "memory+file"
                 b["latency_ms"] = lat
     return bundles
+
 
 
 def find_match_row(

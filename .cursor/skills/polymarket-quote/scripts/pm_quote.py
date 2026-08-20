@@ -7,9 +7,7 @@ Examples:
   python3 pm_quote.py once --event-id 674336 --home-score 1 --away-score 0 --json
   python3 pm_quote.py watch --interval 0.25
   python3 pm_quote.py watch --take-depth walk --max-usdc 10   # dry-run trade plans
-  python3 pm_quote.py watch --live --take-depth top --max-usdc 2
-  python3 pm_quote.py watch --goals-mode dry --ft-mode live --max-usdc 1
-  python3 pm_quote.py watch --goals-mode live --ft-mode dry --max-usdc 1
+  python3 pm_quote.py watch --goals-mode dry --ft-mode dry --max-usdc 1
 """
 
 from __future__ import annotations
@@ -27,77 +25,29 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
-from book_context_observe import try_create_observer as try_create_book_observer  # noqa: E402
 from dqd_stream_observe import try_create_observer as try_create_dqd_stream_observer  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
-from trade_settings import load_trade_settings, resolve_live_modes, size_tiers_label  # noqa: E402
-from af_referee import AfReferee, DEFAULT_TIMEOUT_S  # noqa: E402
+from trade_settings import load_trade_settings, size_tiers_label  # noqa: E402
 
 
 def root() -> Path:
     return lib.repo_root_from(Path(__file__))
 
 
-def build_af_referee(args: argparse.Namespace, rt: Path) -> AfReferee | None:
-    """AF goal confirmation (default on). Disable with --no-af-referee."""
-    if getattr(args, "no_af_referee", False):
-        return None
-    timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
-    poll = getattr(args, "af_poll", None)
-    af_mode = resolve_af_mode(args)
-    # Default: flat schedule 2s → every 2s → timeout.
-    # --af-poll N forces a fixed interval (disables the schedule).
-    if poll is None:
-        ref = AfReferee(rt, timeout_s=timeout, poll_schedule=True, env_path=None)
-        sched = ref._schedule_desc()
-        print(
-            f"af-referee → on (apifootball-bridge lib · async · schedule={sched} "
-            f"timeout={timeout}s · af_mode={af_mode} · DQD reversal → Odds 5s×6 gate)",
-            file=sys.stderr,
-            flush=True,
-        )
-    else:
-        ref = AfReferee(
-            rt,
-            poll_s=float(poll),
-            timeout_s=timeout,
-            poll_schedule=False,
-            env_path=None,
-        )
-        print(
-            f"af-referee → on (apifootball-bridge lib · async · fixed poll={poll}s "
-            f"timeout={timeout}s · af_mode={af_mode} · DQD reversal → Odds 5s×6 gate)",
-            file=sys.stderr,
-            flush=True,
-        )
-    return ref
-
-
-def resolve_af_mode(args: argparse.Namespace) -> str:
-    if getattr(args, "no_af_referee", False):
-        return "off"
-    if getattr(args, "af_postcheck_trade", False):
-        return "postcheck"
-    return "gate"
-
-
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
-    """Build TradeExecutor when trading is enabled (default on; --no-trade disables)."""
+    """Build TradeExecutor when trading is enabled (default on; --no-trade disables).
+
+    Live CLOB is force-paused this round (screenshot gate lands next). Always dry.
+    """
     if getattr(args, "no_trade", False):
         return None
-    live = bool(getattr(args, "live", False))
-    goals_mode = getattr(args, "goals_mode", None)
-    ft_mode = getattr(args, "ft_mode", None)
-    # Peek modes so require_key matches either live channel.
-    live_goals, live_ft = resolve_live_modes(
-        live=live, goals_mode=goals_mode, ft_mode=ft_mode
-    )
+    # Force dry regardless of --live / --goals-mode / --ft-mode.
     settings = load_trade_settings(
-        live=live,
-        goals_mode=goals_mode,
-        ft_mode=ft_mode,
+        live=False,
+        goals_mode="dry",
+        ft_mode="dry",
         take_depth=str(getattr(args, "take_depth", "walk") or "walk"),
         max_levels=int(getattr(args, "max_levels", 5)),
         max_usdc=float(getattr(args, "max_usdc", 1.0)),
@@ -107,37 +57,25 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         min_buy_price=float(getattr(args, "min_buy_price", 0.6)),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
-        require_key=bool(live_goals or live_ft),
+        require_key=False,
     )
-    af_mode = resolve_af_mode(args)
-    timeout = float(getattr(args, "af_timeout", DEFAULT_TIMEOUT_S))
-    executor = TradeExecutor(
-        rt,
-        settings,
-        af_mode=af_mode if af_mode != "off" else "off",
-        af_timeout_s=timeout,
-    )
-    # Plan: initialize ClobClient once at watch/start when trading is on (reuse).
-    # Position client still used for flatten / open-lot balance checks.
+    executor = TradeExecutor(rt, settings)
     if settings.private_key:
         try:
             executor.ensure_trader()
         except Exception as e:  # noqa: BLE001
-            if settings.live:
-                raise
             print(
                 f"trade → CLOB init failed (sell position checks disabled): {e}",
                 file=sys.stderr,
                 flush=True,
             )
-    g = "live" if settings.live_goals else "dry"
-    f = "live" if settings.live_ft else "dry"
     print(
-        f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
+        f"trade → goals=dry ft=dry take_depth={settings.take_depth} "
         f"max_usdc={settings.max_usdc} max_shares={settings.max_shares} "
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
-        f"size_tiers={size_tiers_label(settings)}",
+        f"size_tiers={size_tiers_label(settings)} "
+        f"(live buys paused pending screenshot gate)",
         file=sys.stderr,
         flush=True,
     )
@@ -154,7 +92,6 @@ def cmd_once(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"trade setup failed: {e}", file=sys.stderr)
         return 1
-    referee = build_af_referee(args, rt)
 
     try:
         if args.from_bridge:
@@ -170,8 +107,6 @@ def cmd_once(args: argparse.Namespace) -> int:
                 force=bool(args.force),
                 trade_executor=executor,
                 market_cache=cache,
-                af_referee=referee,
-                af_mode=resolve_af_mode(args) if referee is not None else "off",
             )
             payload = {
                 "quoted_at": lib.now_cn_iso(),
@@ -286,7 +221,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"trade setup failed: {e}", file=sys.stderr)
         return 1
-    referee = build_af_referee(args, rt)
 
     # Configure process proxy once before warmer + quote share SOCKS socket patch.
     try:
@@ -337,7 +271,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         lsa_obs.start()
         print(
             f"livescore observe → {lib.data_dir(rt) / 'livescore_observe.jsonl'} "
-            f"(LSA events+commentary · AF confirm/+15/+45 + DQD reverse · observe-only)",
+            f"(LSA events+commentary · DQD reverse · observe-only)",
             file=sys.stderr,
             flush=True,
         )
@@ -347,25 +281,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-    book_obs = try_create_book_observer(rt)
-    if book_obs is not None:
-        book_obs.start()
-        print(
-            f"book-context observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
-            f"(DQD starts Odds/Bet365 · B live · A waits for AF · "
-            f"goals 0/3/…/90s · reversals 5s×6)",
-            file=sys.stderr,
-            flush=True,
-        )
-    else:
-        print(
-            "odds confirmation skipped (set ODDS_API_IO_KEY)",
-            file=sys.stderr,
-            flush=True,
-        )
     print(
         f"polymarket-quote watch (wake≤{interval}s · memory queue|file · "
-        f"market_cache · retain={retain_h}h) → {lib.data_dir(rt)}",
+        f"market_cache · retain={retain_h}h · dry quote; live paused) → {lib.data_dir(rt)}",
         file=sys.stderr,
         flush=True,
     )
@@ -395,8 +313,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 force=False,
                 trade_executor=executor,
                 market_cache=cache,
-                af_referee=referee,
-                af_mode=resolve_af_mode(args) if referee is not None else "off",
                 events_override=mem_events if mem_events else None,
             )
             for b in bundles:
@@ -414,19 +330,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         f"trigger={b.get('trigger')}: {b.get('error')}{lat_s}",
                         flush=True,
                     )
-                elif str(b.get("mode") or "").startswith("af_"):
-                    gate = b.get("af_referee") or {}
-                    print(
-                        f"[{b.get('quoted_at')}] {b.get('mode')} "
-                        f"match_id={b.get('match_id')} "
-                        f"score={b.get('home_score')}-{b.get('away_score')} "
-                        f"af={gate.get('reason') or gate.get('error') or gate}"
-                        f"{lat_s}",
-                        flush=True,
-                    )
-                    if args.json:
-                        json.dump(b, sys.stdout, ensure_ascii=False)
-                        print(flush=True)
                 else:
                     prev = b.get("prev_score") or {}
                     prev_s = (
@@ -465,8 +368,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         sampler.stop()
         if lsa_obs is not None:
             lsa_obs.stop()
-        if book_obs is not None:
-            book_obs.stop()
+        if dqd_stream_obs is not None:
+            dqd_stream_obs.stop()
         if not args.no_upstream:
             lib.stop_owned_bridge()
         return 0
@@ -494,7 +397,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         help="Skip More Markets / Exact Score discovery",
     )
     sp.add_argument("--no-exact", action="store_true", help="Skip Exact Score only")
-    # --- in-process trading (after misprice; default dry-run) ---
+    # --- in-process trading (after misprice; default dry-run; live paused) ---
     sp.add_argument(
         "--no-trade",
         action="store_true",
@@ -503,19 +406,19 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--live",
         action="store_true",
-        help="Post real CLOB orders for both goals and FT (override with --goals-mode/--ft-mode)",
+        help="Ignored this round: live CLOB buys paused pending screenshot gate",
     )
     sp.add_argument(
         "--goals-mode",
         choices=("dry", "live"),
         default=None,
-        help="score_change dry|live (default dry; --live sets live unless overridden)",
+        help="Ignored this round: forced dry (screenshot gate next)",
     )
     sp.add_argument(
         "--ft-mode",
         choices=("dry", "live"),
         default=None,
-        help="match_finished dry|live (default dry; --live sets live unless overridden)",
+        help="Ignored this round: forced dry (screenshot gate next)",
     )
     sp.add_argument(
         "--take-depth",
@@ -557,43 +460,6 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         "--trade-env-file",
         default=None,
         help="Env file with PRIVATE_KEY/FUNDER/… (default repo .env)",
-    )
-    # --- AF referee (confirm DQD goals via API-Football events) ---
-    sp.add_argument(
-        "--no-af-referee",
-        action="store_true",
-        help="Disable AF confirmation (DQD-only buys; reversals still require Odds 5s×6 arbitration)",
-    )
-    sp.add_argument(
-        "--af-postcheck-trade",
-        action="store_true",
-        help=(
-            "Aggressive: trade on DQD goal immediately, hold if AF confirms, "
-            "flatten on AF timeout; DQD reversal still needs Odds arbitration"
-        ),
-    )
-    sp.add_argument(
-        "--af-gate-before-trade",
-        action="store_true",
-        help=(
-            "Explicit gate (same as default): wait for AF confirm before trading; "
-            "AF timeout ignores the goal (no flatten)"
-        ),
-    )
-    sp.add_argument(
-        "--af-poll",
-        type=float,
-        default=None,
-        help=(
-            "Fixed AF events poll interval seconds (disables default schedule: "
-            "2s → every 2s → timeout)"
-        ),
-    )
-    sp.add_argument(
-        "--af-timeout",
-        type=float,
-        default=DEFAULT_TIMEOUT_S,
-        help=f"Give up confirming a goal after this many seconds (default {DEFAULT_TIMEOUT_S})",
     )
 
 
