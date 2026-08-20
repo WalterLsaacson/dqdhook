@@ -22,13 +22,17 @@ PORT = 8791
 MODULE_ID = "pitch-gate-board"
 
 DATA = ROOT / "data" / "pm-quote"
+BRIDGE_EVENTS_PATH = ROOT / "data" / "bridge" / "events.jsonl"
 OBSERVE_PATH = DATA / "dqd_stream_observe.jsonl"
 JUDGE_PATH = DATA / "pitch_state_judge.jsonl"
+QUOTES_PATH = DATA / "quotes.jsonl"
 FRAMES_ROOT = DATA / "dqd_stream_frames"
 
 # Cap how much history we scan for the board.
 _MAX_OBSERVE_LINES = 8000
 _MAX_JUDGE_LINES = 8000
+_MAX_BRIDGE_LINES = 4000
+_MAX_QUOTES_LINES = 4000
 
 
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
@@ -199,10 +203,87 @@ def _goal_verdict(frames: list[dict[str, Any]]) -> str:
     return "mixed"
 
 
+def _ts_key(raw: Any) -> str:
+    return str(raw or "")
+
+
+def _load_reversal_index() -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Bridge reversals + quote gate-cancel rows.
+
+    Returns:
+      recent_reversals (newest first),
+      latest_reversal_by_match_id,
+      gate_cancel_by_event_key
+    """
+    recent: list[dict[str, Any]] = []
+    by_match: dict[str, dict[str, Any]] = {}
+    for row in _read_jsonl_tail(BRIDGE_EVENTS_PATH, max_lines=_MAX_BRIDGE_LINES):
+        if str(row.get("type") or "") != "score_change":
+            continue
+        if not bool(row.get("is_reversal")):
+            continue
+        mid = str(row.get("match_id") or "").strip()
+        if not mid:
+            continue
+        prev = row.get("prev") if isinstance(row.get("prev"), dict) else {}
+        curr = row.get("curr") if isinstance(row.get("curr"), dict) else {}
+        item = {
+            "type": "score_change",
+            "is_reversal": True,
+            "ts": row.get("ts"),
+            "match_id": mid,
+            "home": row.get("home") or "",
+            "away": row.get("away") or "",
+            "league": row.get("league") or "",
+            "prev": prev,
+            "curr": curr,
+            "home_score": row.get("home_score"),
+            "away_score": row.get("away_score"),
+            "event_key": (
+                f"score_change|{mid}|"
+                f"{prev.get('home')}-{prev.get('away')}->"
+                f"{curr.get('home')}-{curr.get('away')}"
+            ),
+        }
+        recent.append(item)
+        # Later lines overwrite → keep newest per match.
+        by_match[mid] = item
+    recent.reverse()  # newest first for UI toasts
+
+    cancel_by_key: dict[str, dict[str, Any]] = {}
+    for row in _read_jsonl_tail(QUOTES_PATH, max_lines=_MAX_QUOTES_LINES):
+        mode = str(row.get("mode") or "")
+        if mode not in {
+            "pitch_gate_canceled",
+            "dqd_reversal_pitch_gate_canceled",
+        } and "pitch_gate_canceled" not in mode:
+            continue
+        key = str(row.get("event_key") or "").strip()
+        mid = str(row.get("match_id") or "").strip()
+        item = {
+            "mode": mode,
+            "ts": row.get("quoted_at") or row.get("ts"),
+            "match_id": mid,
+            "event_key": key,
+            "home": row.get("home") or "",
+            "away": row.get("away") or "",
+            "home_score": row.get("home_score"),
+            "away_score": row.get("away_score"),
+            "pitch_gate": row.get("pitch_gate"),
+            "reason": (row.get("pitch_gate") or {}).get("reason")
+            if isinstance(row.get("pitch_gate"), dict)
+            else mode,
+        }
+        if key:
+            cancel_by_key[key] = item
+    return recent, by_match, cancel_by_key
+
+
 def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
     observe = _read_jsonl_tail(OBSERVE_PATH, max_lines=_MAX_OBSERVE_LINES)
     judges = _read_jsonl_tail(JUDGE_PATH, max_lines=_MAX_JUDGE_LINES)
     by_key, by_path = _index_judges(judges)
+    recent_reversals, rev_by_match, cancel_by_key = _load_reversal_index()
 
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -285,7 +366,7 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         g["frames"] = frames
         g["frame_count"] = len(frames)
         g["ok_count"] = sum(1 for f in frames if f.get("ok") is True)
-        g["verdict"] = _goal_verdict(frames)
+        verdict = _goal_verdict(frames)
         in_play_at = None
         for f in frames:
             j = f.get("judge") or {}
@@ -293,11 +374,46 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
                 in_play_at = f.get("elapsed_s")
                 break
         g["in_play_elapsed_s"] = in_play_at
+
+        mid = str(g.get("match_id") or "")
+        cancel = cancel_by_key.get(ek)
+        rev = rev_by_match.get(mid)
+        reversed_flag = False
+        reversal_info: dict[str, Any] | None = None
+        if cancel:
+            reversed_flag = True
+            reversal_info = {
+                "source": "pitch_gate_cancel",
+                "ts": cancel.get("ts"),
+                "reason": cancel.get("reason") or cancel.get("mode"),
+                "mode": cancel.get("mode"),
+            }
+        if rev:
+            # Reversal after this goal (or any later correction on the match).
+            goal_ts = _ts_key(g.get("dqd_ts"))
+            rev_ts = _ts_key(rev.get("ts"))
+            if not goal_ts or rev_ts >= goal_ts:
+                reversed_flag = True
+                reversal_info = {
+                    "source": "dqd_reversal",
+                    "ts": rev.get("ts"),
+                    "prev": rev.get("prev"),
+                    "curr": rev.get("curr"),
+                    "home_score": rev.get("home_score"),
+                    "away_score": rev.get("away_score"),
+                    "event_key": rev.get("event_key"),
+                }
+        g["reversed"] = reversed_flag
+        g["reversal"] = reversal_info
+        if reversed_flag:
+            verdict = "reversed"
+        g["verdict"] = verdict
         goals.append(g)
         if len(goals) >= max(1, limit):
             break
 
     in_play_n = sum(1 for g in goals if g.get("verdict") == "in_play")
+    rev_n = sum(1 for g in goals if g.get("reversed"))
     gate_n = sum(1 for g in goals if g.get("gate"))
     return {
         "updated_at": None,
@@ -307,9 +423,11 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         "goal_count": len(goals),
         "gate_goal_count": gate_n,
         "in_play_count": in_play_n,
+        "reversed_count": rev_n,
         "observe_rows": len(observe),
         "judge_rows": len(judges),
         "goals": goals,
+        "recent_reversals": recent_reversals[:40],
     }
 
 
@@ -330,7 +448,11 @@ def status_payload() -> dict[str, Any]:
         "goal_count": snap["goal_count"],
         "gate_goal_count": snap["gate_goal_count"],
         "in_play_count": snap["in_play_count"],
+        "reversed_count": snap.get("reversed_count") or 0,
         "latest_dqd_ts": latest,
+        "latest_reversal_ts": (snap.get("recent_reversals") or [{}])[0].get("ts")
+        if snap.get("recent_reversals")
+        else None,
     }
 
 

@@ -11,7 +11,7 @@ polymarket-soccer ┘         │
                             ▼
               polymarket-quote watch
                     │
-                    ├── goal → 5s pitch-gate ≤120s → in_play → one buy (goals live)
+                    ├── goal → 5 frames @ 5s → first in_play → one buy (keep capturing)
                     ├── FT → immediate quote (default live)
                     └── DQD stream + pitch-state frames
 ```

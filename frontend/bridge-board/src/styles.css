@@ -578,6 +578,15 @@ body {
   color: #0b1220;
 }
 
+.toast--rev {
+  border-color: rgba(251, 113, 133, 0.45);
+}
+
+.toast--rev .toast__badge {
+  background: #fb7185;
+  color: #fff;
+}
+
 .toast.is-out {
   animation: toastOut 0.25s ease forwards;
 }

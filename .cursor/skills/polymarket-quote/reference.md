@@ -103,11 +103,11 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 **Pitch-gate buy (two-confirm)**
 
 1. DQD goal-up + Polymarket paired → `PitchGateCoordinator.start_gate` (no immediate `_quote_one`).
-2. Capture every **5s**, first frame immediately, until **120s** or cancel.
-3. Each successful JPEG → pitch-state `judge_inputs`; `play_state == "in_play"` → one `_quote_one` with `trade_context.pitch_gate=True`, then stop that session.
-4. `stopped` / `unclear` → keep capturing within the window.
-5. Timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
-6. DQD reversal → `cancel_match(match_id)` → `mode=pitch_gate_canceled`.
+2. Capture **5** frames at **5s** interval (first frame immediately), or until cancel / safety timeout (~90s).
+3. Each successful JPEG → pitch-state `judge_inputs` with expected DQD score; OCR board score must match, then `play_state == "in_play"` → one `_quote_one` with `trade_context.pitch_gate=True` (**buy once**). Score mismatch / missing → keep capturing (no buy).
+4. After that buy, **keep capturing/judging** the remaining frames (board/debug); do not buy again. Session ends with `complete`.
+5. Never `in_play` across 5 frames → `mode=pitch_gate_timeout`, mark seen, no buy.
+6. DQD reversal → `cancel_match(match_id)` → `mode=pitch_gate_canceled` (if already bought, cancel is informational).
 7. Requires `QUOTE_DQD_STREAM_OBSERVE=1` and `QUOTE_PITCH_STATE=1`; else `pitch_gate_unavailable`.
 8. FT path remains immediate quote (default live), no screenshot gate.
 
@@ -126,7 +126,7 @@ After a `score_change` that successfully `buy_win`s (dry_run or posted), watch w
 
 **DQD stream / pitch-state (gate + research)**
 
-Pitch-gate drives 5s captures for up to 120s after a paired goal. Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
+Pitch-gate drives **5** captures at 5s after a paired goal (continues after first `in_play` buy). Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
 
 Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`.
 
@@ -138,7 +138,7 @@ Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`.
 
 When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, DQD-reversal may resolve the fixture via `scores/live.json`, then pull **raw** `matches/events.json` (GOAL/score) and `commentary/events.json` (VAR if package allows; errors kept raw) into `data/pm-quote/livescore_observe.jsonl`. DQD→LSA id map cached in `livescore_match_map.json`. Trial is not expected to expose `KICK_OFF`. Does **not** gate buys or flatten.
 
-**System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with default **goals=live / ft=live** (+ repo `.env`). Pitch-gate: 5s screenshots ≤120s → `in_play` → one buy. Logs: `data/pm-quote/watch.log`.
+**System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with default **goals=live / ft=live** (+ repo `.env`). Pitch-gate: 5 frames @ 5s → first `in_play` → one buy (keep capturing). Logs: `data/pm-quote/watch.log`.
 
 ## CLOB endpoints
 

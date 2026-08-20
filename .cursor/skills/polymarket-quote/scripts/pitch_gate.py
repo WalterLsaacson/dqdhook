@@ -1,4 +1,4 @@
-"""Pitch-screenshot gate: DQD goal → 5s frames ≤120s → in_play → one buy."""
+"""Pitch-screenshot gate: DQD goal → 5 frames @ 5s → first in_play buys once."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from typing import Any, Callable
 logger = logging.getLogger("pm_quote.pitch_gate")
 
 GATE_INTERVAL_S = 5.0
-GATE_TIMEOUT_S = 120.0
+GATE_FRAME_COUNT = 5
+# Safety ceiling for the whole session (capture + OCR can overrun intervals).
+GATE_TIMEOUT_S = 90.0
 
 OnInPlay = Callable[[dict[str, Any]], None]
 # result payload: {status, event_key, match_id, ev, judge?, reason?, elapsed_s?}
@@ -45,6 +47,7 @@ class _GateSession:
     cancel_reason: str = ""
     thread: threading.Thread | None = None
     finished: bool = False
+    buy_emitted: bool = False
 
 
 class PitchGateCoordinator:
@@ -128,7 +131,8 @@ class PitchGateCoordinator:
         thread.start()
         print(
             f"pitch-gate → START match_id={mid} key={key} "
-            f"interval={GATE_INTERVAL_S:g}s timeout={GATE_TIMEOUT_S:g}s",
+            f"frames={GATE_FRAME_COUNT} interval={GATE_INTERVAL_S:g}s "
+            f"(buy on first in_play; keep capturing)",
             flush=True,
         )
         return True
@@ -157,6 +161,39 @@ class PitchGateCoordinator:
         with self._lock:
             self._done.append(row)
 
+    def _emit_buy_once(
+        self,
+        session: _GateSession,
+        *,
+        judge: dict[str, Any] | None,
+        elapsed_s: float,
+        sample_i: int,
+    ) -> bool:
+        """Queue a one-shot buy signal without ending the capture session."""
+        with self._lock:
+            if session.finished or session.buy_emitted or session.cancel.is_set():
+                return False
+            session.buy_emitted = True
+            self._done.append(
+                {
+                    "status": "in_play",
+                    "event_key": session.event_key,
+                    "match_id": session.match_id,
+                    "ev": dict(session.ev),
+                    "judge": judge,
+                    "reason": "play_state_in_play",
+                    "elapsed_s": elapsed_s,
+                    "sample_i": sample_i,
+                }
+            )
+        print(
+            f"pitch-gate → IN_PLAY (buy once) match_id={session.match_id} "
+            f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
+            f"· continue → {GATE_FRAME_COUNT} frames",
+            flush=True,
+        )
+        return True
+
     def _finish_session(
         self,
         session: _GateSession,
@@ -169,7 +206,6 @@ class PitchGateCoordinator:
         with self._lock:
             if session.finished:
                 return
-            # Reversal / FT / supersede must win over a late in_play after OCR.
             if status == "in_play" and session.cancel.is_set():
                 status = "canceled"
                 reason = getattr(session, "cancel_reason", None) or reason or "canceled"
@@ -190,13 +226,15 @@ class PitchGateCoordinator:
                     "judge": judge,
                     "reason": reason or status,
                     "elapsed_s": elapsed_s,
+                    "buy_emitted": bool(session.buy_emitted),
                 }
             )
 
     def _run_session(self, session: _GateSession, observer: Any) -> None:
         try:
-            sample_i = 0
-            while not session.cancel.is_set():
+            for sample_i in range(GATE_FRAME_COUNT):
+                if session.cancel.is_set():
+                    break
                 elapsed = time.monotonic() - session.t0_mono
                 if elapsed > GATE_TIMEOUT_S + 1e-9:
                     self._finish_session(
@@ -212,7 +250,6 @@ class PitchGateCoordinator:
                     )
                     return
 
-                # Build a lightweight job-like object for capture_row.
                 job = _CaptureJob(
                     match_id=session.match_id,
                     event_key=session.event_key,
@@ -236,40 +273,23 @@ class PitchGateCoordinator:
                     judged = _judge_frame_sync(row)
                     play_state = str((judged or {}).get("play_state") or "")
                     if play_state == "in_play":
-                        # Re-check cancel after blocking OCR/VLM.
                         if session.cancel.is_set():
-                            self._finish_session(
-                                session,
-                                status="canceled",
-                                reason=getattr(session, "cancel_reason", None)
-                                or "canceled",
-                                elapsed_s=round(
-                                    time.monotonic() - session.t0_mono, 3
-                                ),
-                            )
-                            return
-                        self._finish_session(
+                            break
+                        self._emit_buy_once(
                             session,
-                            status="in_play",
                             judge=judged,
-                            reason="play_state_in_play",
                             elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                            sample_i=sample_i,
                         )
-                        print(
-                            f"pitch-gate → IN_PLAY match_id={session.match_id} "
-                            f"key={session.event_key} sample={sample_i} "
-                            f"elapsed={elapsed:.1f}s",
-                            flush=True,
-                        )
-                        return
+                        # Keep capturing remaining frames; do not return.
 
-                sample_i += 1
-                next_t = session.t0_mono + sample_i * GATE_INTERVAL_S
+                if sample_i + 1 >= GATE_FRAME_COUNT:
+                    break
+                next_t = session.t0_mono + (sample_i + 1) * GATE_INTERVAL_S
                 while not session.cancel.is_set():
                     now = time.monotonic()
                     if now >= next_t:
                         break
-                    # Also stop sleeping once past timeout.
                     if now - session.t0_mono > GATE_TIMEOUT_S:
                         break
                     time.sleep(min(0.2, next_t - now))
@@ -280,6 +300,33 @@ class PitchGateCoordinator:
                     status="canceled",
                     reason=getattr(session, "cancel_reason", None) or "canceled",
                     elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                )
+                return
+
+            if session.buy_emitted:
+                self._finish_session(
+                    session,
+                    status="complete",
+                    reason=f"captured_{GATE_FRAME_COUNT}_frames",
+                    elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                )
+                print(
+                    f"pitch-gate → COMPLETE match_id={session.match_id} "
+                    f"key={session.event_key} frames={GATE_FRAME_COUNT} "
+                    f"(buy already emitted)",
+                    flush=True,
+                )
+            else:
+                self._finish_session(
+                    session,
+                    status="timeout",
+                    reason=f"no_in_play_in_{GATE_FRAME_COUNT}_frames",
+                    elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                )
+                print(
+                    f"pitch-gate → NO_IN_PLAY match_id={session.match_id} "
+                    f"key={session.event_key} frames={GATE_FRAME_COUNT}",
+                    flush=True,
                 )
         except Exception as e:  # noqa: BLE001
             logger.exception(
@@ -334,6 +381,10 @@ def _judge_frame_sync(row: dict[str, Any]) -> dict[str, Any] | None:
                 "match_id": row.get("match_id"),
                 "event_key": row.get("event_key"),
                 "gate": True,
+                "home_score": row.get("home_score"),
+                "away_score": row.get("away_score"),
+                "expected_home_score": row.get("home_score"),
+                "expected_away_score": row.get("away_score"),
             },
             append_output=True,
             write_sidecars=True,

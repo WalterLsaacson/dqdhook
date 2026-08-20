@@ -6,6 +6,15 @@ function playStateOf(frame) {
   return String(frame?.judge?.play_state || "pending_judge");
 }
 
+function scorePair(obj) {
+  if (!obj || typeof obj !== "object") return "?-?";
+  return `${obj.home ?? "?"}-${obj.away ?? "?"}`;
+}
+
+function reversalKey(ev) {
+  return `${ev?.match_id || ""}|${ev?.ts || ""}|${ev?.event_key || ""}`;
+}
+
 export function renderMeta(snap) {
   state.lastMeta = snap;
   const pill = $("pillStatus");
@@ -14,8 +23,57 @@ export function renderMeta(snap) {
   $("pillGoals").textContent = `Goals ${snap.goal_count ?? 0}`;
   $("pillGate").textContent = `Gate ${snap.gate_goal_count ?? 0}`;
   $("pillInPlay").textContent = `in_play ${snap.in_play_count ?? 0}`;
+  const revN = snap.reversed_count ?? 0;
+  const pillRev = $("pillReversed");
+  if (pillRev) {
+    pillRev.textContent = `回撤 ${revN}`;
+    pillRev.classList.toggle("is-rev", revN > 0);
+  }
   const latest = snap.goals?.[0]?.dqd_ts;
   $("pillLatest").textContent = latest ? `Latest ${formatBeijing(latest)}` : "No goals yet";
+}
+
+export function pushReversalToast(ev) {
+  if (!ev) return;
+  const key = reversalKey(ev);
+  if (state.seenReversalKeys.has(key)) return;
+  state.seenReversalKeys.add(key);
+
+  const stack = $("toasts");
+  if (!stack) return;
+  const el = document.createElement("div");
+  el.className = "toast";
+  const prev = scorePair(ev.prev);
+  const curr = scorePair(ev.curr);
+  el.innerHTML = `
+    <div class="toast__badge">回撤</div>
+    <div>
+      <div class="toast__title">${escapeHtml(ev.home || "?")} ${escapeHtml(prev)}→${escapeHtml(curr)} ${escapeHtml(ev.away || "?")}</div>
+      <div class="toast__meta">
+        match ${escapeHtml(ev.match_id || "")}
+        ${ev.league ? ` · ${escapeHtml(ev.league)}` : ""}
+        ${ev.ts ? ` · ${escapeHtml(formatBeijing(ev.ts))}` : ""}
+        · 门控已取消
+      </div>
+    </div>`;
+  stack.prepend(el);
+  setTimeout(() => {
+    el.classList.add("is-out");
+    setTimeout(() => el.remove(), 280);
+  }, 7000);
+}
+
+export function consumeReversals(list, { toast = true } = {}) {
+  for (const ev of list || []) {
+    const key = reversalKey(ev);
+    if (!state.seededReversals) {
+      state.seenReversalKeys.add(key);
+      continue;
+    }
+    if (toast) pushReversalToast(ev);
+    else state.seenReversalKeys.add(key);
+  }
+  if (!state.seededReversals) state.seededReversals = true;
 }
 
 export function renderRail(goals) {
@@ -27,9 +85,10 @@ export function renderRail(goals) {
   rail.innerHTML = goals
     .map((g) => {
       const active = g.event_key === state.selectedKey ? "is-active" : "";
+      const revClass = g.reversed ? "is-reversed" : "";
       const title = `${escapeHtml(g.home || "?")} ${escapeHtml(scoreLabel(g))} ${escapeHtml(g.away || "?")}`;
       return `
-        <button type="button" class="goal-item ${active}" data-key="${escapeHtml(g.event_key)}">
+        <button type="button" class="goal-item ${active} ${revClass}" data-key="${escapeHtml(g.event_key)}">
           <p class="goal-item__title">${title}</p>
           <div class="goal-item__meta">
             <span class="${stateBadgeClass(g.verdict)}">${escapeHtml(g.verdict)}</span>
@@ -58,6 +117,16 @@ export function renderDetail(goal) {
 
   const frames = goal.frames || [];
   const title = `${escapeHtml(goal.home || "?")} ${escapeHtml(scoreLabel(goal))} ${escapeHtml(goal.away || "?")}`;
+  const rev = goal.reversal;
+  let revLine = "";
+  if (goal.reversed && rev) {
+    if (rev.source === "dqd_reversal") {
+      revLine = `<p class="detail__rev">比分回撤 ${escapeHtml(scorePair(rev.prev))} → ${escapeHtml(scorePair(rev.curr))} · 门控已取消 · ${escapeHtml(formatBeijing(rev.ts))}</p>`;
+    } else {
+      revLine = `<p class="detail__rev">门控取消 · ${escapeHtml(rev.reason || rev.mode || "canceled")} · ${escapeHtml(formatBeijing(rev.ts))}</p>`;
+    }
+  }
+
   const framesHtml = frames.length
     ? `<div class="frames">${frames
         .map((f) => {
@@ -109,6 +178,7 @@ export function renderDetail(goal) {
               : ""
           }
         </p>
+        ${revLine}
       </div>
       <span class="${stateBadgeClass(goal.verdict)}">${escapeHtml(goal.verdict)}</span>
     </div>

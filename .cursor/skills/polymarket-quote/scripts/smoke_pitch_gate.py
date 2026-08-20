@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: pitch-gate sessions (in_play once / timeout / cancel / multi-match)."""
+"""Smoke: pitch-gate sessions (5 frames, buy-once, timeout / cancel / multi-match)."""
 
 from __future__ import annotations
 
@@ -65,30 +65,30 @@ def main() -> int:
 
     old_interval = pg.GATE_INTERVAL_S
     old_timeout = pg.GATE_TIMEOUT_S
+    old_frames = pg.GATE_FRAME_COUNT
     pg.GATE_INTERVAL_S = 0.05
-    pg.GATE_TIMEOUT_S = 0.25
-
-    # --- in_play fires once then stops ---
-    pg.reset_coordinator_for_tests()
-    fake = _FakeObserver()
-    set_active_observer(fake)  # type: ignore[arg-type]
-    judges = {"n": 0}
-
-    def judge_in_play(**_kwargs: Any) -> dict[str, Any]:
-        judges["n"] += 1
-        if judges["n"] >= 2:
-            return {"play_state": "in_play", "confidence": 0.9}
-        return {"play_state": "stopped", "confidence": 0.5}
+    pg.GATE_TIMEOUT_S = 5.0
+    pg.GATE_FRAME_COUNT = 5
 
     import pitch_gate as pg_mod
 
     orig_judge = pg_mod._judge_frame_sync
 
-    def fake_judge(row: dict[str, Any]) -> dict[str, Any] | None:
-        return judge_in_play()
-
-    pg_mod._judge_frame_sync = fake_judge  # type: ignore[assignment]
     try:
+        # --- in_play fires once; still captures all 5 frames → complete ---
+        pg.reset_coordinator_for_tests()
+        fake = _FakeObserver()
+        set_active_observer(fake)  # type: ignore[arg-type]
+        judges = {"n": 0}
+
+        def judge_in_play(**_kwargs: Any) -> dict[str, Any]:
+            judges["n"] += 1
+            if judges["n"] >= 2:
+                return {"play_state": "in_play", "confidence": 0.9}
+            return {"play_state": "stopped", "confidence": 0.5}
+
+        pg_mod._judge_frame_sync = lambda row: judge_in_play()  # type: ignore[assignment]
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             coord = pg.get_coordinator(root)
@@ -103,17 +103,16 @@ def main() -> int:
                 "polymarket": {"event_id": "e1"},
             }
             assert coord.start_gate(ev, event_key="k1")
-            done = _wait_done(coord, n=1, timeout=2.0)
-            assert len(done) == 1, done
-            assert done[0]["status"] == "in_play", done[0]
-            assert done[0]["event_key"] == "k1"
-            # Stopped after in_play — not many more frames after success.
-            frames_at = fake.frames
-            time.sleep(0.2)
-            assert fake.frames == frames_at, (frames_at, fake.frames)
-            assert judges["n"] == 2
+            done = _wait_done(coord, n=2, timeout=3.0)
+            statuses = [d["status"] for d in done]
+            assert "in_play" in statuses, done
+            assert "complete" in statuses, done
+            assert fake.frames == 5, fake.frames
+            # Buy only once even though later frames also in_play.
+            assert sum(1 for d in done if d["status"] == "in_play") == 1
+            assert judges["n"] == 5
 
-            # --- timeout ---
+            # --- timeout: never in_play across all frames ---
             judges["n"] = 0
 
             def always_stopped(**_kwargs: Any) -> dict[str, Any]:
@@ -122,10 +121,12 @@ def main() -> int:
 
             pg_mod._judge_frame_sync = lambda row: always_stopped()  # type: ignore[assignment]
             assert coord.start_gate({**ev, "match_id": "m2"}, event_key="k2")
-            done2 = _wait_done(coord, n=1, timeout=2.0)
+            done2 = _wait_done(coord, n=1, timeout=3.0)
             assert len(done2) == 1 and done2[0]["status"] == "timeout", done2
+            assert done2[0].get("buy_emitted") is False
+            assert judges["n"] == 5
 
-            # --- cancel ---
+            # --- cancel mid-session ---
             assert coord.start_gate({**ev, "match_id": "m3"}, event_key="k3")
             time.sleep(0.02)
             assert coord.cancel_match("m3") >= 1
@@ -135,7 +136,6 @@ def main() -> int:
             # --- multi-match concurrent: cancel one does not stop the other ---
             def stopped_or_play(row: dict[str, Any]) -> dict[str, Any] | None:
                 mid = str(row.get("match_id") or "")
-                # Hold both matches until we cancel ma; mb goes in_play on sample≥1.
                 if mid == "mb" and int(row.get("sample_i") or 0) >= 1:
                     return {"play_state": "in_play", "confidence": 0.9}
                 return {"play_state": "stopped", "confidence": 0.5}
@@ -146,16 +146,20 @@ def main() -> int:
             time.sleep(0.03)
             assert "ka" in coord.pending_event_keys()
             coord.cancel_match("ma")
-            done_m = _wait_done(coord, n=2, timeout=3.0)
-            statuses = {d["event_key"]: d["status"] for d in done_m}
-            assert statuses.get("ka") == "canceled", statuses
-            assert statuses.get("kb") == "in_play", statuses
+            done_m = _wait_done(coord, n=3, timeout=4.0)
+            by_key: dict[str, list[str]] = {}
+            for d in done_m:
+                by_key.setdefault(str(d["event_key"]), []).append(str(d["status"]))
+            assert by_key.get("ka") == ["canceled"], by_key
+            assert "in_play" in by_key.get("kb", []), by_key
+            assert "complete" in by_key.get("kb", []), by_key
     finally:
         pg_mod._judge_frame_sync = orig_judge  # type: ignore[assignment]
         set_active_observer(None)
         pg.reset_coordinator_for_tests()
         pg.GATE_INTERVAL_S = old_interval
         pg.GATE_TIMEOUT_S = old_timeout
+        pg.GATE_FRAME_COUNT = old_frames
 
     # --- unavailable when env off ---
     os.environ["QUOTE_PITCH_STATE"] = "0"
@@ -216,10 +220,9 @@ def main() -> int:
             is None
         )
 
-    # ensure research observer module still importable after set_active
     assert obs_mod.get_active_observer() is None
 
-    print("ok: pitch_gate sessions + pitch_gate size relax")
+    print("ok: pitch_gate 5-frame continue + buy-once + size relax")
     return 0
 
 

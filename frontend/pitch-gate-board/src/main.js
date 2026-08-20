@@ -4,12 +4,13 @@
 import { state } from "./state.js";
 import { $, escapeHtml } from "./utils.js";
 import { fetchGoals } from "./api.js";
-import { render, renderMeta } from "./render.js";
+import { consumeReversals, render, renderMeta } from "./render.js";
 
 async function refresh() {
   const snap = await fetchGoals(100);
   renderMeta(snap);
   render(snap.goals || []);
+  consumeReversals(snap.recent_reversals || [], { toast: true });
   return snap;
 }
 

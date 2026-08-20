@@ -5,4 +5,6 @@ export const state = {
   selectedKey: null,
   pollTimer: null,
   lastMeta: null,
+  seenReversalKeys: new Set(),
+  seededReversals: false,
 };

@@ -63,6 +63,45 @@ def main() -> int:
             assert img1.with_suffix(".json").is_file(), "missing per-frame sidecar"
             assert not (frame_dir / "pitch_state.json").exists(), "sequence summary should not be written"
 
+            # Expected DQD score must match OCR board score before in_play.
+            mismatch = pipeline.judge_inputs(
+                image=img1,
+                frame_meta={"expected_home_score": 1, "expected_away_score": 0},
+                ocr_engine=FakeOcrEngine(
+                    {
+                        "00_00s.jpg": [
+                            {"text": "控球", "score": 0.99, "box": [[100, 100], [120, 100], [120, 120], [100, 120]]},
+                            {"text": "0:0", "score": 0.98, "box": [[200, 360], [260, 360], [260, 384], [200, 384]]},
+                            {"text": "27:23", "score": 1.0, "box": [[180, 338], [240, 338], [240, 356], [180, 356]]},
+                        ]
+                    }
+                ),
+                append_output=False,
+                write_sidecars=False,
+            )
+            assert mismatch["play_state"] == "unclear", mismatch
+            assert mismatch.get("score_match") is False, mismatch
+            assert mismatch.get("ocr_score") == "0-0", mismatch
+            assert any("比分不一致" in str(e) for e in mismatch.get("evidence") or []), mismatch
+
+            matched = pipeline.judge_inputs(
+                image=img1,
+                frame_meta={"home_score": 1, "away_score": 0},
+                ocr_engine=FakeOcrEngine(
+                    {
+                        "00_00s.jpg": [
+                            {"text": "控球", "score": 0.99, "box": [[100, 100], [120, 100], [120, 120], [100, 120]]},
+                            {"text": "1:0", "score": 0.98, "box": [[200, 360], [260, 360], [260, 384], [200, 384]]},
+                        ]
+                    }
+                ),
+                append_output=False,
+                write_sidecars=False,
+            )
+            assert matched["play_state"] == "in_play", matched
+            assert matched.get("score_match") is True, matched
+            assert matched.get("ocr_score") == "1-0", matched
+
             stopped = pipeline.judge_inputs(
                 image=img2,
                 match_id="m1",

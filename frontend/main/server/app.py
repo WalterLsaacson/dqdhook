@@ -521,6 +521,7 @@ def status() -> dict[str, Any]:
                     "goal_count": st.get("goal_count"),
                     "in_play_count": st.get("in_play_count"),
                     "gate_goal_count": st.get("gate_goal_count"),
+                    "reversed_count": st.get("reversed_count"),
                 }
         boards_st.append(
             {
@@ -849,7 +850,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(pitch-gate: 5s/120s in_play → one buy)",
+        f"(pitch-gate: 5 frames @ 5s; first in_play → one buy)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

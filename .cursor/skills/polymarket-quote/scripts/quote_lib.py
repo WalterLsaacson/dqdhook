@@ -1934,8 +1934,9 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into quotes/trades.
 
-    Goal-ups wait for pitch-state ``in_play`` (5s screenshots ≤120s) before one
-    ``_quote_one``. DQD reversals cancel rest orders and open pitch-gate sessions.
+    Goal-ups wait for pitch-state ``in_play`` (5 frames @ 5s; buy once, keep
+    capturing) before one ``_quote_one``. DQD reversals cancel rest orders and
+    open pitch-gate sessions.
     """
     from score_events import (
         event_is_goal_up,
@@ -2111,10 +2112,11 @@ def process_bridge_events(
                     "pitch_gate": True,
                     "pitch_judge": item.get("judge"),
                     "pitch_elapsed_s": item.get("elapsed_s"),
+                    "pitch_sample_i": item.get("sample_i"),
                 }
                 print(
                     f"pitch-gate → BUY match_id={mid} key={key} "
-                    f"elapsed={item.get('elapsed_s')}",
+                    f"elapsed={item.get('elapsed_s')} sample={item.get('sample_i')}",
                     flush=True,
                 )
                 n_before = len(bundles)
@@ -2127,8 +2129,20 @@ def process_bridge_events(
                     bundles[-1]["pitch_gate"] = {
                         "status": "in_play",
                         "elapsed_s": item.get("elapsed_s"),
+                        "sample_i": item.get("sample_i"),
                         "judge": item.get("judge"),
                     }
+                continue
+            if status == "complete":
+                # Remaining frames finished after a prior in_play buy.
+                if key not in seen:
+                    seen.add(key)
+                print(
+                    f"pitch-gate → COMPLETE match_id={mid} key={key} "
+                    f"reason={item.get('reason')} "
+                    f"(frames done; buy_emitted={item.get('buy_emitted')})",
+                    flush=True,
+                )
                 continue
             mode = {
                 "timeout": "pitch_gate_timeout",
@@ -2136,6 +2150,14 @@ def process_bridge_events(
                 "unavailable": "pitch_gate_unavailable",
                 "error": "pitch_gate_error",
             }.get(status, f"pitch_gate_{status or 'unknown'}")
+            # Already bought this goal: cancel of leftover frames is informational.
+            if status == "canceled" and key in seen:
+                print(
+                    f"pitch-gate → CANCELED (after buy) match_id={mid} key={key} "
+                    f"reason={item.get('reason')}",
+                    flush=True,
+                )
+                continue
             bundles.append(
                 {
                     "quoted_at": now_cn_iso(),
@@ -2153,6 +2175,7 @@ def process_bridge_events(
                         "status": status,
                         "reason": item.get("reason"),
                         "elapsed_s": item.get("elapsed_s"),
+                        "buy_emitted": item.get("buy_emitted"),
                     },
                 }
             )

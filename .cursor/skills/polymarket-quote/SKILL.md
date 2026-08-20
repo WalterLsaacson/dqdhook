@@ -13,7 +13,7 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（两阳门控）**：DQD `score_change` 进球且已配对 → 每 **5s** 截图、窗口 **≤120s** → pitch-state `play_state=in_play` 后 **一刀** `_quote_one`（goals/ft 默认 **live**）；回撤取消门控；超时放弃。终场立刻询价（不经截图门控）。
+**当前策略（两阳门控）**：DQD `score_change` 进球且已配对 → 固定抓 **5** 张截图（间隔 **5s**）并逐帧判定；OCR 比分与 DQD 一致且 `play_state=in_play` 后 **一刀** `_quote_one`，后续帧继续判定但不再下单（goals/ft 默认 **live**）；比分不一致视为判定失败；回撤取消门控；5 帧皆无合格 in_play 则放弃。终场立刻询价（不经截图门控）。
 
 - 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**；**不自动 flatten**
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
@@ -53,7 +53,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
-   - `score_change` goal-up (paired) → **start pitch-gate** (5s/120s); quote only after `in_play`
+   - `score_change` goal-up (paired) → **start pitch-gate** (5 frames @ 5s); quote on first `in_play`, keep capturing
    - `score_change` reversal → cancel rest + cancel pitch-gate; no auto-flatten
    - `match_finished` → immediate quote (default live; stale / once-per-match skip)
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.

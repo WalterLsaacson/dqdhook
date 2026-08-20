@@ -173,24 +173,41 @@ export function eventKey(ev) {
 }
 
 export function pushToast(ev) {
-  if (!ev || ev.type !== "match_finished") return;
+  if (!ev) return;
   const key = eventKey(ev);
   if (state.seenEventKeys.has(key)) return;
+
+  const isFt = ev.type === "match_finished";
+  const isRev = ev.type === "score_change" && !!ev.is_reversal;
+  if (!isFt && !isRev) return;
   state.seenEventKeys.add(key);
 
   const stack = $("toasts");
   if (!stack) return;
   const el = document.createElement("div");
-  el.className = "toast toast--ft";
-  const score =
-    ev.home_score != null && ev.away_score != null
-      ? `${ev.home_score} - ${ev.away_score}`
-      : "FT";
+  el.className = isRev ? "toast toast--rev" : "toast toast--ft";
+  let score;
+  let badge;
+  let metaExtra;
+  if (isRev) {
+    const prev = ev.prev || {};
+    const curr = ev.curr || {};
+    score = `${prev.home ?? "?"}-${prev.away ?? "?"} → ${curr.home ?? "?"}-${curr.away ?? "?"}`;
+    badge = "回撤";
+    metaExtra = "比分回撤 · 门控取消";
+  } else {
+    score =
+      ev.home_score != null && ev.away_score != null
+        ? `${ev.home_score} - ${ev.away_score}`
+        : "FT";
+    badge = "FT";
+    metaExtra = "完场";
+  }
   el.innerHTML = `
-    <div class="toast__badge">FT</div>
+    <div class="toast__badge">${badge}</div>
     <div class="toast__body">
       <div class="toast__title">${escapeHtml(ev.home || "")} ${escapeHtml(score)} ${escapeHtml(ev.away || "")}</div>
-      <div class="toast__meta">${escapeHtml(ev.league || "")} · 完场${ev.ts ? ` · ${escapeHtml(formatBeijingDateTime(ev.ts))}` : ""}</div>
+      <div class="toast__meta">${escapeHtml(ev.league || "")} · ${metaExtra}${ev.ts ? ` · ${escapeHtml(formatBeijingDateTime(ev.ts))}` : ""}</div>
     </div>
   `;
   stack.prepend(el);
