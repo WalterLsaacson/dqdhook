@@ -373,14 +373,28 @@ class DqdStreamObserver:
         try:
             from playwright.sync_api import sync_playwright
         except Exception:
-            return False, "playwright_not_installed", "page"
+            return (
+                False,
+                "playwright_not_installed: pip install playwright && python3 -m playwright install chromium",
+                "page",
+            )
         wait_s = float(os.getenv("QUOTE_DQD_STREAM_PAGE_WAIT_S", "2.0") or 2.0)
         selector_timeout_s = float(
             os.getenv("QUOTE_DQD_STREAM_SELECTOR_TIMEOUT_S", "15") or 15
         )
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
+                try:
+                    browser = pw.chromium.launch(headless=True)
+                except Exception as launch_err:  # noqa: BLE001
+                    msg = str(launch_err)
+                    if "Executable doesn't exist" in msg or "playwright install" in msg:
+                        return (
+                            False,
+                            "playwright_browser_missing: python3 -m playwright install chromium",
+                            "page",
+                        )
+                    return False, f"playwright_launch_failed: {msg.splitlines()[0][:160]}", "page"
                 context = browser.new_context(
                     viewport={"width": 1280, "height": 900},
                     user_agent=(
@@ -425,7 +439,14 @@ class DqdStreamObserver:
                 context.close()
                 browser.close()
         except Exception as e:  # noqa: BLE001
-            return False, str(e), "page"
+            msg = str(e)
+            if "Executable doesn't exist" in msg or "playwright install" in msg:
+                return (
+                    False,
+                    "playwright_browser_missing: python3 -m playwright install chromium",
+                    "page",
+                )
+            return False, msg.splitlines()[0][:200] if msg else "page_capture_failed", "page"
         return (
             frame_path.is_file(),
             None if frame_path.is_file() else "page_capture_failed",
