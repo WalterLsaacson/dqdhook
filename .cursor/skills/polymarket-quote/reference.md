@@ -120,7 +120,9 @@ After a `score_change` that successfully `buy_win`s (dry_run or posted), watch w
 
 **DQD stream observe (trial, observe-only)**
 
-When `.env` has `QUOTE_DQD_STREAM_OBSERVE=1`, every DQD goal-up also schedules **6** screenshots at **t0/+10s/+20s/+30s/+40s/+50s** into `data/pm-quote/dqd_stream_observe.jsonl`, with JPEGs under `data/pm-quote/dqd_stream_frames/`. Discovery is best-effort from Dongqiudi live hints and otherwise falls back to page screenshots, so animation-only and video pages share one path. Missing `ffmpeg` / Playwright writes `ok=false` rows but does not affect trading.
+When `.env` has `QUOTE_DQD_STREAM_OBSERVE=1`, every DQD goal-up also schedules **6** screenshots at **t0/+10s/+20s/+30s/+40s/+50s** into `data/pm-quote/dqd_stream_observe.jsonl`, with JPEGs under `data/pm-quote/dqd_stream_frames/`. Discovery is best-effort from Dongqiudi live hints and otherwise falls back to page screenshots, so animation-only and video pages share one path. Rows include `frame_kind` (`animation` / `video` / `page`) for downstream classification. Missing `ffmpeg` / Playwright writes `ok=false` rows but does not affect trading.
+
+When `.env` has `QUOTE_PITCH_STATE=1`, the observer warms PaddleOCR at start and judges each successful screenshot immediately into `data/pm-quote/pitch_state_judge.jsonl`. Animation frames use local OCR/rules only; real video can fall back to an OpenAI-compatible vision model. Each frame also gets a sibling `.json` next to the JPEG (e.g. `00_00s.json`). This remains observe-only and does not gate trading.
 
 **Post-confirm DQD/AF sampling (disabled)**
 

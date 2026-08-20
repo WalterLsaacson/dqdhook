@@ -98,6 +98,12 @@ class DqdStreamObserver:
         self._thread.start()
         set_active_observer(self)
         logger.info("DQD stream observe on → %s", observe_path(self.root))
+        # Load PaddleOCR in the background so the first goal frame is not cold-start.
+        threading.Thread(
+            target=self._warmup_pitch_state,
+            name="pitch-state-ocr-warmup",
+            daemon=True,
+        ).start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -130,7 +136,9 @@ class DqdStreamObserver:
             away_score=ev.get("away_score"),
             t0_mono=time.monotonic(),
         )
-        self._write_rows([self._capture_row(job, sample_i=0, elapsed_s=0.0)])
+        row = self._capture_row(job, sample_i=0, elapsed_s=0.0)
+        self._write_rows([row])
+        self._schedule_judge_frame(row)
         self._q.put(job)
         return True
 
@@ -172,7 +180,10 @@ class DqdStreamObserver:
             if self._stop.is_set():
                 return
             elapsed = round(time.monotonic() - job.t0_mono, 3)
-            self._write_rows([self._capture_row(job, sample_i=sample_i, elapsed_s=elapsed)])
+            row = self._capture_row(job, sample_i=sample_i, elapsed_s=elapsed)
+            self._write_rows([row])
+            # Keep the sample clock on capture timing; OCR runs off-thread.
+            self._schedule_judge_frame(row)
 
     def _capture_row(self, job: _ObserveJob, *, sample_i: int, elapsed_s: float) -> dict[str, Any]:
         discover_timeout_s = float(os.getenv("QUOTE_DQD_STREAM_DISCOVER_TIMEOUT_S", "2.0") or 2.0)
@@ -189,19 +200,29 @@ class DqdStreamObserver:
         ok = False
         err: str | None = None
         method = "skipped"
+        frame_kind = "page"
         stream_url = str(info.get("stream_url") or "")
         page_url = str(info.get("page_url") or "")
         surface = str(info.get("surface") or "none")
+        # Animation surfaces must stay on page/OCR path even if a stream URL leaks in.
+        prefer_page = surface == "animation" or (bool(page_url) and not stream_url)
 
-        if stream_url:
+        if stream_url and not prefer_page:
             method = "ffmpeg"
             ok, err = self._capture_stream_fn(stream_url, frame_path)
-            if not ok and page_url:
+            if ok:
+                frame_kind = "video"
+            elif page_url:
                 method = "playwright"
-                ok, err = self._capture_page_fn(page_url, frame_path)
+                ok, err, frame_kind = self._capture_page(page_url, frame_path)
         elif page_url:
             method = "playwright"
-            ok, err = self._capture_page_fn(page_url, frame_path)
+            ok, err, frame_kind = self._capture_page(page_url, frame_path)
+        elif stream_url:
+            method = "ffmpeg"
+            ok, err = self._capture_stream_fn(stream_url, frame_path)
+            if ok:
+                frame_kind = "video"
         else:
             err = "no_live_surface"
 
@@ -225,6 +246,7 @@ class DqdStreamObserver:
             "page_url": page_url or None,
             "stream_url": stream_url or None,
             "capture_method": method,
+            "frame_kind": frame_kind,
             "frame_path": str(frame_path) if ok else None,
             "ok": bool(ok),
             "error": None if ok else (err or "capture_failed"),
@@ -233,6 +255,88 @@ class DqdStreamObserver:
 
     def _write_rows(self, rows: list[dict[str, Any]]) -> None:
         lib.append_jsonl(observe_path(self.root), rows)
+
+    def _capture_page(
+        self,
+        page_url: str,
+        frame_path: Path,
+    ) -> tuple[bool, str | None, str]:
+        result = self._capture_page_fn(page_url, frame_path)
+        if isinstance(result, tuple) and len(result) >= 3:
+            ok, err, frame_kind = result[0], result[1], result[2]
+            return bool(ok), err, str(frame_kind or "page")
+        if isinstance(result, tuple) and len(result) >= 2:
+            ok, err = result[0], result[1]
+            return bool(ok), err, "page"
+        return False, "invalid_capture_result", "page"
+
+    def _schedule_judge_frame(self, row: dict[str, Any]) -> None:
+        """Run pitch-state off the capture/event threads so sampling stays on schedule."""
+        if not _env_bool("QUOTE_PITCH_STATE", False):
+            return
+        if row.get("ok") is not True or not row.get("frame_path"):
+            return
+        sample_i = row.get("sample_i")
+        match_id = row.get("match_id")
+        threading.Thread(
+            target=self._maybe_judge_frame,
+            args=(row,),
+            name=f"pitch-state-{match_id}-{sample_i}",
+            daemon=True,
+        ).start()
+
+    def _maybe_judge_frame(self, row: dict[str, Any]) -> None:
+        if not _env_bool("QUOTE_PITCH_STATE", False):
+            return
+        if row.get("ok") is not True or not row.get("frame_path"):
+            return
+        try:
+            pitch_state_scripts = Path(__file__).resolve().parents[2] / "pitch-state" / "scripts"
+            if str(pitch_state_scripts) not in sys.path:
+                sys.path.insert(0, str(pitch_state_scripts))
+            from pipeline import judge_inputs  # type: ignore
+
+            judge_inputs(
+                image=Path(str(row["frame_path"])),
+                match_id=str(row.get("match_id") or "") or None,
+                event_key=str(row.get("event_key") or "") or None,
+                frame_meta={
+                    "sample_i": row.get("sample_i"),
+                    "elapsed_s": row.get("elapsed_s"),
+                    "surface": row.get("surface"),
+                    "stream_url": row.get("stream_url"),
+                    "page_url": row.get("page_url"),
+                    "frame_kind": row.get("frame_kind"),
+                    "match_id": row.get("match_id"),
+                    "event_key": row.get("event_key"),
+                },
+                append_output=True,
+                write_sidecars=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "pitch-state frame judge failed match=%s sample=%s",
+                row.get("match_id"),
+                row.get("sample_i"),
+            )
+
+    def _warmup_pitch_state(self) -> None:
+        if not _env_bool("QUOTE_PITCH_STATE", False):
+            return
+        try:
+            pitch_state_scripts = Path(__file__).resolve().parents[2] / "pitch-state" / "scripts"
+            if str(pitch_state_scripts) not in sys.path:
+                sys.path.insert(0, str(pitch_state_scripts))
+            from animation_ocr import warmup_ocr  # type: ignore
+
+            info = warmup_ocr()
+            if info.get("ok"):
+                print(f"pitch-state OCR ready ({info.get('latency_ms')}ms)", flush=True)
+            else:
+                print(f"pitch-state OCR warmup failed: {info.get('error')}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"pitch-state OCR warmup failed: {e}", flush=True)
+            logger.exception("pitch-state OCR warmup failed")
 
     @staticmethod
     def _capture_stream_ffmpeg(stream_url: str, frame_path: Path) -> tuple[bool, str | None]:
@@ -265,11 +369,11 @@ class DqdStreamObserver:
         return True, None
 
     @staticmethod
-    def _capture_page_playwright(page_url: str, frame_path: Path) -> tuple[bool, str | None]:
+    def _capture_page_playwright(page_url: str, frame_path: Path) -> tuple[bool, str | None, str]:
         try:
             from playwright.sync_api import sync_playwright
         except Exception:
-            return False, "playwright_not_installed"
+            return False, "playwright_not_installed", "page"
         wait_s = float(os.getenv("QUOTE_DQD_STREAM_PAGE_WAIT_S", "2.0") or 2.0)
         selector_timeout_s = float(
             os.getenv("QUOTE_DQD_STREAM_SELECTOR_TIMEOUT_S", "15") or 15
@@ -289,6 +393,7 @@ class DqdStreamObserver:
                 page = context.new_page()
                 page.goto(page_url, wait_until="networkidle", timeout=30000)
                 found_sel: str | None = None
+                frame_kind = "page"
                 deadline = time.monotonic() + selector_timeout_s
                 while time.monotonic() < deadline:
                     iframe = page.locator("iframe.md-anim-iframe")
@@ -297,6 +402,7 @@ class DqdStreamObserver:
                         try:
                             if src and iframe.first.is_visible():
                                 found_sel = "iframe.md-anim-iframe"
+                                frame_kind = "animation"
                                 break
                         except Exception:
                             pass
@@ -305,6 +411,7 @@ class DqdStreamObserver:
                         try:
                             if video.first.is_visible():
                                 found_sel = "video"
+                                frame_kind = "video"
                                 break
                         except Exception:
                             pass
@@ -318,8 +425,12 @@ class DqdStreamObserver:
                 context.close()
                 browser.close()
         except Exception as e:  # noqa: BLE001
-            return False, str(e)
-        return (frame_path.is_file(), None if frame_path.is_file() else "page_capture_failed")
+            return False, str(e), "page"
+        return (
+            frame_path.is_file(),
+            None if frame_path.is_file() else "page_capture_failed",
+            frame_kind,
+        )
 
 
 def try_create_observer(root: Path) -> DqdStreamObserver | None:
