@@ -492,10 +492,6 @@ class TradeExecutor:
         """Keep buy_win row as open lot for the channel's current dry/live mode."""
         if not row.get("success"):
             return False
-        ctx = row.get("trade_context") if isinstance(row.get("trade_context"), dict) else {}
-        # Grade C is trades-only — never rebuild into open exposure.
-        if str(ctx.get("odds_grade") or "").strip().upper() == "C":
-            return False
         sig = signal_from_event_key(str(row.get("event_key") or ""))
         channel_live = self._live_for_signal(sig)
         if channel_live:
@@ -900,16 +896,12 @@ class TradeExecutor:
                 }
         return fak_row
 
-    def _odds_grade(self, match_meta: dict[str, Any] | None) -> str:
-        # Odds A/B/C gates stripped — always empty so rest/grade paths stay inert.
-        return ""
-
     def _buy_target_usdc(
         self,
         quote: dict[str, Any],
         match_meta: dict[str, Any] | None,
     ) -> tuple[float, str]:
-        """Cushion rest target, or legacy trade_context target_usdc (rest-only)."""
+        """Cushion rest target only (quote_reversal_cushion → CUSHION_REST_USDC)."""
         ctx = (
             (match_meta or {}).get("trade_context")
             if isinstance((match_meta or {}).get("trade_context"), dict)
@@ -918,11 +910,7 @@ class TradeExecutor:
         base = str(ctx.get("base_event_key") or "")
         if quote_reversal_cushion(quote):
             return float(CUSHION_REST_USDC), base
-        try:
-            target = max(0.0, float(ctx.get("target_usdc") or 0))
-        except (TypeError, ValueError):
-            target = 0.0
-        return target, base
+        return 0.0, ""
 
     def _skip_rest_after_prepare(self, row: dict[str, Any] | None) -> bool:
         if not isinstance(row, dict):
@@ -961,16 +949,12 @@ class TradeExecutor:
         mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
         already = 0.0
         if target > 1e-9 and base and token_id:
-            prefix = base + "|odds_grade_"
             already = sum(
                 float(lot.get("usdc") or 0)
                 for lot in self.ledger.all_open()
                 if str(lot.get("token_id") or "") == token_id
                 and (not mid or str(lot.get("match_id") or "") == mid)
-                and (
-                    str(lot.get("event_key") or "") == base
-                    or str(lot.get("event_key") or "").startswith(prefix)
-                )
+                and str(lot.get("event_key") or "") == base
             )
             already += self._pending_already_usdc_locked(
                 token_id=token_id, match_id=mid, base_event_key=base
@@ -1174,9 +1158,7 @@ class TradeExecutor:
         if not posted:
             return None
 
-        grade = self._odds_grade(match_meta)
         for order in posted:
-            order["odds_grade"] = grade
             order["base_event_key"] = base
             order["target_usdc"] = target
             order["event_key"] = event_key
@@ -1217,7 +1199,6 @@ class TradeExecutor:
                         if quote.get("neg_risk") is not None
                         else None
                     ),
-                    odds_grade=grade,
                 )
             plan = FillPlan(
                 trade="buy_win",
@@ -1237,7 +1218,6 @@ class TradeExecutor:
                 "rest_orders": posted,
                 "rest_replace": replace,
                 "size_policy": {
-                    "odds_grade": self._odds_grade(match_meta),
                     "target_usdc": target,
                     "remaining_target_usdc": round(gap, 6),
                     "base_event_key": base,
@@ -1469,15 +1449,10 @@ class TradeExecutor:
                         levels_used=1,
                         levels=[{"price": order.get("price"), "size": delta_sh}],
                     )
-                    grade = str(
-                        order.get("odds_grade") or lot.get("odds_grade") or ""
-                    ).strip().upper()
                     fill_event_key = str(
                         order.get("event_key") or lot.get("event_key") or ""
                     )
                     fill_ctx: dict[str, Any] = {}
-                    if grade:
-                        fill_ctx["odds_grade"] = grade
                     if order.get("target_usdc") is not None:
                         fill_ctx["target_usdc"] = order.get("target_usdc")
                     elif lot.get("target_usdc") is not None:
@@ -1546,15 +1521,13 @@ class TradeExecutor:
         match_id: str,
         base_event_key: str,
     ) -> float:
-        prefix = base_event_key + "|odds_grade_"
         total = 0.0
         for p in self._pending.values():
             if str(p.get("token_id") or "") != token_id:
                 continue
             if match_id and str(p.get("match_id") or "") != match_id:
                 continue
-            ek = str(p.get("event_key") or "")
-            if ek == base_event_key or ek.startswith(prefix):
+            if str(p.get("event_key") or "") == base_event_key:
                 total += float(p.get("usdc") or 0)
         return total
 

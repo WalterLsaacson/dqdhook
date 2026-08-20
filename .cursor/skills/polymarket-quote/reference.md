@@ -24,7 +24,7 @@ Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
 |---|---|
 | `market_cache/*.json` | Keep open paired matches plus finished matches not yet present in `cursor.processed_ft_match_ids`; also scan `events.jsonl` so an unconsumed FT remains protected after it disappears from `matches.json`. Drop consumed FT / orphan. **Skip** if matches file missing / bad / empty. |
 | `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` / `post_goal_samples.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
-| `livescore_observe.jsonl` / historical `book_context_*` / `goal_context_*` | **Not pruned** (historical research) |
+| `livescore_observe.jsonl` | **Not pruned** (research) |
 | `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
 
 Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
@@ -103,9 +103,8 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 **Score reversal / disallowed goal**
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
-- AF referee and Odds/Bet365 gates are **removed**. Goal-ups and FT quote **immediately** (dry only this round). Events older than `QUOTE_FT_MAX_AGE_S` (default **900**) are skipped; FT once-per-`match_id` via `cursor.processed_ft_match_ids`.
+- Goal-ups and FT quote **immediately** on DQD events (dry only this round; AF/Odds gates removed). Events older than `QUOTE_FT_MAX_AGE_S` (default **900**) are skipped; FT once-per-`match_id` via `cursor.processed_ft_match_ids`.
 - DQD reversal cancels rest orders and **does not auto-flatten** (screenshot gate next round).
-- Open lots may still carry legacy `af_status` / `odds_grade` fields from older sessions.
 - Live flatten (when re-enabled later) FAK-sells floored shares with entry×80% floor; dry lots never CLOB-sell.
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
 - Dry-run logs `flatten_dry_run`. Open lots: `data/pm-quote/open_positions.json`.
@@ -120,13 +119,9 @@ When `.env` has `QUOTE_DQD_STREAM_OBSERVE=1`, every DQD goal-up also schedules *
 
 When `.env` has `QUOTE_PITCH_STATE=1`, the observer warms PaddleOCR at start and judges each successful screenshot immediately into `data/pm-quote/pitch_state_judge.jsonl`. Animation frames use local OCR/rules only; real video can fall back to an OpenAI-compatible vision model. Each frame also gets a sibling `.json` next to the JPEG (e.g. `00_00s.json`). This remains observe-only and does not gate trading.
 
-**Post-confirm DQD/AF / Odds sampling (removed)**
-
-AF referee, Odds/Bet365 graded buys, and book-context observe are deleted. Historical `book_context_*` / `goal_context_*` / `af_confirmed_scores.json` may remain on disk.
-
 **Live Score API observe (trial, observe-only)**
 
-When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, DQD-reversal (and any remaining LSA hooks) may resolve the fixture via `scores/live.json`, then pull **raw** `matches/events.json` (GOAL/score) and `commentary/events.json` (VAR if package allows; errors kept raw) into `data/pm-quote/livescore_observe.jsonl`. DQD→LSA id map cached in `livescore_match_map.json`. Trial is not expected to expose `KICK_OFF`. Does **not** gate buys or flatten.
+When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, DQD-reversal may resolve the fixture via `scores/live.json`, then pull **raw** `matches/events.json` (GOAL/score) and `commentary/events.json` (VAR if package allows; errors kept raw) into `data/pm-quote/livescore_observe.jsonl`. DQD→LSA id map cached in `livescore_match_map.json`. Trial is not expected to expose `KICK_OFF`. Does **not** gate buys or flatten.
 
 **System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` as **forced dry** (+ repo `.env`). Live CLOB paused pending screenshot gate. Logs: `data/pm-quote/watch.log`.
 

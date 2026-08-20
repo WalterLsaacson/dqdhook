@@ -1934,9 +1934,9 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into dry quotes.
 
-    AF referee and Odds/Bet365 gates are removed. Live CLOB buys are paused
-    at the hub/settings layer; this path quotes immediately on DQD events.
-    DQD reversals cancel rest orders but do not auto-flatten.
+    Live CLOB buys are paused at the hub/settings layer; this path quotes
+    immediately on DQD events. DQD reversals cancel rest orders but do not
+    auto-flatten.
     """
     from score_events import (
         event_is_goal_up,

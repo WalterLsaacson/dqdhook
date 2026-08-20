@@ -5,8 +5,7 @@ Trial-oriented: does **not** rely on ``KICK_OFF``. Pulls:
   - ``matches/events.json`` → GOAL / score raw
   - ``commentary/events.json`` → VAR_* if package allows (else keep HTTP error raw)
 
-Phases (same timing as goal-context observe):
-  - ``af_confirmed`` / ``post_confirm_15s`` / ``post_confirm_45s`` / ``dqd_reversal``
+Phase: ``dqd_reversal`` only (AF confirm / post-confirm timers removed).
 
 Does **not** gate buys or flatten. Enabled only when
 ``LIVESCORE_API_KEY`` + ``LIVESCORE_API_SECRET`` are set.
@@ -44,15 +43,10 @@ COMMENTARY_PATH = "/commentary/events.json"
 ENV_KEY = "LIVESCORE_API_KEY"
 ENV_SECRET = "LIVESCORE_API_SECRET"
 
-DEFAULT_DELAY_15_S = 15.0
-DEFAULT_DELAY_45_S = 45.0
 DEFAULT_WORKERS = 4
 DEFAULT_HTTP_TIMEOUT_S = 12.0
 DEFAULT_MIN_SIDE_SIM = 0.72
 
-PHASE_AF_CONFIRMED = "af_confirmed"
-PHASE_POST_15 = "post_confirm_15s"
-PHASE_POST_45 = "post_confirm_45s"
 PHASE_DQD_REVERSAL = "dqd_reversal"
 
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
@@ -100,9 +94,6 @@ def load_credentials(*, env: dict[str, str] | None = None) -> tuple[str, str] | 
 
 def try_create_observer(
     root: Path,
-    *,
-    delay_15_s: float = DEFAULT_DELAY_15_S,
-    delay_45_s: float = DEFAULT_DELAY_45_S,
     **kwargs: Any,
 ) -> "LiveScoreObserver | None":
     creds = load_credentials()
@@ -112,8 +103,6 @@ def try_create_observer(
         root,
         api_key=creds[0],
         api_secret=creds[1],
-        delay_15_s=delay_15_s,
-        delay_45_s=delay_45_s,
         **kwargs,
     )
 
@@ -246,7 +235,7 @@ class _GroupState:
 
 
 class LiveScoreObserver:
-    """Background LSA snapshots for AF-confirmed goals and DQD reversals."""
+    """Background LSA snapshots for DQD reversals (observe-only)."""
 
     def __init__(
         self,
@@ -254,8 +243,6 @@ class LiveScoreObserver:
         *,
         api_key: str,
         api_secret: str,
-        delay_15_s: float = DEFAULT_DELAY_15_S,
-        delay_45_s: float = DEFAULT_DELAY_45_S,
         workers: int = DEFAULT_WORKERS,
         http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
         min_side_sim: float = DEFAULT_MIN_SIDE_SIM,
@@ -266,8 +253,6 @@ class LiveScoreObserver:
         self.root = Path(root)
         self.api_key = str(api_key or "").strip()
         self.api_secret = str(api_secret or "").strip()
-        self.delay_15_s = max(0.0, float(delay_15_s))
-        self.delay_45_s = max(0.0, float(delay_45_s))
         self.http_timeout_s = max(0.5, float(http_timeout_s))
         self.min_side_sim = float(min_side_sim)
         self._fetch_live = fetch_live
@@ -288,10 +273,8 @@ class LiveScoreObserver:
         self._stop.clear()
         set_active_observer(self)
         logger.info(
-            "livescore observe on → %s (delays=%ss/%ss)",
+            "livescore observe on → %s",
             observe_path(self.root),
-            self.delay_15_s,
-            self.delay_45_s,
         )
 
     def stop(self) -> None:
@@ -307,68 +290,6 @@ class LiveScoreObserver:
             self._pool.shutdown(wait=False)
         if get_active_observer() is self:
             set_active_observer(None)
-
-    def on_af_confirmed(
-        self,
-        root: Path | None = None,
-        *,
-        match_id: str,
-        event_key: str,
-        ev: dict[str, Any] | None = None,
-        af_gate: dict[str, Any] | None = None,
-    ) -> str | None:
-        if self._stop.is_set():
-            return None
-        mid = str(match_id or "").strip()
-        if not mid:
-            return None
-        ev = ev if isinstance(ev, dict) else {}
-        gate = af_gate if isinstance(af_gate, dict) else {}
-        home = ev.get("home_score", gate.get("home_score"))
-        away = ev.get("away_score", gate.get("away_score"))
-        if isinstance(gate.get("goals"), dict):
-            g = gate["goals"]
-            if home is None:
-                home = g.get("home")
-            if away is None:
-                away = g.get("away")
-        key = str(event_key or "")
-        group_id = make_observe_group_id(mid, home, away, key)
-        dqd_score = {"home": home, "away": away}
-        with self._lock:
-            prev = self._by_match.get(mid)
-            if prev is not None:
-                for t in prev.timers:
-                    t.cancel()
-                prev.timers.clear()
-                gen = prev.gen + 1
-            else:
-                gen = 1
-            state = _GroupState(
-                observe_group_id=group_id,
-                match_id=mid,
-                event_key=key,
-                home=str(ev.get("home") or ""),
-                away=str(ev.get("away") or ""),
-                dqd_score=dqd_score,
-                gen=gen,
-            )
-            self._by_match[mid] = state
-            self._arm_delayed(state)
-        self._pool.submit(
-            self._safe_snapshot,
-            PHASE_AF_CONFIRMED,
-            state.observe_group_id,
-            mid,
-            key,
-            state.home,
-            state.away,
-            dict(dqd_score),
-            None,
-            False,
-            gen,
-        )
-        return group_id
 
     def on_dqd_reversal(
         self,
@@ -434,40 +355,6 @@ class LiveScoreObserver:
             gen,
         )
         return group_id
-
-    def _arm_delayed(self, state: _GroupState) -> None:
-        for delay, phase in (
-            (self.delay_15_s, PHASE_POST_15),
-            (self.delay_45_s, PHASE_POST_45),
-        ):
-            gen = state.gen
-
-            def _fire(ph: str = phase, g: int = gen, mid: str = state.match_id) -> None:
-                if self._stop.is_set():
-                    return
-                with self._lock:
-                    cur = self._by_match.get(mid)
-                    if cur is None or cur.gen != g:
-                        return
-                    snap_state = cur
-                self._pool.submit(
-                    self._safe_snapshot,
-                    ph,
-                    snap_state.observe_group_id,
-                    snap_state.match_id,
-                    snap_state.event_key,
-                    snap_state.home,
-                    snap_state.away,
-                    dict(snap_state.dqd_score),
-                    None,
-                    False,
-                    g,
-                )
-
-            t = threading.Timer(delay, _fire)
-            t.daemon = True
-            state.timers.append(t)
-            t.start()
 
     def _load_match_map(self) -> None:
         path = match_map_path(self.root)
@@ -674,12 +561,6 @@ class LiveScoreObserver:
     ) -> None:
         if self._stop.is_set():
             return
-        if phase in (PHASE_POST_15, PHASE_POST_45):
-            with self._lock:
-                cur = self._by_match.get(match_id)
-                if cur is None or cur.gen != gen:
-                    return
-
         errors: dict[str, Any] = {}
         resolve = self._resolve_for_match(match_id, home, away)
         lsa_match_id = resolve.get("lsa_match_id")

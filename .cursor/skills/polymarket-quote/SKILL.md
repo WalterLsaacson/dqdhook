@@ -102,8 +102,6 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots |
 | Cursor | `data/pm-quote/cursor.json` | Processed keys / FT ids / offset |
 
-Historical (no longer written): `book_context_observe.jsonl`, `af_confirmed_scores.json`, `goal_context_observe.jsonl`.
-
 ## Related skills
 
 - [`match-bridge`](../match-bridge/SKILL.md) — FT / score_change trigger
