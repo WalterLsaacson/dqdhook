@@ -15,8 +15,29 @@
 - `frame_kind=animation`
 - `surface=animation`
 - `iframe.md-anim-iframe`
-- tracker 域名（如 `tracker.namitiyu.com`）
+- tracker 域名（**纳米数据**）
 - 绿色球场 + 固定底部比分栏 + 中文事件文案
+
+### Upstream (Dongqiudi → namitiyu)
+
+官网动画不是懂球帝自研，而是嵌纳米 tracker：
+
+```text
+https://tracker.namitiyu.com/zh/football?profile=<partner>&id=<nami_match_id>
+```
+
+DQD `match_id` → full URL via:
+
+```text
+GET https://www.dongqiudi.com/magicball/v1/match/app/detail?id=<dqd_match_id>&app=dqd&lang=zh-cn
+→ living[] / matchLiving[] with live_type=animation → url
+```
+
+- `profile`：懂球帝合作方 slot（观察到恒为 `yADdIyHoruqHP`）
+- namitiyu `id`：**不等于** DQD `match_id`，只能从返回的 `url` 解析
+- 相关域：`tracker.namitiyu.com`、`tracker-api.namitiyu.com`、`cdn.namitiyu.com`、`s.namitiyu.com`
+
+Full notes: [`dongqiudi-match/reference.md`](../dongqiudi-match/reference.md)#animation-live-纳米数据--namitiyu.
 
 ### OCR keyword table
 

@@ -128,6 +128,15 @@ After a `score_change` that successfully `buy_win`s (dry_run or posted), watch w
 
 Pitch-gate drives **5** captures at 5s after a paired goal (continues after first `in_play` buy). Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
 
+**Animation source (纳米数据):** Dongqiudi embeds `iframe.md-anim-iframe` pointing at `https://tracker.namitiyu.com/zh/football?profile=…&id=…`. Map DQD → tracker via:
+
+```text
+GET /magicball/v1/match/app/detail?id=<dqd_match_id>&app=dqd&lang=zh-cn
+→ living[] / matchLiving[] where live_type=animation → url
+```
+
+`profile` is the DQD partner slot (observed `yADdIyHoruqHP`); namitiyu `id` ≠ DQD `match_id` and must come from that URL. Prefer opening the tracker URL directly for OCR (avoids copyright `video` on the match page). Details: [`dongqiudi-match/reference.md`](../dongqiudi-match/reference.md)#animation-live-纳米数据--namitiyu.
+
 Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`.
 
 **Pitch Gate board (System Main)**

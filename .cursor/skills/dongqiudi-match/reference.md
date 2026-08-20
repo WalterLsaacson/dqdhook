@@ -113,6 +113,54 @@ DQD_SCORE_CHANGE {"type":"score_change",...}
   - **extra_time**: playing, no injury_time, and minute > 90 (or ET/PEN period) — logged only
 - First sighting of a match only seeds `prev_scores`; it does not emit an event
 
+## Animation live (纳米数据 / namitiyu)
+
+官网「动画直播」是 **纳米数据** iframe，不是懂球帝自研画面。
+
+### How DQD match_id maps to the tracker URL
+
+There is **no local formula** that turns a Dongqiudi `match_id` into a namitiyu id. Resolve via:
+
+```
+GET https://www.dongqiudi.com/magicball/v1/match/app/detail
+  ?id=<dqd_match_id>
+  &app=dqd
+  &lang=zh-cn
+```
+
+Response (top-level JSON, not always wrapped in `{code,data}`):
+
+- `living[]` / `matchLiving[]` — live surfaces for the match
+- Pick the entry with `live_type` / `ios_play_by` / `android_play_by` = `animation`
+- That entry’s `url` is the full tracker page to embed / screenshot
+
+Example (observed 2026-08-21):
+
+| DQD `match_id` | namitiyu tracker `url` |
+|---|---|
+| `54544881` | `https://tracker.namitiyu.com/zh/football?profile=yADdIyHoruqHP&id=4608865` |
+| `54544883` | `https://tracker.namitiyu.com/zh/football?profile=yADdIyHoruqHP&id=4608866` |
+
+URL shape:
+
+```text
+https://tracker.namitiyu.com/zh/football?profile=<partner_profile>&id=<nami_match_id>
+```
+
+- `profile` — partner slot for 懂球帝; observed constant `yADdIyHoruqHP` across matches
+- `id` — **纳米侧比赛 id**（与 DQD `match_id` 不同；必须从 `living[].url` 解析）
+- Page title: `纳米数据-足球动画`; DOM on DQD match page: `iframe.md-anim-iframe`
+
+Related hosts once the tracker page loads:
+
+| Host | Role |
+|---|---|
+| `tracker.namitiyu.com` | Animation HTML / JS |
+| `tracker-api.namitiyu.com` | Progress / config APIs |
+| `cdn.namitiyu.com` / `s.namitiyu.com` | Static assets |
+
+**Note:** `/magicball/v1/match/detail?match_id=` often returns an empty stub (`animation: null`). Prefer **`/match/app/detail?id=`** for live surfaces. `scripts/dqd_live.py` still probes older endpoints and may fall back to `https://www.dongqiudi.com/match/{id}` page screenshots.
+
 ## State files (`data/`)
 
 | File | Role |
@@ -120,6 +168,7 @@ DQD_SCORE_CHANGE {"type":"score_change",...}
 | `snapshot.json` | Last `list` / `watch` snapshot |
 | `prev_scores.json` | `{match_id: {home, away}}` baseline for diffs |
 | `events.jsonl` | Append-only score_change log |
+| `dqd_live_cache.json` | Cached live-surface discovery (page/stream hints) |
 
 ## Loop integration
 

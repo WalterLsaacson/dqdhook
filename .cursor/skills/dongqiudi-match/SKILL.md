@@ -41,7 +41,7 @@ Defaults: soccer only, `language=en`, **`--days 3`**. Today from `match_list`; l
 2. **Watch scores** — prefer `watch --tab hot --once` on a loop (`/loop 15s` when live; 30–60s when idle). Resident `watch` without `--once` is fine for a dedicated terminal.
 3. **On score change** — text mode prints `DQD_SCORE_CHANGE {...}` on stdout; every mode appends the same object to `data/events.jsonl`. With `--json`, read the `events` array instead. Forward that JSON to any cooperating skill the user named (notify / announce / log). Do not invent events.
 4. **Extra time** — DQD `injury_time > 0` ⇒ 伤停补时 (still emit). Playing with `minute > 90` and no injury_time (or ET period) ⇒ 加时: **still append** `events.jsonl` with `extra_time=true`, but **do not** print sentinels / include in watch `events` for downstream.
-5. **Live-surface discovery (observe-only)** — cooperating skills may resolve a goal match to a Dongqiudi page / stream hint via `scripts/dqd_live.py`, then screenshot either page animation or video at t0/+10…+50s. This is research-only and does not change score events.
+5. **Live-surface discovery (observe-only)** — cooperating skills may resolve a goal match to a Dongqiudi page / stream hint via `scripts/dqd_live.py`, then screenshot either page animation or video. **Official animation source** is 纳米数据: call `/magicball/v1/match/app/detail?id=<dqd_match_id>&app=dqd` → `living[]` entry with `live_type=animation` → full `tracker.namitiyu.com` URL (see [reference.md](reference.md)#animation-live-纳米数据--namitiyu). Research/gate only; does not change score events.
 
 ## Cooperation contract (for other skills)
 
