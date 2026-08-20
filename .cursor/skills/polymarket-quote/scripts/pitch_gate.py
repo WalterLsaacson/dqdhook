@@ -1,4 +1,4 @@
-"""Pitch-screenshot gate: DQD goal → 5 frames @ 5s → first in_play buys once."""
+"""Pitch-screenshot gate: first frame @+5s, then every 5s until 2.5min; buy once on in_play."""
 
 from __future__ import annotations
 
@@ -13,9 +13,14 @@ from typing import Any, Callable
 logger = logging.getLogger("pm_quote.pitch_gate")
 
 GATE_INTERVAL_S = 5.0
-GATE_FRAME_COUNT = 5
-# Safety ceiling for the whole session (capture + OCR can overrun intervals).
-GATE_TIMEOUT_S = 90.0
+# First capture is delayed so celebration/VAR overlays can clear.
+GATE_FIRST_DELAY_S = 5.0
+# Minimum captures for the board / research trail (keep going after early in_play).
+GATE_MIN_FRAMES = 5
+# Hard ceiling for the whole session (not a max frame count).
+GATE_TIMEOUT_S = 150.0
+# Backward-compat alias used by older smokes/docs.
+GATE_FRAME_COUNT = GATE_MIN_FRAMES
 
 OnInPlay = Callable[[dict[str, Any]], None]
 # result payload: {status, event_key, match_id, ev, judge?, reason?, elapsed_s?}
@@ -131,8 +136,9 @@ class PitchGateCoordinator:
         thread.start()
         print(
             f"pitch-gate → START match_id={mid} key={key} "
-            f"frames={GATE_FRAME_COUNT} interval={GATE_INTERVAL_S:g}s "
-            f"(buy on first in_play; keep capturing)",
+            f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
+            f"min_frames={GATE_MIN_FRAMES} timeout={GATE_TIMEOUT_S:g}s "
+            f"(buy on first in_play; keep capturing until timeout)",
             flush=True,
         )
         return True
@@ -189,7 +195,7 @@ class PitchGateCoordinator:
         print(
             f"pitch-gate → IN_PLAY (buy once) match_id={session.match_id} "
             f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
-            f"· continue → {GATE_FRAME_COUNT} frames",
+            f"· continue ≥{GATE_MIN_FRAMES} frames / ≤{GATE_TIMEOUT_S:g}s",
             flush=True,
         )
         return True
@@ -202,6 +208,7 @@ class PitchGateCoordinator:
         judge: dict[str, Any] | None = None,
         reason: str = "",
         elapsed_s: float | None = None,
+        frames: int | None = None,
     ) -> None:
         with self._lock:
             if session.finished:
@@ -226,29 +233,32 @@ class PitchGateCoordinator:
                     "judge": judge,
                     "reason": reason or status,
                     "elapsed_s": elapsed_s,
+                    "frames": frames,
                     "buy_emitted": bool(session.buy_emitted),
                 }
             )
 
     def _run_session(self, session: _GateSession, observer: Any) -> None:
+        captured = 0
+        sample_i = 0
         try:
-            for sample_i in range(GATE_FRAME_COUNT):
+            # First frame at t0 + GATE_FIRST_DELAY_S (default +5s after goal).
+            first_t = session.t0_mono + max(0.0, float(GATE_FIRST_DELAY_S))
+            while not session.cancel.is_set():
+                now = time.monotonic()
+                if now - session.t0_mono > GATE_TIMEOUT_S + 1e-9:
+                    break
+                if now >= first_t:
+                    break
+                time.sleep(min(0.2, max(0.0, first_t - now)))
+
+            while True:
                 if session.cancel.is_set():
                     break
                 elapsed = time.monotonic() - session.t0_mono
+                # Stop starting new captures after the hard timeout.
                 if elapsed > GATE_TIMEOUT_S + 1e-9:
-                    self._finish_session(
-                        session,
-                        status="timeout",
-                        reason="pitch_gate_timeout",
-                        elapsed_s=round(elapsed, 3),
-                    )
-                    print(
-                        f"pitch-gate → TIMEOUT match_id={session.match_id} "
-                        f"key={session.event_key} elapsed={elapsed:.1f}s",
-                        flush=True,
-                    )
-                    return
+                    break
 
                 job = _CaptureJob(
                     match_id=session.match_id,
@@ -268,6 +278,7 @@ class PitchGateCoordinator:
                     observer._write_rows([row])
                 except Exception:  # noqa: BLE001
                     logger.exception("pitch-gate observe write failed")
+                captured += 1
 
                 if row.get("ok") is True and row.get("frame_path"):
                     judged = _judge_frame_sync(row)
@@ -281,25 +292,33 @@ class PitchGateCoordinator:
                             elapsed_s=round(time.monotonic() - session.t0_mono, 3),
                             sample_i=sample_i,
                         )
-                        # Keep capturing remaining frames; do not return.
+                        # Keep capturing until timeout; do not return.
 
-                if sample_i + 1 >= GATE_FRAME_COUNT:
+                sample_i += 1
+                next_t = (
+                    session.t0_mono
+                    + max(0.0, float(GATE_FIRST_DELAY_S))
+                    + sample_i * GATE_INTERVAL_S
+                )
+                # Next slot past the timeout ceiling → done.
+                if next_t - session.t0_mono > GATE_TIMEOUT_S + 1e-9:
                     break
-                next_t = session.t0_mono + (sample_i + 1) * GATE_INTERVAL_S
                 while not session.cancel.is_set():
                     now = time.monotonic()
                     if now >= next_t:
                         break
                     if now - session.t0_mono > GATE_TIMEOUT_S:
                         break
-                    time.sleep(min(0.2, next_t - now))
+                    time.sleep(min(0.2, max(0.0, next_t - now)))
 
+            elapsed_end = round(time.monotonic() - session.t0_mono, 3)
             if session.cancel.is_set():
                 self._finish_session(
                     session,
                     status="canceled",
                     reason=getattr(session, "cancel_reason", None) or "canceled",
-                    elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                    elapsed_s=elapsed_end,
+                    frames=captured,
                 )
                 return
 
@@ -307,25 +326,32 @@ class PitchGateCoordinator:
                 self._finish_session(
                     session,
                     status="complete",
-                    reason=f"captured_{GATE_FRAME_COUNT}_frames",
-                    elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                    reason=f"captured_{captured}_frames",
+                    elapsed_s=elapsed_end,
+                    frames=captured,
                 )
                 print(
                     f"pitch-gate → COMPLETE match_id={session.match_id} "
-                    f"key={session.event_key} frames={GATE_FRAME_COUNT} "
-                    f"(buy already emitted)",
+                    f"key={session.event_key} frames={captured} "
+                    f"elapsed={elapsed_end:.1f}s (buy already emitted)",
                     flush=True,
                 )
             else:
                 self._finish_session(
                     session,
                     status="timeout",
-                    reason=f"no_in_play_in_{GATE_FRAME_COUNT}_frames",
-                    elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                    reason=(
+                        f"no_in_play_in_{captured}_frames"
+                        if captured
+                        else "pitch_gate_timeout"
+                    ),
+                    elapsed_s=elapsed_end,
+                    frames=captured,
                 )
                 print(
                     f"pitch-gate → NO_IN_PLAY match_id={session.match_id} "
-                    f"key={session.event_key} frames={GATE_FRAME_COUNT}",
+                    f"key={session.event_key} frames={captured} "
+                    f"elapsed={elapsed_end:.1f}s",
                     flush=True,
                 )
         except Exception as e:  # noqa: BLE001
@@ -339,6 +365,7 @@ class PitchGateCoordinator:
                 status="error",
                 reason=str(e),
                 elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                frames=captured,
             )
 
 
@@ -383,8 +410,6 @@ def _judge_frame_sync(row: dict[str, Any]) -> dict[str, Any] | None:
                 "gate": True,
                 "home_score": row.get("home_score"),
                 "away_score": row.get("away_score"),
-                "expected_home_score": row.get("home_score"),
-                "expected_away_score": row.get("away_score"),
             },
             append_output=True,
             write_sidecars=True,

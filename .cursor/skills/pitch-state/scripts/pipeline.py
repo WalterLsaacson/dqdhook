@@ -76,8 +76,6 @@ def load_observe_frames(
                 "event_key": row.get("event_key"),
                 "home_score": row.get("home_score"),
                 "away_score": row.get("away_score"),
-                "expected_home_score": row.get("home_score"),
-                "expected_away_score": row.get("away_score"),
             }
         )
     rows.sort(key=lambda row: (float(row.get("elapsed_s") or 0.0), int(row.get("sample_i") or 0)))
@@ -122,22 +120,9 @@ def _normalize_frames(
                 "event_key": meta.get("event_key") or event_key,
                 "home_score": meta.get("home_score"),
                 "away_score": meta.get("away_score"),
-                "expected_home_score": meta.get("expected_home_score", meta.get("home_score")),
-                "expected_away_score": meta.get("expected_away_score", meta.get("away_score")),
             }
         )
     return frames
-
-
-def _expected_scores(frame: dict[str, Any]) -> tuple[Any, Any]:
-    """DQD expected score from frame meta / observe row (gate path)."""
-    h = frame.get("expected_home_score")
-    a = frame.get("expected_away_score")
-    if h is None:
-        h = frame.get("home_score")
-    if a is None:
-        a = frame.get("away_score")
-    return h, a
 
 
 def _judge_animation_frame(
@@ -170,12 +155,7 @@ def _judge_animation_frame(
             "stopped_reason": None,
             "evidence": [f"OCR unavailable: {ocr.get('error') or 'unknown'}"],
         }
-    exp_h, exp_a = _expected_scores(frame)
-    judged = judge_animation(
-        list(ocr.get("lines") or []),
-        expected_home=exp_h,
-        expected_away=exp_a,
-    )
+    judged = judge_animation(list(ocr.get("lines") or []))
     judged["frame_type"] = "animation"
     judged["ocr_lines"] = ocr.get("lines") or []
     return judged
@@ -204,10 +184,6 @@ def write_frame_sidecars(result: dict[str, Any]) -> list[str]:
             "evidence": row.get("evidence") or result.get("evidence") or [],
             "decision_source": result.get("decision_source"),
             "latency_ms": result.get("latency_ms"),
-            "ocr_score": row.get("ocr_score", result.get("ocr_score")),
-            "score_match": row.get("score_match", result.get("score_match")),
-            "expected_home_score": result.get("expected_home_score"),
-            "expected_away_score": result.get("expected_away_score"),
         }
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -231,14 +207,6 @@ def _judge_single_frame(
     play_state = "unclear"
     confidence = 0.0
     stopped_reason = None
-    score_fields: dict[str, Any] = {
-        "ocr_score": None,
-        "ocr_home_score": None,
-        "ocr_away_score": None,
-        "expected_home_score": None,
-        "expected_away_score": None,
-        "score_match": None,
-    }
 
     per_row = {
         "sample_i": frame.get("sample_i"),
@@ -249,22 +217,12 @@ def _judge_single_frame(
 
     if frame_type in {"animation", "unknown"}:
         judged = _judge_animation_frame(frame, ocr_engine)
-        score_fields = {
-            "ocr_score": judged.get("ocr_score"),
-            "ocr_home_score": judged.get("ocr_home_score"),
-            "ocr_away_score": judged.get("ocr_away_score"),
-            "expected_home_score": judged.get("expected_home_score"),
-            "expected_away_score": judged.get("expected_away_score"),
-            "score_match": judged.get("score_match"),
-        }
         per_row.update(
             {
                 "play_state": judged.get("play_state"),
                 "confidence": judged.get("confidence"),
                 "stopped_reason": judged.get("stopped_reason"),
                 "evidence": judged.get("evidence"),
-                "ocr_score": score_fields["ocr_score"],
-                "score_match": score_fields["score_match"],
             }
         )
         if frame_type == "unknown" and judged.get("play_state") != "unclear":
@@ -320,7 +278,6 @@ def _judge_single_frame(
             "error": None,
             "match_id": match_id or frame.get("match_id"),
             "event_key": event_key or frame.get("event_key"),
-            **score_fields,
         }
     )
 

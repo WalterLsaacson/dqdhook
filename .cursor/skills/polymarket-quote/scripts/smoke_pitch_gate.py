@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: pitch-gate sessions (5 frames, buy-once, timeout / cancel / multi-match)."""
+"""Smoke: pitch-gate (≥5 frames until timeout, buy-once, cancel / multi-match)."""
 
 from __future__ import annotations
 
@@ -65,9 +65,13 @@ def main() -> int:
 
     old_interval = pg.GATE_INTERVAL_S
     old_timeout = pg.GATE_TIMEOUT_S
-    old_frames = pg.GATE_FRAME_COUNT
+    old_min = pg.GATE_MIN_FRAMES
+    old_first = pg.GATE_FIRST_DELAY_S
+    # ~7 frames after first delay: 0.05 + 0..0.30 @ 0.05s.
+    pg.GATE_FIRST_DELAY_S = 0.05
     pg.GATE_INTERVAL_S = 0.05
-    pg.GATE_TIMEOUT_S = 5.0
+    pg.GATE_TIMEOUT_S = 0.37
+    pg.GATE_MIN_FRAMES = 5
     pg.GATE_FRAME_COUNT = 5
 
     import pitch_gate as pg_mod
@@ -75,7 +79,7 @@ def main() -> int:
     orig_judge = pg_mod._judge_frame_sync
 
     try:
-        # --- in_play fires once; still captures all 5 frames → complete ---
+        # --- in_play fires once; keep capturing past min until timeout → complete ---
         pg.reset_coordinator_for_tests()
         fake = _FakeObserver()
         set_active_observer(fake)  # type: ignore[arg-type]
@@ -107,13 +111,17 @@ def main() -> int:
             statuses = [d["status"] for d in done]
             assert "in_play" in statuses, done
             assert "complete" in statuses, done
-            assert fake.frames == 5, fake.frames
+            assert fake.frames >= pg.GATE_MIN_FRAMES, fake.frames
+            assert fake.frames > pg.GATE_MIN_FRAMES, (
+                f"expected more than min frames until timeout, got {fake.frames}"
+            )
             # Buy only once even though later frames also in_play.
             assert sum(1 for d in done if d["status"] == "in_play") == 1
-            assert judges["n"] == 5
+            assert judges["n"] == fake.frames
 
-            # --- timeout: never in_play across all frames ---
+            # --- timeout: never in_play until wall clock expires ---
             judges["n"] = 0
+            frames_before = fake.frames
 
             def always_stopped(**_kwargs: Any) -> dict[str, Any]:
                 judges["n"] += 1
@@ -124,7 +132,9 @@ def main() -> int:
             done2 = _wait_done(coord, n=1, timeout=3.0)
             assert len(done2) == 1 and done2[0]["status"] == "timeout", done2
             assert done2[0].get("buy_emitted") is False
-            assert judges["n"] == 5
+            frames_m2 = fake.frames - frames_before
+            assert frames_m2 >= pg.GATE_MIN_FRAMES, frames_m2
+            assert judges["n"] == frames_m2
 
             # --- cancel mid-session ---
             assert coord.start_gate({**ev, "match_id": "m3"}, event_key="k3")
@@ -159,7 +169,9 @@ def main() -> int:
         pg.reset_coordinator_for_tests()
         pg.GATE_INTERVAL_S = old_interval
         pg.GATE_TIMEOUT_S = old_timeout
-        pg.GATE_FRAME_COUNT = old_frames
+        pg.GATE_MIN_FRAMES = old_min
+        pg.GATE_FIRST_DELAY_S = old_first
+        pg.GATE_FRAME_COUNT = old_min
 
     # --- unavailable when env off ---
     os.environ["QUOTE_PITCH_STATE"] = "0"
@@ -186,7 +198,7 @@ def main() -> int:
     # --- trade_context pitch_gate skips min price ---
     assert _trade_context_pitch_gate({"trade_context": {"pitch_gate": True}})
     assert not _trade_context_pitch_gate({})
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         root = Path(td)
         (root / "data" / "pm-quote").mkdir(parents=True)
         settings = TradeSettings(
@@ -196,7 +208,7 @@ def main() -> int:
             chain_id=137,
             clob_host="https://clob.polymarket.com",
             data_api_url="https://data-api.polymarket.com",
-            live_goals=True,
+            live_goals=False,
             live_ft=False,
             take_depth="top",
             max_levels=5,
@@ -220,9 +232,54 @@ def main() -> int:
             is None
         )
 
+        # Pitch-gate: no ask / not misprice → dry rest @0.99 GTD ~1h (opt-in).
+        os.environ["QUOTE_REST_ENABLED"] = "1"
+        quote = {
+            "token_id": "tok_pitch_rest",
+            "market_key": "match_total_0.5_over",
+            "settlement": "WIN",
+            "locked": True,
+            "trade": "buy_win",
+            "misprice": False,
+            "best_bid": 0.999,
+            "best_ask": None,
+            "tick_size": "0.01",
+            "asks_top": [],
+            "bids_top": [{"price": 0.999, "size": 10}],
+        }
+        meta = {
+            "match_id": "m_pitch_rest",
+            "event_type": "score_change",
+            "event_key": "score_change|m_pitch_rest|0-0->1-0",
+            "trade_context": {
+                "pitch_gate": True,
+                "base_event_key": "score_change|m_pitch_rest|0-0->1-0",
+            },
+        }
+        row = ex.maybe_trade(
+            quote,
+            event_key=meta["event_key"],
+            match_meta=meta,
+            event_type="score_change",
+        )
+        assert row is not None, row
+        assert row.get("status") == "rest_dry_run", row
+        plan = row.get("plan") or {}
+        levels = plan.get("levels") or row.get("rest_orders") or []
+        orders = row.get("rest_orders") or levels
+        if not orders and isinstance(plan, dict):
+            orders = plan.get("rest_orders") or plan.get("levels") or []
+        assert orders, row
+        assert abs(float(orders[0].get("price") or 0) - 0.99) < 1e-9, orders
+        assert float(orders[0].get("shares") or 0) + 1e-9 >= 5.0, orders
+        assert float(orders[0].get("usdc") or 0) + 1e-9 >= 4.95, orders
+        assert str(orders[0].get("order_type") or "") == "GTD", orders
+        exp = int(orders[0].get("expiration") or 0)
+        assert exp > time.time() + 3000, (exp, time.time())
+
     assert obs_mod.get_active_observer() is None
 
-    print("ok: pitch_gate 5-frame continue + buy-once + size relax")
+    print("ok: pitch_gate min5+timeout + buy-once + rest@0.99≥5sh fallback")
     return 0
 
 

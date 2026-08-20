@@ -1,5 +1,12 @@
 import { state } from "./state.js";
-import { $, escapeHtml, formatBeijing, scoreLabel, stateBadgeClass } from "./utils.js";
+import {
+  $,
+  escapeHtml,
+  formatBeijing,
+  scoreLabel,
+  stateBadgeClass,
+  stateLabel,
+} from "./utils.js";
 
 function playStateOf(frame) {
   if (frame?.ok === false) return "capture_failed";
@@ -91,7 +98,7 @@ export function renderRail(goals) {
         <button type="button" class="goal-item ${active} ${revClass}" data-key="${escapeHtml(g.event_key)}">
           <p class="goal-item__title">${title}</p>
           <div class="goal-item__meta">
-            <span class="${stateBadgeClass(g.verdict)}">${escapeHtml(g.verdict)}</span>
+            <span class="${stateBadgeClass(g.verdict)}">${escapeHtml(stateLabel(g.verdict))}</span>
             <span>${g.frame_count || 0} frames</span>
             <span>${g.gate ? "gate" : "observe"}</span>
             <span>${escapeHtml(formatBeijing(g.dqd_ts))}</span>
@@ -145,7 +152,7 @@ export function renderDetail(goal) {
               <div class="frame__body">
                 <div class="frame__row">
                   <span class="frame__elapsed">t+${escapeHtml(String(f.elapsed_s ?? "?"))}s</span>
-                  <span class="${stateBadgeClass(ps)}">${escapeHtml(ps)}</span>
+                  <span class="${stateBadgeClass(ps)}">${escapeHtml(stateLabel(ps))}</span>
                 </div>
                 <div class="frame__row">
                   <span>#${escapeHtml(String(f.sample_i ?? "?"))}</span>
@@ -180,7 +187,7 @@ export function renderDetail(goal) {
         </p>
         ${revLine}
       </div>
-      <span class="${stateBadgeClass(goal.verdict)}">${escapeHtml(goal.verdict)}</span>
+      <span class="${stateBadgeClass(goal.verdict)}">${escapeHtml(stateLabel(goal.verdict))}</span>
     </div>
     ${framesHtml}`;
 }

@@ -19,6 +19,8 @@ from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
     ask_in_fak_zone,
+    min_rest_usdc,
+    rest_enabled,
     rest_expire_s,
     rest_limit_tick_size,
 )
@@ -67,7 +69,6 @@ FLATTEN_ORDER_MAX_WAIT_S = 60.0
 # storm while waiting for the exchange's balance/order views to converge.
 FLATTEN_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_ORDER_RECHECK_INTERVAL_S = 2.0
-MIN_WIN_BEST_BID = 0.85
 CUSHION_REST_USDC = 10.0
 CUSHION_REST_PRICES = (0.99,)
 # Keep pending_reason bounded (append loops used to grow to 80KB+).
@@ -84,16 +85,6 @@ _NOT_ENOUGH_BAL_RE = re.compile(
     r"not enough balance\s*/\s*allowance",
     re.IGNORECASE,
 )
-
-
-def best_bid_clears_min(best_bid: Any, floor: float = MIN_WIN_BEST_BID) -> bool:
-    """Live buy_win requires a visible bid at or above the floor (missing bid fails)."""
-    if best_bid is None or best_bid == "":
-        return False
-    try:
-        return float(best_bid) + 1e-12 >= float(floor)
-    except (TypeError, ValueError):
-        return False
 
 
 def quote_reversal_cushion(quote: dict[str, Any] | None) -> bool:
@@ -747,15 +738,15 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice (rest-after-FAK disabled while Odds grades are off)."""
+        """FAK a misprice; pitch-gate may rest @0.99 GTD when rest is enabled."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
         if str(q.get("trade") or "") != "buy_win" and str(q.get("settlement") or "") == "WIN":
             q["trade"] = "buy_win"
         mis = bool(q.get("misprice"))
-        # Rest ladder was Odds A/B only; grades stripped → never rest this round.
-        rest_ok = False
+        # Rest ladder: pitch-gate confirmed buys when QUOTE_REST_ENABLED=1.
+        rest_ok = rest_enabled() and _trade_context_pitch_gate(match_meta)
         if not mis and not rest_ok:
             return None
 
@@ -766,32 +757,6 @@ class TradeExecutor:
         typ = self._resolve_event_type(
             event_type=event_type, event_key=event_key, match_meta=match_meta
         )
-        if (
-            typ == "score_change"
-            and str(q.get("trade") or "") == "buy_win"
-            and rest_ok
-            and not best_bid_clears_min(q.get("best_bid"))
-        ):
-            return self._record(
-                q,
-                event_key=event_key,
-                match_meta=match_meta,
-                plan=None,
-                status="skipped",
-                skip_reason="best_bid_below_min",
-                response=None,
-                success=False,
-                idempotency_key=trade_idempotency_key(
-                    event_key or "", token_id, "buy_win"
-                ),
-                live=self._live_for_signal(typ),
-                extra={
-                    "size_policy": {
-                        "best_bid": q.get("best_bid"),
-                        "min_win_best_bid": MIN_WIN_BEST_BID,
-                    }
-                },
-            )
         channel_live = self._live_for_signal(typ)
         if mis and token_id and mid:
             n = self._cancel_live_rest_for_token(
@@ -916,13 +881,37 @@ class TradeExecutor:
         quote: dict[str, Any],
         match_meta: dict[str, Any] | None,
     ) -> tuple[float, str]:
-        """Cushion rest target only (quote_reversal_cushion → CUSHION_REST_USDC)."""
+        """Rest target: pitch-gate size @0.99, or cushion rest."""
         ctx = (
             (match_meta or {}).get("trade_context")
             if isinstance((match_meta or {}).get("trade_context"), dict)
             else {}
         )
-        base = str(ctx.get("base_event_key") or "")
+        base = str(
+            ctx.get("base_event_key")
+            or (match_meta or {}).get("event_key")
+            or ""
+        )
+        if _trade_context_pitch_gate(match_meta):
+            open_usdc = (
+                sum(float(r.get("usdc") or 0) for r in self.ledger.all_open())
+                + self._pending_usdc_total_locked()
+                + self.ledger.rest_reserved_usdc()
+            )
+            # CLOB limit min is 5 shares → ~$4.95 @ 0.99 (not the $1 FAK tier).
+            rest_floor = min_rest_usdc(0.99)
+            caps = compute_buy_size_caps(
+                0.99,
+                max_usdc=max(float(self.settings.max_usdc or 0), rest_floor),
+                max_shares=self.settings.max_shares,
+                tiers=self.settings.size_tiers,
+                open_usdc=open_usdc,
+                max_open_usdc=self.settings.max_open_usdc,
+                floor_usdc=0.0,
+            )
+            if caps.skip_reason:
+                return 0.0, base
+            return max(float(caps.max_usdc), rest_floor), base
         if quote_reversal_cushion(quote):
             return float(CUSHION_REST_USDC), base
         return 0.0, ""
@@ -937,7 +926,6 @@ class TradeExecutor:
             "in_flight",
             "sell_lose_disabled",
             "already_done",
-            "best_bid_below_min",
         ):
             return True
         if str(row.get("status") or "") == "record_only":
@@ -990,6 +978,8 @@ class TradeExecutor:
         ignore_ask_zone: bool = False,
     ) -> dict[str, Any] | None:
         """Post/adjust GTD bids for A/B remainder after FAK."""
+        if not rest_enabled():
+            return None
         typ = self._resolve_event_type(
             event_type=event_type, event_key=event_key, match_meta=match_meta
         )
@@ -999,10 +989,10 @@ class TradeExecutor:
         mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
         if not token_id or not mid:
             return None
-        if not best_bid_clears_min(quote.get("best_bid")):
-            return None
         cushion = quote_reversal_cushion(quote)
-        rest_prices = CUSHION_REST_PRICES if cushion else None
+        pitch = _trade_context_pitch_gate(match_meta)
+        # Pitch-gate: single 0.99 bid (equivalent size); cushion also 0.99-only.
+        rest_prices = CUSHION_REST_PRICES if (cushion or pitch) else None
         with self._lock:
             if self._match_buy_blocked_locked(mid) or mid in self._rest_blocked_matches:
                 return None
@@ -1038,7 +1028,13 @@ class TradeExecutor:
                 if not replace and add_usdc + 1e-12 < floor:
                     return None
                 place_usdc = gap if replace else add_usdc
-                ask_for_ladder = None if ignore_ask_zone else quote.get("best_ask")
+                # Pitch-gate rest is for no-ask / non-FAK books — never treat ask
+                # as blocking the 0.99 GTD fallback.
+                ask_for_ladder = (
+                    None
+                    if (ignore_ask_zone or pitch)
+                    else quote.get("best_ask")
+                )
                 # Adding rest while the ask is FAK-able is wrong; shrinking an
                 # oversized ladder (cushion cap drop) must still go through.
                 if ask_in_fak_zone(ask_for_ladder) and not replace:
@@ -1086,9 +1082,22 @@ class TradeExecutor:
         if not levels:
             return None
 
-        expire_s = 0.0 if cushion else rest_expire_s()
+        # Pitch-gate fallback is always GTD ~1h; cushion-only rests stay GTC.
+        if pitch:
+            expire_s = rest_expire_s()
+        elif cushion:
+            expire_s = 0.0
+        else:
+            expire_s = rest_expire_s()
         ot = "GTC" if expire_s <= 0 else "GTD"
         exp = int(time.time()) + int(expire_s) if ot == "GTD" else 0
+        if pitch:
+            print(
+                f"pitch-gate → REST @{levels[0].get('price')} "
+                f"usdc={sum(float(l.get('usdc') or 0) for l in levels):.2f} "
+                f"token={token_id[:12]}… {ot} expire_s={int(expire_s)}",
+                flush=True,
+            )
         posted: list[dict[str, Any]] = []
         responses: list[dict[str, Any]] = []
         if not channel_live:

@@ -47,7 +47,7 @@ data/pm-quote/dqd_stream_frames/<match_id>/<event_key>/
    - `animation`：懂球帝动画球场 / tracker
    - `real_video`：真实转播画面
    - `unknown` / `mixed`
-3. 动画图只走本地 OCR + 规则，**不再升级 VLM**。门控路径会 OCR 底部比分：与 DQD 期望比分一致后才允许 `in_play`；不一致 / 未识别 → `unclear`（不下单）。
+3. 动画图只走本地 OCR + 规则，**不再升级 VLM**。门控只看「进攻/控球/VAR」等关键词；**不做比分 OCR**。
 4. 真实视频图仍可走 OpenAI 兼容视觉模型。
 5. 保守输出：不确定时给 `unclear`，不要硬判 `in_play`。
 

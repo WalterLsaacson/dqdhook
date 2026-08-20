@@ -187,36 +187,107 @@ def _lookup_judge(
 
 
 def _goal_verdict(frames: list[dict[str, Any]]) -> str:
-    states = [
-        str((f.get("judge") or {}).get("play_state") or "")
+    """Aggregate badge: prefer specific wait reasons over opaque 'waiting'."""
+    judges = [
+        f.get("judge")
         for f in frames
         if isinstance(f.get("judge"), dict)
     ]
+    states = [str(j.get("play_state") or "") for j in judges]
     if any(s == "in_play" for s in states):
         return "in_play"
     if frames and all(f.get("ok") is False for f in frames):
         return "capture_failed"
-    if states and all(s in ("stopped", "unclear", "") for s in states):
-        return "waiting"
     if not states:
         return "pending_judge"
+    if any(s == "stopped" for s in states) and all(
+        s in ("stopped", "unclear", "") for s in states
+    ):
+        return "stopped"
+    # All unclear/empty — still waiting for in_play tokens.
+    if states and all(s in ("unclear", "") for s in states):
+        return "waiting_in_play"
     return "mixed"
 
 
-def _ts_key(raw: Any) -> str:
-    return str(raw or "")
+def _score_pair(obj: Any) -> tuple[int | None, int | None]:
+    if not isinstance(obj, dict):
+        return None, None
+    try:
+        h = obj.get("home")
+        a = obj.get("away")
+        return (int(h) if h is not None and h != "" else None,
+                int(a) if a is not None and a != "" else None)
+    except (TypeError, ValueError):
+        return None, None
 
 
-def _load_reversal_index() -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+def _parse_score_transition(
+    event_key: str,
+) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    """Parse ``score_change|<mid>|<ph>-<pa>-><ch>-<ca>`` → (prev, curr)."""
+    parts = str(event_key or "").split("|")
+    if len(parts) < 3:
+        return None, None
+    trans = parts[-1]
+    if "->" not in trans:
+        return None, None
+    left, right = trans.split("->", 1)
+
+    def _one(raw: str) -> tuple[int, int] | None:
+        raw = raw.strip()
+        if "-" not in raw:
+            return None
+        hs, as_ = raw.split("-", 1)
+        try:
+            return int(hs), int(as_)
+        except (TypeError, ValueError):
+            return None
+
+    return _one(left), _one(right)
+
+
+def _invert_score_change_key(event_key: str) -> str | None:
+    """``…|1-0->2-0`` → ``…|2-0->1-0`` (the DQD reversal that undoes this goal)."""
+    parts = str(event_key or "").split("|")
+    if len(parts) < 3:
+        return None
+    prev, curr = _parse_score_transition(event_key)
+    if prev is None or curr is None:
+        return None
+    parts = list(parts)
+    parts[-1] = f"{curr[0]}-{curr[1]}->{prev[0]}-{prev[1]}"
+    return "|".join(parts)
+
+
+def _reversal_undoes_goal(
+    rev: dict[str, Any],
+    *,
+    goal_prev: tuple[int, int] | None,
+    goal_curr: tuple[int, int] | None,
+) -> bool:
+    """True when reverse is the mirror of this goal (e.g. 1-0→2-0 undone by 2-0→1-0)."""
+    if goal_prev is None or goal_curr is None:
+        return False
+    rp = _score_pair(rev.get("prev"))
+    rc = _score_pair(rev.get("curr"))
+    return rp == goal_curr and rc == goal_prev
+
+
+def _load_reversal_index() -> tuple[
+    list[dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, dict[str, Any]],
+]:
     """Bridge reversals + quote gate-cancel rows.
 
     Returns:
       recent_reversals (newest first),
-      latest_reversal_by_match_id,
-      gate_cancel_by_event_key
+      reversals_by_match_id (all, chronological),
+      gate_cancel_by_event_key (goal key and/or reverse key)
     """
     recent: list[dict[str, Any]] = []
-    by_match: dict[str, dict[str, Any]] = {}
+    by_match: dict[str, list[dict[str, Any]]] = {}
     for row in _read_jsonl_tail(BRIDGE_EVENTS_PATH, max_lines=_MAX_BRIDGE_LINES):
         if str(row.get("type") or "") != "score_change":
             continue
@@ -246,8 +317,7 @@ def _load_reversal_index() -> tuple[list[dict[str, Any]], dict[str, dict[str, An
             ),
         }
         recent.append(item)
-        # Later lines overwrite → keep newest per match.
-        by_match[mid] = item
+        by_match.setdefault(mid, []).append(item)
     recent.reverse()  # newest first for UI toasts
 
     cancel_by_key: dict[str, dict[str, Any]] = {}
@@ -276,6 +346,10 @@ def _load_reversal_index() -> tuple[list[dict[str, Any]], dict[str, dict[str, An
         }
         if key:
             cancel_by_key[key] = item
+            # Also index under the goal key this reverse undoes.
+            inv = _invert_score_change_key(key)
+            if inv and inv not in cancel_by_key:
+                cancel_by_key[inv] = item
     return recent, by_match, cancel_by_key
 
 
@@ -376,11 +450,13 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         g["in_play_elapsed_s"] = in_play_at
 
         mid = str(g.get("match_id") or "")
+        ek = str(g.get("event_key") or "")
+        goal_prev, goal_curr = _parse_score_transition(ek)
         cancel = cancel_by_key.get(ek)
-        rev = rev_by_match.get(mid)
         reversed_flag = False
         reversal_info: dict[str, Any] | None = None
         if cancel:
+            # Gate session for THIS goal was canceled (often because its reverse arrived).
             reversed_flag = True
             reversal_info = {
                 "source": "pitch_gate_cancel",
@@ -388,21 +464,23 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
                 "reason": cancel.get("reason") or cancel.get("mode"),
                 "mode": cancel.get("mode"),
             }
-        if rev:
-            # Reversal after this goal (or any later correction on the match).
-            goal_ts = _ts_key(g.get("dqd_ts"))
-            rev_ts = _ts_key(rev.get("ts"))
-            if not goal_ts or rev_ts >= goal_ts:
-                reversed_flag = True
-                reversal_info = {
-                    "source": "dqd_reversal",
-                    "ts": rev.get("ts"),
-                    "prev": rev.get("prev"),
-                    "curr": rev.get("curr"),
-                    "home_score": rev.get("home_score"),
-                    "away_score": rev.get("away_score"),
-                    "event_key": rev.get("event_key"),
-                }
+        # Only mark reversed when a DQD reverse is the mirror of THIS goal
+        # (1-0→2-0 undone by 2-0→1-0). A later reverse on the same match must
+        # not paint every earlier goal as reversed.
+        for rev in rev_by_match.get(mid) or []:
+            if not _reversal_undoes_goal(rev, goal_prev=goal_prev, goal_curr=goal_curr):
+                continue
+            reversed_flag = True
+            reversal_info = {
+                "source": "dqd_reversal",
+                "ts": rev.get("ts"),
+                "prev": rev.get("prev"),
+                "curr": rev.get("curr"),
+                "home_score": rev.get("home_score"),
+                "away_score": rev.get("away_score"),
+                "event_key": rev.get("event_key"),
+            }
+            break
         g["reversed"] = reversed_flag
         g["reversal"] = reversal_info
         if reversed_flag:

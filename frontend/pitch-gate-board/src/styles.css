@@ -261,6 +261,7 @@ body {
 
 .badge--unclear,
 .badge--waiting,
+.badge--waiting_in_play,
 .badge--pending_judge,
 .badge--mixed {
   color: var(--ink);

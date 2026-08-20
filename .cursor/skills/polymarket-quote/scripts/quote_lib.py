@@ -1640,7 +1640,22 @@ def quote_tokens(
         else:
             if str(row.get("settlement") or "") == "WIN":
                 item["trade"] = item.get("trade") or "buy_win"
-            if trade_executor is not None and mis:
+            # Pitch-gate: also attempt trade/rest when locked WIN has no FAK ask.
+            pitch_rest = False
+            tc = (
+                (match_meta or {}).get("trade_context")
+                if isinstance((match_meta or {}).get("trade_context"), dict)
+                else {}
+            )
+            if (
+                bool(tc.get("pitch_gate"))
+                and str((match_meta or {}).get("event_type") or "") == "score_change"
+                and str(item.get("settlement") or "") == "WIN"
+                and str(item.get("trade") or "") == "buy_win"
+                and item.get("locked") is not False
+            ):
+                pitch_rest = True
+            if trade_executor is not None and (mis or pitch_rest):
                 trade_jobs.append((len(priced), item))
         priced.append(item)
 
@@ -1839,9 +1854,12 @@ def quote_bridge_event(
         "home_score": ctx.get("home_score"),
         "away_score": ctx.get("away_score"),
         "event_type": str(ev.get("type") or ""),
+        "event_key": ek,
     }
     if trade_context is not None:
         match_meta["trade_context"] = dict(trade_context)
+        if not match_meta["trade_context"].get("base_event_key"):
+            match_meta["trade_context"]["base_event_key"] = ek
     quote_kw = dict(
         proxy=proxy,
         eps=eps,
@@ -1934,9 +1952,9 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into quotes/trades.
 
-    Goal-ups wait for pitch-state ``in_play`` (5 frames @ 5s; buy once, keep
-    capturing) before one ``_quote_one``. DQD reversals cancel rest orders and
-    open pitch-gate sessions.
+    Goal-ups wait for pitch-state ``in_play`` (first frame @+5s, then every 5s
+    until 150s; buy once, keep capturing) before one ``_quote_one``. DQD reversals
+    cancel rest orders and open pitch-gate sessions.
     """
     from score_events import (
         event_is_goal_up,
@@ -2110,6 +2128,7 @@ def process_bridge_events(
                 work_ev = dict(ev)
                 work_ev["_trade_context"] = {
                     "pitch_gate": True,
+                    "base_event_key": key,
                     "pitch_judge": item.get("judge"),
                     "pitch_elapsed_s": item.get("elapsed_s"),
                     "pitch_sample_i": item.get("sample_i"),
