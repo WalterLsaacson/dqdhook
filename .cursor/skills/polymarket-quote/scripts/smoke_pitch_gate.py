@@ -196,7 +196,7 @@ def main() -> int:
                 # sample0 in_play, sample1 stopped → streak reset; never reaches 2.
                 if int(row.get("sample_i") or 0) == 0:
                     return {"play_state": "in_play", "confidence": 0.9}
-                return {"play_state": "stopped", "stopped_reason": "var", "confidence": 0.9}
+                return {"play_state": "stopped", "stopped_reason": "celebration", "confidence": 0.9}
 
             pg_mod._judge_frame_sync = single_then_drop  # type: ignore[assignment]
             assert coord.start_gate(
@@ -206,6 +206,49 @@ def main() -> int:
             done_st = _wait_done(coord, n=1, timeout=3.0)
             assert done_st and done_st[0]["status"] == "timeout", done_st
             assert done_st[0].get("buy_emitted") is False
+
+            # --- VAR during capture → permanent no-buy even if later in_play ---
+            def var_then_in_play(row: dict[str, Any]) -> dict[str, Any] | None:
+                if int(row.get("sample_i") or 0) == 0:
+                    return {
+                        "play_state": "stopped",
+                        "stopped_reason": "var",
+                        "confidence": 0.95,
+                        "evidence": ["VAR"],
+                    }
+                return {"play_state": "in_play", "confidence": 0.9}
+
+            pg_mod._judge_frame_sync = var_then_in_play  # type: ignore[assignment]
+            assert coord.start_gate(
+                {**ev, "match_id": "m_varveto", "home_score": 1, "away_score": 0},
+                event_key="k_varveto",
+            )
+            done_vv = _wait_done(coord, n=1, timeout=3.0)
+            assert done_vv and done_vv[0]["status"] == "var_veto", done_vv
+            assert done_vv[0].get("buy_emitted") is False
+            assert done_vv[0].get("var_seen") is True
+            assert done_vv[0].get("reason") == "var_during_capture"
+            assert sum(1 for d in done_vv if d["status"] == "in_play") == 0
+
+            # --- in_play confirm then VAR before second confirm → var_veto ---
+            def in_play_then_var(row: dict[str, Any]) -> dict[str, Any] | None:
+                if int(row.get("sample_i") or 0) == 0:
+                    return {"play_state": "in_play", "confidence": 0.9}
+                return {
+                    "play_state": "stopped",
+                    "stopped_reason": "var",
+                    "confidence": 0.95,
+                }
+
+            pg_mod._judge_frame_sync = in_play_then_var  # type: ignore[assignment]
+            assert coord.start_gate(
+                {**ev, "match_id": "m_var2", "home_score": 2, "away_score": 0},
+                event_key="k_var2",
+            )
+            done_v2 = _wait_done(coord, n=1, timeout=3.0)
+            assert done_v2 and done_v2[0]["status"] == "var_veto", done_v2
+            assert done_v2[0].get("buy_emitted") is False
+            assert done_v2[0].get("var_seen") is True
     finally:
         pg_mod._judge_frame_sync = orig_judge  # type: ignore[assignment]
         set_active_observer(None)
@@ -322,7 +365,7 @@ def main() -> int:
 
     assert obs_mod.get_active_observer() is None
 
-    print("ok: pitch_gate min5+timeout + buy-once + rest@0.99≥5sh fallback")
+    print("ok: pitch_gate min5+timeout + buy-once + var_veto + rest@0.99≥5sh fallback")
     return 0
 
 

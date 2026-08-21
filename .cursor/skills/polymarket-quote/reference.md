@@ -104,13 +104,14 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 
 1. DQD goal-up + Polymarket paired → `PitchGateCoordinator.start_gate` (no immediate `_quote_one`).
 2. Capture frames every **5s** for up to **150s**, with the **first frame at +5s** after the goal: **≥5** frames under normal timing; early `in_play` does **not** stop capture.
-3. Each successful JPEG → pitch-state `judge_inputs`; `play_state == "in_play"` (OCR play tokens such as 进攻/控球; **no board-score OCR**) → one `_quote_one` with `trade_context.pitch_gate=True` (**buy once**). Otherwise keep capturing (no buy).
-4. After that buy, **keep capturing/judging** until the 150s timeout (board/debug); do not buy again. Session ends with `complete`.
-5. Never `in_play` before timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
-6. DQD reversal → `cancel_match(match_id)` → `mode=pitch_gate_canceled` (if already bought, cancel is informational).
-7. Requires `QUOTE_DQD_STREAM_OBSERVE=1` and `QUOTE_PITCH_STATE=1`; else `pitch_gate_unavailable`.
-8. FT path remains immediate quote (default live), no screenshot gate.
-9. **Rest fallback** (opt-in): when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill (no ask / not misprice), post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size is at least **5 shares** (CLOB limit floor, ≈ **$4.95** @ 0.99). Default **`QUOTE_REST_ENABLED=0`** (no limit posts). Logged as `rest_dry_run` / `rest_posted`; DQD reversal still cancels these rests.
+3. Each successful JPEG → pitch-state `judge_inputs`. Need **board OCR score match** + **2 consecutive** `in_play` frames → one `_quote_one` with `trade_context.pitch_gate=True` (**buy once**). Otherwise keep capturing (no buy).
+4. Any frame with **VAR** (`stopped_reason=var`) during the session → **permanent no-buy** for that goal (`mode=pitch_gate_var_veto`); keep capturing until timeout.
+5. After a buy, **keep capturing/judging** until the 150s timeout (board/debug); do not buy again. Session ends with `complete`.
+6. Never `in_play` before timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
+7. DQD reversal → `cancel_match(match_id)` → `mode=pitch_gate_canceled` (if already bought, cancel is informational).
+8. Requires `QUOTE_DQD_STREAM_OBSERVE=1` and `QUOTE_PITCH_STATE=1`; else `pitch_gate_unavailable`.
+9. FT path remains immediate quote (default live), no screenshot gate.
+10. **Rest fallback** (opt-in): when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill (no ask / not misprice), post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size is at least **5 shares** (CLOB limit floor, ≈ **$4.95** @ 0.99). Default **`QUOTE_REST_ENABLED=0`** (no limit posts). Logged as `rest_dry_run` / `rest_posted`; DQD reversal still cancels these rests.
 
 **Score reversal / disallowed goal**
 

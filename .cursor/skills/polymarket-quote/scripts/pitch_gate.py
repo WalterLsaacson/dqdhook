@@ -31,6 +31,21 @@ OnInPlay = Callable[[dict[str, Any]], None]
 # result payload: {status, event_key, match_id, ev, judge?, reason?, elapsed_s?}
 
 
+def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
+    """True when pitch-state marked this frame as a VAR review overlay."""
+    if not isinstance(judge, dict):
+        return False
+    reason = str(judge.get("stopped_reason") or "").strip().lower()
+    if reason == "var":
+        return True
+    # Defensive: evidence sometimes carries the token without stopped_reason.
+    for item in judge.get("evidence") or []:
+        text = str(item or "")
+        if "VAR" in text or text.strip().lower() == "var":
+            return True
+    return False
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
@@ -61,6 +76,8 @@ class _GateSession:
     # Always on for gate: board OCR must match expected score for in_play.
     require_score: bool = True
     confirm_streak: int = 0
+    # Any VAR frame during this goal's capture → never buy for this session.
+    var_seen: bool = False
 
 
 class PitchGateCoordinator:
@@ -146,7 +163,8 @@ class PitchGateCoordinator:
             f"pitch-gate → START match_id={mid} key={key} "
             f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
             f"min_frames={GATE_MIN_FRAMES} timeout={GATE_TIMEOUT_S:g}s "
-            f"(in_play+score×{GATE_CONFIRM_FRAMES}; keep capturing until timeout)",
+            f"(in_play+score×{GATE_CONFIRM_FRAMES}; VAR→no buy; "
+            f"keep capturing until timeout)",
             flush=True,
         )
         return True
@@ -185,7 +203,12 @@ class PitchGateCoordinator:
     ) -> bool:
         """Queue a one-shot buy signal without ending the capture session."""
         with self._lock:
-            if session.finished or session.buy_emitted or session.cancel.is_set():
+            if (
+                session.finished
+                or session.buy_emitted
+                or session.cancel.is_set()
+                or session.var_seen
+            ):
                 return False
             session.buy_emitted = True
             self._done.append(
@@ -244,6 +267,7 @@ class PitchGateCoordinator:
                     "elapsed_s": elapsed_s,
                     "frames": frames,
                     "buy_emitted": bool(session.buy_emitted),
+                    "var_seen": bool(session.var_seen),
                 }
             )
 
@@ -295,30 +319,52 @@ class PitchGateCoordinator:
                     )
                     judged = _judge_frame_sync(row)
                     play_state = str((judged or {}).get("play_state") or "")
-                    if play_state == "in_play":
-                        session.confirm_streak += 1
-                        need = max(1, int(GATE_CONFIRM_FRAMES))
-                        if session.confirm_streak < need:
+                    if _judge_shows_var(judged):
+                        if not session.var_seen:
+                            session.var_seen = True
                             print(
-                                f"pitch-gate → CONFIRM {session.confirm_streak}/{need} "
-                                f"match_id={session.match_id} key={session.event_key} "
-                                f"sample={sample_i} score="
-                                f"{session.ev.get('home_score')}-"
-                                f"{session.ev.get('away_score')}",
+                                f"pitch-gate → VAR_VETO match_id={session.match_id} "
+                                f"key={session.event_key} sample={sample_i} "
+                                f"(no buy for this goal; keep capturing)",
                                 flush=True,
                             )
-                        elif session.cancel.is_set():
-                            break
-                        else:
-                            self._emit_buy_once(
-                                session,
-                                judge=judged,
-                                elapsed_s=round(
-                                    time.monotonic() - session.t0_mono, 3
-                                ),
-                                sample_i=sample_i,
+                        if session.confirm_streak:
+                            print(
+                                f"pitch-gate → CONFIRM_RESET "
+                                f"match_id={session.match_id} key={session.event_key} "
+                                f"was={session.confirm_streak} play_state={play_state} "
+                                f"reason=var",
+                                flush=True,
                             )
-                            # Keep capturing until timeout; do not return.
+                        session.confirm_streak = 0
+                    elif play_state == "in_play":
+                        if session.var_seen:
+                            # Later in_play after VAR still must not buy.
+                            session.confirm_streak = 0
+                        else:
+                            session.confirm_streak += 1
+                            need = max(1, int(GATE_CONFIRM_FRAMES))
+                            if session.confirm_streak < need:
+                                print(
+                                    f"pitch-gate → CONFIRM {session.confirm_streak}/{need} "
+                                    f"match_id={session.match_id} key={session.event_key} "
+                                    f"sample={sample_i} score="
+                                    f"{session.ev.get('home_score')}-"
+                                    f"{session.ev.get('away_score')}",
+                                    flush=True,
+                                )
+                            elif session.cancel.is_set():
+                                break
+                            else:
+                                self._emit_buy_once(
+                                    session,
+                                    judge=judged,
+                                    elapsed_s=round(
+                                        time.monotonic() - session.t0_mono, 3
+                                    ),
+                                    sample_i=sample_i,
+                                )
+                                # Keep capturing until timeout; do not return.
                     else:
                         if session.confirm_streak:
                             print(
@@ -369,6 +415,20 @@ class PitchGateCoordinator:
                     f"pitch-gate → COMPLETE match_id={session.match_id} "
                     f"key={session.event_key} frames={captured} "
                     f"elapsed={elapsed_end:.1f}s (buy already emitted)",
+                    flush=True,
+                )
+            elif session.var_seen:
+                self._finish_session(
+                    session,
+                    status="var_veto",
+                    reason="var_during_capture",
+                    elapsed_s=elapsed_end,
+                    frames=captured,
+                )
+                print(
+                    f"pitch-gate → VAR_VETO_DONE match_id={session.match_id} "
+                    f"key={session.event_key} frames={captured} "
+                    f"elapsed={elapsed_end:.1f}s (no buy)",
                     flush=True,
                 )
             else:

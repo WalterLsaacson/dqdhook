@@ -2222,6 +2222,7 @@ def process_bridge_events(
                 "canceled": "pitch_gate_canceled",
                 "unavailable": "pitch_gate_unavailable",
                 "error": "pitch_gate_error",
+                "var_veto": "pitch_gate_var_veto",
             }.get(status, f"pitch_gate_{status or 'unknown'}")
             # Already bought this goal: cancel of leftover frames is informational.
             if status == "canceled" and key in seen:
@@ -2249,6 +2250,7 @@ def process_bridge_events(
                         "reason": item.get("reason"),
                         "elapsed_s": item.get("elapsed_s"),
                         "buy_emitted": item.get("buy_emitted"),
+                        "var_seen": item.get("var_seen"),
                     },
                 }
             )
