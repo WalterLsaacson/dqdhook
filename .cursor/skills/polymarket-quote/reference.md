@@ -168,7 +168,7 @@ This is a research tap for deciding whether ball position can replace OCR. It ne
 
 **Pitch Gate board (System Main)**
 
-`frontend/pitch-gate-board` on **:8791** (launched by `run_main`) reads `dqd_stream_observe.jsonl` + `pitch_state_judge.jsonl`, groups by goal `event_key`, and shows each frame thumbnail with `play_state` / confidence / evidence. Read-only viewer (no Start/Stop).
+`frontend/pitch-gate-board` on **:8791** (launched by `run_main`) reads `dqd_stream_observe.jsonl` + `af_observe.jsonl` + `pitch_state_judge.jsonl`, groups by goal `event_key`, and shows each DOM frame with `play_state` plus the AF score trail (match/miss chips). Read-only viewer (no Start/Stop).
 
 **Live Score API observe (trial, observe-only)**
 
