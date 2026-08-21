@@ -327,6 +327,22 @@ def main() -> int:
         == bl.normalize_team("Inverness CT"),
         "Inverness CT",
     )
+    # 2026-08-21 league gaps (Serie A / ISR / GRE1 / GSC)
+    _assert(bl.normalize_league("意甲", "") == "ita", "意甲")
+    _assert(bl.normalize_league("Serie A", "") == "ita", "Serie A")
+    _assert(bl.normalize_league("以超", "") == "isr", "以超")
+    _assert(bl.normalize_league("GRE1", "gre1") == "gre1", "GRE1")
+    _assert(bl.normalize_league("德超级杯", "") == "gsc", "德超级杯")
+    _assert(
+        bl.normalize_team("Qingdao Xihaian FC")
+        == bl.normalize_team("Qingdao West Coast"),
+        "Qingdao Xihaian",
+    )
+    _assert(
+        bl.normalize_team("Club NXT")
+        == bl.normalize_team("Club Brugge Ⅱ"),
+        "Club NXT",
+    )
     _assert(
         bl.normalize_team("FK Obolon Kyiv")
         == bl.normalize_team("Obolon'-Brovar"),
