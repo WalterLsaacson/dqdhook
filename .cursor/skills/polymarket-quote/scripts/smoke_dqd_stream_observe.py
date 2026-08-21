@@ -17,6 +17,81 @@ import dqd_stream_observe as obs_mod  # noqa: E402
 from dqd_stream_observe import DqdStreamObserver, observe_path  # noqa: E402
 
 
+def check_capture_result_arity(root: Path) -> None:
+    """capture_page_fn may return 2, 3 or 4 items; only the 4th carries DOM state."""
+    dom = {"pop_box": "Home 进攻", "pop_class": "pop-box home", "marks": ["attack-move"]}
+    cases = {
+        2: lambda _u, p: (_touch(p), None),
+        3: lambda _u, p: (_touch(p), None, "animation"),
+        4: lambda _u, p: (_touch(p), None, "animation", dom),
+    }
+    for arity, fn in cases.items():
+        obs = DqdStreamObserver(
+            root,
+            discover_fn=lambda mid, *, root=None: {
+                "match_id": mid,
+                "page_url": "https://example.com/x",
+                "stream_url": None,
+                "surface": "animation",
+                "raw_hint": {},
+            },
+            capture_page_fn=fn,
+            capture_stream_fn=lambda *_a, **_k: (False, "unused"),
+        )
+        row = obs._capture_row(
+            obs_mod._ObserveJob(
+                match_id=f"arity{arity}",
+                event_key="k",
+                dqd_ts="2026-08-19T14:00:00+08:00",
+                home="H",
+                away="A",
+                home_score=1,
+                away_score=0,
+                t0_mono=time.monotonic(),
+            ),
+            sample_i=0,
+            elapsed_s=0.0,
+        )
+        assert row["ok"] is True, (arity, row)
+        expected = dom if arity == 4 else None
+        assert row["dom_state"] == expected, (arity, row["dom_state"])
+
+    # A malformed return must degrade, not raise.
+    obs = DqdStreamObserver(
+        root,
+        discover_fn=lambda mid, *, root=None: {
+            "match_id": mid,
+            "page_url": "https://example.com/x",
+            "stream_url": None,
+            "surface": "animation",
+            "raw_hint": {},
+        },
+        capture_page_fn=lambda _u, _p: "nonsense",
+        capture_stream_fn=lambda *_a, **_k: (False, "unused"),
+    )
+    row = obs._capture_row(
+        obs_mod._ObserveJob(
+            match_id="bad",
+            event_key="k",
+            dqd_ts="2026-08-19T14:00:00+08:00",
+            home="H",
+            away="A",
+            home_score=1,
+            away_score=0,
+            t0_mono=time.monotonic(),
+        ),
+        sample_i=0,
+        elapsed_s=0.0,
+    )
+    assert row["ok"] is False and row["dom_state"] is None, row
+
+
+def _touch(path: Path) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"jpeg")
+    return True
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -130,6 +205,9 @@ def main() -> int:
             assert calls["page"] == 1, calls
             assert row["frame_kind"] == "animation", row
             assert row["capture_method"] == "playwright", row
+            assert row["dom_state"] is None, "3-tuple capture has no DOM readout"
+
+            check_capture_result_arity(root)
         finally:
             if obs is not None:
                 obs.stop()

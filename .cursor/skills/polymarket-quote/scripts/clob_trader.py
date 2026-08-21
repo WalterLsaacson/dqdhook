@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
@@ -11,6 +12,44 @@ from eth_account import Account
 from trade_settings import TradeSettings
 
 logger = logging.getLogger("pm_quote.clob")
+
+API_CREDS_ATTEMPTS = 4
+API_CREDS_BACKOFF_S = 1.5
+
+
+def _api_creds_with_retry(client: Any) -> Any:
+    """Derive (or first-time create) API creds, tolerating transient auth failures.
+
+    The auth endpoint routinely times out behind a proxy and answers HTTP 400
+    ("Could not create api key") for those transient failures, so a single miss
+    must not abort startup.
+    """
+    last: Exception | None = None
+    for attempt in range(1, API_CREDS_ATTEMPTS + 1):
+        try:
+            creds = client.derive_api_key()
+            logger.debug("CLOB API key derived (attempt %d)", attempt)
+            return creds
+        except Exception as e:  # noqa: BLE001
+            last = e
+        try:
+            creds = client.create_api_key()
+            logger.info("CLOB API key created (first registration, attempt %d)", attempt)
+            return creds
+        except Exception as e:  # noqa: BLE001
+            last = e
+        logger.warning(
+            "CLOB API key handshake attempt %d/%d failed: %s",
+            attempt,
+            API_CREDS_ATTEMPTS,
+            last,
+        )
+        if attempt < API_CREDS_ATTEMPTS:
+            time.sleep(API_CREDS_BACKOFF_S * attempt)
+    raise RuntimeError(
+        f"CLOB API key handshake failed after {API_CREDS_ATTEMPTS} attempts: {last}"
+    )
+
 
 class ClobTrader:
     """Auth once, reuse for market FOK/FAK orders."""
@@ -36,12 +75,7 @@ class ClobTrader:
             kwargs["funder"] = self._settings.funder
 
         client = ClobClient(**kwargs)
-        try:
-            creds = client.derive_api_key()
-            logger.debug("CLOB API key derived")
-        except Exception:
-            creds = client.create_api_key()
-            logger.info("CLOB API key created (first registration)")
+        creds = _api_creds_with_retry(client)
         client.set_api_creds(creds)
         self._client = client
         self._wallet_address = self._resolve_wallet_address()

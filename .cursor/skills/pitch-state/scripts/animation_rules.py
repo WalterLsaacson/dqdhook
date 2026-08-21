@@ -310,6 +310,172 @@ def extract_board_score(
     return best
 
 
+# The animation renders its play state as text; OCR only recovers it from
+# pixels. When the DOM is readable we take the same strings directly.
+# The board renders the score with spaces around the colon ("1 : 0") and the
+# clock without ("78:57"), which is what separates them.
+_DOM_SCORE_SPACED_RE = re.compile(r"(\d{1,2})\s+[:：]\s+(\d{1,2})\s*$")
+_DOM_SCORE_TAIL_RE = re.compile(r"(\d{1,2})\s*[:：]\s*(\d{1,2})\s*$")
+_DOM_CLOCK_ANY_RE = re.compile(r"(\d{1,3})[:：](\d{1,2})")
+_DOM_CLOCK_HEAD_RE = re.compile(r"^\s*(\d{1,3})[:：](\d{2})")
+
+
+def parse_dom_center(center_box: Any) -> dict[str, Any]:
+    """Split `.center-box` (e.g. ``"78:57 1 : 0"``) into clock and board score.
+
+    Never lets a bare clock become a scoreline — reading ``"45:00"`` as 45-0 is
+    exactly the confusion that trips the OCR path.
+    """
+    raw = str(center_box or "").strip()
+    out: dict[str, Any] = {"clock": None, "home": None, "away": None, "text": None}
+    if not raw:
+        return out
+
+    spaced = _DOM_SCORE_SPACED_RE.search(raw)
+    if spaced:
+        home, away, head = spaced.group(1), spaced.group(2), raw[: spaced.start()]
+        clock = _DOM_CLOCK_ANY_RE.search(head)
+    else:
+        # Fall back to clock-first so an unspaced board still parses safely.
+        head_clock = _DOM_CLOCK_HEAD_RE.match(raw)
+        rest = raw[head_clock.end() :] if head_clock else raw
+        tail = _DOM_SCORE_TAIL_RE.search(rest)
+        if tail is None:
+            if head_clock:
+                out["clock"] = f"{int(head_clock.group(1))}:{head_clock.group(2)}"
+            return out
+        home, away, clock = tail.group(1), tail.group(2), head_clock
+
+    out["home"] = int(home)
+    out["away"] = int(away)
+    out["text"] = f"{out['home']}-{out['away']}"
+    if clock:
+        out["clock"] = f"{int(clock.group(1))}:{clock.group(2)}"
+    return out
+
+
+def judge_dom(
+    dom: dict[str, Any] | None,
+    *,
+    expected_home: Any = None,
+    expected_away: Any = None,
+    require_score: bool = False,
+    prev_clock: Any = None,
+) -> dict[str, Any]:
+    """Judge play state from the animation's own DOM text.
+
+    Same verdict shape and same keyword tables as :func:`judge_animation`, but
+    the board score is exact instead of OCR'd. ``prev_clock`` guards against a
+    frozen page: the tracker clock ticks every second, so an unchanged clock
+    means the reading is stale and must not open the gate.
+    """
+    pop = str((dom or {}).get("pop_box") or "").strip()
+    center = parse_dom_center((dom or {}).get("center_box"))
+    exp_h = _as_int(expected_home)
+    exp_a = _as_int(expected_away)
+    evidence: list[str] = []
+
+    score_payload: dict[str, Any] = {
+        "ocr_score": center["text"],
+        "ocr_home_score": center["home"],
+        "ocr_away_score": center["away"],
+        "expected_home_score": exp_h,
+        "expected_away_score": exp_a,
+        "score_match": None,
+        "require_score": bool(require_score),
+        "source": "dom",
+        "dom_pop_box": pop or None,
+        "dom_clock": center["clock"],
+        "dom_marks": list((dom or {}).get("marks") or []),
+    }
+
+    if not pop and center["text"] is None:
+        return {
+            "play_state": "unclear",
+            "stopped_reason": None,
+            "confidence": 0.0,
+            "evidence": ["动画 DOM 无有效文本"],
+            **score_payload,
+        }
+
+    # A page that stopped updating keeps rendering its last state forever.
+    if prev_clock and center["clock"] and str(prev_clock) == str(center["clock"]):
+        evidence.append(f"页面时钟未推进（{center['clock']}），判定为僵死读数")
+        return {
+            "play_state": "unclear",
+            "stopped_reason": "stale_page",
+            "confidence": 0.2,
+            "evidence": evidence,
+            **score_payload,
+        }
+
+    scan_text = pop.replace("伤停补时", "")
+    for token, reason in STOPPED_TOKEN_MAP.items():
+        if reason is None or not token:
+            continue
+        hit = (
+            ("VAR" in scan_text or "var" in scan_text.lower())
+            if token.lower() == "var"
+            else token in scan_text
+        )
+        if hit:
+            label = "VAR" if token.lower() == "var" else token
+            evidence.append(f"命中暂停关键词: {label}")
+            return {
+                "play_state": "stopped",
+                "stopped_reason": reason,
+                "confidence": 0.95 if label in {"VAR", "换人"} else 0.88,
+                "evidence": evidence,
+                **score_payload,
+            }
+
+    if require_score and exp_h is not None and exp_a is not None:
+        if center["text"] is None:
+            score_payload["score_match"] = False
+            evidence.append(f"比分未读到（期望 {exp_h}-{exp_a}）")
+            return {
+                "play_state": "unclear",
+                "stopped_reason": None,
+                "confidence": 0.25,
+                "evidence": evidence,
+                **score_payload,
+            }
+        matched = center["home"] == exp_h and center["away"] == exp_a
+        score_payload["score_match"] = matched
+        if not matched:
+            evidence.append(
+                f"比分不一致: DOM {center['text']} ≠ 期望 {exp_h}-{exp_a}"
+            )
+            return {
+                "play_state": "unclear",
+                "stopped_reason": None,
+                "confidence": 0.6,
+                "evidence": evidence,
+                **score_payload,
+            }
+        evidence.append(f"比分一致: DOM {center['text']} = 期望 {exp_h}-{exp_a}")
+
+    play_hits = [token for token in IN_PLAY_TOKENS if token in pop]
+    if play_hits:
+        evidence.append(f"命中进行中关键词: {play_hits[0]}")
+        return {
+            "play_state": "in_play",
+            "stopped_reason": None,
+            "confidence": 0.95,
+            "evidence": evidence,
+            **score_payload,
+        }
+
+    evidence.append(f"未命中状态关键词: {pop[:40]!r}" if pop else "无状态文本")
+    return {
+        "play_state": "unclear",
+        "stopped_reason": None,
+        "confidence": 0.3,
+        "evidence": evidence,
+        **score_payload,
+    }
+
+
 def judge_animation(
     lines: list[dict[str, Any]],
     *,

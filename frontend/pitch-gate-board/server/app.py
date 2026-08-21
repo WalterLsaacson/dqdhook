@@ -391,18 +391,22 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
 
         sample_i = row.get("sample_i")
         frame_path = str(row.get("frame_path") or "") or None
-        judge = _lookup_judge(
-            mid=mid,
-            ek=ek,
-            sample_i=sample_i,
-            frame_path=frame_path or "",
-            by_key=by_key,
-            by_path=by_path,
-        )
+        # DOM mode judges inline (no screenshot, no OCR sidecar to join against).
+        judge = row.get("judge") if isinstance(row.get("judge"), dict) else None
+        if judge is None:
+            judge = _lookup_judge(
+                mid=mid,
+                ek=ek,
+                sample_i=sample_i,
+                frame_path=frame_path or "",
+                by_key=by_key,
+                by_path=by_path,
+            )
+        dom = row.get("dom_state") if isinstance(row.get("dom_state"), dict) else None
         frame = {
             "sample_i": sample_i,
             "elapsed_s": row.get("elapsed_s"),
-            "sampled_at": row.get("sampled_at"),
+            "sampled_at": row.get("sampled_at") or row.get("observed_at"),
             "ok": row.get("ok"),
             "error": row.get("error"),
             "gate": bool(row.get("gate")),
@@ -413,6 +417,10 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
             "frame_path": frame_path,
             "thumb_url": _rel_frame_url(frame_path) if frame_path else None,
             "judge": judge,
+            "dom_pop_box": (dom or {}).get("pop_box"),
+            "dom_pop_class": (dom or {}).get("pop_class"),
+            "dom_center_box": (dom or {}).get("center_box"),
+            "dom_marks": (dom or {}).get("marks"),
         }
 
         # Upsert by sample_i so re-reads / retries replace.

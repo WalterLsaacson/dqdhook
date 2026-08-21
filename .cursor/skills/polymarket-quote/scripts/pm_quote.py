@@ -16,6 +16,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from dqd_stream_observe import try_create_observer as try_create_dqd_stream_observer  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
+from nami_observe import try_create_observer as try_create_nami_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import (  # noqa: E402
@@ -34,6 +36,11 @@ from trade_settings import (  # noqa: E402
     resolve_live_modes,
     size_tiers_label,
 )
+
+
+TRADE_SETUP_ATTEMPTS = 5
+TRADE_SETUP_BACKOFF_S = 5.0
+TRADE_SETUP_BACKOFF_MAX_S = 30.0
 
 
 def root() -> Path:
@@ -235,11 +242,22 @@ def cmd_watch(args: argparse.Namespace) -> int:
             print(f"upstream → failed to start bridge: {e}", file=sys.stderr, flush=True)
             return 1
 
-    try:
-        executor = build_executor(args, rt)
-    except Exception as e:  # noqa: BLE001
-        print(f"trade setup failed: {e}", file=sys.stderr)
-        return 1
+    # Retry in-process: exiting here costs a supervisor restart plus a full OCR
+    # model reload, and CLOB auth fails transiently whenever the proxy hiccups.
+    executor = None
+    for attempt in range(1, TRADE_SETUP_ATTEMPTS + 1):
+        try:
+            executor = build_executor(args, rt)
+            break
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"trade setup failed (attempt {attempt}/{TRADE_SETUP_ATTEMPTS}): {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if attempt >= TRADE_SETUP_ATTEMPTS:
+                return 1
+            time.sleep(min(TRADE_SETUP_BACKOFF_S * attempt, TRADE_SETUP_BACKOFF_MAX_S))
 
     # Configure process proxy once before warmer + quote share SOCKS socket patch.
     try:
@@ -282,6 +300,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
     else:
         print(
             "dqd-stream observe skipped (set QUOTE_DQD_STREAM_OBSERVE=1)",
+            file=sys.stderr,
+            flush=True,
+        )
+    nami_obs = try_create_nami_observer(rt)
+    if nami_obs is not None:
+        nami_obs.start()
+    else:
+        print(
+            "nami observe skipped (set QUOTE_NAMI_OBSERVE=1)",
             file=sys.stderr,
             flush=True,
         )
@@ -389,6 +416,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             lsa_obs.stop()
         if dqd_stream_obs is not None:
             dqd_stream_obs.stop()
+        if nami_obs is not None:
+            nami_obs.stop()
         if not args.no_upstream:
             lib.stop_owned_bridge()
         return 0

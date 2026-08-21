@@ -67,10 +67,17 @@ QUOTE_SCRIPT = (
     ROOT / ".cursor" / "skills" / "polymarket-quote" / "scripts" / "pm_quote.py"
 )
 
+QUOTE_HEALTHY_UPTIME_S = 120.0
+QUOTE_RETRY_BASE_S = 10.0
+QUOTE_RETRY_MAX_S = 300.0
+
 _children: list[subprocess.Popen[Any]] = []
 _lock = threading.RLock()
 _started_at: str | None = None
 _quote_proc: subprocess.Popen[Any] | None = None
+_quote_started_monotonic: float = 0.0
+_quote_fail_streak: int = 0
+_quote_retry_at: float = 0.0
 _quote_trade: dict[str, Any]
 _shutting_down = threading.Event()
 _httpd: ThreadingHTTPServer | None = None
@@ -327,10 +334,35 @@ def _trade_mode_label(trade: dict[str, Any]) -> str:
 def _ensure_quote() -> bool:
     """Start quote watch if missing. Returns True if (re)started.
 
+    Repeated fast exits (usually CLOB auth or upstream network failures) back off
+    instead of hot-looping.
+
     Caller must hold ``_lock``.
     """
-    global _quote_proc
+    global _quote_proc, _quote_fail_streak, _quote_retry_at, _quote_started_monotonic
     if _quote_proc is not None and _quote_proc.poll() is None:
+        return False
+    now = time.monotonic()
+    if _quote_proc is not None:
+        rc = _quote_proc.poll()
+        ran_for = now - _quote_started_monotonic
+        if ran_for < QUOTE_HEALTHY_UPTIME_S:
+            _quote_fail_streak += 1
+            delay = min(
+                QUOTE_RETRY_BASE_S * (2 ** (_quote_fail_streak - 1)), QUOTE_RETRY_MAX_S
+            )
+            _quote_retry_at = now + delay
+            print(
+                f"main → quote watch exited rc={rc} after {ran_for:.0f}s "
+                f"(failure #{_quote_fail_streak}); retrying in {delay:.0f}s "
+                f"· see data/pm-quote/watch.log",
+                flush=True,
+            )
+        else:
+            _quote_fail_streak = 0
+            _quote_retry_at = 0.0
+        _quote_proc = None
+    if now < _quote_retry_at:
         return False
     watch_args = quote_watch_argv(_quote_trade)
     trade = _quote_trade
@@ -344,6 +376,7 @@ def _ensure_quote() -> bool:
     )
     quote_log = ROOT / "data" / "pm-quote" / "watch.log"
     _quote_proc = _spawn(QUOTE_SCRIPT, *watch_args, log_path=quote_log)
+    _quote_started_monotonic = now
     _children.append(_quote_proc)
     return True
 
@@ -459,12 +492,14 @@ def _open_uis(launched: list[dict[str, Any]]) -> None:
 
 def stop_stack() -> dict[str, Any]:
     """Stop boards + quote children; disable supervisor heal."""
-    global _quote_proc, _started_at
+    global _quote_proc, _started_at, _quote_fail_streak, _quote_retry_at
     _supervisor_stop.set()
     with _lock:
         procs = list(_children)
         _children.clear()
         _quote_proc = None
+        _quote_fail_streak = 0
+        _quote_retry_at = 0.0
         _started_at = None
     for p in procs:
         if p.poll() is None:
@@ -850,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(pitch-gate: 5 frames @ 5s; first in_play → one buy)",
+        f"(pitch-gate: DOM state @ 5s; first in_play → one buy)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

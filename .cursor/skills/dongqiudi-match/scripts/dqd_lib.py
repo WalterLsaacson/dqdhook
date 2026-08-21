@@ -163,6 +163,19 @@ def _score(side: dict[str, Any], is_fixture: bool) -> int | None:
         return 0
 
 
+def nami_id_from_url(url: Any) -> str | None:
+    """Pull the nami match id out of an ``animation_live`` tracker URL."""
+    text = str(url or "").strip()
+    if not text:
+        return None
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(text).query)
+    except ValueError:
+        return None
+    mid = (qs.get("id") or [""])[0].strip()
+    return mid or None
+
+
 def map_match(raw: dict[str, Any]) -> dict[str, Any]:
     team_a = raw.get("team_A") or {}
     team_b = raw.get("team_B") or {}
@@ -207,6 +220,10 @@ def map_match(raw: dict[str, Any]) -> dict[str, Any]:
         # List-side event codes (G/COR/YC/…) — useful as goal-context 旁证.
         "team_A_event": raw.get("team_A_event"),
         "team_B_event": raw.get("team_B_event"),
+        # Nami (纳米数据) animation tracker — the same surface DQD embeds, but
+        # reachable directly, so live-video fixtures still have an OCR-able frame.
+        "animation_live": str(raw.get("animation_live") or "") or None,
+        "nami_id": nami_id_from_url(raw.get("animation_live")),
         "start_play": start_play,
         "match_timestamp": match_ts,
         "update_timestamp": update_ts,

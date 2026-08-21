@@ -34,6 +34,54 @@ def cache_path(root: Path) -> Path:
     return Path(root) / "data" / "dqd_live_cache.json"
 
 
+def snapshot_path(root: Path) -> Path:
+    return Path(root) / "data" / "snapshot.json"
+
+
+_ANIM_MAP: tuple[Any, dict[str, str]] = (None, {})
+
+
+def _animation_map(root: Path) -> dict[str, str]:
+    """``{match_id: animation_live}`` from the DQD snapshot, memoized on mtime.
+
+    Gate sessions call this every few seconds, and the snapshot holds thousands
+    of rows, so re-parsing it per sample would be pure waste.
+    """
+    global _ANIM_MAP
+    path = snapshot_path(root)
+    try:
+        st = path.stat()
+        stamp = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _ANIM_MAP[0] == stamp:
+        return _ANIM_MAP[1]
+    try:
+        snap = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, str] = {}
+    if isinstance(snap, dict):
+        for m in snap.get("matches") or []:
+            if not isinstance(m, dict):
+                continue
+            url = str(m.get("animation_live") or "").strip()
+            if url:
+                out[str(m.get("id") or "")] = url
+    _ANIM_MAP = (stamp, out)
+    return out
+
+
+def animation_url_from_snapshot(match_id: str, root: Path | None) -> str:
+    """Look up ``animation_live`` for a match in the DQD snapshot.
+
+    The snapshot is rewritten on every DQD tick, so this needs no extra fetch.
+    """
+    if root is None:
+        return ""
+    return _animation_map(Path(root)).get(str(match_id), "")
+
+
 def now_cn_iso() -> str:
     return datetime.now(TZ_CN).isoformat(timespec="seconds")
 
@@ -105,16 +153,28 @@ def discover_live_surface(
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     mid = str(match_id or "").strip()
-    out = {
+    out: dict[str, Any] = {
         "match_id": mid,
         "page_url": _page_url(mid) if mid else "",
         "stream_url": None,
         "surface": "none",
+        "nami_id": None,
         "discovered_at": now_cn_iso(),
         "raw_hint": {},
     }
     if not mid:
         out["raw_hint"] = {"error": "missing_match_id"}
+        return out
+
+    # Preferred surface: the nami animation tracker straight from the match list.
+    # It is the same animation DQD embeds, so it works for live-video fixtures
+    # too, and it skips the DQD page (and its DOM) entirely.
+    anim_url = animation_url_from_snapshot(mid, root)
+    if anim_url:
+        out["page_url"] = anim_url
+        out["surface"] = "animation"
+        out["nami_id"] = lib.nami_id_from_url(anim_url)
+        out["raw_hint"] = {"source": "match_list.animation_live"}
         return out
 
     cpath = cache_path(root) if root is not None else None

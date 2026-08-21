@@ -21,7 +21,12 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 - **买后保护窗口**：门控买入的 lot 在 **`QUOTE_GATE_PROTECT_S`（默认 300s）** 内遇到 DQD 回撤 → **立即 FAK 平仓**（`gate_protect_reversal`）。超窗、非门控（FT）lot 仍沿用「等终场 `ft_reversal_vs_entry`」（那时基本已归零，只是清仓释放额度）；`QUOTE_GATE_PROTECT_S=0` 关闭该保护。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
-- 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1` 且 `QUOTE_PITCH_STATE=1`（缺则 `pitch_gate_unavailable`，该球不下单）
+- 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1`（缺则 `pitch_gate_unavailable`，该球不下单）
+- **判定源默认是动画 DOM，不再截图 / 不再跑 OCR**（`QUOTE_GATE_SOURCE=dom`，默认）：整场门控只开一个 tracker 页面，每次采样直接读 `.pop-box`（`控球`/`进攻`/`VAR`…）与 `.center-box`（时钟 + 比分）。比分是精确值，不存在 OCR 误读。`QUOTE_GATE_SOURCE=ocr` 可切回旧的截图 + PaddleOCR 路径（代码保留）。
+- **防僵死**：页面卡死会一直渲染最后状态，因此判定要求 `.center-box` 时钟相对上一次读数有推进；开页时先取一次时钟基线，使第 0 帧也受保护。时钟没走 → `unclear`（`stopped_reason=stale_page`），不下单。
+- **抓帧对象是纳米数据动画本身**：`match_list` 每行自带 `animation_live`（`tracker.namitiyu.com/...&id=<nami_id>`），直接截它而不是懂球帝比赛页 → **现场直播场次也有可 OCR 的动画**，且不依赖懂球帝页面 DOM。无该字段的场次退回原路径。纳米对不做动画的比赛显示「暂无动画」，此时门控自然超时不下单。
+- **纳米实时流（observe-only）**：`QUOTE_NAMI_OBSERVE=1` 时订阅纳米 MQTT（比分 + 球场归一化球位）落到 `data/pm-quote/nami_observe.jsonl`，用于评估「用结构化数据替掉 OCR」。**不参与任何下单判断。**
+- **DOM vs OCR 对照（仅 `QUOTE_GATE_SOURCE=ocr` 时产生）**：OCR 模式下每帧顺带记录 DOM 读数，与该帧 OCR 判定并排写入 `data/pm-quote/dom_vs_ocr.jsonl`，用于回看两者差异。
 - Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **≥5 shares** / **`QUOTE_REST_EXPIRE_S`（默认 3600）**
 
 ## Quick start

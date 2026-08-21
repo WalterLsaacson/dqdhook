@@ -131,16 +131,40 @@ After a `score_change` that successfully `buy_win`s (dry_run or posted), watch w
 
 Pitch-gate drives captures every **5s** for up to **150s** after a paired goal (first frame @ **+5s**; ≥5 frames; continues after first `in_play` buy). Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
 
-**Animation source (纳米数据):** Dongqiudi embeds `iframe.md-anim-iframe` pointing at `https://tracker.namitiyu.com/zh/football?profile=…&id=…`. Map DQD → tracker via:
+**Animation source (纳米数据):** the gate screenshots the nami tracker directly rather than the DQD match page. `match_list` already returns `animation_live` (`https://tracker.namitiyu.com/zh/football?profile=…&id=<nami_id>`) on every row, so `map_match` keeps it and `dqd_live.discover_live_surface` reads it out of `data/snapshot.json` (memoized on mtime) and returns `surface="animation"` with the tracker as `page_url` — no extra request, and no dependency on the DQD page DOM. Rows carry `nami_id`.
 
-```text
-GET /magicball/v1/match/app/detail?id=<dqd_match_id>&app=dqd&lang=zh-cn
-→ living[] / matchLiving[] where live_type=animation → url
-```
+Fixtures with no `animation_live` fall back to the previous behaviour (magicball probes, then the DQD page). Playwright screenshots `.football-animate` on the tracker, still falling back to `iframe.md-anim-iframe` / `video` for the DQD page. Measured ~4.4s per capture vs ~5.0s via the DQD page.
 
-`profile` is the DQD partner slot (observed `yADdIyHoruqHP`); namitiyu `id` ≠ DQD `match_id` and must come from that URL. Prefer opening the tracker URL directly for OCR (avoids copyright `video` on the match page). Details: [`dongqiudi-match/reference.md`](../dongqiudi-match/reference.md)#animation-live-纳米数据--namitiyu.
+Two things this does **not** fix: nami serves 暂无动画 for fixtures it does not animate (the gate then just times out with no buy, which is the safe outcome), and `profile` is DQD's partner slot — it is re-read from `animation_live` on every tick rather than hardcoded.
 
-Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`.
+Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_nami_observe.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
+
+**Nami live feed observe (`QUOTE_NAMI_OBSERVE=1`, observe-only)**
+
+The tracker SPA streams live state over MQTT-on-WebSocket (`wss://trackermq.namitiyu.com/mqtt`, anonymous, topics `live/m1/<nami_id>` and `live/m1/<nami_id>/nft/zh`); payloads are undocumented protobuf. `nami_observe.py` implements just enough MQTT 3.1.1 to subscribe while a match is under gate (plus 60s linger) and appends to `data/pm-quote/nami_observe.jsonl`.
+
+Each row keeps `msg_type`, `score_raw` (`"1-0-1-0"` = full/half), `ball_xy` (normalized pitch position), and `payload_hex` so the schema can be reverse-engineered offline. Rather than pin field numbers, `harvest()` scans the wire format for those two value shapes. Observed ~1.7 msgs/s across 5 live matches; `score_raw` agreed with the DQD score on every sample so far.
+
+**Gate source: DOM (default) vs OCR (legacy)**
+
+`QUOTE_GATE_SOURCE` selects what the gate judges. Default `dom`; `ocr` restores the screenshot + PaddleOCR path, which stays in the tree but is off by default.
+
+The animation renders its play state as text and CSS classes, which is exactly what OCR was recovering from the pixels: `.pop-box` → `"皮尔利斯 危险进攻"` (with `pop-box home|away`), `.center-box` → `"78:57 1 : 0"`, plus marker classes `possession-rect` / `attack-move` / `dangerous-attack-move`. `animation_rules.judge_dom()` applies the same `IN_PLAY_TOKENS` / `STOPPED_TOKEN_MAP` tables to that text, so VAR veto and score matching behave identically — only the input is exact instead of inferred.
+
+`DomReader` keeps **one** page open per goal instead of launching Chromium per sample: opening costs ~1.7-2.4s (overlapped with the +5s first-frame delay) and each subsequent read is 2-8ms, against ~4.4s page load plus ~3.8s OCR before. A live end-to-end gate bought at t+5.01s with zero screenshots written. The reader finds `.football-animate` in the top frame (nami tracker) or inside `iframe.md-anim-iframe` (DQD match page), and gives up after `QUOTE_DOM_OPEN_TIMEOUT_S` (default 15s) with `dom_reader: no_animation_frame` → `unavailable`, never a buy.
+
+Two failure modes are specific to this source and are guarded:
+
+- **Frozen page.** A stalled tab keeps rendering its last state forever. `judge_dom` requires the `.center-box` clock to have advanced since the previous read, and the reader takes a clock baseline at open so even sample 0 is covered. No advance → `unclear` with `stopped_reason=stale_page`.
+- **Clock read as score.** `"45:00"` must not become 45-0 — the same confusion that trips OCR. `parse_dom_center` splits on the board's spacing convention (score is `1 : 0`, clock is `78:57`) and falls back to consuming a leading clock before looking for a trailing score.
+
+Ball coordinates from the MQTT feed are deliberately *not* used to infer restart-of-play: the animation moves the ball during celebrations and VAR, and the feed only pushes on change, so neither motion nor stillness maps onto play state.
+
+Why the switch: a 24-frame sample across 3 live matches agreed 88%, and all 3 disagreements were OCR failing to read the scoreboard on a frame the DOM read exactly (the reverse never happened). Because the gate needs `in_play` **and** a matching board score, those misses did not open the gate wrongly — they delayed entry to a later 5s sample.
+
+In `ocr` mode each frame still records its DOM readout beside the OCR verdict in `data/pm-quote/dom_vs_ocr.jsonl` for comparison.
+
+This is a research tap for deciding whether ball position can replace OCR. It never feeds pitch-gate or trading. There is also a REST side (`https://tracker-api.namitiyu.com/api/football/{static_detail,variable_detail,progress}?id=<nami_id>`, protobuf, requires `Origin: https://tracker.namitiyu.com`) that is not wired up.
 
 **Pitch Gate board (System Main)**
 

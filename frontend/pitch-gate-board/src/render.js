@@ -15,6 +15,45 @@ function playStateOf(frame) {
   return String(frame?.judge?.play_state || "pending_judge");
 }
 
+const MARK_LABELS = {
+  "possession-rect": "控球",
+  attack: "进攻",
+  "attack-move": "进攻",
+  "dangerous-attack": "危险进攻",
+  "dangerous-attack-move": "危险进攻",
+  ball: "射门",
+  net: "射门",
+  "penalty-box": "禁区",
+};
+
+/** DOM-mode frames have no screenshot; show the text the gate actually read. */
+function renderDomCard(f) {
+  const pop = f.dom_pop_box;
+  if (!pop && !f.dom_center_box) {
+    return `<div class="frame__img-wrap"><div class="frame__placeholder">${escapeHtml(
+      f.error || "no reading",
+    )}</div></div>`;
+  }
+  const side = String(f.dom_pop_class || "").includes("away")
+    ? "away"
+    : String(f.dom_pop_class || "").includes("home")
+      ? "home"
+      : "";
+  const marks = [...new Set((f.dom_marks || []).map((m) => MARK_LABELS[m]).filter(Boolean))];
+  return `
+    <div class="frame__dom">
+      <div class="frame__dom-state ${side ? `is-${side}` : ""}">${escapeHtml(pop || "—")}</div>
+      <div class="frame__dom-board">${escapeHtml(f.dom_center_box || "—")}</div>
+      ${
+        marks.length
+          ? `<div class="frame__dom-marks">${marks
+              .map((m) => `<span>${escapeHtml(m)}</span>`)
+              .join("")}</div>`
+          : ""
+      }
+    </div>`;
+}
+
 function scorePair(obj) {
   if (!obj || typeof obj !== "object") return "?-?";
   return `${obj.home ?? "?"}-${obj.away ?? "?"}`;
@@ -128,7 +167,7 @@ export function renderRail(goals) {
         ? "当前筛选下无 in_play 进球。"
         : state.filter === "reversed"
           ? "当前筛选下无回撤进球。"
-          : "暂无进球截图。<br/>等 DQD goal + pitch-gate 抓帧。";
+          : "暂无进球记录。<br/>等 DQD goal + pitch-gate 采样。";
     rail.innerHTML = `<div class="empty" style="padding:20px">${emptyMsg}</div>`;
     return;
   }
@@ -172,7 +211,7 @@ export function renderDetail(goal) {
         ? "当前筛选下无 in_play 进球。"
         : state.filter === "reversed"
           ? "当前筛选下无回撤进球。"
-          : "选择左侧一场进球查看截图判定。";
+          : "选择左侧一场进球查看逐帧判定。";
     board.innerHTML = `<div class="empty">${empty}</div>`;
     return;
   }
@@ -205,12 +244,12 @@ export function renderDetail(goal) {
           const evidence = Array.isArray(f.judge?.evidence)
             ? f.judge.evidence.slice(0, 3).join(" · ")
             : "";
-          const img = f.thumb_url
-            ? `<img src="${escapeHtml(f.thumb_url)}" alt="frame ${f.sample_i}" loading="lazy" />`
-            : `<div class="frame__placeholder">${escapeHtml(f.error || "no frame")}</div>`;
+          const visual = f.thumb_url
+            ? `<div class="frame__img-wrap"><img src="${escapeHtml(f.thumb_url)}" alt="frame ${f.sample_i}" loading="lazy" /></div>`
+            : renderDomCard(f);
           return `
             <article class="frame ${ps === "in_play" ? "is-in_play" : ""}">
-              <div class="frame__img-wrap">${img}</div>
+              ${visual}
               <div class="frame__body">
                 <div class="frame__row">
                   <span class="frame__elapsed">t+${escapeHtml(String(f.elapsed_s ?? "?"))}s</span>
@@ -231,7 +270,7 @@ export function renderDetail(goal) {
             </article>`;
         })
         .join("")}</div>`
-    : `<div class="empty">该球尚无截帧。</div>`;
+    : `<div class="empty">该球尚无采样。</div>`;
 
   board.innerHTML = `
     <div class="detail__head">

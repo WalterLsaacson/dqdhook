@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -44,6 +45,12 @@ class _FakeObserver:
             "stream_url": None,
             "page_url": "https://example.com",
             "frame_kind": "page",
+            "dom_state": {
+                "pop_box": "Home 控球",
+                "pop_class": "pop-box home",
+                "center_box": "12:34 1 : 0",
+                "marks": ["possession-rect"],
+            },
         }
 
     def _write_rows(self, rows: list[dict[str, Any]]) -> None:
@@ -64,6 +71,8 @@ def _wait_done(coord: pg.PitchGateCoordinator, *, n: int, timeout: float = 3.0) 
 def main() -> int:
     os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
     os.environ["QUOTE_PITCH_STATE"] = "1"
+    # This file covers the legacy screenshot+OCR path; DOM mode has its own smoke.
+    os.environ["QUOTE_GATE_SOURCE"] = "ocr"
 
     old_interval = pg.GATE_INTERVAL_S
     old_timeout = pg.GATE_TIMEOUT_S
@@ -120,6 +129,24 @@ def main() -> int:
             # Buy only once even though later frames also in_play.
             assert sum(1 for d in done if d["status"] == "in_play") == 1
             assert judges["n"] == fake.frames
+
+            # Research trail: DOM readout and OCR verdict land on one row.
+            cmp_rows = [
+                json.loads(line)
+                for line in pg.dom_vs_ocr_path(root)
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            assert len(cmp_rows) == fake.frames, (len(cmp_rows), fake.frames)
+            first = cmp_rows[0]
+            assert first["dom_pop_box"] == "Home 控球", first
+            assert first["dom_pop_class"] == "pop-box home", first
+            assert first["dom_center_box"] == "12:34 1 : 0", first
+            assert first["dom_marks"] == ["possession-rect"], first
+            assert first["expected_score"] == "1-0", first
+            assert first["match_id"] == "m1" and first["event_key"] == "k1", first
+            assert {r["ocr_play_state"] for r in cmp_rows} <= {"in_play", "stopped"}, cmp_rows
 
             # --- timeout: never in_play until wall clock expires ---
             judges["n"] = 0

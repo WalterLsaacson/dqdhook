@@ -54,11 +54,29 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _animation_rules() -> Any:
+    """Keyword tables live with pitch-state; DOM mode reuses them without OCR."""
+    import sys
+
+    scripts = Path(__file__).resolve().parents[2] / "pitch-state" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import animation_rules  # type: ignore
+
+    return animation_rules
+
+
+def gate_source() -> str:
+    """`dom` reads the animation's own text; `ocr` is the legacy screenshot path."""
+    raw = str(os.getenv("QUOTE_GATE_SOURCE") or "").strip().lower()
+    return "ocr" if raw == "ocr" else "dom"
+
+
 def gate_ready() -> tuple[bool, str]:
-    """Both stream observe and pitch-state must be enabled for the gate."""
+    """Stream observe is always needed; OCR mode additionally needs pitch-state."""
     if not _env_bool("QUOTE_DQD_STREAM_OBSERVE", False):
         return False, "QUOTE_DQD_STREAM_OBSERVE=0"
-    if not _env_bool("QUOTE_PITCH_STATE", False):
+    if gate_source() == "ocr" and not _env_bool("QUOTE_PITCH_STATE", False):
         return False, "QUOTE_PITCH_STATE=0"
     return True, ""
 
@@ -79,6 +97,8 @@ class _GateSession:
     confirm_streak: int = 0
     # Any VAR frame during this goal's capture → never buy for this session.
     var_seen: bool = False
+    # Nami tracker id, only used to tag the observe-only feed recording.
+    nami_id: str = ""
 
 
 class PitchGateCoordinator:
@@ -155,6 +175,7 @@ class PitchGateCoordinator:
             )
             self._by_event[key] = session
             self._by_match.setdefault(mid, set()).add(key)
+        self._nami_observe_start(session)
 
         thread = threading.Thread(
             target=self._run_session,
@@ -328,13 +349,159 @@ class PitchGateCoordinator:
                     "frames": frames,
                     "buy_emitted": bool(session.buy_emitted),
                     "var_seen": bool(session.var_seen),
+                    "nami_id": session.nami_id or None,
                 }
             )
+        self._nami_observe_stop(session)
+
+    def _nami_observe_start(self, session: _GateSession) -> None:
+        """Tap the nami live feed for this goal. Observe-only, never fatal."""
+        try:
+            from nami_observe import get_active_observer as get_nami
+
+            observer = get_nami()
+            if observer is None:
+                return
+            import dqd_live  # type: ignore
+            import dqd_lib  # type: ignore
+
+            url = dqd_live.animation_url_from_snapshot(session.match_id, self.root)
+            nami_id = dqd_lib.nami_id_from_url(url) or ""
+            if not nami_id:
+                return
+            session.nami_id = nami_id
+            observer.observe_match(
+                nami_id,
+                {
+                    "match_id": session.match_id,
+                    "event_key": session.event_key,
+                    "home": session.ev.get("home"),
+                    "away": session.ev.get("away"),
+                    "dqd_score": (
+                        f"{session.ev.get('home_score')}-{session.ev.get('away_score')}"
+                    ),
+                },
+                ttl_s=GATE_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("nami observe start skipped", exc_info=True)
+
+    def _nami_observe_stop(self, session: _GateSession) -> None:
+        if not session.nami_id:
+            return
+        try:
+            from nami_observe import get_active_observer as get_nami
+
+            observer = get_nami()
+            if observer is not None:
+                observer.release_match(session.nami_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("nami observe stop skipped", exc_info=True)
+
+    def _open_dom_reader(self, session: _GateSession, observer: Any) -> Any:
+        """Resolve the tracker URL once and keep that page open for the session."""
+        from dqd_stream_observe import DomReader
+
+        info = observer._resolve_surface(session.match_id)
+        page_url = str((info or {}).get("page_url") or "")
+        if not page_url:
+            return None, "no_page_url", info
+        reader = DomReader(page_url)
+        ok, err = reader.open()
+        if not ok:
+            reader.close()
+            return None, err or "dom_open_failed", info
+        return reader, None, info
+
+    @staticmethod
+    def _baseline_clock(reader: Any) -> str | None:
+        """Clock at page-open, so even the first sample can detect a frozen page."""
+        try:
+            dom, _err = reader.read()
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(dom, dict):
+            return None
+        return _animation_rules().parse_dom_center(dom.get("center_box")).get("clock")
+
+    def _sample_dom(
+        self,
+        session: _GateSession,
+        reader: Any,
+        info: dict[str, Any],
+        *,
+        sample_i: int,
+        elapsed_s: float,
+        prev_clock: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        import quote_lib as lib
+
+        rules = _animation_rules()
+
+        dom, err = reader.read()
+        row: dict[str, Any] = {
+            "observed_at": lib.now_cn_iso(),
+            "match_id": session.match_id,
+            "event_key": session.event_key,
+            "dqd_ts": str(session.ev.get("ts") or ""),
+            "home": str(session.ev.get("home") or ""),
+            "away": str(session.ev.get("away") or ""),
+            "home_score": session.ev.get("home_score"),
+            "away_score": session.ev.get("away_score"),
+            "sample_i": sample_i,
+            "elapsed_s": elapsed_s,
+            "surface": (info or {}).get("surface"),
+            "page_url": (info or {}).get("page_url"),
+            "stream_url": None,
+            "nami_id": (info or {}).get("nami_id"),
+            "capture_method": "dom",
+            "frame_kind": "dom",
+            "frame_path": None,
+            "ok": dom is not None,
+            "error": err,
+            "dom_state": dom,
+            "gate": True,
+        }
+        if dom is None:
+            return row, None
+        judged = rules.judge_dom(
+            dom,
+            expected_home=session.ev.get("home_score"),
+            expected_away=session.ev.get("away_score"),
+            require_score=bool(session.require_score and GATE_REQUIRE_SCORE),
+            prev_clock=prev_clock,
+        )
+        row["judge"] = judged
+        return row, judged
 
     def _run_session(self, session: _GateSession, observer: Any) -> None:
         captured = 0
         sample_i = 0
+        source = gate_source()
+        reader: Any = None
+        surface_info: dict[str, Any] = {}
+        prev_clock: str | None = None
         try:
+            # Load the page inside the first-frame delay so the wait is not
+            # spent twice: the browser is ready by the time sampling starts.
+            if source == "dom" and not session.cancel.is_set():
+                reader, open_err, surface_info = self._open_dom_reader(session, observer)
+                if reader is None:
+                    self._finish_session(
+                        session,
+                        status="unavailable",
+                        reason=f"dom_reader: {open_err}",
+                        elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                        frames=0,
+                    )
+                    print(
+                        f"pitch-gate → DOM_UNAVAILABLE match_id={session.match_id} "
+                        f"key={session.event_key} reason={open_err} (no buy)",
+                        flush=True,
+                    )
+                    return
+                prev_clock = self._baseline_clock(reader)
+
             # First frame at t0 + GATE_FIRST_DELAY_S (default +5s after goal).
             first_t = session.t0_mono + max(0.0, float(GATE_FIRST_DELAY_S))
             while not session.cancel.is_set():
@@ -353,31 +520,50 @@ class PitchGateCoordinator:
                 if elapsed > GATE_TIMEOUT_S + 1e-9:
                     break
 
-                job = _CaptureJob(
-                    match_id=session.match_id,
-                    event_key=session.event_key,
-                    dqd_ts=str(session.ev.get("ts") or ""),
-                    home=str(session.ev.get("home") or ""),
-                    away=str(session.ev.get("away") or ""),
-                    home_score=session.ev.get("home_score"),
-                    away_score=session.ev.get("away_score"),
-                    t0_mono=session.t0_mono,
-                )
-                row = observer._capture_row(
-                    job, sample_i=sample_i, elapsed_s=round(elapsed, 3)
-                )
-                row["gate"] = True
+                if source == "dom":
+                    row, judged = self._sample_dom(
+                        session,
+                        reader,
+                        surface_info,
+                        sample_i=sample_i,
+                        elapsed_s=round(elapsed, 3),
+                        prev_clock=prev_clock,
+                    )
+                    clock = str((judged or {}).get("dom_clock") or "")
+                    if clock:
+                        prev_clock = clock
+                    has_reading = row.get("ok") is True
+                else:
+                    job = _CaptureJob(
+                        match_id=session.match_id,
+                        event_key=session.event_key,
+                        dqd_ts=str(session.ev.get("ts") or ""),
+                        home=str(session.ev.get("home") or ""),
+                        away=str(session.ev.get("away") or ""),
+                        home_score=session.ev.get("home_score"),
+                        away_score=session.ev.get("away_score"),
+                        t0_mono=session.t0_mono,
+                    )
+                    row = observer._capture_row(
+                        job, sample_i=sample_i, elapsed_s=round(elapsed, 3)
+                    )
+                    row["gate"] = True
+                    judged = None
+                    has_reading = bool(row.get("ok") is True and row.get("frame_path"))
+
                 try:
                     observer._write_rows([row])
                 except Exception:  # noqa: BLE001
                     logger.exception("pitch-gate observe write failed")
                 captured += 1
 
-                if row.get("ok") is True and row.get("frame_path"):
-                    row["require_score"] = bool(
-                        session.require_score and GATE_REQUIRE_SCORE
-                    )
-                    judged = _judge_frame_sync(row)
+                if has_reading:
+                    if source == "ocr":
+                        row["require_score"] = bool(
+                            session.require_score and GATE_REQUIRE_SCORE
+                        )
+                        judged = _judge_frame_sync(row)
+                        _write_dom_vs_ocr(self.root, session, row, judged)
                     play_state = str((judged or {}).get("play_state") or "")
                     if _judge_shows_var(judged):
                         if not session.var_seen:
@@ -522,6 +708,9 @@ class PitchGateCoordinator:
                 elapsed_s=round(time.monotonic() - session.t0_mono, 3),
                 frames=captured,
             )
+        finally:
+            if reader is not None:
+                reader.close()
 
 
 @dataclass
@@ -536,6 +725,61 @@ class _CaptureJob:
     home_score: Any
     away_score: Any
     t0_mono: float
+
+
+def dom_vs_ocr_path(root: Path) -> Path:
+    import quote_lib as lib
+
+    return lib.data_dir(root) / "dom_vs_ocr.jsonl"
+
+
+def _write_dom_vs_ocr(
+    root: Path,
+    session: _GateSession,
+    row: dict[str, Any],
+    judged: dict[str, Any] | None,
+) -> None:
+    """Pair the DOM readout with the OCR verdict for the same frame.
+
+    Research trail only: it answers whether reading the overlay text off the
+    page could replace OCR, which cannot be settled without both sides of the
+    same frame side by side.
+    """
+    try:
+        import quote_lib as lib
+
+        dom = row.get("dom_state")
+        if not isinstance(dom, dict):
+            dom = {}
+        judged = judged if isinstance(judged, dict) else {}
+        lib.append_jsonl(
+            dom_vs_ocr_path(root),
+            [
+                {
+                    "observed_at": lib.now_cn_iso(),
+                    "match_id": session.match_id,
+                    "event_key": session.event_key,
+                    "nami_id": session.nami_id or None,
+                    "sample_i": row.get("sample_i"),
+                    "elapsed_s": row.get("elapsed_s"),
+                    "expected_score": (
+                        f"{session.ev.get('home_score')}-{session.ev.get('away_score')}"
+                    ),
+                    "page_url": row.get("page_url"),
+                    "frame_kind": row.get("frame_kind"),
+                    "dom_pop_box": dom.get("pop_box"),
+                    "dom_pop_class": dom.get("pop_class"),
+                    "dom_center_box": dom.get("center_box"),
+                    "dom_marks": dom.get("marks"),
+                    "ocr_play_state": judged.get("play_state"),
+                    "ocr_stopped_reason": judged.get("stopped_reason"),
+                    "ocr_confidence": judged.get("confidence"),
+                    "ocr_score": judged.get("score") or judged.get("board_score"),
+                }
+            ],
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("dom_vs_ocr write skipped", exc_info=True)
 
 
 def _judge_frame_sync(row: dict[str, Any]) -> dict[str, Any] | None:

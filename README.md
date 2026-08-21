@@ -1,6 +1,6 @@
 # dqdhook
 
-懂球帝 ↔ Polymarket 足球流水线：实时比分、赛事配对、截图门控后的 CLOB 询价与下单。
+懂球帝 ↔ Polymarket 足球流水线：实时比分、赛事配对、动画状态门控后的 CLOB 询价与下单。
 
 ---
 
@@ -18,7 +18,7 @@
          ┌───────────┼───────────┐
          ▼           ▼           ▼
    进球 pitch-gate   终场立刻询价   回撤取消门控/rest
-   （截图+OCR）      （无截图门控）  （不自动平仓）
+   （读动画 DOM）     （无门控直接询价）（不自动平仓）
 ```
 
 | 模块 | 作用 |
@@ -26,7 +26,7 @@
 | `dongqiudi-match` | 懂球帝赛程 / 比分 / 比分变化 |
 | `polymarket-soccer` | Polymarket Gamma 足球对阵快照 |
 | `match-bridge` | DQD ↔ PM 模糊配对；发出 `score_change` / `match_finished` |
-| `pitch-state` | 动画截图 OCR：是否恢复比赛（`in_play` / `stopped` / `unclear`） |
+| `pitch-state` | 动画状态判定规则表：是否恢复比赛（`in_play` / `stopped` / `unclear`） |
 | `polymarket-quote` | 门控询价 + 进程内下单（默认 goals/ft 均为 live） |
 | `trade-analytics` | 历史成交 / 估算盈亏分析（独立） |
 
@@ -40,7 +40,7 @@
 | 懂球帝看板 | `:8787` | DQD 赛程 |
 | Polymarket 看板 | `:8788` | Gamma 快照 |
 | Match Bridge 看板 | `:8789` | 配对结果（只读；quote 持有桥） |
-| Pitch Gate 看板 | `:8791` | 每球截图 + 判定（可筛 in_play / 回撤） |
+| Pitch Gate 看板 | `:8791` | 每球逐帧状态 + 判定（可筛 in_play / 回撤） |
 | `pm_quote watch` | — | **进程内持有 match-bridge**，内存队列直达询价 |
 
 不要单独再开 `pm_quote`、boards skill host，或第二个 `run_main`（`:8790` 占用会直接退出）。  
@@ -58,7 +58,7 @@
 4. Bridge 产出事件：
    - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**
    - `score_change` + 回撤（任一侧比分下降）→ **取消**该场门控与 rest；**不自动 flatten**
-   - `match_finished`（`period` 切入 `FT`）→ **立刻询价下单**（无截图门控）
+   - `match_finished`（`period` 切入 `FT`）→ **立刻询价下单**（不过门控）
 5. 加时中（DQD 仍在踢、`minute>90` 且 `injury_time==0`）的比分抖动**不发事件**，避免误触发。
 
 ### 2. 进球通道（pitch-gate，核心）
@@ -68,18 +68,37 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 抓帧 | 进球后 **+5s** 起第一帧，之后每 **5s** 一帧，直到 **150s** 超时或回撤取消 |
-| 判定 | 每帧 JPEG → `pitch-state`：关键词（进攻/控球等）+ **底部比分 OCR 必须等于 DQD 期望比分** |
+| 采样 | 进球后 **+5s** 起第一次读数，之后每 **5s** 一次，直到 **150s** 超时或回撤取消 |
+| 判定 | 直接读动画 DOM 文本：关键词（进攻/控球等）+ **底部比分必须等于 DQD 期望比分**（精确值，非 OCR） |
 | 确认 | **首帧合格即可**（`GATE_CONFIRM_FRAMES=1`），不再要求连续两帧 |
-| 下单 | `_quote_one`（`trade_context.pitch_gate=true`），**每球最多一刀**；买后仍继续抓帧直到超时（供看板复盘） |
-| VAR | 抓帧过程中任一帧判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`），仍抓满超时窗口 |
+| 下单 | `_quote_one`（`trade_context.pitch_gate=true`），**每球最多一刀**；买后仍继续采样直到超时（供看板复盘） |
+| VAR | 采样过程中任一帧判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`），仍采满超时窗口 |
 | 超时 | 全程没有合格 `in_play` → `pitch_gate_timeout`，不买 |
-| 回撤 | DQD 回撤 → 取消会话 `pitch_gate_canceled`；**买后 90s 内**则立即平仓（见下节） |
+| 回撤 | DQD 回撤 → 取消会话 `pitch_gate_canceled`；**买后 300s 内**则立即平仓（见下节） |
+
+**判定源：读动画 DOM，不再截图、不再跑 OCR**
+
+动画自己就把状态渲染成文字和 CSS class，OCR 过去只是在从像素里把这段文字还原回来。现在直接读：
+
+| 读什么 | 例子 | 用途 |
+|---|---|---|
+| `.pop-box` 文本 | `皮尔利斯 危险进攻` / `VAR 回看` | 进行中 / 停止 关键词，与 OCR 用同一张关键词表 |
+| `.center-box` 文本 | `78:57 1 : 0` | 比赛时钟 + 底部比分（**精确值**，不存在误读） |
+| 状态 class | `possession-rect` / `dangerous-attack-move` | 看板展示；文案闪事件时的补充信息 |
+
+- 整场门控**只开一个页面**：开页 ~1.7–2.4s（与 +5s 首帧延迟重叠），之后每次读数 **2–8ms**；旧路径是每帧 ~4.4s 加载 + ~3.8s OCR。实测端到端在 **t+5.01s** 完成买入。
+- 页面来源仍是 `match_list` 每行自带的 `animation_live` 直链（`tracker.namitiyu.com/...&id=<nami_id>`），**现场直播的场次一样有动画**。读不到时会回退去找懂球帝页面里的 `iframe.md-anim-iframe`。
+- 覆盖率实测：全部场次 91%，已配对 Polymarket 的场次 **76/77**，缺失集中在友谊赛和业余级别。
+- 15s（`QUOTE_DOM_OPEN_TIMEOUT_S`）内找不到动画 → `unavailable`，不下单。
+- 换回旧路径：`QUOTE_GATE_SOURCE=ocr`（截图 + PaddleOCR 代码完整保留，只是默认不走）。
+
+**为什么换**：在 3 场直播共 24 帧上同时跑两种判定，一致率 88%；3 次分歧**全部**是 OCR 没读出比分而 DOM 读得准确，反向一次没有。由于门控要求「in_play 且比分相符」，这些漏判不会误开门，但会把入场推迟到下一个 5s 采样点。
 
 **门控通过条件（须同时满足）：**
 
-- OCR 命中「进行中」类关键词（进攻 / 控球 / 任意球等），且非 VAR/换人/庆祝等停止态  
-- 底部比分 OCR = 该球期望的 `home_score-away_score`（比分未更新或不一致 → 不当作 `in_play`）  
+- DOM 状态文本命中「进行中」类关键词（进攻 / 控球 / 任意球等），且非 VAR/换人/庆祝等停止态  
+- 底部比分 = 该球期望的 `home_score-away_score`（比分未更新或不一致 → 不当作 `in_play`）  
+- 页面时钟相对上一次读数**有推进**（防止卡死页面一直重复最后状态）  
 - 本会话**从未**出现过 VAR  
 
 **明确不下单的情况：**
@@ -87,9 +106,11 @@
 | 情况 | 结果 |
 |---|---|
 | 未配对 Polymarket | 不进门控 |
-| 缺 `QUOTE_DQD_STREAM_OBSERVE` / `QUOTE_PITCH_STATE` | `pitch_gate_unavailable` |
+| 缺 `QUOTE_DQD_STREAM_OBSERVE` | `pitch_gate_unavailable` |
+| 打不开动画页（15s 内没有 `.football-animate`） | `dom_reader: no_animation_frame`，不买 |
+| 页面时钟不推进（卡死） | `stale_page`，继续采样但不买 |
 | 事件过旧（默认 >900s） | `goal_stale` 跳过 |
-| 比分 OCR 对不上 | 继续抓，不买 |
+| 比分对不上 | 继续采样，不买 |
 | 抓帧中出现 VAR | `var_veto`，该球不买 |
 | 懂球帝回撤该球（买入前） | 取消门控 + 撤销未 drain 的买信号 |
 | 懂球帝回撤该球（买入后 300s 内） | **立即 FAK 平仓**（见下节） |
@@ -143,7 +164,7 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 | 通道 | 默认 | 说明 |
 |---|---|---|
 | 进球 goals | **live** | 仍须过 pitch-gate 才买 |
-| 终场 ft | **live** | 无截图门控 |
+| 终场 ft | **live** | 不过门控 |
 | `--no-trade` | 关闭执行器 | 只询价落盘 |
 | `--goals-mode` / `--ft-mode` | `dry` \| `live` | 分通道覆盖 |
 
@@ -161,7 +182,6 @@ pip install -r .cursor/skills/polymarket-quote/requirements-trade.txt
 # 仓库根目录 .env（切勿提交），至少包含：
 #   PRIVATE_KEY / FUNDER / SIGNATURE_TYPE / CHAIN_ID / CLOB_HOST
 #   QUOTE_DQD_STREAM_OBSERVE=1
-#   QUOTE_PITCH_STATE=1
 #   PM_PROXY=http://127.0.0.1:1082   # 可选，默认常为此
 
 python3 frontend/run_main.py --no-browser
@@ -194,11 +214,14 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | 变量 | 默认 / 说明 |
 |---|---|
 | `QUOTE_DQD_STREAM_OBSERVE` | 须为 `1`，否则进球门控不可用 |
-| `QUOTE_PITCH_STATE` | 须为 `1`，OCR 判定 |
+| `QUOTE_GATE_SOURCE` | `dom`（默认，读动画 DOM）/ `ocr`（旧截图+OCR 路径，代码保留） |
+| `QUOTE_DOM_OPEN_TIMEOUT_S` | DOM 模式打开动画页的上限，默认 15 |
+| `QUOTE_PITCH_STATE` | 仅 `QUOTE_GATE_SOURCE=ocr` 时需要 |
 | `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` | 未设则均为 `live` |
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控确认单跳过** |
 | `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
+| `QUOTE_NAMI_OBSERVE` | 默认 `0`；`1` 订阅纳米实时流落盘（observe-only，不影响下单） |
 | `QUOTE_REST_ENABLED` | 默认 `0`；`1` 才挂 0.99 rest |
 | `QUOTE_REST_EXPIRE_S` | rest 过期秒数，默认 3600 |
 | `QUOTE_FT_MAX_AGE_S` | 默认 900，过旧事件跳过 |
@@ -214,7 +237,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | 路径 | 用途 |
 |---|---|
 | http://127.0.0.1:8790/ | System Main 总控 |
-| http://127.0.0.1:8791/ | Pitch Gate：按球截图；筛全部 / in_play / 回撤 |
+| http://127.0.0.1:8791/ | Pitch Gate：按球逐帧状态；筛全部 / in_play / 回撤 |
 | `data/pm-quote/watch.log` | 询价 / 门控 / 下单 stdout |
 | `data/pm-quote/trades.jsonl` | dry / live 尝试 |
 | `data/pm-quote/quotes.jsonl` | 完整询价包 |
@@ -222,12 +245,27 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `data/bridge/matches.json` | 最近配对结果 |
 | `data/pm-quote/dqd_stream_observe.jsonl` | 门控帧元数据 |
 | `data/pm-quote/dqd_stream_frames/` | JPEG 截帧 |
-| `data/pm-quote/pitch_state_judge.jsonl` | 每帧判定 |
+| `data/pm-quote/pitch_state_judge.jsonl` | 每帧 OCR 判定（仅 `QUOTE_GATE_SOURCE=ocr`） |
+| `data/pm-quote/nami_observe.jsonl` | 纳米实时流采样（比分 / 球位 / 原始 payload），仅调研 |
+| `data/pm-quote/dom_vs_ocr.jsonl` | DOM 读数与 OCR 判定并排记录（仅 `QUOTE_GATE_SOURCE=ocr`） |
 | `data/pm-quote/open_positions.json` | 未平 `buy_win` 仓 |
 | `data/pm-quote/cursor.json` | 已处理 key / 终场 id |
 
 热路径：DQD 轮询 → rematch → 内存 `event_queue` → pitch-gate → 一次 `/books` + 买。  
 冷路径：`events.jsonl` / `trades.jsonl` / 截帧落盘（异步复盘）。
+
+### 反复出现 `supervisor: quote watch restarted`
+
+代表 `pm_quote.py watch` 启动失败退出，被 System Main 拉起。真正的原因只在 `data/pm-quote/watch.log`，最常见的是网络/代理抖动导致 CLOB 鉴权失败：
+
+```
+[py_clob_client_v2] request error: handshake operation timed out
+trade setup failed: PolyApiException[status_code=400, {'error': 'Could not create api key'}]
+```
+
+现有缓解：`derive/create_api_key` 会重试 4 次（退避 1.5s 起），watch 启动阶段再整体重试 5 次（退避 5s 起、上限 30s），仍失败才退出；supervisor 对「启动后 120s 内退出」按 10s→20s→…→300s 指数退避，并打印退出码。若日志里持续是同一个鉴权错误，先查代理（`PM_PROXY`）与 `PRIVATE_KEY` / `FUNDER`，不要靠重启硬扛。
+
+DQD 侧的 `ssl.SSLEOFError` traceback 不致命，bridge 线程会在 15s 后自行重试。
 
 ---
 
@@ -238,9 +276,12 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 1. **保护窗口只减损不免损**：回撤后价格已经在往下走，FAK 平仓通常拿不回全部本金；`entry×80%` 的最低卖价意味着极端行情下可能吃不掉，残量留到终场。  
 2. **超窗回撤仍无保护**：默认 300s 之外的回撤依旧等终场，那时价格已归零，等于损失已实现。窗口设上限是为了避免被懂球帝的比分抖动误触发平仓。  
 3. **已成交的买无法靠 cancel 撤回**：同 tick 内未 drain 的 `in_play` 会被 `cancel_match` 转为 `buy_revoked`；若上一 tick 已 FAK，只能靠保护窗口平仓。  
-4. **VAR 依赖 OCR 文案**：未识别到 `VAR` 文本则不会 `var_veto`；买入之后出现的 VAR 本身不触发平仓，要等懂球帝真正回撤。  
-5. **时钟误当比分**：少数早期分钟时钟形如 `1:00` 可能被当成 `1-0`（OCR 启发式边界）。  
+4. **VAR 依赖动画文案**：纳米不渲染 `VAR` 就不会 `var_veto`；买入之后出现的 VAR 本身不触发平仓，要等懂球帝真正回撤。  
+5. **DOM 结构依赖**：`.pop-box` / `.center-box` 是纳米前端的私有实现，改名会让门控读不到文本 → `unclear` → 停止下单（安全方向，但会静默停交易）。  
 6. **单帧确认更激进**：改回 1 帧后买入更快、买入率更高，快回撤的拦截完全交给保护窗口。  
+7. **动画源是第三方且非公开接口**：纳米改动 URL 形态或页面结构会让门控退化为「读不到合格状态 → 超时不下单」（安全方向，但会静默停止交易）。同理 `animation_live` 缺失的场次（友谊赛、业余级别）没有门控能力。  
+8. **卡死页面只能靠时钟识别**：判定要求 `.center-box` 时钟相对上次读数有推进，开页时会先取一次基线，所以第 0 帧也受保护。但若纳米某天不渲染时钟，这层保护会静默失效（比分相符仍是主要防线）。  
+9. **纳米实时流尚未验证的部分**：`QUOTE_NAMI_OBSERVE` 只是采样落盘。protobuf 无 schema，字段靠 wire format 反推；采样期间没有收到过 `nft/zh` 主题消息，**VAR 事件能否从该流获取仍未证实**。  
 
 更细的盘口结算与 API 见 `.cursor/skills/polymarket-quote/reference.md`。
 
@@ -282,4 +323,4 @@ data/               # 运行时快照 / jsonl（勿提交密钥与隐私）
 
 - 默认 goals+ft 均为 **live**；进球仍须过 pitch-gate。请用小额 `QUOTE_MAX_USDC` 起步。  
 - 切勿提交 `.env`、私钥、`.idea` 等。  
-- 门控依赖 `QUOTE_DQD_STREAM_OBSERVE=1` 与 `QUOTE_PITCH_STATE=1`。  
+- 门控依赖 `QUOTE_DQD_STREAM_OBSERVE=1`（`QUOTE_GATE_SOURCE=ocr` 时另需 `QUOTE_PITCH_STATE=1`）。  

@@ -54,6 +54,117 @@ def get_active_observer() -> "DqdStreamObserver | None":
         return _active
 
 
+class DomReader:
+    """One long-lived tracker page the gate polls for structured play state.
+
+    The animation publishes its state as text and CSS classes, so a goal only
+    needs the page loaded once: re-launching Chromium per sample costs seconds
+    while a DOM read costs milliseconds.
+    """
+
+    def __init__(self, page_url: str, *, open_timeout_s: float | None = None) -> None:
+        self.page_url = str(page_url or "")
+        # Must stay well under the gate timeout: a page that will never render
+        # the animation has to fail fast rather than eat the whole session.
+        self.open_timeout_s = float(
+            open_timeout_s
+            if open_timeout_s is not None
+            else os.getenv("QUOTE_DOM_OPEN_TIMEOUT_S", "15") or 15
+        )
+        self._pw: Any = None
+        self._browser: Any = None
+        self._context: Any = None
+        self._page: Any = None
+        # Tracker pages render the animation inline; DQD pages nest it in an
+        # iframe, whose contents are invisible to a top-frame evaluate().
+        self._frame: Any = None
+
+    def open(self) -> tuple[bool, str | None]:
+        if not self.page_url:
+            return False, "no_page_url"
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:  # noqa: BLE001
+            return False, "playwright_not_installed"
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(headless=True)
+            self._context = self._browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="zh-CN",
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+            )
+            timeout_ms = int(max(1.0, self.open_timeout_s) * 1000)
+            self._page = self._context.new_page()
+            self._page.goto(
+                self.page_url, wait_until="domcontentloaded", timeout=timeout_ms
+            )
+            self._frame = self._find_animation_frame(deadline=time.monotonic() + self.open_timeout_s)
+            if self._frame is None:
+                self.close()
+                return False, "no_animation_frame"
+            return True, None
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).splitlines()[0][:200] if str(e) else "dom_open_failed"
+            self.close()
+            if "Executable doesn't exist" in msg or "playwright install" in msg:
+                return False, "playwright_browser_missing"
+            return False, msg
+
+    def _find_animation_frame(self, *, deadline: float) -> Any:
+        """Locate the frame that actually holds `.football-animate`."""
+        page = self._page
+        while time.monotonic() < deadline:
+            try:
+                if page.locator(".football-animate").count() > 0:
+                    return page
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                iframe = page.locator("iframe.md-anim-iframe")
+                if iframe.count() > 0:
+                    frame = iframe.first.element_handle().content_frame()
+                    if frame is not None and frame.locator(".football-animate").count() > 0:
+                        return frame
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.25)
+        return None
+
+    def read(self) -> tuple[dict[str, Any] | None, str | None]:
+        if self._frame is None:
+            return None, "not_open"
+        try:
+            dom = self._frame.evaluate(DqdStreamObserver._DOM_STATE_JS)
+        except Exception as e:  # noqa: BLE001
+            return None, str(e).splitlines()[0][:200] if str(e) else "dom_read_failed"
+        if not isinstance(dom, dict):
+            return None, "no_animation_root"
+        return dom, None
+
+    def close(self) -> None:
+        for attr in ("_context", "_browser"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            setattr(self, attr, None)
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._pw = None
+        self._page = None
+        self._frame = None
+
+
 def _safe_part(raw: Any) -> str:
     text = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(raw or ""))
     return text.strip("_") or "na"
@@ -185,15 +296,17 @@ class DqdStreamObserver:
             # Keep the sample clock on capture timing; OCR runs off-thread.
             self._schedule_judge_frame(row)
 
-    def _capture_row(self, job: _ObserveJob, *, sample_i: int, elapsed_s: float) -> dict[str, Any]:
+    def _resolve_surface(self, match_id: str) -> dict[str, Any]:
         discover_timeout_s = float(os.getenv("QUOTE_DQD_STREAM_DISCOVER_TIMEOUT_S", "2.0") or 2.0)
         try:
-            info = self._discover_fn(
-                job.match_id, root=self.root, timeout=discover_timeout_s
-            )
+            info = self._discover_fn(match_id, root=self.root, timeout=discover_timeout_s)
         except TypeError:
             # Backward-compatible for test mocks.
-            info = self._discover_fn(job.match_id, root=self.root)
+            info = self._discover_fn(match_id, root=self.root)
+        return info if isinstance(info, dict) else {}
+
+    def _capture_row(self, job: _ObserveJob, *, sample_i: int, elapsed_s: float) -> dict[str, Any]:
+        info = self._resolve_surface(job.match_id)
         frame_dir = frames_dir(self.root) / _safe_part(job.match_id) / _safe_part(job.event_key)
         frame_dir.mkdir(parents=True, exist_ok=True)
         frame_path = frame_dir / f"{sample_i:02d}_{int(round(elapsed_s)):02d}s.jpg"
@@ -201,6 +314,7 @@ class DqdStreamObserver:
         err: str | None = None
         method = "skipped"
         frame_kind = "page"
+        dom_state: dict[str, Any] | None = None
         stream_url = str(info.get("stream_url") or "")
         page_url = str(info.get("page_url") or "")
         surface = str(info.get("surface") or "none")
@@ -214,10 +328,10 @@ class DqdStreamObserver:
                 frame_kind = "video"
             elif page_url:
                 method = "playwright"
-                ok, err, frame_kind = self._capture_page(page_url, frame_path)
+                ok, err, frame_kind, dom_state = self._capture_page(page_url, frame_path)
         elif page_url:
             method = "playwright"
-            ok, err, frame_kind = self._capture_page(page_url, frame_path)
+            ok, err, frame_kind, dom_state = self._capture_page(page_url, frame_path)
         elif stream_url:
             method = "ffmpeg"
             ok, err = self._capture_stream_fn(stream_url, frame_path)
@@ -243,10 +357,13 @@ class DqdStreamObserver:
                 else None
             ),
             "surface": surface,
+            "nami_id": info.get("nami_id") if isinstance(info, dict) else None,
             "page_url": page_url or None,
             "stream_url": stream_url or None,
             "capture_method": method,
             "frame_kind": frame_kind,
+            # Structured read of the same overlay OCR reads from the pixels.
+            "dom_state": dom_state,
             "frame_path": str(frame_path) if ok else None,
             "ok": bool(ok),
             "error": None if ok else (err or "capture_failed"),
@@ -260,15 +377,23 @@ class DqdStreamObserver:
         self,
         page_url: str,
         frame_path: Path,
-    ) -> tuple[bool, str | None, str]:
+    ) -> tuple[bool, str | None, str, dict[str, Any] | None]:
         result = self._capture_page_fn(page_url, frame_path)
+        if isinstance(result, tuple) and len(result) >= 4:
+            ok, err, frame_kind, dom = result[0], result[1], result[2], result[3]
+            return (
+                bool(ok),
+                err,
+                str(frame_kind or "page"),
+                dom if isinstance(dom, dict) else None,
+            )
         if isinstance(result, tuple) and len(result) >= 3:
             ok, err, frame_kind = result[0], result[1], result[2]
-            return bool(ok), err, str(frame_kind or "page")
+            return bool(ok), err, str(frame_kind or "page"), None
         if isinstance(result, tuple) and len(result) >= 2:
             ok, err = result[0], result[1]
-            return bool(ok), err, "page"
-        return False, "invalid_capture_result", "page"
+            return bool(ok), err, "page", None
+        return False, "invalid_capture_result", "page", None
 
     def _schedule_judge_frame(self, row: dict[str, Any]) -> None:
         """Run pitch-state off the capture/event threads so sampling stays on schedule."""
@@ -323,6 +448,13 @@ class DqdStreamObserver:
     def _warmup_pitch_state(self) -> None:
         if not _env_bool("QUOTE_PITCH_STATE", False):
             return
+        from pitch_gate import gate_source
+
+        if gate_source() != "ocr":
+            # DOM mode never runs the model; loading it would cost seconds of
+            # startup and hundreds of MB for nothing.
+            print("pitch-state OCR skipped (gate reads DOM)", flush=True)
+            return
         try:
             pitch_state_scripts = Path(__file__).resolve().parents[2] / "pitch-state" / "scripts"
             if str(pitch_state_scripts) not in sys.path:
@@ -368,8 +500,43 @@ class DqdStreamObserver:
             return False, (proc.stderr or proc.stdout or "ffmpeg_failed").strip()
         return True, None
 
+    # The nami animation renders its play state as text + CSS classes. OCR
+    # recovers that text from pixels; this reads it straight off the DOM so the
+    # two can be compared on the same frame.
+    _DOM_STATE_JS = """
+    () => {
+      const root = document.querySelector('.football-animate');
+      if (!root) return null;
+      const cls = (el) => {
+        if (!el) return '';
+        const c = el.className;
+        return String((c && c.baseVal !== undefined) ? c.baseVal : (c || ''));
+      };
+      const txt = (sel) => {
+        const el = root.querySelector(sel);
+        return el ? (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80) : null;
+      };
+      const pop = root.querySelector('.pop-box');
+      const marks = ['possession-rect', 'attack-move', 'dangerous-attack-move',
+                     'attack', 'dangerous-attack', 'ball', 'net', 'penalty-box'];
+      const present = new Set();
+      root.querySelectorAll('*').forEach((el) => {
+        cls(el).split(/\\s+/).forEach((c) => { if (marks.includes(c)) present.add(c); });
+      });
+      return {
+        pop_box: txt('.pop-box'),
+        pop_class: cls(pop),
+        center_box: txt('.center-box'),
+        root_class: cls(root),
+        marks: Array.from(present).sort(),
+      };
+    }
+    """
+
     @staticmethod
-    def _capture_page_playwright(page_url: str, frame_path: Path) -> tuple[bool, str | None, str]:
+    def _capture_page_playwright(
+        page_url: str, frame_path: Path
+    ) -> tuple[bool, str | None, str, dict[str, Any] | None]:
         try:
             from playwright.sync_api import sync_playwright
         except Exception:
@@ -377,11 +544,13 @@ class DqdStreamObserver:
                 False,
                 "playwright_not_installed: pip install playwright && python3 -m playwright install chromium",
                 "page",
+                None,
             )
         wait_s = float(os.getenv("QUOTE_DQD_STREAM_PAGE_WAIT_S", "2.0") or 2.0)
         selector_timeout_s = float(
             os.getenv("QUOTE_DQD_STREAM_SELECTOR_TIMEOUT_S", "15") or 15
         )
+        dom_state: Any = None
         try:
             with sync_playwright() as pw:
                 try:
@@ -393,8 +562,14 @@ class DqdStreamObserver:
                             False,
                             "playwright_browser_missing: python3 -m playwright install chromium",
                             "page",
+                            None,
                         )
-                    return False, f"playwright_launch_failed: {msg.splitlines()[0][:160]}", "page"
+                    return (
+                        False,
+                        f"playwright_launch_failed: {msg.splitlines()[0][:160]}",
+                        "page",
+                        None,
+                    )
                 context = browser.new_context(
                     viewport={"width": 1280, "height": 900},
                     user_agent=(
@@ -410,6 +585,17 @@ class DqdStreamObserver:
                 frame_kind = "page"
                 deadline = time.monotonic() + selector_timeout_s
                 while time.monotonic() < deadline:
+                    # Nami tracker renders the animation directly; the DQD page
+                    # wraps that same animation in an iframe.
+                    anim = page.locator(".football-animate")
+                    if anim.count() > 0:
+                        try:
+                            if anim.first.is_visible():
+                                found_sel = ".football-animate"
+                                frame_kind = "animation"
+                                break
+                        except Exception:
+                            pass
                     iframe = page.locator("iframe.md-anim-iframe")
                     if iframe.count() > 0:
                         src = (iframe.first.get_attribute("src") or "").strip()
@@ -436,6 +622,10 @@ class DqdStreamObserver:
                     page.locator(found_sel).first.screenshot(path=str(frame_path))
                 else:
                     page.screenshot(path=str(frame_path), full_page=False)
+                try:
+                    dom_state = page.evaluate(DqdStreamObserver._DOM_STATE_JS)
+                except Exception:  # noqa: BLE001
+                    dom_state = None
                 context.close()
                 browser.close()
         except Exception as e:  # noqa: BLE001
@@ -445,12 +635,19 @@ class DqdStreamObserver:
                     False,
                     "playwright_browser_missing: python3 -m playwright install chromium",
                     "page",
+                    None,
                 )
-            return False, msg.splitlines()[0][:200] if msg else "page_capture_failed", "page"
+            return (
+                False,
+                msg.splitlines()[0][:200] if msg else "page_capture_failed",
+                "page",
+                None,
+            )
         return (
             frame_path.is_file(),
             None if frame_path.is_file() else "page_capture_failed",
             frame_kind,
+            dom_state if isinstance(dom_state, dict) else None,
         )
 
 

@@ -34,6 +34,21 @@ GET https://www.dongqiudi.com/magicball/v1/list/match_list
 | `minute` | `minute` |
 | `start_play` (UTC) | `time`, `local_date` (Asia/Shanghai) |
 | `business_status` | bit flags for tabs |
+| `animation_live` | `animation_live` + `nami_id` |
+
+## `animation_live` (纳米数据 tracker)
+
+Most rows carry a direct link to the nami (纳米数据) animation the DQD page
+embeds, e.g. `https://tracker.namitiyu.com/zh/football?profile=<token>&id=<nami_id>`.
+`map_match` keeps the URL as `animation_live` and its `id` query param as
+`nami_id`.
+
+Why it matters: the URL exists whether or not DQD itself shows an animation for
+that fixture, so a live-video match still has an OCR-able animation surface.
+Coverage measured on one day was 91% of all rows, and 76/77 of the fixtures
+match-bridge had paired with Polymarket; the gaps are friendlies and amateur
+tiers. A URL being present does not guarantee a feed — nami renders 暂无动画
+for matches it does not animate.
 
 ## Tab bit flags
 

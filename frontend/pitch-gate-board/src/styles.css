@@ -471,6 +471,58 @@ button.pill {
   text-align: center;
 }
 
+/* DOM mode: the state text replaces the screenshot entirely. */
+.frame__dom {
+  aspect-ratio: 16 / 10;
+  background: linear-gradient(160deg, #0a1a12, #060a10 70%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  text-align: center;
+}
+
+.frame__dom-state {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: #e6edf3;
+  border-left: 3px solid transparent;
+  padding-left: 8px;
+}
+
+.frame__dom-state.is-home {
+  border-left-color: #38bdf8;
+}
+
+.frame__dom-state.is-away {
+  border-left-color: #fbbf24;
+}
+
+.frame__dom-board {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.frame__dom-marks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: center;
+}
+
+.frame__dom-marks span {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: var(--muted);
+}
+
 .frame__body {
   padding: 10px;
 }
