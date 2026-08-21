@@ -53,6 +53,8 @@ class _GateSession:
     thread: threading.Thread | None = None
     finished: bool = False
     buy_emitted: bool = False
+    # After VAR/celebration, later frames must OCR-match expected score to buy.
+    require_score: bool = False
 
 
 class PitchGateCoordinator:
@@ -281,8 +283,20 @@ class PitchGateCoordinator:
                 captured += 1
 
                 if row.get("ok") is True and row.get("frame_path"):
+                    row["require_score"] = bool(session.require_score)
                     judged = _judge_frame_sync(row)
                     play_state = str((judged or {}).get("play_state") or "")
+                    stopped_reason = str((judged or {}).get("stopped_reason") or "")
+                    if play_state == "stopped" and stopped_reason in ("var", "celebration"):
+                        if not session.require_score:
+                            session.require_score = True
+                            print(
+                                f"pitch-gate → SCORE_GATE_ON match_id={session.match_id} "
+                                f"key={session.event_key} reason={stopped_reason} "
+                                f"(later in_play needs board score = "
+                                f"{session.ev.get('home_score')}-{session.ev.get('away_score')})",
+                                flush=True,
+                            )
                     if play_state == "in_play":
                         if session.cancel.is_set():
                             break
@@ -410,6 +424,7 @@ def _judge_frame_sync(row: dict[str, Any]) -> dict[str, Any] | None:
                 "gate": True,
                 "home_score": row.get("home_score"),
                 "away_score": row.get("away_score"),
+                "require_score": bool(row.get("require_score")),
             },
             append_output=True,
             write_sidecars=True,

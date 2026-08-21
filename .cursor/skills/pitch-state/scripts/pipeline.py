@@ -120,6 +120,7 @@ def _normalize_frames(
                 "event_key": meta.get("event_key") or event_key,
                 "home_score": meta.get("home_score"),
                 "away_score": meta.get("away_score"),
+                "require_score": bool(meta.get("require_score")),
             }
         )
     return frames
@@ -155,7 +156,12 @@ def _judge_animation_frame(
             "stopped_reason": None,
             "evidence": [f"OCR unavailable: {ocr.get('error') or 'unknown'}"],
         }
-    judged = judge_animation(list(ocr.get("lines") or []))
+    judged = judge_animation(
+        list(ocr.get("lines") or []),
+        expected_home=frame.get("home_score"),
+        expected_away=frame.get("away_score"),
+        require_score=bool(frame.get("require_score")),
+    )
     judged["frame_type"] = "animation"
     judged["ocr_lines"] = ocr.get("lines") or []
     return judged
@@ -232,6 +238,17 @@ def _judge_single_frame(
         confidence = float(judged.get("confidence") or 0.0)
         stopped_reason = judged.get("stopped_reason")
         evidence.extend(list(judged.get("evidence") or []))
+        for k in (
+            "ocr_score",
+            "ocr_home_score",
+            "ocr_away_score",
+            "expected_home_score",
+            "expected_away_score",
+            "score_match",
+            "require_score",
+        ):
+            if k in judged:
+                per_row[k] = judged.get(k)
         decision_source = "ocr_rule"
     elif frame_type in {"real_video", "mixed"} and vlm_enabled():
         prompt_path = _SCRIPTS.parent / "prompts" / "single.md"
@@ -278,6 +295,19 @@ def _judge_single_frame(
             "error": None,
             "match_id": match_id or frame.get("match_id"),
             "event_key": event_key or frame.get("event_key"),
+            **{
+                k: per_row[k]
+                for k in (
+                    "ocr_score",
+                    "ocr_home_score",
+                    "ocr_away_score",
+                    "expected_home_score",
+                    "expected_away_score",
+                    "score_match",
+                    "require_score",
+                )
+                if k in per_row
+            },
         }
     )
 

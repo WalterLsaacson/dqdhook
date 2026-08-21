@@ -13,7 +13,7 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（两阳门控）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 抓一帧，**至少 5 张**，直到 **2.5 分钟超时**（或回撤取消）；OCR 命中「进攻/控球」等 → `in_play` → **一刀** `_quote_one`，之后继续抓帧但不再下单（goals/ft 默认 **live**）；超时无 in_play 则放弃。限价 rest（FAK 未吃到时 @0.99 GTD）默认 **关闭**（`QUOTE_REST_ENABLED=0`）；稳定后再开。终场立刻询价（不经截图门控）。
+**当前策略（两阳门控）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 抓一帧，**至少 5 张**，直到 **2.5 分钟超时**（或回撤取消）；OCR 命中「进攻/控球」等 → `in_play` → **一刀** `_quote_one`，之后继续抓帧但不再下单（goals/ft 默认 **live**）。若会话内出现 **VAR/庆祝**，后续帧须 **比分 OCR = 期望进球比分** 才允许买入（挡动画已回撤、DQD 未到）。超时无 in_play 则放弃。限价 rest 默认 **关闭**（`QUOTE_REST_ENABLED=0`）。终场立刻询价（不经截图门控）。
 
 - 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**；**不自动 flatten**
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）

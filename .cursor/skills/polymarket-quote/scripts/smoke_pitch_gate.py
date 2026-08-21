@@ -163,6 +163,39 @@ def main() -> int:
             assert by_key.get("ka") == ["canceled"], by_key
             assert "in_play" in by_key.get("kb", []), by_key
             assert "complete" in by_key.get("kb", []), by_key
+
+            # --- VAR then board already reversed → no buy (Drita-style) ---
+            def var_then_wrong_score(row: dict[str, Any]) -> dict[str, Any] | None:
+                # Simulate pipeline: once require_score is on, mismatch → unclear.
+                if bool(row.get("require_score")):
+                    return {
+                        "play_state": "unclear",
+                        "score_match": False,
+                        "ocr_score": "2-2",
+                        "confidence": 0.55,
+                    }
+                if int(row.get("sample_i") or 0) == 0:
+                    return {
+                        "play_state": "stopped",
+                        "stopped_reason": "var",
+                        "confidence": 0.92,
+                    }
+                return {"play_state": "in_play", "confidence": 0.9}
+
+            pg_mod._judge_frame_sync = var_then_wrong_score  # type: ignore[assignment]
+            assert coord.start_gate(
+                {
+                    **ev,
+                    "match_id": "m_var",
+                    "home_score": 3,
+                    "away_score": 2,
+                },
+                event_key="k_var",
+            )
+            done_var = _wait_done(coord, n=1, timeout=3.0)
+            assert done_var and done_var[0]["status"] == "timeout", done_var
+            assert done_var[0].get("buy_emitted") is False
+            assert sum(1 for d in done_var if d["status"] == "in_play") == 0
     finally:
         pg_mod._judge_frame_sync = orig_judge  # type: ignore[assignment]
         set_active_observer(None)

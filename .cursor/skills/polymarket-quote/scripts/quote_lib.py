@@ -266,6 +266,53 @@ def _norm_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+def _role_for_team_blob(team: str, home: str, away: str) -> str | None:
+    """Map a team label to home/away without short-name substring traps.
+
+    ``ofi`` is a substring of ``pfkcskasofia``; naive ``nh in nt`` wrongly
+    labels CSKA Sofia markets as home. Prefer exact, then side⊂blob, and only
+    allow blob⊂side when that blob is not also embedded in the other side.
+    """
+    nt = _norm_name(team)
+    nh = _norm_name(home)
+    na = _norm_name(away)
+    if not nt:
+        return None
+    if nh and nt == nh:
+        return "home"
+    if na and nt == na:
+        return "away"
+
+    def _hits(nside: str, other: str) -> bool:
+        if not nside:
+            return False
+        if nside in nt:
+            return True
+        if nt in nside:
+            # Short blob inside this side — reject if it also sits inside the
+            # other side (ofi ⊂ OFI Crete and ofi ⊂ PFK CSKA Sofia).
+            if other and nt in other:
+                return False
+            return True
+        return False
+
+    h_hit = _hits(nh, na)
+    a_hit = _hits(na, nh)
+    if h_hit and not a_hit:
+        return "home"
+    if a_hit and not h_hit:
+        return "away"
+    if h_hit and a_hit:
+        # Both sides contain the other (rare); prefer longer side name in blob.
+        hs = len(nh) if nh and nh in nt else (len(nt) if nh and nt in nh else 0)
+        as_ = len(na) if na and na in nt else (len(nt) if na and nt in na else 0)
+        if hs > as_:
+            return "home"
+        if as_ > hs:
+            return "away"
+    return None
+
+
 def classify_moneyline_role(
     market: dict[str, Any],
     home: str,
@@ -278,19 +325,25 @@ def classify_moneyline_role(
         return "draw"
     m = WIN_RE.search(q)
     team = (m.group(1) if m else title).strip()
-    nt = _norm_name(team)
+    role = _role_for_team_blob(team, home, away)
+    if role:
+        return role
+    # Fallback: question mentions a side + "win" — still guard substrings.
+    if "win" not in q.lower():
+        return None
+    qn = _norm_name(q)
     nh, na = _norm_name(home), _norm_name(away)
-    if nh and (nt == nh or nh in nt or nt in nh):
-        return "home"
-    if na and (nt == na or na in nt or nt in na):
-        return "away"
-    # Fallback: question contains team names
-    if nh and nh in _norm_name(q) and "win" in q.lower():
-        return "home"
-    if na and na in _norm_name(q) and "win" in q.lower():
-        return "away"
-    return None
-
+    hits: list[tuple[str, int]] = []
+    if nh and nh in qn:
+        hits.append(("home", len(nh)))
+    if na and na in qn:
+        hits.append(("away", len(na)))
+    if not hits:
+        return None
+    hits.sort(key=lambda x: -x[1])
+    if len(hits) > 1 and hits[0][1] == hits[1][1]:
+        return None
+    return hits[0][0]
 
 def settle_yes_no(yes_wins: bool) -> tuple[str, str]:
     """Return (yes_settlement, no_settlement)."""
@@ -396,9 +449,10 @@ def spread_tokens(
         fav_team, line = parsed
         # Handicap applies to favorite team named in "Spread: Team (line)"
         # If line is -1.5 on home, home covers when margin > 1.5
-        fav_is_home = _norm_name(fav_team) == _norm_name(home) or _norm_name(home) in _norm_name(
-            fav_team
-        )
+        fav_role = _role_for_team_blob(fav_team, home, away)
+        fav_is_home = fav_role == "home"
+        if fav_role is None:
+            continue
         fav_margin = margin if fav_is_home else -margin
         fav_covers = fav_margin + line > 0
         outcomes = m.get("outcomes") or []
@@ -409,7 +463,11 @@ def spread_tokens(
         for i, token in enumerate(tokens[:2]):
             label = str(outcomes[i]) if i < len(outcomes) else f"outcome_{i}"
             nl = _norm_name(label)
-            is_fav = nl == _norm_name(fav_team) or _norm_name(fav_team) in nl or label.lower() == "yes"
+            is_fav = (
+                nl == _norm_name(fav_team)
+                or (_norm_name(fav_team) in nl and len(_norm_name(fav_team)) >= 4)
+                or label.lower() == "yes"
+            )
             if label.lower() == "no":
                 is_fav = False
             settlement = "WIN" if (is_fav and fav_covers) or ((not is_fav) and (not fav_covers)) else "LOSE"
@@ -473,15 +531,11 @@ def _parse_total_market(
 
     side = "match"
     if team_blob:
-        nt = _norm_name(team_blob)
-        nh, na = _norm_name(home), _norm_name(away)
-        if nh and (nt == nh or nh in nt or nt in nh):
-            side = "home"
-        elif na and (nt == na or na in nt or nt in na):
-            side = "away"
-        else:
+        role = _role_for_team_blob(team_blob, home, away)
+        if role is None:
             # Named team we cannot map — do not fall back to match total.
             return None
+        side = role
 
     return {"line": line, "period": period, "side": side}
 
