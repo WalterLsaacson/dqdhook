@@ -424,12 +424,28 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         }
 
         # Upsert by sample_i so re-reads / retries replace.
+        # screenshot_only amendments only attach the JPEG — keep DOM judge text.
         frames: list[dict[str, Any]] = g["frames"]
         replaced = False
         if sample_i is not None:
             for i, prev in enumerate(frames):
                 if prev.get("sample_i") == sample_i:
-                    frames[i] = frame
+                    if row.get("screenshot_only") is True:
+                        if frame_path:
+                            prev["frame_path"] = frame_path
+                            prev["thumb_url"] = _rel_frame_url(frame_path)
+                        if row.get("error"):
+                            prev["ref_error"] = row.get("error")
+                        prev["ref_capture_method"] = row.get("capture_method")
+                        frames[i] = prev
+                    elif prev.get("thumb_url") and not frame.get("thumb_url"):
+                        # DOM row arriving after a late ref shot — keep the image.
+                        frame["frame_path"] = prev.get("frame_path")
+                        frame["thumb_url"] = prev.get("thumb_url")
+                        frame["ref_capture_method"] = prev.get("ref_capture_method")
+                        frames[i] = frame
+                    else:
+                        frames[i] = frame
                     replaced = True
                     break
         if not replaced:

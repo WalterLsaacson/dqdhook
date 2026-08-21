@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,33 @@ OnInPlay = Callable[[dict[str, Any]], None]
 # result payload: {status, event_key, match_id, ev, judge?, reason?, elapsed_s?}
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class _RefShotJob:
+    """Background screenshot work — never feeds OCR or the buy path."""
+
+    op: str  # open | shot | close
+    event_key: str
+    page_url: str = ""
+    match_id: str = ""
+    sample_i: int = 0
+    elapsed_s: float = 0.0
+    dqd_ts: str = ""
+    home: str = ""
+    away: str = ""
+    home_score: Any = None
+    away_score: Any = None
+    surface: Any = None
+    nami_id: Any = None
+    root: Path | None = None
+
+
 def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
     """True when pitch-state marked this frame as a VAR review overlay."""
     if not isinstance(judge, dict):
@@ -45,13 +73,6 @@ def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
         if "VAR" in text or text.strip().lower() == "var":
             return True
     return False
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _animation_rules() -> Any:
@@ -70,6 +91,13 @@ def gate_source() -> str:
     """`dom` reads the animation's own text; `ocr` is the legacy screenshot path."""
     raw = str(os.getenv("QUOTE_GATE_SOURCE") or "").strip().lower()
     return "ocr" if raw == "ocr" else "dom"
+
+
+def ref_screenshot_enabled() -> bool:
+    """DOM mode: async store-only tracker screenshots for side-by-side对照."""
+    if gate_source() != "dom":
+        return False
+    return _env_bool("QUOTE_GATE_REF_SCREENSHOT", True)
 
 
 def gate_ready() -> tuple[bool, str]:
@@ -110,6 +138,135 @@ class PitchGateCoordinator:
         self._by_event: dict[str, _GateSession] = {}
         self._by_match: dict[str, set[str]] = {}
         self._done: list[dict[str, Any]] = []
+        # Async store-only screenshots (DOM mode对照); never touch OCR / buys.
+        self._ref_q: queue.Queue[_RefShotJob | None] = queue.Queue()
+        self._ref_stop = threading.Event()
+        self._ref_thread: threading.Thread | None = None
+        self._ref_readers: dict[str, Any] = {}
+
+    def _ensure_ref_worker(self) -> None:
+        if self._ref_thread is not None and self._ref_thread.is_alive():
+            return
+        self._ref_stop.clear()
+        self._ref_thread = threading.Thread(
+            target=self._ref_worker_loop,
+            name="pitch-gate-ref-shot",
+            daemon=True,
+        )
+        self._ref_thread.start()
+
+    def _enqueue_ref(self, job: _RefShotJob) -> None:
+        if not ref_screenshot_enabled():
+            return
+        self._ensure_ref_worker()
+        self._ref_q.put(job)
+
+    def _ref_worker_loop(self) -> None:
+        while not self._ref_stop.is_set():
+            try:
+                job = self._ref_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            try:
+                self._ref_handle(job)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "ref screenshot failed op=%s key=%s", job.op, job.event_key
+                )
+        for reader in list(self._ref_readers.values()):
+            try:
+                reader.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._ref_readers.clear()
+
+    def _ref_handle(self, job: _RefShotJob) -> None:
+        from dqd_stream_observe import (
+            DomReader,
+            _safe_part,
+            frames_dir,
+            get_active_observer,
+        )
+        import quote_lib as lib
+
+        key = job.event_key
+        if job.op == "open":
+            old = self._ref_readers.pop(key, None)
+            if old is not None:
+                old.close()
+            if not job.page_url:
+                return
+            reader = DomReader(job.page_url)
+            ok, err = reader.open()
+            if not ok:
+                reader.close()
+                logger.debug("ref DomReader open failed key=%s err=%s", key, err)
+                return
+            self._ref_readers[key] = reader
+            return
+
+        if job.op == "close":
+            reader = self._ref_readers.pop(key, None)
+            if reader is not None:
+                reader.close()
+            return
+
+        if job.op != "shot":
+            return
+
+        reader = self._ref_readers.get(key)
+        if reader is None and job.page_url:
+            reader = DomReader(job.page_url)
+            ok, err = reader.open()
+            if ok:
+                self._ref_readers[key] = reader
+            else:
+                reader.close()
+                logger.debug("ref shot open-on-demand failed key=%s err=%s", key, err)
+                return
+        if reader is None:
+            return
+
+        root = Path(job.root or self.root)
+        frame_dir = (
+            frames_dir(root) / _safe_part(job.match_id) / _safe_part(job.event_key)
+        )
+        frame_path = frame_dir / (
+            f"{int(job.sample_i):02d}_{int(round(job.elapsed_s)):02d}s_ref.jpg"
+        )
+        ok, err = reader.screenshot(frame_path)
+        observer = get_active_observer()
+        if observer is None:
+            return
+        row = {
+            "observed_at": lib.now_cn_iso(),
+            "match_id": job.match_id,
+            "event_key": job.event_key,
+            "dqd_ts": job.dqd_ts,
+            "home": job.home,
+            "away": job.away,
+            "home_score": job.home_score,
+            "away_score": job.away_score,
+            "sample_i": job.sample_i,
+            "elapsed_s": job.elapsed_s,
+            "surface": job.surface,
+            "page_url": job.page_url or None,
+            "nami_id": job.nami_id,
+            "capture_method": "dom_ref_shot",
+            "frame_kind": "animation",
+            "frame_path": str(frame_path) if ok else None,
+            "ok": bool(ok),
+            "error": None if ok else (err or "ref_screenshot_failed"),
+            "screenshot_only": True,
+            "no_ocr": True,
+            "gate": True,
+        }
+        try:
+            observer._write_rows([row])
+        except Exception:  # noqa: BLE001
+            logger.exception("ref screenshot observe write failed")
 
     def pending_event_keys(self) -> set[str]:
         with self._lock:
@@ -501,6 +658,16 @@ class PitchGateCoordinator:
                     )
                     return
                 prev_clock = self._baseline_clock(reader)
+                if ref_screenshot_enabled():
+                    self._enqueue_ref(
+                        _RefShotJob(
+                            op="open",
+                            event_key=session.event_key,
+                            page_url=str((surface_info or {}).get("page_url") or ""),
+                            match_id=session.match_id,
+                            root=self.root,
+                        )
+                    )
 
             # First frame at t0 + GATE_FIRST_DELAY_S (default +5s after goal).
             first_t = session.t0_mono + max(0.0, float(GATE_FIRST_DELAY_S))
@@ -621,6 +788,26 @@ class PitchGateCoordinator:
                             )
                         session.confirm_streak = 0
 
+                if source == "dom" and ref_screenshot_enabled():
+                    self._enqueue_ref(
+                        _RefShotJob(
+                            op="shot",
+                            event_key=session.event_key,
+                            page_url=str((surface_info or {}).get("page_url") or ""),
+                            match_id=session.match_id,
+                            sample_i=sample_i,
+                            elapsed_s=round(elapsed, 3),
+                            dqd_ts=str(session.ev.get("ts") or ""),
+                            home=str(session.ev.get("home") or ""),
+                            away=str(session.ev.get("away") or ""),
+                            home_score=session.ev.get("home_score"),
+                            away_score=session.ev.get("away_score"),
+                            surface=(surface_info or {}).get("surface"),
+                            nami_id=(surface_info or {}).get("nami_id"),
+                            root=self.root,
+                        )
+                    )
+
                 sample_i += 1
                 next_t = (
                     session.t0_mono
@@ -709,6 +896,10 @@ class PitchGateCoordinator:
                 frames=captured,
             )
         finally:
+            if source == "dom" and ref_screenshot_enabled():
+                self._enqueue_ref(
+                    _RefShotJob(op="close", event_key=session.event_key, root=self.root)
+                )
             if reader is not None:
                 reader.close()
 
@@ -843,4 +1034,10 @@ def get_coordinator(root: Path | None = None) -> PitchGateCoordinator:
 def reset_coordinator_for_tests() -> None:
     global _coordinator
     with _coord_lock:
+        if _coordinator is not None:
+            try:
+                _coordinator._ref_stop.set()
+                _coordinator._ref_q.put(None)
+            except Exception:  # noqa: BLE001
+                pass
         _coordinator = None

@@ -290,6 +290,8 @@ def check_dom_session() -> None:
 def main() -> int:
     os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
     os.environ["QUOTE_GATE_SOURCE"] = "dom"
+    # Store-only ref shots need a real tracker page; keep smokes on DOM-only.
+    os.environ["QUOTE_GATE_REF_SCREENSHOT"] = "0"
 
     check_parse_center()
     check_judge_dom()
@@ -302,6 +304,7 @@ def main() -> int:
     pg.GATE_MIN_FRAMES = 3
     try:
         check_dom_session()
+        check_ref_shot_enqueue()
     finally:
         (
             pg.GATE_FIRST_DELAY_S,
@@ -312,6 +315,93 @@ def main() -> int:
 
     print("ok: pitch_gate DOM mode (no screenshot/OCR) + judge_dom rules")
     return 0
+
+
+def check_ref_shot_enqueue() -> None:
+    """Ref-shot worker writes store-only amendments and never invents a judge."""
+    os.environ["QUOTE_GATE_REF_SCREENSHOT"] = "1"
+    shots: list[Any] = []
+
+    class _ShotReader:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def open(self) -> tuple[bool, str | None]:
+            return True, None
+
+        def screenshot(self, path: Path) -> tuple[bool, str | None]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"jpeg")
+            shots.append(path)
+            return True, None
+
+        def close(self) -> None:
+            self.closed = True
+
+    orig_reader = None
+    try:
+        import dqd_stream_observe as dso
+
+        orig_reader = dso.DomReader
+        dso.DomReader = lambda *_a, **_k: _ShotReader()  # type: ignore[misc, assignment]
+
+        pg.reset_coordinator_for_tests()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            obs = _FakeObserver(root)
+            set_active_observer(obs)  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            coord._enqueue_ref(
+                pg._RefShotJob(
+                    op="open",
+                    event_key="k_ref",
+                    page_url="https://tracker.example/x",
+                    match_id="m_ref",
+                    root=root,
+                )
+            )
+            coord._enqueue_ref(
+                pg._RefShotJob(
+                    op="shot",
+                    event_key="k_ref",
+                    page_url="https://tracker.example/x",
+                    match_id="m_ref",
+                    sample_i=3,
+                    elapsed_s=20.0,
+                    home="H",
+                    away="A",
+                    home_score=1,
+                    away_score=0,
+                    root=root,
+                )
+            )
+            coord._enqueue_ref(pg._RefShotJob(op="close", event_key="k_ref", root=root))
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not shots:
+                time.sleep(0.05)
+            assert shots, "ref worker should write a JPEG"
+            assert shots[0].is_file() and shots[0].name.endswith("_ref.jpg"), shots[0]
+            # Wait for close + jsonl
+            time.sleep(0.2)
+            rows = [
+                json.loads(line)
+                for line in observe_path(root).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert len(rows) == 1, rows
+            assert rows[0]["screenshot_only"] is True
+            assert rows[0]["no_ocr"] is True
+            assert rows[0].get("judge") is None
+            assert rows[0]["frame_path"] and Path(rows[0]["frame_path"]).is_file()
+    finally:
+        if orig_reader is not None:
+            import dqd_stream_observe as dso
+
+            dso.DomReader = orig_reader  # type: ignore[misc]
+        os.environ["QUOTE_GATE_REF_SCREENSHOT"] = "0"
+        pg.reset_coordinator_for_tests()
+        set_active_observer(None)
 
 
 if __name__ == "__main__":

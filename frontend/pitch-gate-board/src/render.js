@@ -244,9 +244,17 @@ export function renderDetail(goal) {
           const evidence = Array.isArray(f.judge?.evidence)
             ? f.judge.evidence.slice(0, 3).join(" · ")
             : "";
-          const visual = f.thumb_url
-            ? `<div class="frame__img-wrap"><img src="${escapeHtml(f.thumb_url)}" alt="frame ${f.sample_i}" loading="lazy" /></div>`
-            : renderDomCard(f);
+          const visual = [
+            f.dom_pop_box || f.dom_center_box ? renderDomCard(f) : "",
+            f.thumb_url
+              ? `<div class="frame__img-wrap"><img src="${escapeHtml(f.thumb_url)}" alt="frame ${f.sample_i}" loading="lazy" /></div>`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("") ||
+            `<div class="frame__img-wrap"><div class="frame__placeholder">${escapeHtml(
+              f.error || "no reading",
+            )}</div></div>`;
           return `
             <article class="frame ${ps === "in_play" ? "is-in_play" : ""}">
               ${visual}

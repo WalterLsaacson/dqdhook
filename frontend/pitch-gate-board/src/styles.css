@@ -484,6 +484,17 @@ button.pill {
   text-align: center;
 }
 
+/* When a reference screenshot sits under the DOM card, shrink the text block. */
+.frame__dom + .frame__img-wrap {
+  border-top: 1px solid var(--line);
+}
+
+.frame:has(.frame__dom):has(.frame__img-wrap) .frame__dom {
+  aspect-ratio: auto;
+  min-height: 72px;
+  padding: 10px 12px;
+}
+
 .frame__dom-state {
   font-size: 15px;
   font-weight: 600;

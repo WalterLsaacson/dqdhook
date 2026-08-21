@@ -215,6 +215,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 |---|---|
 | `QUOTE_DQD_STREAM_OBSERVE` | 须为 `1`，否则进球门控不可用 |
 | `QUOTE_GATE_SOURCE` | `dom`（默认，读动画 DOM）/ `ocr`（旧截图+OCR 路径，代码保留） |
+| `QUOTE_GATE_REF_SCREENSHOT` | 默认 `1`；DOM 模式下异步另开页面截动画只存盘（不跑 OCR），供看板对照 |
 | `QUOTE_DOM_OPEN_TIMEOUT_S` | DOM 模式打开动画页的上限，默认 15 |
 | `QUOTE_PITCH_STATE` | 仅 `QUOTE_GATE_SOURCE=ocr` 时需要 |
 | `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` | 未设则均为 `live` |
