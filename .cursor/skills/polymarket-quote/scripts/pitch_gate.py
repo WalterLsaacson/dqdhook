@@ -21,9 +21,10 @@ GATE_MIN_FRAMES = 5
 GATE_TIMEOUT_S = 150.0
 # Pitch-gate buys require board OCR == expected DQD score on every in_play.
 GATE_REQUIRE_SCORE = True
-# Need this many consecutive in_play(+score) frames before the one-shot buy.
-# Softens "board already shows goal then DQD reverses a few seconds later".
-GATE_CONFIRM_FRAMES = 2
+# Consecutive in_play(+score) frames required before the one-shot buy.
+# 1 = buy on the first confirmed frame; delayed reversals are handled after the
+# buy by the post-buy protection window (QUOTE_GATE_PROTECT_S) instead.
+GATE_CONFIRM_FRAMES = 1
 # Backward-compat alias used by older smokes/docs.
 GATE_FRAME_COUNT = GATE_MIN_FRAMES
 

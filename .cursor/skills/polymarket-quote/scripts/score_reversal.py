@@ -137,6 +137,37 @@ def lot_depends_on_disallowed_goal(
     return is_score_decrease(entry_tuple(lot), after_score)
 
 
+def lot_protect_age_s(lot: dict[str, Any], *, now: datetime | None = None) -> float | None:
+    """Seconds since this lot was opened, or None when ``opened_at`` is unusable."""
+    opened = parse_iso(str(lot.get("opened_at") or "") or None)
+    if opened is None:
+        return None
+    ref = now or datetime.now(TZ_CN)
+    return (ref - opened).total_seconds()
+
+
+def lot_in_protect_window(
+    lot: dict[str, Any],
+    *,
+    window_s: float,
+    now: datetime | None = None,
+) -> bool:
+    """True when a pitch-gate lot is still inside its post-buy protection window.
+
+    Only gate buys are protected: FT buys are not exposed to delayed DQD
+    reversals, and a missing/unparseable ``opened_at`` must not open an
+    unbounded flatten window.
+    """
+    if window_s <= 0:
+        return False
+    if not lot.get("pitch_gate"):
+        return False
+    age = lot_protect_age_s(lot, now=now)
+    if age is None:
+        return False
+    return -1.0 <= age <= float(window_s)
+
+
 def iso_now() -> str:
     return datetime.now(TZ_CN).isoformat(timespec="seconds")
 
@@ -211,6 +242,8 @@ class OpenPositionLedger:
         tick_size: str = "0.01",
         neg_risk: bool | None = None,
         fill_status: str = FILL_STATUS_OPEN,
+        pitch_gate: bool = False,
+        opened_at: str | None = None,
     ) -> None:
         if not match_id or not token_id or shares <= 0:
             return
@@ -245,6 +278,9 @@ class OpenPositionLedger:
                     (existing.get("entry_score") or [None, None])[0],
                     (existing.get("entry_score") or [None, None])[1],
                 ) or sc
+            pitch_gate = bool(pitch_gate or existing.get("pitch_gate"))
+            # Top-ups must not extend the protection window past the first buy.
+            opened_at = str(existing.get("opened_at") or "") or opened_at
         row = {
             "status": "open",
             "match_id": str(match_id),
@@ -261,6 +297,8 @@ class OpenPositionLedger:
             "tick_size": tick_size or "0.01",
             "neg_risk": neg_risk if neg_risk is not None else (existing.get("neg_risk") if existing else None),
             "fill_status": fill,
+            "pitch_gate": bool(pitch_gate),
+            "opened_at": str(opened_at or iso_now()),
         }
         if existing is not None and existing.get("pending_flatten"):
             row["pending_flatten"] = True

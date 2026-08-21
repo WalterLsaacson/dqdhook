@@ -13,11 +13,12 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（两阳门控）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 抓一帧，直到 **2.5 分钟超时**（或回撤取消）；需 **进攻/控球等 + 底部比分 OCR=期望**，且 **连续 2 帧** `in_play` 才 **一刀** `_quote_one`（之后继续抓帧不再下单）。比分未更新 / 不一致 → 不买。截图过程中出现 **VAR** → **该球永久不下单**（继续抓帧，结束 `pitch_gate_var_veto`）。限价 rest 默认关。终场立刻询价。
+**当前策略（门控买入 + 买后保护）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 抓一帧，直到 **2.5 分钟超时**（或回撤取消）；需 **进攻/控球等 + 底部比分 OCR=期望**，**首帧合格即 `in_play`** 就 **一刀** `_quote_one`（之后继续抓帧不再下单）。比分未更新 / 不一致 → 不买。截图过程中出现 **VAR** → **该球永久不下单**（继续抓帧，结束 `pitch_gate_var_veto`）。限价 rest 默认关。终场立刻询价。
 
-> 动画已改比分、随后 DQD 才回撤的延迟回撤，比分门控拦不住；连续 2 帧只能挡住部分快回撤（约一个采样间隔内）。VAR 若出现在已下单之后则拦不住该刀。
+> 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；这一类风险由**买后保护窗口**（下条）承接，而不是靠拖延买点。
 
-- 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**，并 **撤销尚未 drain 的 `in_play` 买信号**（`buy_revoked`）；**不自动 flatten**。询价 tick **先处理事件再 drain 门控**，避免同 tick 回撤输掉竞态。
+- 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**，并 **撤销尚未 drain 的 `in_play` 买信号**（`buy_revoked`）。询价 tick **先处理事件再 drain 门控**，避免同 tick 回撤输掉竞态。
+- **买后保护窗口**：门控买入的 lot 在 **`QUOTE_GATE_PROTECT_S`（默认 300s）** 内遇到 DQD 回撤 → **立即 FAK 平仓**（`gate_protect_reversal`）。超窗、非门控（FT）lot 仍沿用「等终场 `ft_reversal_vs_entry`」（那时基本已归零，只是清仓释放额度）；`QUOTE_GATE_PROTECT_S=0` 关闭该保护。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
 - 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1` 且 `QUOTE_PITCH_STATE=1`（缺则 `pitch_gate_unavailable`，该球不下单）

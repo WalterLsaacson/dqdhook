@@ -100,11 +100,11 @@ SDK: `py-clob-client-v2` (see `requirements-trade.txt`). Env: `PRIVATE_KEY`, `FU
 
 Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_executor.py`, `score_reversal.py`, `pitch_gate.py`.
 
-**Pitch-gate buy (two-confirm)**
+**Pitch-gate buy (single confirm + post-buy protection)**
 
 1. DQD goal-up + Polymarket paired → `PitchGateCoordinator.start_gate` (no immediate `_quote_one`).
 2. Capture frames every **5s** for up to **150s**, with the **first frame at +5s** after the goal: **≥5** frames under normal timing; early `in_play` does **not** stop capture.
-3. Each successful JPEG → pitch-state `judge_inputs`. Need **board OCR score match** + **2 consecutive** `in_play` frames → one `_quote_one` with `trade_context.pitch_gate=True` (**buy once**). Otherwise keep capturing (no buy).
+3. Each successful JPEG → pitch-state `judge_inputs`. Need **board OCR score match** + **`GATE_CONFIRM_FRAMES`** (currently **1**) consecutive `in_play` frames → one `_quote_one` with `trade_context.pitch_gate=True` (**buy once**). Otherwise keep capturing (no buy). Delayed reversals are covered by the protection window below, not by extra confirm frames.
 4. Any frame with **VAR** (`stopped_reason=var`) during the session → **permanent no-buy** for that goal (`mode=pitch_gate_var_veto`); keep capturing until timeout.
 5. After a buy, **keep capturing/judging** until the 150s timeout (board/debug); do not buy again. Session ends with `complete`.
 6. Never `in_play` before timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
@@ -117,7 +117,8 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
 - Goal-ups wait for pitch-gate; FT quotes immediately (default live). Events older than `QUOTE_FT_MAX_AGE_S` (default **900**) are skipped; FT once-per-`match_id` via `cursor.processed_ft_match_ids`.
-- DQD reversal cancels rest orders and open pitch-gate sessions; **does not auto-flatten**.
+- DQD reversal cancels rest orders and open pitch-gate sessions, and revokes undrained buys.
+- **Post-buy protection window**: lots carry `pitch_gate` + `opened_at`. A DQD reversal that undoes the entry score flattens gate lots opened within **`QUOTE_GATE_PROTECT_S`** (default **300s**, `0` disables) as `gate_protect_reversal`. Lots outside the window, and non-gate (FT) lots, stay deferred to the FT `ft_reversal_vs_entry` path — by then the token is near zero, so that exit frees budget rather than recovering value. Top-ups keep the first `opened_at` so the window never extends. The window is bounded because late DQD score drops are more often data noise than real VAR calls, and flattening on noise sells into a bad book for nothing.
 - Live flatten FAK-sells floored shares with entry×80% floor; dry lots never CLOB-sell.
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
 - Dry-run logs `flatten_dry_run`. Open lots: `data/pm-quote/open_positions.json`.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -33,6 +34,8 @@ from score_reversal import (
     event_signals_reversal,
     ft_reversal_vs_entry,
     lot_depends_on_disallowed_goal,
+    lot_in_protect_window,
+    lot_protect_age_s,
     reconcile_lot_inventory,
     rest_order_is_live,
     rest_order_working_usdc,
@@ -58,6 +61,11 @@ FLATTEN_SELL_HAIRCUT = Decimal("0.99")
 FLATTEN_GATE_BAL_EPS = Decimal("0.02")
 # Hard stop: zombie pending_flatten loops (resolved markets / never-filled buys).
 FLATTEN_MAX_ATTEMPTS = 60
+# Post-buy protection window for pitch-gate lots: a DQD reversal inside this
+# window flattens immediately instead of waiting for FT (delayed reversals are
+# invisible at buy time, so the exit is where that risk is priced). Sized to
+# cover slow VAR checks; beyond it, DQD score drops are more likely data noise.
+GATE_PROTECT_DEFAULT_S = 300.0
 # Delayed buy never shows balance → abandon (don't retry forever).
 FLATTEN_DELAYED_FILL_MAX_ATTEMPTS = 30
 # Accepted asynchronous sell orders get one settlement window.  During this
@@ -85,6 +93,17 @@ _NOT_ENOUGH_BAL_RE = re.compile(
     r"not enough balance\s*/\s*allowance",
     re.IGNORECASE,
 )
+
+
+def gate_protect_window_s() -> float:
+    """``QUOTE_GATE_PROTECT_S`` — 0 disables post-buy reversal flatten."""
+    raw = os.getenv("QUOTE_GATE_PROTECT_S")
+    if raw is None or str(raw).strip() == "":
+        return GATE_PROTECT_DEFAULT_S
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return GATE_PROTECT_DEFAULT_S
 
 
 def quote_reversal_cushion(quote: dict[str, Any] | None) -> bool:
@@ -565,6 +584,8 @@ class TradeExecutor:
                 family=str(row.get("family") or ""),
                 tick_size="0.01",
                 neg_risk=None,
+                pitch_gate=_trade_context_pitch_gate(row),
+                opened_at=str(row.get("quoted_at") or "") or None,
             )
         self._close_stale_finished_lots()
 
@@ -1984,10 +2005,11 @@ class TradeExecutor:
             tick_size=str(quote.get("tick_size") or "0.01"),
             neg_risk=bool(neg) if neg is not None else None,
             fill_status=fill_status,
+            pitch_gate=_trade_context_pitch_gate(meta),
         )
 
     def maybe_flatten_for_event(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
-        """Flatten FT corrections; score_change reversals deferred (no AF this round)."""
+        """Flatten FT corrections, plus DQD reversals inside the gate window."""
         with self._lock:
             return self._maybe_flatten_for_event_locked(ev)
 
@@ -2005,15 +2027,31 @@ class TradeExecutor:
         typ = ev.get("type") or ""
         after: tuple[int, int] | None = None
         reason = ""
+        protect_only = False
 
         if typ == "score_change" and event_signals_reversal(ev):
-            logger.info(
-                "defer score_change reversal flatten match=%s score=%s-%s",
-                mid,
-                ev.get("home_score"),
-                ev.get("away_score"),
+            window_s = gate_protect_window_s()
+            curr = ev.get("curr") if isinstance(ev.get("curr"), dict) else {}
+            after = score_pair(
+                curr.get("home", ev.get("home_score")),
+                curr.get("away", ev.get("away_score")),
             )
-            return []
+            if window_s <= 0 or after is None:
+                logger.info(
+                    "defer score_change reversal flatten match=%s score=%s-%s "
+                    "(window=%.0fs after=%s)",
+                    mid,
+                    ev.get("home_score"),
+                    ev.get("away_score"),
+                    window_s,
+                    after,
+                )
+                return []
+            protect_only = True
+            reason = (
+                f"gate_protect_reversal window={window_s:g}s "
+                f"after={after[0]}-{after[1]}"
+            )
         elif typ == "match_finished":
             after = score_pair(ev.get("home_score"), ev.get("away_score"))
             reason = (
@@ -2027,6 +2065,23 @@ class TradeExecutor:
             for lot in open_lots
             if lot_depends_on_disallowed_goal(lot, after_score=after)
         ]
+        if protect_only:
+            window_s = gate_protect_window_s()
+            in_window = [
+                lot for lot in affected if lot_in_protect_window(lot, window_s=window_s)
+            ]
+            for lot in affected:
+                if lot in in_window:
+                    continue
+                logger.info(
+                    "gate-protect skip match=%s token=%s… pitch_gate=%s age=%s window=%.0fs",
+                    mid,
+                    str(lot.get("token_id") or "")[:12],
+                    bool(lot.get("pitch_gate")),
+                    lot_protect_age_s(lot),
+                    window_s,
+                )
+            affected = in_window
         if not affected:
             return []
 

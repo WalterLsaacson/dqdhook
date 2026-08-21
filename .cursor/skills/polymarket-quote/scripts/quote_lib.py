@@ -2345,6 +2345,27 @@ def process_bridge_events(
                         f"ALERT pitch-gate cancel on reversal failed match={mid_rev}: {e}",
                         flush=True,
                     )
+                # Post-buy protection window: exit gate lots the reversal undoes.
+                rev_flatten: list[dict[str, Any]] = []
+                if trade_executor is not None:
+                    try:
+                        rev_flatten = list(
+                            trade_executor.maybe_flatten_for_event(ev) or []
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        rev_flatten = [
+                            {
+                                "quoted_at": now_cn_iso(),
+                                "status": "flatten_error",
+                                "error": str(e),
+                                "match_id": mid_rev,
+                                "event_key": key,
+                            }
+                        ]
+                        print(
+                            f"ALERT gate-protect flatten failed match={mid_rev}: {e}",
+                            flush=True,
+                        )
                 try:
                     from livescore_observe import get_active_observer as get_lsa_observer
 
@@ -2369,13 +2390,15 @@ def process_bridge_events(
                         "away": ev.get("away"),
                         "home_score": ev.get("home_score"),
                         "away_score": ev.get("away_score"),
-                        "flatten_count": 0,
+                        "flatten_attempts": rev_flatten,
+                        "flatten_count": len(rev_flatten),
                         "pitch_gate": {"status": "cancel_requested"},
                     }
                 )
                 seen.add(key)
                 print(
-                    f"dqd-reversal → cancel pitch-gate match_id={mid_rev} key={key}",
+                    f"dqd-reversal → cancel pitch-gate match_id={mid_rev} key={key} "
+                    f"flatten={len(rev_flatten)}",
                     flush=True,
                 )
                 continue

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ if str(_SCRIPTS) not in sys.path:
 import dqd_stream_observe as obs_mod  # noqa: E402
 import pitch_gate as pg  # noqa: E402
 from dqd_stream_observe import set_active_observer  # noqa: E402
+from score_reversal import TZ_CN, iso_now, lot_in_protect_window  # noqa: E402
 from trade_executor import TradeExecutor, _trade_context_pitch_gate  # noqa: E402
 from trade_settings import TradeSettings  # noqa: E402
 
@@ -227,21 +229,24 @@ def main() -> int:
             assert done_var[0].get("buy_emitted") is False
             assert sum(1 for d in done_var if d["status"] == "in_play") == 0
 
-            # --- two consecutive in_play confirms before buy ---
-            def single_then_drop(row: dict[str, Any]) -> dict[str, Any] | None:
-                # sample0 in_play, sample1 stopped → streak reset; never reaches 2.
+            # --- single in_play is enough (GATE_CONFIRM_FRAMES=1) ---
+            assert pg.GATE_CONFIRM_FRAMES == 1, pg.GATE_CONFIRM_FRAMES
+
+            def first_frame_in_play(row: dict[str, Any]) -> dict[str, Any] | None:
                 if int(row.get("sample_i") or 0) == 0:
                     return {"play_state": "in_play", "confidence": 0.9}
                 return {"play_state": "stopped", "stopped_reason": "celebration", "confidence": 0.9}
 
-            pg_mod._judge_frame_sync = single_then_drop  # type: ignore[assignment]
+            pg_mod._judge_frame_sync = first_frame_in_play  # type: ignore[assignment]
             assert coord.start_gate(
                 {**ev, "match_id": "m_streak", "home_score": 1, "away_score": 0},
                 event_key="k_streak",
             )
-            done_st = _wait_done(coord, n=1, timeout=3.0)
-            assert done_st and done_st[0]["status"] == "timeout", done_st
-            assert done_st[0].get("buy_emitted") is False
+            done_st = _wait_done(coord, n=2, timeout=3.0)
+            st_by_status = [d["status"] for d in done_st]
+            assert "in_play" in st_by_status, done_st
+            buy_st = next(d for d in done_st if d["status"] == "in_play")
+            assert buy_st.get("sample_i") == 0, buy_st
 
             # --- VAR during capture → permanent no-buy even if later in_play ---
             def var_then_in_play(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -266,17 +271,17 @@ def main() -> int:
             assert done_vv[0].get("reason") == "var_during_capture"
             assert sum(1 for d in done_vv if d["status"] == "in_play") == 0
 
-            # --- in_play confirm then VAR before second confirm → var_veto ---
-            def in_play_then_var(row: dict[str, Any]) -> dict[str, Any] | None:
+            # --- VAR on a later frame still vetoes when no buy fired yet ---
+            def unclear_then_var(row: dict[str, Any]) -> dict[str, Any] | None:
                 if int(row.get("sample_i") or 0) == 0:
-                    return {"play_state": "in_play", "confidence": 0.9}
+                    return {"play_state": "unclear", "confidence": 0.3}
                 return {
                     "play_state": "stopped",
                     "stopped_reason": "var",
                     "confidence": 0.95,
                 }
 
-            pg_mod._judge_frame_sync = in_play_then_var  # type: ignore[assignment]
+            pg_mod._judge_frame_sync = unclear_then_var  # type: ignore[assignment]
             assert coord.start_gate(
                 {**ev, "match_id": "m_var2", "home_score": 2, "away_score": 0},
                 event_key="k_var2",
@@ -399,9 +404,89 @@ def main() -> int:
         exp = int(orders[0].get("expiration") or 0)
         assert exp > time.time() + 3000, (exp, time.time())
 
+        # --- post-buy protection window: DQD reversal flattens gate lots ---
+        os.environ.pop("QUOTE_REST_ENABLED", None)
+        os.environ["QUOTE_GATE_PROTECT_S"] = "90"
+
+        def _open_lot(mid: str, tid: str, *, gate: bool, opened_at: str) -> None:
+            ex.ledger.register_buy(
+                match_id=mid,
+                token_id=tid,
+                market_key="match_total_0.5_over",
+                shares=5.0,
+                usdc=4.95,
+                home_score=1,
+                away_score=0,
+                live=False,
+                event_key=f"score_change|{mid}|0-0->1-0",
+                home="H",
+                away="A",
+                pitch_gate=gate,
+                opened_at=opened_at,
+            )
+
+        fresh = iso_now()
+        stale = (datetime.now(TZ_CN) - timedelta(seconds=600)).isoformat(
+            timespec="seconds"
+        )
+        _open_lot("m_prot", "tok_prot", gate=True, opened_at=fresh)
+        _open_lot("m_prot_old", "tok_prot_old", gate=True, opened_at=stale)
+        _open_lot("m_prot_ft", "tok_prot_ft", gate=False, opened_at=fresh)
+
+        lots = {r["match_id"]: r for r in ex.ledger.all_open()}
+        assert lot_in_protect_window(lots["m_prot"], window_s=90), lots["m_prot"]
+        assert not lot_in_protect_window(lots["m_prot_old"], window_s=90)
+        assert not lot_in_protect_window(lots["m_prot_ft"], window_s=90)
+
+        def _reversal(mid: str) -> dict[str, Any]:
+            return {
+                "type": "score_change",
+                "match_id": mid,
+                "is_reversal": True,
+                "home_score": 0,
+                "away_score": 0,
+                "prev": {"home": 1, "away": 0},
+                "curr": {"home": 0, "away": 0},
+                "ts": iso_now(),
+            }
+
+        # Fresh gate lot → flatten now (dry lot never touches CLOB).
+        rows = ex.maybe_flatten_for_event(_reversal("m_prot"))
+        assert rows and rows[0].get("status") == "flatten_dry_run", rows
+        assert "gate_protect_reversal" in str(rows[0].get("skip_reason") or ""), rows
+        assert not ex.ledger.open_for_match("m_prot")
+
+        # Outside the window, and non-gate lots → still deferred to FT.
+        assert ex.maybe_flatten_for_event(_reversal("m_prot_old")) == []
+        assert ex.ledger.open_for_match("m_prot_old")
+        assert ex.maybe_flatten_for_event(_reversal("m_prot_ft")) == []
+        assert ex.ledger.open_for_match("m_prot_ft")
+
+        # Window disabled → no reversal flatten at all.
+        os.environ["QUOTE_GATE_PROTECT_S"] = "0"
+        _open_lot("m_prot_off", "tok_prot_off", gate=True, opened_at=iso_now())
+        assert ex.maybe_flatten_for_event(_reversal("m_prot_off")) == []
+        assert ex.ledger.open_for_match("m_prot_off")
+
+        # FT reversal still flattens regardless of window/gate flag.
+        os.environ.pop("QUOTE_GATE_PROTECT_S", None)
+        ft_rows = ex.maybe_flatten_for_event(
+            {
+                "type": "match_finished",
+                "match_id": "m_prot_ft",
+                "home_score": 0,
+                "away_score": 0,
+                "ts": iso_now(),
+            }
+        )
+        assert ft_rows and ft_rows[0].get("status") == "flatten_dry_run", ft_rows
+        assert not ex.ledger.open_for_match("m_prot_ft")
+
     assert obs_mod.get_active_observer() is None
 
-    print("ok: pitch_gate min5+timeout + buy-once + var_veto + buy_revoke + rest@0.99≥5sh")
+    print(
+        "ok: pitch_gate 1-frame buy + var_veto + buy_revoke + gate_protect_flatten"
+    )
     return 0
 
 

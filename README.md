@@ -70,17 +70,16 @@
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
 | 抓帧 | 进球后 **+5s** 起第一帧，之后每 **5s** 一帧，直到 **150s** 超时或回撤取消 |
 | 判定 | 每帧 JPEG → `pitch-state`：关键词（进攻/控球等）+ **底部比分 OCR 必须等于 DQD 期望比分** |
-| 确认 | 需 **连续 2 帧** 均为合格 `in_play` 才发出一次买信号 |
+| 确认 | **首帧合格即可**（`GATE_CONFIRM_FRAMES=1`），不再要求连续两帧 |
 | 下单 | `_quote_one`（`trade_context.pitch_gate=true`），**每球最多一刀**；买后仍继续抓帧直到超时（供看板复盘） |
 | VAR | 抓帧过程中任一帧判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`），仍抓满超时窗口 |
-| 超时 | 从未达到两帧确认 → `pitch_gate_timeout`，不买 |
-| 回撤 | DQD 回撤 → 取消会话 `pitch_gate_canceled`（若已买过，取消只影响剩余抓帧） |
+| 超时 | 全程没有合格 `in_play` → `pitch_gate_timeout`，不买 |
+| 回撤 | DQD 回撤 → 取消会话 `pitch_gate_canceled`；**买后 90s 内**则立即平仓（见下节） |
 
 **门控通过条件（须同时满足）：**
 
 - OCR 命中「进行中」类关键词（进攻 / 控球 / 任意球等），且非 VAR/换人/庆祝等停止态  
 - 底部比分 OCR = 该球期望的 `home_score-away_score`（比分未更新或不一致 → 不当作 `in_play`）  
-- 连续 **2** 帧合格  
 - 本会话**从未**出现过 VAR  
 
 **明确不下单的情况：**
@@ -92,9 +91,10 @@
 | 事件过旧（默认 >900s） | `goal_stale` 跳过 |
 | 比分 OCR 对不上 | 继续抓，不买 |
 | 抓帧中出现 VAR | `var_veto`，该球不买 |
-| 懂球帝回撤该球 | 取消门控；已成交不自动平仓 |
-| 动画已改比分、随后 DQD 才长延迟回撤 | 比分门控拦不住；2 帧确认只能挡约一个采样间隔内的快回撤 |
-| VAR 出现在**已经下单之后** | 拦不住该刀 |
+| 懂球帝回撤该球（买入前） | 取消门控 + 撤销未 drain 的买信号 |
+| 懂球帝回撤该球（买入后 300s 内） | **立即 FAK 平仓**（见下节） |
+| 动画已改比分、随后 DQD 才长延迟回撤 | 买入时无法预知；由买后保护窗口兜底 |
+| VAR 出现在**已经下单之后** | 拦不住该刀（除非随后 DQD 回撤触发保护窗口） |
 
 ### 3. 终场通道（FT）
 
@@ -102,13 +102,19 @@
 - 默认 **live**；同 `match_id` 终场只处理一次（`cursor.processed_ft_match_ids`）。
 - 过旧事件同样受 `QUOTE_FT_MAX_AGE_S`（默认 900s）约束。
 
-### 4. 回撤与持仓
+### 4. 回撤、买后保护与持仓
+
+**买后保护窗口**是延迟回撤的主要防线：买入那一刻无法知道十几秒后懂球帝会不会推翻进球，所以风险在出场端处理，而不是靠拖延买点。
 
 | 动作 | 行为 |
 |---|---|
-| DQD 回撤 | 取消该场 **rest 限价** + **进行中的 pitch-gate** |
-| 自动平仓 | **不做**（进球回撤不 flatten；持仓留到终场相关逻辑或人工） |
-| 同场新进球 | 会取消该场先前未完成的门控会话（`superseded_by_new_goal`） |
+| DQD 回撤 | 取消该场 **rest 限价** + **进行中的 pitch-gate** + 撤销未 drain 的买信号 |
+| 回撤发生在门控买入后 **`QUOTE_GATE_PROTECT_S`（默认 300s）** 内 | **立即 FAK 平仓**（`gate_protect_reversal`），dry lot 只记 `flatten_dry_run` |
+| 回撤超出该窗口，或是 FT（非门控）持仓 | 不动，沿用终场 `ft_reversal_vs_entry`（届时已近归零，只是清仓释放额度） |
+| `QUOTE_GATE_PROTECT_S=0` | 关闭买后保护，退回「一律等终场」 |
+| 同场新进球 | 取消该场先前未完成的门控会话（`superseded_by_new_goal`） |
+
+平仓卖出沿用既有风控：按 `entry×80%` 设最低卖价，不做 0.01 甩卖；吃不掉的残量留给后续 tick 重试。持仓记录在 `data/pm-quote/open_positions.json`，带 `pitch_gate` 与 `opened_at` 两个字段用于判定窗口。
 
 Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 后又回撤，列表按钮/徽章为**红色**（「回撤·曾in_play」）。
 
@@ -192,6 +198,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` | 未设则均为 `live` |
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控确认单跳过** |
+| `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
 | `QUOTE_REST_ENABLED` | 默认 `0`；`1` 才挂 0.99 rest |
 | `QUOTE_REST_EXPIRE_S` | rest 过期秒数，默认 3600 |
 | `QUOTE_FT_MAX_AGE_S` | 默认 900，过旧事件跳过 |
@@ -228,12 +235,12 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 
 以下为当前实现的真实边界，不是「预期内可忽视」的噪音：
 
-1. **回撤不自动平仓**：进球被吹掉后，已成交 `buy_win` 仍持有，直到终场相关逻辑或人工处理。  
-2. **已成交的买无法靠 cancel 撤回**：同 tick 内未 drain 的 `in_play` 会被 `cancel_match` 转为 `buy_revoked`；若上一 tick 已 FAK，回撤只能取消剩余门控/rest。  
-3. **长延迟回撤**：动画板已显示进球、懂球帝十余秒后才回撤时，比分 OCR 与两帧确认都可能已放行。  
-4. **VAR 依赖 OCR 文案**：未识别到 `VAR` 文本则不会 `var_veto`；VAR 出现在下单之后也不回滚。  
+1. **保护窗口只减损不免损**：回撤后价格已经在往下走，FAK 平仓通常拿不回全部本金；`entry×80%` 的最低卖价意味着极端行情下可能吃不掉，残量留到终场。  
+2. **超窗回撤仍无保护**：默认 300s 之外的回撤依旧等终场，那时价格已归零，等于损失已实现。窗口设上限是为了避免被懂球帝的比分抖动误触发平仓。  
+3. **已成交的买无法靠 cancel 撤回**：同 tick 内未 drain 的 `in_play` 会被 `cancel_match` 转为 `buy_revoked`；若上一 tick 已 FAK，只能靠保护窗口平仓。  
+4. **VAR 依赖 OCR 文案**：未识别到 `VAR` 文本则不会 `var_veto`；买入之后出现的 VAR 本身不触发平仓，要等懂球帝真正回撤。  
 5. **时钟误当比分**：少数早期分钟时钟形如 `1:00` 可能被当成 `1-0`（OCR 启发式边界）。  
-6. **截帧失败不重置确认计数**：两帧确认可能被失败帧「隔开」，略弱于「严格相邻两帧」。  
+6. **单帧确认更激进**：改回 1 帧后买入更快、买入率更高，快回撤的拦截完全交给保护窗口。  
 
 更细的盘口结算与 API 见 `.cursor/skills/polymarket-quote/reference.md`。
 
