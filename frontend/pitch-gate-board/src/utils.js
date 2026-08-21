@@ -50,7 +50,23 @@ export function stateLabel(state) {
     pending_judge: "待判定",
     capture_failed: "截帧失败",
     reversed: "回撤",
+    reversed_after_in_play: "回撤·曾in_play",
     mixed: "mixed",
   };
   return map[s] || s;
+}
+
+/** True when this goal was judged in_play on a frame, then later reversed. */
+export function reversedAfterInPlay(goal) {
+  return Boolean(
+    (goal?.reversed || goal?.verdict === "reversed") && goal?.in_play_elapsed_s != null
+  );
+}
+
+/** Badge key for a goal row (splits plain reverse vs reverse-after-in_play). */
+export function goalVerdictKey(goal) {
+  if (goal?.reversed || goal?.verdict === "reversed") {
+    return reversedAfterInPlay(goal) ? "reversed_after_in_play" : "reversed";
+  }
+  return goal?.verdict;
 }

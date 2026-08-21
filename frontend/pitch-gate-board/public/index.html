@@ -26,6 +26,11 @@
         </div>
       </div>
       <div class="controls">
+        <div class="filter" role="group" aria-label="进球筛选">
+          <button type="button" class="filter__btn is-active" data-filter="all">全部</button>
+          <button type="button" class="filter__btn" data-filter="in_play">in_play</button>
+          <button type="button" class="filter__btn" data-filter="reversed">回撤</button>
+        </div>
         <div class="actions">
           <button id="btnRefresh" class="btn btn--ghost" type="button">Refresh</button>
         </div>
@@ -36,8 +41,8 @@
       <div class="pill" id="pillStatus">Idle</div>
       <div class="pill pill--muted" id="pillGoals">Goals —</div>
       <div class="pill pill--muted" id="pillGate">Gate —</div>
-      <div class="pill pill--muted" id="pillInPlay">in_play —</div>
-      <div class="pill pill--muted" id="pillReversed">回撤 —</div>
+      <button type="button" class="pill pill--muted pill--filter" id="pillInPlay" data-filter="in_play">in_play —</button>
+      <button type="button" class="pill pill--muted pill--filter" id="pillReversed" data-filter="reversed">回撤 —</button>
       <div class="pill pill--muted" id="pillLatest">—</div>
     </section>
 

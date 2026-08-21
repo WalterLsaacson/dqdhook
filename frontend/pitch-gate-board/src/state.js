@@ -2,6 +2,8 @@
 
 export const state = {
   goals: [],
+  /** @type {"all"|"in_play"|"reversed"} */
+  filter: "all",
   selectedKey: null,
   pollTimer: null,
   lastMeta: null,

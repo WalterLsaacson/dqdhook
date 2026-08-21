@@ -4,7 +4,7 @@
 import { state } from "./state.js";
 import { $, escapeHtml } from "./utils.js";
 import { fetchGoals } from "./api.js";
-import { consumeReversals, render, renderMeta } from "./render.js";
+import { consumeReversals, render, renderMeta, setFilter } from "./render.js";
 
 async function refresh() {
   const snap = await fetchGoals(100);
@@ -40,6 +40,17 @@ function bind() {
     } catch (e) {
       $("board").innerHTML = `<div class="empty">Failed: ${escapeHtml(e.message)}</div>`;
     }
+  });
+
+  document.querySelectorAll(".filter__btn").forEach((el) => {
+    el.addEventListener("click", () => {
+      setFilter(el.getAttribute("data-filter") || "all");
+    });
+  });
+  document.querySelectorAll(".pill--filter").forEach((el) => {
+    el.addEventListener("click", () => {
+      setFilter(el.getAttribute("data-filter") || "all", { toggle: true });
+    });
   });
 }
 

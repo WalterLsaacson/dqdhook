@@ -3,6 +3,8 @@ import {
   $,
   escapeHtml,
   formatBeijing,
+  goalVerdictKey,
+  reversedAfterInPlay,
   scoreLabel,
   stateBadgeClass,
   stateLabel,
@@ -22,6 +24,40 @@ function reversalKey(ev) {
   return `${ev?.match_id || ""}|${ev?.ts || ""}|${ev?.event_key || ""}`;
 }
 
+/** @param {Array} goals */
+export function filterGoals(goals) {
+  const list = goals || [];
+  if (state.filter === "in_play") {
+    return list.filter((g) => g.verdict === "in_play");
+  }
+  if (state.filter === "reversed") {
+    return list.filter((g) => g.reversed || g.verdict === "reversed");
+  }
+  return list;
+}
+
+export function syncFilterUi() {
+  document.querySelectorAll(".filter__btn").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.getAttribute("data-filter") === state.filter);
+  });
+  const pillIn = $("pillInPlay");
+  const pillRev = $("pillReversed");
+  if (pillIn) pillIn.classList.toggle("is-active", state.filter === "in_play");
+  if (pillRev) pillRev.classList.toggle("is-active", state.filter === "reversed");
+}
+
+export function setFilter(next, { toggle = false } = {}) {
+  const allowed = new Set(["all", "in_play", "reversed"]);
+  if (!allowed.has(next)) return;
+  if (toggle && state.filter === next && next !== "all") {
+    state.filter = "all";
+  } else {
+    state.filter = next;
+  }
+  syncFilterUi();
+  render(state.goals);
+}
+
 export function renderMeta(snap) {
   state.lastMeta = snap;
   const pill = $("pillStatus");
@@ -38,6 +74,7 @@ export function renderMeta(snap) {
   }
   const latest = snap.goals?.[0]?.dqd_ts;
   $("pillLatest").textContent = latest ? `Latest ${formatBeijing(latest)}` : "No goals yet";
+  syncFilterUi();
 }
 
 export function pushReversalToast(ev) {
@@ -86,19 +123,31 @@ export function consumeReversals(list, { toast = true } = {}) {
 export function renderRail(goals) {
   const rail = $("goalRail");
   if (!goals.length) {
-    rail.innerHTML = `<div class="empty" style="padding:20px">暂无进球截图。<br/>等 DQD goal + pitch-gate 抓帧。</div>`;
+    const emptyMsg =
+      state.filter === "in_play"
+        ? "当前筛选下无 in_play 进球。"
+        : state.filter === "reversed"
+          ? "当前筛选下无回撤进球。"
+          : "暂无进球截图。<br/>等 DQD goal + pitch-gate 抓帧。";
+    rail.innerHTML = `<div class="empty" style="padding:20px">${emptyMsg}</div>`;
     return;
   }
   rail.innerHTML = goals
     .map((g) => {
       const active = g.event_key === state.selectedKey ? "is-active" : "";
-      const revClass = g.reversed ? "is-reversed" : "";
+      const afterIp = reversedAfterInPlay(g);
+      const revClass = g.reversed
+        ? afterIp
+          ? "is-reversed is-reversed-after-inplay"
+          : "is-reversed"
+        : "";
+      const vKey = goalVerdictKey(g);
       const title = `${escapeHtml(g.home || "?")} ${escapeHtml(scoreLabel(g))} ${escapeHtml(g.away || "?")}`;
       return `
         <button type="button" class="goal-item ${active} ${revClass}" data-key="${escapeHtml(g.event_key)}">
           <p class="goal-item__title">${title}</p>
           <div class="goal-item__meta">
-            <span class="${stateBadgeClass(g.verdict)}">${escapeHtml(stateLabel(g.verdict))}</span>
+            <span class="${stateBadgeClass(vKey)}">${escapeHtml(stateLabel(vKey))}</span>
             <span>${g.frame_count || 0} frames</span>
             <span>${g.gate ? "gate" : "observe"}</span>
             <span>${escapeHtml(formatBeijing(g.dqd_ts))}</span>
@@ -118,19 +167,32 @@ export function renderRail(goals) {
 export function renderDetail(goal) {
   const board = $("board");
   if (!goal) {
-    board.innerHTML = `<div class="empty">选择左侧一场进球查看截图判定。</div>`;
+    const empty =
+      state.filter === "in_play"
+        ? "当前筛选下无 in_play 进球。"
+        : state.filter === "reversed"
+          ? "当前筛选下无回撤进球。"
+          : "选择左侧一场进球查看截图判定。";
+    board.innerHTML = `<div class="empty">${empty}</div>`;
     return;
   }
 
   const frames = goal.frames || [];
   const title = `${escapeHtml(goal.home || "?")} ${escapeHtml(scoreLabel(goal))} ${escapeHtml(goal.away || "?")}`;
   const rev = goal.reversal;
+  const afterIp = reversedAfterInPlay(goal);
+  const vKey = goalVerdictKey(goal);
   let revLine = "";
   if (goal.reversed && rev) {
+    const revCls = afterIp ? "detail__rev detail__rev--after-inplay" : "detail__rev";
     if (rev.source === "dqd_reversal") {
-      revLine = `<p class="detail__rev">比分回撤 ${escapeHtml(scorePair(rev.prev))} → ${escapeHtml(scorePair(rev.curr))} · 门控已取消 · ${escapeHtml(formatBeijing(rev.ts))}</p>`;
+      revLine = `<p class="${revCls}">比分回撤 ${escapeHtml(scorePair(rev.prev))} → ${escapeHtml(scorePair(rev.curr))} · 门控已取消 · ${escapeHtml(formatBeijing(rev.ts))}${
+        afterIp ? " · 曾判定 in_play" : ""
+      }</p>`;
     } else {
-      revLine = `<p class="detail__rev">门控取消 · ${escapeHtml(rev.reason || rev.mode || "canceled")} · ${escapeHtml(formatBeijing(rev.ts))}</p>`;
+      revLine = `<p class="${revCls}">门控取消 · ${escapeHtml(rev.reason || rev.mode || "canceled")} · ${escapeHtml(formatBeijing(rev.ts))}${
+        afterIp ? " · 曾判定 in_play" : ""
+      }</p>`;
     }
   }
 
@@ -187,20 +249,22 @@ export function renderDetail(goal) {
         </p>
         ${revLine}
       </div>
-      <span class="${stateBadgeClass(goal.verdict)}">${escapeHtml(stateLabel(goal.verdict))}</span>
+      <span class="${stateBadgeClass(vKey)}">${escapeHtml(stateLabel(vKey))}</span>
     </div>
     ${framesHtml}`;
 }
 
 export function render(goals) {
   state.goals = goals || [];
-  if (!state.selectedKey && state.goals.length) {
-    state.selectedKey = state.goals[0].event_key;
+  const visible = filterGoals(state.goals);
+  if (state.selectedKey && !visible.some((g) => g.event_key === state.selectedKey)) {
+    state.selectedKey = visible[0]?.event_key || null;
   }
-  if (state.selectedKey && !state.goals.some((g) => g.event_key === state.selectedKey)) {
-    state.selectedKey = state.goals[0]?.event_key || null;
+  if (!state.selectedKey && visible.length) {
+    state.selectedKey = visible[0].event_key;
   }
-  renderRail(state.goals);
-  const selected = state.goals.find((g) => g.event_key === state.selectedKey) || null;
+  syncFilterUi();
+  renderRail(visible);
+  const selected = visible.find((g) => g.event_key === state.selectedKey) || null;
   renderDetail(selected);
 }
