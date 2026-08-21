@@ -131,13 +131,15 @@ After a `score_change` that successfully `buy_win`s (dry_run or posted), watch w
 
 Pitch-gate drives captures every **5s** for up to **150s** after a paired goal (first frame @ **+5s**; ≥5 frames; continues after first `in_play` buy). Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
 
+**AF score observe (research only):** on the same goal `t0`, `af_observe.py` polls API-Football events on the **same +5s / 5s clock** but only for **90s**, writing `data/pm-quote/af_observe.jsonl`. Enabled by default when `apifootball_key` is set (`QUOTE_AF_OBSERVE=0` to disable). Never buys. Fixture ids are cache-only from `apifootball-bridge` (`MAIN_AF_WATCH` via af-bridge-board **:8792**).
+
 **Animation source (纳米数据):** the gate screenshots the nami tracker directly rather than the DQD match page. `match_list` already returns `animation_live` (`https://tracker.namitiyu.com/zh/football?profile=…&id=<nami_id>`) on every row, so `map_match` keeps it and `dqd_live.discover_live_surface` reads it out of `data/snapshot.json` (memoized on mtime) and returns `surface="animation"` with the tracker as `page_url` — no extra request, and no dependency on the DQD page DOM. Rows carry `nami_id`.
 
 Fixtures with no `animation_live` fall back to the previous behaviour (magicball probes, then the DQD page). Playwright screenshots `.football-animate` on the tracker, still falling back to `iframe.md-anim-iframe` / `video` for the DQD page. Measured ~4.4s per capture vs ~5.0s via the DQD page.
 
 Two things this does **not** fix: nami serves 暂无动画 for fixtures it does not animate (the gate then just times out with no buy, which is the safe outcome), and `profile` is DQD's partner slot — it is re-read from `animation_live` on every tick rather than hardcoded.
 
-Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_nami_observe.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
+Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_nami_observe.py`, `.../smoke_af_observe.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
 
 **Nami live feed observe (`QUOTE_NAMI_OBSERVE=1`, observe-only)**
 
