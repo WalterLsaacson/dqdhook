@@ -164,31 +164,25 @@ def main() -> int:
             assert "in_play" in by_key.get("kb", []), by_key
             assert "complete" in by_key.get("kb", []), by_key
 
-            # --- VAR then board already reversed → no buy (Drita-style) ---
-            def var_then_wrong_score(row: dict[str, Any]) -> dict[str, Any] | None:
-                # Simulate pipeline: once require_score is on, mismatch → unclear.
+            # --- score required + board already reversed → no buy ---
+            def always_wrong_score(row: dict[str, Any]) -> dict[str, Any] | None:
+                # Gate always sets require_score; mismatch must not buy.
                 if bool(row.get("require_score")):
                     return {
                         "play_state": "unclear",
                         "score_match": False,
-                        "ocr_score": "2-2",
+                        "ocr_score": "0-0",
                         "confidence": 0.55,
-                    }
-                if int(row.get("sample_i") or 0) == 0:
-                    return {
-                        "play_state": "stopped",
-                        "stopped_reason": "var",
-                        "confidence": 0.92,
                     }
                 return {"play_state": "in_play", "confidence": 0.9}
 
-            pg_mod._judge_frame_sync = var_then_wrong_score  # type: ignore[assignment]
+            pg_mod._judge_frame_sync = always_wrong_score  # type: ignore[assignment]
             assert coord.start_gate(
                 {
                     **ev,
                     "match_id": "m_var",
-                    "home_score": 3,
-                    "away_score": 2,
+                    "home_score": 1,
+                    "away_score": 0,
                 },
                 event_key="k_var",
             )
@@ -196,6 +190,22 @@ def main() -> int:
             assert done_var and done_var[0]["status"] == "timeout", done_var
             assert done_var[0].get("buy_emitted") is False
             assert sum(1 for d in done_var if d["status"] == "in_play") == 0
+
+            # --- two consecutive in_play confirms before buy ---
+            def single_then_drop(row: dict[str, Any]) -> dict[str, Any] | None:
+                # sample0 in_play, sample1 stopped → streak reset; never reaches 2.
+                if int(row.get("sample_i") or 0) == 0:
+                    return {"play_state": "in_play", "confidence": 0.9}
+                return {"play_state": "stopped", "stopped_reason": "var", "confidence": 0.9}
+
+            pg_mod._judge_frame_sync = single_then_drop  # type: ignore[assignment]
+            assert coord.start_gate(
+                {**ev, "match_id": "m_streak", "home_score": 1, "away_score": 0},
+                event_key="k_streak",
+            )
+            done_st = _wait_done(coord, n=1, timeout=3.0)
+            assert done_st and done_st[0]["status"] == "timeout", done_st
+            assert done_st[0].get("buy_emitted") is False
     finally:
         pg_mod._judge_frame_sync = orig_judge  # type: ignore[assignment]
         set_active_observer(None)

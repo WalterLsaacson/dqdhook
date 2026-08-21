@@ -317,12 +317,12 @@ def judge_animation(
     expected_away: Any = None,
     require_score: bool = False,
 ) -> dict[str, Any]:
-    """Judge play state from OCR tokens; optional post-VAR score veto.
+    """Judge play state from OCR tokens; optional board-score gate.
 
     Default: keyword-only (进攻/控球 vs VAR…).
-    When ``require_score`` (pitch-gate saw VAR/celebration earlier): board OCR
-    must match expected DQD score before ``in_play`` — blocks animation-ahead
-    reversals that DQD has not emitted yet.
+    When ``require_score`` (pitch-gate): board OCR must match expected DQD
+    score before ``in_play`` — blocks stale boards and many animation-ahead
+    reversals (not all: board can show the goal then DQD reverses later).
     """
     texts = [
         str(line.get("text") or "").strip()
@@ -373,11 +373,11 @@ def judge_animation(
             **score_payload,
         }
 
-    # Post-VAR / celebration: veto in_play unless board score still matches.
+    # Pitch-gate: veto in_play unless board score matches expected DQD score.
     if require_score and exp_h is not None and exp_a is not None:
         if board is None:
             score_payload["score_match"] = False
-            evidence.append(f"VAR后需比分确认（未识别，期望 {exp_h}-{exp_a}）")
+            evidence.append(f"比分未识别（期望 {exp_h}-{exp_a}）")
             return {
                 "play_state": "unclear",
                 "stopped_reason": None,
@@ -388,10 +388,10 @@ def judge_animation(
         matched = int(board["home"]) == exp_h and int(board["away"]) == exp_a
         score_payload["score_match"] = matched
         if matched:
-            evidence.append(f"VAR后比分一致: OCR {board['text']} = 期望 {exp_h}-{exp_a}")
+            evidence.append(f"比分一致: OCR {board['text']} = 期望 {exp_h}-{exp_a}")
         else:
             evidence.append(
-                f"VAR后比分不一致: OCR {board['text']} ≠ 期望 {exp_h}-{exp_a}"
+                f"比分不一致: OCR {board['text']} ≠ 期望 {exp_h}-{exp_a}"
             )
             return {
                 "play_state": "unclear",

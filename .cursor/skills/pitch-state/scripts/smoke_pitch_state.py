@@ -163,7 +163,7 @@ def main() -> int:
             )
             assert ignore_score["play_state"] == "in_play", ignore_score
 
-            # After VAR, mismatched board score must block in_play (Drita-style).
+            # After require_score, mismatched board score must block in_play.
             post_var = pipeline.judge_inputs(
                 image=img1,
                 frame_meta={
@@ -188,6 +188,7 @@ def main() -> int:
             )
             assert post_var["play_state"] == "unclear", post_var
             assert post_var.get("score_match") is False, post_var
+            assert any("比分不一致" in str(x) for x in (post_var.get("evidence") or [])), post_var
 
             post_var_ok = pipeline.judge_inputs(
                 image=img1,

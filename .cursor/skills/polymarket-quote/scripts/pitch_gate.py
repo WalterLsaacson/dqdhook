@@ -19,6 +19,11 @@ GATE_FIRST_DELAY_S = 5.0
 GATE_MIN_FRAMES = 5
 # Hard ceiling for the whole session (not a max frame count).
 GATE_TIMEOUT_S = 150.0
+# Pitch-gate buys require board OCR == expected DQD score on every in_play.
+GATE_REQUIRE_SCORE = True
+# Need this many consecutive in_play(+score) frames before the one-shot buy.
+# Softens "board already shows goal then DQD reverses a few seconds later".
+GATE_CONFIRM_FRAMES = 2
 # Backward-compat alias used by older smokes/docs.
 GATE_FRAME_COUNT = GATE_MIN_FRAMES
 
@@ -53,8 +58,9 @@ class _GateSession:
     thread: threading.Thread | None = None
     finished: bool = False
     buy_emitted: bool = False
-    # After VAR/celebration, later frames must OCR-match expected score to buy.
-    require_score: bool = False
+    # Always on for gate: board OCR must match expected score for in_play.
+    require_score: bool = True
+    confirm_streak: int = 0
 
 
 class PitchGateCoordinator:
@@ -140,7 +146,7 @@ class PitchGateCoordinator:
             f"pitch-gate → START match_id={mid} key={key} "
             f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
             f"min_frames={GATE_MIN_FRAMES} timeout={GATE_TIMEOUT_S:g}s "
-            f"(buy on first in_play; keep capturing until timeout)",
+            f"(in_play+score×{GATE_CONFIRM_FRAMES}; keep capturing until timeout)",
             flush=True,
         )
         return True
@@ -194,12 +200,13 @@ class PitchGateCoordinator:
                     "sample_i": sample_i,
                 }
             )
-        print(
-            f"pitch-gate → IN_PLAY (buy once) match_id={session.match_id} "
-            f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
-            f"· continue ≥{GATE_MIN_FRAMES} frames / ≤{GATE_TIMEOUT_S:g}s",
-            flush=True,
-        )
+            print(
+                f"pitch-gate → IN_PLAY (buy once) match_id={session.match_id} "
+                f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
+                f"· confirmed×{max(1, int(GATE_CONFIRM_FRAMES))} "
+                f"· continue ≥{GATE_MIN_FRAMES} frames / ≤{GATE_TIMEOUT_S:g}s",
+                flush=True,
+            )
         return True
 
     def _finish_session(
@@ -283,30 +290,44 @@ class PitchGateCoordinator:
                 captured += 1
 
                 if row.get("ok") is True and row.get("frame_path"):
-                    row["require_score"] = bool(session.require_score)
+                    row["require_score"] = bool(
+                        session.require_score and GATE_REQUIRE_SCORE
+                    )
                     judged = _judge_frame_sync(row)
                     play_state = str((judged or {}).get("play_state") or "")
-                    stopped_reason = str((judged or {}).get("stopped_reason") or "")
-                    if play_state == "stopped" and stopped_reason in ("var", "celebration"):
-                        if not session.require_score:
-                            session.require_score = True
+                    if play_state == "in_play":
+                        session.confirm_streak += 1
+                        need = max(1, int(GATE_CONFIRM_FRAMES))
+                        if session.confirm_streak < need:
                             print(
-                                f"pitch-gate → SCORE_GATE_ON match_id={session.match_id} "
-                                f"key={session.event_key} reason={stopped_reason} "
-                                f"(later in_play needs board score = "
-                                f"{session.ev.get('home_score')}-{session.ev.get('away_score')})",
+                                f"pitch-gate → CONFIRM {session.confirm_streak}/{need} "
+                                f"match_id={session.match_id} key={session.event_key} "
+                                f"sample={sample_i} score="
+                                f"{session.ev.get('home_score')}-"
+                                f"{session.ev.get('away_score')}",
                                 flush=True,
                             )
-                    if play_state == "in_play":
-                        if session.cancel.is_set():
+                        elif session.cancel.is_set():
                             break
-                        self._emit_buy_once(
-                            session,
-                            judge=judged,
-                            elapsed_s=round(time.monotonic() - session.t0_mono, 3),
-                            sample_i=sample_i,
-                        )
-                        # Keep capturing until timeout; do not return.
+                        else:
+                            self._emit_buy_once(
+                                session,
+                                judge=judged,
+                                elapsed_s=round(
+                                    time.monotonic() - session.t0_mono, 3
+                                ),
+                                sample_i=sample_i,
+                            )
+                            # Keep capturing until timeout; do not return.
+                    else:
+                        if session.confirm_streak:
+                            print(
+                                f"pitch-gate → CONFIRM_RESET "
+                                f"match_id={session.match_id} key={session.event_key} "
+                                f"was={session.confirm_streak} play_state={play_state}",
+                                flush=True,
+                            )
+                        session.confirm_streak = 0
 
                 sample_i += 1
                 next_t = (

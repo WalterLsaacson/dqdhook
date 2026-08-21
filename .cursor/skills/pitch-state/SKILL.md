@@ -47,10 +47,10 @@ data/pm-quote/dqd_stream_frames/<match_id>/<event_key>/
    - `animation`：懂球帝动画球场 / tracker
    - `real_video`：真实转播画面
    - `unknown` / `mixed`
-3. 动画图只走本地 OCR + 规则，**不再升级 VLM**。默认只看「进攻/控球/VAR」等关键词；**仅当本场门控已见过 VAR/庆祝** 时，才要求底部比分 OCR 与 DQD 期望一致才允许 `in_play`。比分提取会过滤时钟/球衣号/顶部角标/乱码，并兼容 Paddle 的 numpy box。
+3. 动画图只走本地 OCR + 规则，**不再升级 VLM**。门控路径：`in_play` 需 **关键词 + 底部比分 OCR = DQD 期望**，且连续 **2** 帧确认后才买（挡未更新比分、以及部分快回撤）。非门控仍可只看关键词。
 4. 真实视频图仍可走 OpenAI 兼容视觉模型。
 5. 保守输出：不确定时给 `unclear`，不要硬判 `in_play`。
-
+6. 限制：动画已显示进球、随后 DQD 才回撤的长延迟（如 20s+）仍可能漏过。
 ## Labels
 
 - `play_state`
