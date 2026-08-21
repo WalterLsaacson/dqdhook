@@ -27,6 +27,7 @@ import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from dqd_stream_observe import try_create_observer as try_create_dqd_stream_observer  # noqa: E402
+from af_observe import try_create_observer as try_create_af_observer  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
 from nami_observe import try_create_observer as try_create_nami_observer  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
@@ -312,6 +313,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
+    af_obs = try_create_af_observer(rt)
+    if af_obs is not None:
+        af_obs.start()
+    else:
+        print(
+            "af observe skipped (QUOTE_AF_OBSERVE=0 or missing apifootball_key)",
+            file=sys.stderr,
+            flush=True,
+        )
     lsa_obs = try_create_lsa_observer(rt)
     if lsa_obs is not None:
         lsa_obs.start()
@@ -418,6 +428,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             dqd_stream_obs.stop()
         if nami_obs is not None:
             nami_obs.stop()
+        if af_obs is not None:
+            af_obs.stop()
         if not args.no_upstream:
             lib.stop_owned_bridge()
         return 0

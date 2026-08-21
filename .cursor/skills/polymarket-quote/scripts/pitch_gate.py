@@ -288,6 +288,8 @@ class PitchGateCoordinator:
             return False
         observer = get_active_observer()
         if observer is None:
+            # Still sample AF scores for research when DOM gate cannot run.
+            self._af_observe_start(ev, event_key=key)
             self._push_done(
                 {
                     "status": "unavailable",
@@ -301,6 +303,7 @@ class PitchGateCoordinator:
 
         ok, reason = gate_ready()
         if not ok:
+            self._af_observe_start(ev, event_key=key)
             self._push_done(
                 {
                     "status": "unavailable",
@@ -332,6 +335,8 @@ class PitchGateCoordinator:
             )
             self._by_event[key] = session
             self._by_match.setdefault(mid, set()).add(key)
+        # AF + DOM share this t0 (+5s / 5s); AF stops at 90s.
+        self._af_observe_start(ev, event_key=key)
         self._nami_observe_start(session)
 
         thread = threading.Thread(
@@ -370,6 +375,14 @@ class PitchGateCoordinator:
             revoked = self._revoke_pending_buys_locked(
                 match_id=mid, reason=reason or "dqd_reversal"
             )
+        try:
+            from af_observe import get_active_observer as get_af
+
+            af = get_af()
+            if af is not None:
+                af.cancel_match(mid, reason=reason or "dqd_reversal")
+        except Exception:  # noqa: BLE001
+            logger.debug("af observe cancel skipped", exc_info=True)
         if n or revoked:
             print(
                 f"pitch-gate → CANCEL match_id={mid} sessions={n} "
@@ -510,6 +523,18 @@ class PitchGateCoordinator:
                 }
             )
         self._nami_observe_stop(session)
+
+    def _af_observe_start(self, ev: dict[str, Any], *, event_key: str) -> None:
+        """Kick AF score sampling for this goal. Observe-only, never fatal."""
+        try:
+            from af_observe import get_active_observer as get_af
+
+            observer = get_af()
+            if observer is None:
+                return
+            observer.start_session(ev, event_key=event_key)
+        except Exception:  # noqa: BLE001
+            logger.debug("af observe start skipped", exc_info=True)
 
     def _nami_observe_start(self, session: _GateSession) -> None:
         """Tap the nami live feed for this goal. Observe-only, never fatal."""

@@ -61,6 +61,13 @@ BOARDS = (
         "port": 8791,
         "skill": "polymarket-quote / pitch-state",
     },
+    {
+        "id": "af-bridge-board",
+        "name": "API-Football Bridge",
+        "script": FRONTEND / "run_af_bridge.py",
+        "port": 8792,
+        "skill": "apifootball-bridge",
+    },
 )
 
 QUOTE_SCRIPT = (
@@ -251,7 +258,65 @@ def _http_json(url: str, *, timeout: float = 1.5) -> dict[str, Any] | None:
         return None
 
 
+def _http_post_json(
+    url: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 8.0,
+) -> dict[str, Any] | None:
+    try:
+        body = json.dumps(payload or {}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "User-Agent": "main-module/1.0",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 BRIDGE_BOARD_PORT = 8789
+AF_BRIDGE_BOARD_PORT = 8792
+
+
+def _ensure_af_bridge_watch() -> dict[str, Any]:
+    """Start apifootball-bridge watch via af-bridge-board API (fixture cache warmer).
+
+    Needed so pitch-gate AF observe can resolve DQD→AF fixture ids. Disable with
+    ``MAIN_AF_WATCH=0``.
+    """
+    if not _env_bool("MAIN_AF_WATCH", True):
+        return {"ok": True, "skipped": True, "reason": "MAIN_AF_WATCH=0"}
+    port = AF_BRIDGE_BOARD_PORT
+    if not _port_open(port):
+        return {"ok": False, "error": "af_bridge_board_down", "port": port}
+    st = _http_json(f"http://{HOST}:{port}/api/status", timeout=2.0)
+    if st and st.get("running"):
+        print(
+            f"main → apifootball-bridge watch already running "
+            f"(entries={st.get('entry_count')} unresolved={st.get('unresolved_count')})",
+            flush=True,
+        )
+        return {"ok": True, "already": True, "running": True, **st}
+    print("main → starting apifootball-bridge watch via af-bridge-board…", flush=True)
+    result = _http_post_json(f"http://{HOST}:{port}/api/af/start", {}, timeout=10.0)
+    if not result:
+        return {"ok": False, "error": "af_start_http_failed", "port": port}
+    print(
+        f"main → apifootball-bridge watch "
+        f"{'already' if result.get('already') else 'started'} "
+        f"(running={result.get('running')})",
+        flush=True,
+    )
+    return {"ok": True, **result}
 
 
 def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess.Popen[Any]:
@@ -397,9 +462,14 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
 
     # HTTP / port waits outside _lock so /api/status stays responsive.
     if already_up:
-        return status()
+        af_st = _ensure_af_bridge_watch()
+        out = status()
+        out["af_bridge"] = af_st
+        return out
 
     _wait_port(BRIDGE_BOARD_PORT, timeout_s=20)
+    _wait_port(AF_BRIDGE_BOARD_PORT, timeout_s=20)
+    af_st = _ensure_af_bridge_watch()
 
     with _lock:
         if _shutting_down.is_set():
@@ -419,6 +489,7 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
             "ok": True,
             "started_at": _started_at,
             "boards": launched,
+            "af_bridge": af_st,
             "quote_pid": _quote_proc.pid if _quote_proc else None,
             "quote_trade": dict(trade),
             "quote_argv": quote_watch_argv(trade),
@@ -451,6 +522,25 @@ def _supervisor_loop() -> None:
         # Port wait must not hold _lock (status / start would stall).
         if healed_boards:
             _wait_port(BRIDGE_BOARD_PORT, timeout_s=15)
+            _wait_port(AF_BRIDGE_BOARD_PORT, timeout_s=15)
+            try:
+                _ensure_af_bridge_watch()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+        else:
+            try:
+                st = _http_json(
+                    f"http://{HOST}:{AF_BRIDGE_BOARD_PORT}/api/status", timeout=1.0
+                )
+                if (
+                    st is not None
+                    and not st.get("running")
+                    and _env_bool("MAIN_AF_WATCH", True)
+                ):
+                    print("main → supervisor: AF watch idle, restarting…", flush=True)
+                    _ensure_af_bridge_watch()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
         with _lock:
             if _started_at is None or _shutting_down.is_set():
                 continue
@@ -558,6 +648,16 @@ def status() -> dict[str, Any]:
                     "gate_goal_count": st.get("gate_goal_count"),
                     "reversed_count": st.get("reversed_count"),
                 }
+        if up and board["id"] == "af-bridge-board":
+            st = _http_json(f"http://{HOST}:{port}/api/status")
+            if st:
+                extra = {
+                    "skill_running": st.get("running"),
+                    "entry_count": st.get("entry_count"),
+                    "unresolved_count": st.get("unresolved_count"),
+                    "bridge_mapped": st.get("bridge_mapped"),
+                    "bridge_unresolved": st.get("bridge_unresolved"),
+                }
         boards_st.append(
             {
                 "id": board["id"],
@@ -587,6 +687,7 @@ def status() -> dict[str, Any]:
                 "match-bridge",
                 "dongqiudi-match",
                 "polymarket-soccer",
+                "apifootball-bridge",
             ],
             "trade": {
                 **trade,
@@ -596,6 +697,10 @@ def status() -> dict[str, Any]:
                 "watch_log": str(ROOT / "data" / "pm-quote" / "watch.log"),
             },
         },
+        "af_bridge": next(
+            (b for b in boards_st if b["id"] == "af-bridge-board"),
+            None,
+        ),
         "boards": boards_st,
         "ok": True,
     }

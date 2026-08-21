@@ -24,12 +24,14 @@ MODULE_ID = "pitch-gate-board"
 DATA = ROOT / "data" / "pm-quote"
 BRIDGE_EVENTS_PATH = ROOT / "data" / "bridge" / "events.jsonl"
 OBSERVE_PATH = DATA / "dqd_stream_observe.jsonl"
+AF_OBSERVE_PATH = DATA / "af_observe.jsonl"
 JUDGE_PATH = DATA / "pitch_state_judge.jsonl"
 QUOTES_PATH = DATA / "quotes.jsonl"
 FRAMES_ROOT = DATA / "dqd_stream_frames"
 
 # Cap how much history we scan for the board.
 _MAX_OBSERVE_LINES = 8000
+_MAX_AF_OBSERVE_LINES = 8000
 _MAX_JUDGE_LINES = 8000
 _MAX_BRIDGE_LINES = 4000
 _MAX_QUOTES_LINES = 4000
@@ -451,6 +453,51 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         if not replaced:
             frames.append(frame)
 
+    af_rows = _read_jsonl_tail(AF_OBSERVE_PATH, max_lines=_MAX_AF_OBSERVE_LINES)
+    af_by_key: dict[str, list[dict[str, Any]]] = {}
+    for row in af_rows:
+        ek = str(row.get("event_key") or "").strip()
+        mid = str(row.get("match_id") or "").strip()
+        if not ek or not mid:
+            continue
+        if ek not in groups:
+            groups[ek] = {
+                "event_key": ek,
+                "match_id": mid,
+                "home": row.get("home") or "",
+                "away": row.get("away") or "",
+                "home_score": row.get("home_score"),
+                "away_score": row.get("away_score"),
+                "score": row.get("dqd_score"),
+                "dqd_ts": row.get("dqd_ts") or row.get("observed_at"),
+                "gate": bool(row.get("gate")),
+                "frames": [],
+            }
+            order.append(ek)
+        g = groups[ek]
+        for k in ("home", "away", "home_score", "away_score", "dqd_ts"):
+            if row.get(k) is not None and row.get(k) != "":
+                g[k] = row.get(k)
+        if row.get("dqd_score"):
+            g["score"] = row.get("dqd_score")
+        af_by_key.setdefault(ek, []).append(
+            {
+                "sample_i": row.get("sample_i"),
+                "elapsed_s": row.get("elapsed_s"),
+                "observed_at": row.get("observed_at"),
+                "ok": row.get("ok"),
+                "error": row.get("error"),
+                "af_fixture_id": row.get("af_fixture_id"),
+                "af_home": row.get("af_home"),
+                "af_away": row.get("af_away"),
+                "af_home_score": row.get("af_home_score"),
+                "af_away_score": row.get("af_away_score"),
+                "af_score": row.get("af_score"),
+                "dqd_score": row.get("dqd_score"),
+                "score_match": row.get("score_match"),
+            }
+        )
+
     goals: list[dict[str, Any]] = []
     for ek in reversed(order):
         g = groups[ek]
@@ -464,6 +511,24 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         g["frames"] = frames
         g["frame_count"] = len(frames)
         g["ok_count"] = sum(1 for f in frames if f.get("ok") is True)
+        af_frames = list(af_by_key.get(ek) or [])
+        af_frames.sort(
+            key=lambda f: (
+                float(f.get("elapsed_s") or 0),
+                int(f.get("sample_i") or 0),
+            )
+        )
+        g["af_frames"] = af_frames
+        g["af_frame_count"] = len(af_frames)
+        g["af_match_count"] = sum(1 for f in af_frames if f.get("score_match") is True)
+        g["af_first_match_elapsed_s"] = next(
+            (
+                f.get("elapsed_s")
+                for f in af_frames
+                if f.get("score_match") is True
+            ),
+            None,
+        )
         verdict = _goal_verdict(frames)
         in_play_at = None
         for f in frames:
@@ -520,6 +585,7 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
     return {
         "updated_at": None,
         "observe_path": str(OBSERVE_PATH),
+        "af_observe_path": str(AF_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
         "frames_root": str(FRAMES_ROOT),
         "goal_count": len(goals),
@@ -527,6 +593,7 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
         "in_play_count": in_play_n,
         "reversed_count": rev_n,
         "observe_rows": len(observe),
+        "af_observe_rows": len(af_rows),
         "judge_rows": len(judges),
         "goals": goals,
         "recent_reversals": recent_reversals[:40],
@@ -543,9 +610,11 @@ def status_payload() -> dict[str, Any]:
         "running": True,
         "viewer": True,
         "observe_path": str(OBSERVE_PATH),
+        "af_observe_path": str(AF_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
         "frames_root": str(FRAMES_ROOT),
         "observe_exists": OBSERVE_PATH.is_file(),
+        "af_observe_exists": AF_OBSERVE_PATH.is_file(),
         "judge_exists": JUDGE_PATH.is_file(),
         "goal_count": snap["goal_count"],
         "gate_goal_count": snap["gate_goal_count"],
@@ -638,6 +707,7 @@ def main() -> int:
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Pitch Gate Board → http://{HOST}:{PORT}/", flush=True)
     print(f"  observe → {OBSERVE_PATH}", flush=True)
+    print(f"  af observe → {AF_OBSERVE_PATH}", flush=True)
     print(f"  judge   → {JUDGE_PATH}", flush=True)
     try:
         httpd.serve_forever()

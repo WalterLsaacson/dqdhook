@@ -188,6 +188,11 @@ export function renderRail(goals) {
           <div class="goal-item__meta">
             <span class="${stateBadgeClass(vKey)}">${escapeHtml(stateLabel(vKey))}</span>
             <span>${g.frame_count || 0} frames</span>
+            ${
+              g.af_frame_count
+                ? `<span class="goal-item__af">AF ${g.af_match_count || 0}/${g.af_frame_count}</span>`
+                : ""
+            }
             <span>${g.gate ? "gate" : "observe"}</span>
             <span>${escapeHtml(formatBeijing(g.dqd_ts))}</span>
           </div>
@@ -217,6 +222,7 @@ export function renderDetail(goal) {
   }
 
   const frames = goal.frames || [];
+  const afFrames = goal.af_frames || [];
   const title = `${escapeHtml(goal.home || "?")} ${escapeHtml(scoreLabel(goal))} ${escapeHtml(goal.away || "?")}`;
   const rev = goal.reversal;
   const afterIp = reversedAfterInPlay(goal);
@@ -234,6 +240,50 @@ export function renderDetail(goal) {
       }</p>`;
     }
   }
+
+  const afHtml = afFrames.length
+    ? `<section class="af-trail">
+        <div class="af-trail__head">
+          <h3>API-Football observe</h3>
+          <span>${afFrames.length} samples · ≤90s @ 5s
+          ${
+            goal.af_first_match_elapsed_s != null
+              ? ` · match @ t+${escapeHtml(String(goal.af_first_match_elapsed_s))}s`
+              : ""
+          }</span>
+        </div>
+        <div class="af-trail__row">
+          ${afFrames
+            .map((f) => {
+              const matchCls =
+                f.score_match === true
+                  ? "is-match"
+                  : f.score_match === false
+                    ? "is-miss"
+                    : f.ok
+                      ? ""
+                      : "is-err";
+              const score = f.af_score || (f.ok ? "?-?" : "—");
+              return `<div class="af-chip ${matchCls}" title="${escapeHtml(
+                f.error || f.af_home || "",
+              )}">
+                <span class="af-chip__t">t+${escapeHtml(String(f.elapsed_s ?? "?"))}</span>
+                <span class="af-chip__s">${escapeHtml(String(score))}</span>
+                <span class="af-chip__m">${
+                  f.score_match === true
+                    ? "OK"
+                    : f.score_match === false
+                      ? "≠"
+                      : f.ok
+                        ? "…"
+                        : "err"
+                }</span>
+              </div>`;
+            })
+            .join("")}
+        </div>
+      </section>`
+    : "";
 
   const framesHtml = frames.length
     ? `<div class="frames">${frames
@@ -289,6 +339,11 @@ export function renderDetail(goal) {
           ${goal.gate ? "pitch-gate" : "observe"} ·
           ${frames.length} frames
           ${
+            afFrames.length
+              ? ` · AF ${goal.af_match_count || 0}/${afFrames.length}`
+              : ""
+          }
+          ${
             goal.in_play_elapsed_s != null
               ? ` · in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s`
               : ""
@@ -298,6 +353,7 @@ export function renderDetail(goal) {
       </div>
       <span class="${stateBadgeClass(vKey)}">${escapeHtml(stateLabel(vKey))}</span>
     </div>
+    ${afHtml}
     ${framesHtml}`;
 }
 

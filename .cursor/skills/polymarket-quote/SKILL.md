@@ -103,6 +103,8 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | DQD stream frames | `data/pm-quote/dqd_stream_frames/` | JPEG frames |
 | Pitch-state judge | `data/pm-quote/pitch_state_judge.jsonl` | Per-frame resume-play verdict |
 | Pitch Gate board | http://127.0.0.1:8791/ | Per-goal frames + judgments (System Main) |
+| AF observe | `data/pm-quote/af_observe.jsonl` | AF score trail after DQD goal (+5s/5s ≤90s; research only) |
+| AF Bridge board | http://127.0.0.1:8792/ | DQD→AF fixture cache / events |
 | Live Score observe | `data/pm-quote/livescore_observe.jsonl` | Optional LSA research |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots |
 | Cursor | `data/pm-quote/cursor.json` | Processed keys / FT ids / offset |
@@ -110,6 +112,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 ## Related skills
 
 - [`match-bridge`](../match-bridge/SKILL.md) — FT / score_change trigger
+- [`apifootball-bridge`](../apifootball-bridge/SKILL.md) — DQD→AF fixture cache (AF observe)
 - [`pitch-state`](../pitch-state/SKILL.md) — screenshot resume-play judge (gate)
 - [`polymarket-soccer`](../polymarket-soccer/SKILL.md) — Gamma helpers / fixture list
 - [`trade-analytics`](../trade-analytics/SKILL.md) — historical trades / PnL

@@ -40,7 +40,8 @@
 | 懂球帝看板 | `:8787` | DQD 赛程 |
 | Polymarket 看板 | `:8788` | Gamma 快照 |
 | Match Bridge 看板 | `:8789` | 配对结果（只读；quote 持有桥） |
-| Pitch Gate 看板 | `:8791` | 每球逐帧状态 + 判定（可筛 in_play / 回撤） |
+| Pitch Gate 看板 | `:8791` | 每球逐帧 DOM 状态 + AF 比分观察（可筛 in_play / 回撤） |
+| API-Football Bridge 看板 | `:8792` | DQD→AF fixture 缓存 / events |
 | `pm_quote watch` | — | **进程内持有 match-bridge**，内存队列直达询价 |
 
 不要单独再开 `pm_quote`、boards skill host，或第二个 `run_main`（`:8790` 占用会直接退出）。  
@@ -238,7 +239,8 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | 路径 | 用途 |
 |---|---|
 | http://127.0.0.1:8790/ | System Main 总控 |
-| http://127.0.0.1:8791/ | Pitch Gate：按球逐帧状态；筛全部 / in_play / 回撤 |
+| http://127.0.0.1:8791/ | Pitch Gate：按球逐帧状态 + AF 比分观察；筛全部 / in_play / 回撤 |
+| http://127.0.0.1:8792/ | API-Football Bridge：fixture 缓存 |
 | `data/pm-quote/watch.log` | 询价 / 门控 / 下单 stdout |
 | `data/pm-quote/trades.jsonl` | dry / live 尝试 |
 | `data/pm-quote/quotes.jsonl` | 完整询价包 |
@@ -247,6 +249,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `data/pm-quote/dqd_stream_observe.jsonl` | 门控帧元数据 |
 | `data/pm-quote/dqd_stream_frames/` | JPEG 截帧 |
 | `data/pm-quote/pitch_state_judge.jsonl` | 每帧 OCR 判定（仅 `QUOTE_GATE_SOURCE=ocr`） |
+| `data/pm-quote/af_observe.jsonl` | AF 比分观察（进球后 +5s/5s ≤90s，不下单） |
 | `data/pm-quote/nami_observe.jsonl` | 纳米实时流采样（比分 / 球位 / 原始 payload），仅调研 |
 | `data/pm-quote/dom_vs_ocr.jsonl` | DOM 读数与 OCR 判定并排记录（仅 `QUOTE_GATE_SOURCE=ocr`） |
 | `data/pm-quote/open_positions.json` | 未平 `buy_win` 仓 |
