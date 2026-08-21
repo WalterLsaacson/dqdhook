@@ -143,6 +143,42 @@ def main() -> int:
             done3 = _wait_done(coord, n=1, timeout=2.0)
             assert len(done3) == 1 and done3[0]["status"] == "canceled", done3
 
+            # --- queued in_play buy revoked by cancel (same-tick race fix) ---
+            pg.reset_coordinator_for_tests()
+            set_active_observer(fake)  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            with coord._lock:
+                coord._done.append(
+                    {
+                        "status": "in_play",
+                        "event_key": "k_queued",
+                        "match_id": "m_queued",
+                        "ev": {**ev, "match_id": "m_queued"},
+                        "reason": "play_state_in_play",
+                        "elapsed_s": 10.0,
+                        "sample_i": 2,
+                    }
+                )
+                # Sibling match must not be touched.
+                coord._done.append(
+                    {
+                        "status": "in_play",
+                        "event_key": "k_other",
+                        "match_id": "m_other",
+                        "ev": {**ev, "match_id": "m_other"},
+                        "reason": "play_state_in_play",
+                        "elapsed_s": 10.0,
+                        "sample_i": 2,
+                    }
+                )
+            assert coord.cancel_match("m_queued", reason="dqd_reversal") >= 1
+            drained = coord.drain_done()
+            by_k = {str(d["event_key"]): d for d in drained}
+            assert by_k["k_queued"]["status"] == "buy_revoked", by_k
+            assert by_k["k_queued"].get("buy_emitted") is False
+            assert by_k["k_other"]["status"] == "in_play", by_k
+            assert sum(1 for d in drained if d["status"] == "in_play") == 1
+
             # --- multi-match concurrent: cancel one does not stop the other ---
             def stopped_or_play(row: dict[str, Any]) -> dict[str, Any] | None:
                 mid = str(row.get("match_id") or "")
@@ -365,7 +401,7 @@ def main() -> int:
 
     assert obs_mod.get_active_observer() is None
 
-    print("ok: pitch_gate min5+timeout + buy-once + var_veto + rest@0.99≥5sh fallback")
+    print("ok: pitch_gate min5+timeout + buy-once + var_veto + buy_revoke + rest@0.99≥5sh")
     return 0
 
 

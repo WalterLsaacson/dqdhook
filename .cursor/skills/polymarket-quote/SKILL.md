@@ -17,7 +17,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 > 动画已改比分、随后 DQD 才回撤的延迟回撤，比分门控拦不住；连续 2 帧只能挡住部分快回撤（约一个采样间隔内）。VAR 若出现在已下单之后则拦不住该刀。
 
-- 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**；**不自动 flatten**
+- 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**，并 **撤销尚未 drain 的 `in_play` 买信号**（`buy_revoked`）；**不自动 flatten**。询价 tick **先处理事件再 drain 门控**，避免同 tick 回撤输掉竞态。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
 - 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1` 且 `QUOTE_PITCH_STATE=1`（缺则 `pitch_gate_unavailable`，该球不下单）

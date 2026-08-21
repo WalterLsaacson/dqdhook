@@ -2206,6 +2206,38 @@ def process_bridge_events(
                         "judge": item.get("judge"),
                     }
                 continue
+            if status == "buy_revoked":
+                # Queued buy invalidated by cancel/reversal before drain.
+                if key not in seen:
+                    seen.add(key)
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "pitch_gate_buy_revoked",
+                        "event_key": key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "pitch_gate": {
+                            "status": "buy_revoked",
+                            "reason": item.get("reason"),
+                            "elapsed_s": item.get("elapsed_s"),
+                            "sample_i": item.get("sample_i"),
+                            "buy_emitted": False,
+                        },
+                    }
+                )
+                print(
+                    f"pitch-gate → BUY_REVOKED match_id={mid} key={key} "
+                    f"reason={item.get('reason')}",
+                    flush=True,
+                )
+                continue
             if status == "complete":
                 # Remaining frames finished after a prior in_play buy.
                 if key not in seen:
@@ -2223,6 +2255,7 @@ def process_bridge_events(
                 "unavailable": "pitch_gate_unavailable",
                 "error": "pitch_gate_error",
                 "var_veto": "pitch_gate_var_veto",
+                "buy_revoked": "pitch_gate_buy_revoked",
             }.get(status, f"pitch_gate_{status or 'unknown'}")
             # Already bought this goal: cancel of leftover frames is informational.
             if status == "canceled" and key in seen:
@@ -2261,7 +2294,8 @@ def process_bridge_events(
                 flush=True,
             )
 
-    _drain_pitch_gate()
+    # Events first, then drain: same-tick DQD reversal → cancel_match revokes
+    # queued in_play rows before any _quote_one.
 
     # Memory events (in-process bridge) first; file scan for restart / board path.
     events_iter: list[dict[str, Any]] = []

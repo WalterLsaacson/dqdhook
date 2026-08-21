@@ -148,6 +148,10 @@ class PitchGateCoordinator:
                 if old is not None and not old.finished:
                     old.cancel_reason = "superseded_by_new_goal"
                     old.cancel.set()
+            # Also drop any undrained buy for those prior goals.
+            self._revoke_pending_buys_locked(
+                match_id=mid, reason="superseded_by_new_goal"
+            )
             self._by_event[key] = session
             self._by_match.setdefault(mid, set()).add(key)
 
@@ -174,6 +178,7 @@ class PitchGateCoordinator:
         if not mid:
             return 0
         n = 0
+        revoked = 0
         with self._lock:
             keys = list(self._by_match.get(mid) or ())
             for key in keys:
@@ -182,12 +187,66 @@ class PitchGateCoordinator:
                     sess.cancel_reason = reason
                     sess.cancel.set()
                     n += 1
-        if n:
+            # Drop queued buys that have not been drained yet (same-tick race).
+            revoked = self._revoke_pending_buys_locked(
+                match_id=mid, reason=reason or "dqd_reversal"
+            )
+        if n or revoked:
             print(
-                f"pitch-gate → CANCEL match_id={mid} sessions={n} reason={reason}",
+                f"pitch-gate → CANCEL match_id={mid} sessions={n} "
+                f"revoked_buys={revoked} reason={reason}",
                 flush=True,
             )
-        return n
+        return n + revoked
+
+    def _revoke_pending_buys_locked(
+        self,
+        *,
+        match_id: str | None = None,
+        event_key: str | None = None,
+        reason: str = "canceled",
+    ) -> int:
+        """Invalidate undrained ``in_play`` buy rows. Caller must hold ``_lock``."""
+        mid = str(match_id or "").strip() or None
+        ek = str(event_key or "").strip() or None
+        if mid is None and ek is None:
+            return 0
+        kept: list[dict[str, Any]] = []
+        revoked = 0
+        for row in self._done:
+            if str(row.get("status") or "") != "in_play":
+                kept.append(row)
+                continue
+            row_mid = str(row.get("match_id") or "")
+            row_ek = str(row.get("event_key") or "")
+            if mid is not None and row_mid != mid:
+                kept.append(row)
+                continue
+            if ek is not None and row_ek != ek:
+                kept.append(row)
+                continue
+            revoked += 1
+            sess = self._by_event.get(row_ek)
+            if sess is not None:
+                # Buy never executed — allow finish status to reflect cancel, not complete.
+                sess.buy_emitted = False
+            kept.append(
+                {
+                    "status": "buy_revoked",
+                    "event_key": row_ek,
+                    "match_id": row_mid,
+                    "ev": row.get("ev") if isinstance(row.get("ev"), dict) else {},
+                    "judge": row.get("judge"),
+                    "reason": reason or "buy_revoked_on_cancel",
+                    "elapsed_s": row.get("elapsed_s"),
+                    "sample_i": row.get("sample_i"),
+                    "buy_emitted": False,
+                    "revoked": True,
+                }
+            )
+        if revoked:
+            self._done = kept
+        return revoked
 
     def _push_done(self, row: dict[str, Any]) -> None:
         with self._lock:
