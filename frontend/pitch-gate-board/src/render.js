@@ -1,9 +1,14 @@
 import { state } from "./state.js";
 import {
   $,
+  GOAL_FILTERS,
+  countByFilter,
+  emptyFilterMessage,
   escapeHtml,
   formatBeijing,
+  goalMatchesFilter,
   goalVerdictKey,
+  isGoalFilter,
   reversedAfterInPlay,
   scoreLabel,
   stateBadgeClass,
@@ -63,31 +68,41 @@ function reversalKey(ev) {
   return `${ev?.match_id || ""}|${ev?.ts || ""}|${ev?.event_key || ""}`;
 }
 
+export function ensureFilterUi() {
+  const bar = $("filterBar");
+  if (bar && !bar.dataset.ready) {
+    bar.innerHTML = GOAL_FILTERS.map(
+      (f) =>
+        `<button type="button" class="filter__btn${f.id === "all" ? " is-active" : ""}" data-filter="${escapeHtml(f.id)}">${escapeHtml(f.short)}</button>`,
+    ).join("");
+    bar.dataset.ready = "1";
+  }
+  const pills = $("verdictPills");
+  if (pills && !pills.dataset.ready) {
+    pills.innerHTML = GOAL_FILTERS.filter((f) => f.id !== "all")
+      .map(
+        (f) =>
+          `<button type="button" class="pill pill--muted pill--filter" data-filter="${escapeHtml(f.id)}" id="pillFilter-${escapeHtml(f.id)}">${escapeHtml(f.short)} —</button>`,
+      )
+      .join("");
+    pills.dataset.ready = "1";
+  }
+}
+
 /** @param {Array} goals */
 export function filterGoals(goals) {
-  const list = goals || [];
-  if (state.filter === "in_play") {
-    return list.filter((g) => g.verdict === "in_play");
-  }
-  if (state.filter === "reversed") {
-    return list.filter((g) => g.reversed || g.verdict === "reversed");
-  }
-  return list;
+  return (goals || []).filter((g) => goalMatchesFilter(g, state.filter));
 }
 
 export function syncFilterUi() {
-  document.querySelectorAll(".filter__btn").forEach((btn) => {
-    btn.classList.toggle("is-active", btn.getAttribute("data-filter") === state.filter);
+  ensureFilterUi();
+  document.querySelectorAll(".filter__btn, .pill--filter").forEach((el) => {
+    el.classList.toggle("is-active", el.getAttribute("data-filter") === state.filter);
   });
-  const pillIn = $("pillInPlay");
-  const pillRev = $("pillReversed");
-  if (pillIn) pillIn.classList.toggle("is-active", state.filter === "in_play");
-  if (pillRev) pillRev.classList.toggle("is-active", state.filter === "reversed");
 }
 
 export function setFilter(next, { toggle = false } = {}) {
-  const allowed = new Set(["all", "in_play", "reversed"]);
-  if (!allowed.has(next)) return;
+  if (!isGoalFilter(next)) return;
   if (toggle && state.filter === next && next !== "all") {
     state.filter = "all";
   } else {
@@ -99,18 +114,27 @@ export function setFilter(next, { toggle = false } = {}) {
 
 export function renderMeta(snap) {
   state.lastMeta = snap;
-  const pill = $("pillStatus");
-  pill.textContent = "Watching jsonl";
-  pill.className = "pill is-ok";
+  ensureFilterUi();
+  const statusPill = $("pillStatus");
+  statusPill.textContent = "Watching jsonl";
+  statusPill.className = "pill is-ok";
   $("pillGoals").textContent = `Goals ${snap.goal_count ?? 0}`;
   $("pillGate").textContent = `Gate ${snap.gate_goal_count ?? 0}`;
-  $("pillInPlay").textContent = `in_play ${snap.in_play_count ?? 0}`;
-  const revN = snap.reversed_count ?? 0;
-  const pillRev = $("pillReversed");
-  if (pillRev) {
-    pillRev.textContent = `回撤 ${revN}`;
-    pillRev.classList.toggle("is-rev", revN > 0);
+  const counts = countByFilter(snap.goals || []);
+  for (const f of GOAL_FILTERS) {
+    if (f.id === "all") continue;
+    const n = counts[f.id] ?? 0;
+    const countPill = $(`pillFilter-${f.id}`);
+    if (countPill) {
+      countPill.textContent = `${f.short} ${n}`;
+      countPill.classList.toggle("is-rev", f.id === "reversed" && n > 0);
+      countPill.classList.toggle("is-rev-hard", f.id === "reversed_after_in_play" && n > 0);
+    }
+    const btn = document.querySelector(`.filter__btn[data-filter="${f.id}"]`);
+    if (btn) btn.textContent = `${f.short} ${n}`;
   }
+  const allBtn = document.querySelector('.filter__btn[data-filter="all"]');
+  if (allBtn) allBtn.textContent = `全部 ${counts.all ?? 0}`;
   const latest = snap.goals?.[0]?.dqd_ts;
   $("pillLatest").textContent = latest ? `Latest ${formatBeijing(latest)}` : "No goals yet";
   syncFilterUi();
@@ -162,12 +186,7 @@ export function consumeReversals(list, { toast = true } = {}) {
 export function renderRail(goals) {
   const rail = $("goalRail");
   if (!goals.length) {
-    const emptyMsg =
-      state.filter === "in_play"
-        ? "当前筛选下无 in_play 进球。"
-        : state.filter === "reversed"
-          ? "当前筛选下无回撤进球。"
-          : "暂无进球记录。<br/>等 DQD goal + pitch-gate 采样。";
+    const emptyMsg = emptyFilterMessage(state.filter);
     rail.innerHTML = `<div class="empty" style="padding:20px">${emptyMsg}</div>`;
     return;
   }
@@ -211,12 +230,7 @@ export function renderRail(goals) {
 export function renderDetail(goal) {
   const board = $("board");
   if (!goal) {
-    const empty =
-      state.filter === "in_play"
-        ? "当前筛选下无 in_play 进球。"
-        : state.filter === "reversed"
-          ? "当前筛选下无回撤进球。"
-          : "选择左侧一场进球查看逐帧判定。";
+    const empty = emptyFilterMessage(state.filter, { detail: true });
     board.innerHTML = `<div class="empty">${empty}</div>`;
     return;
   }

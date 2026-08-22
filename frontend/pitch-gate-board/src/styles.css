@@ -100,12 +100,14 @@ body {
 }
 
 .filter {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   padding: 3px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.03);
   gap: 2px;
+  max-width: min(100%, 920px);
 }
 
 .filter__btn {
@@ -114,10 +116,11 @@ body {
   color: var(--muted);
   font-family: var(--font-body);
   font-weight: 650;
-  font-size: 12px;
-  padding: 8px 12px;
+  font-size: 11px;
+  padding: 7px 10px;
   border-radius: 9px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .filter__btn:hover {
@@ -174,10 +177,47 @@ button.pill {
   cursor: pointer;
 }
 
+.verdict-pills {
+  display: contents;
+}
+
 .pill--filter.is-active {
   border-color: rgba(56, 189, 248, 0.55);
   color: var(--accent);
   background: rgba(56, 189, 248, 0.1);
+}
+
+.pill--filter[data-filter="in_play"].is-active {
+  border-color: rgba(52, 211, 153, 0.55);
+  color: var(--live);
+  background: rgba(52, 211, 153, 0.12);
+}
+
+.pill--filter[data-filter="stopped"].is-active {
+  border-color: rgba(251, 191, 36, 0.55);
+  color: var(--stopped);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.pill--filter[data-filter="reversed"].is-active,
+.pill--filter[data-filter="reversed_after_in_play"].is-active,
+.pill.is-rev.is-active {
+  border-color: rgba(245, 158, 11, 0.6);
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.pill--filter[data-filter="reversed_after_in_play"].is-active,
+.pill.is-rev-hard.is-active {
+  border-color: rgba(251, 113, 133, 0.6);
+  color: var(--danger);
+  background: rgba(251, 113, 133, 0.12);
+}
+
+.pill--filter[data-filter="capture_failed"].is-active {
+  border-color: rgba(251, 113, 133, 0.55);
+  color: var(--danger);
+  background: rgba(251, 113, 133, 0.12);
 }
 
 .pill.is-ok {
@@ -339,6 +379,11 @@ button.pill {
 .pill.is-rev {
   border-color: rgba(245, 158, 11, 0.55);
   color: var(--warn);
+}
+
+.pill.is-rev-hard {
+  border-color: rgba(251, 113, 133, 0.55);
+  color: var(--danger);
 }
 
 .goal-item.is-reversed {

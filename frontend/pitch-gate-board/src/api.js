@@ -9,7 +9,7 @@ export async function api(path, options = {}) {
   return data;
 }
 
-export function fetchGoals(limit = 80) {
+export function fetchGoals(limit = 500) {
   return api(`/api/goals?limit=${limit}`);
 }
 

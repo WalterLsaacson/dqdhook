@@ -4,10 +4,10 @@
 import { state } from "./state.js";
 import { $, escapeHtml } from "./utils.js";
 import { fetchGoals } from "./api.js";
-import { consumeReversals, render, renderMeta, setFilter } from "./render.js";
+import { consumeReversals, ensureFilterUi, render, renderMeta, setFilter } from "./render.js";
 
 async function refresh() {
-  const snap = await fetchGoals(100);
+  const snap = await fetchGoals(500);
   renderMeta(snap);
   render(snap.goals || []);
   consumeReversals(snap.recent_reversals || [], { toast: true });
@@ -42,15 +42,14 @@ function bind() {
     }
   });
 
-  document.querySelectorAll(".filter__btn").forEach((el) => {
-    el.addEventListener("click", () => {
-      setFilter(el.getAttribute("data-filter") || "all");
-    });
+  ensureFilterUi();
+  $("filterBar")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-filter]");
+    if (btn) setFilter(btn.getAttribute("data-filter") || "all");
   });
-  document.querySelectorAll(".pill--filter").forEach((el) => {
-    el.addEventListener("click", () => {
-      setFilter(el.getAttribute("data-filter") || "all", { toggle: true });
-    });
+  $("verdictPills")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-filter]");
+    if (btn) setFilter(btn.getAttribute("data-filter") || "all", { toggle: true });
   });
 }
 

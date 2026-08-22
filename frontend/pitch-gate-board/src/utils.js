@@ -68,5 +68,56 @@ export function goalVerdictKey(goal) {
   if (goal?.reversed || goal?.verdict === "reversed") {
     return reversedAfterInPlay(goal) ? "reversed_after_in_play" : "reversed";
   }
-  return goal?.verdict;
+  const v = goal?.verdict;
+  if (v === "waiting" || v === "unclear") return "waiting_in_play";
+  return v;
+}
+
+/** Header / pill filters — one bucket per row badge, plus 全部. */
+export const GOAL_FILTERS = [
+  { id: "all", short: "全部" },
+  { id: "in_play", short: "in_play" },
+  { id: "stopped", short: "stopped" },
+  { id: "waiting_in_play", short: "等待信号" },
+  { id: "pending_judge", short: "待判定" },
+  { id: "capture_failed", short: "截帧失败" },
+  { id: "mixed", short: "mixed" },
+  { id: "reversed", short: "回撤" },
+  { id: "reversed_after_in_play", short: "回撤·曾in_play" },
+];
+
+const FILTER_IDS = new Set(GOAL_FILTERS.map((f) => f.id));
+
+export function isGoalFilter(id) {
+  return FILTER_IDS.has(id);
+}
+
+export function goalMatchesFilter(goal, filter) {
+  if (!filter || filter === "all") return true;
+  return goalVerdictKey(goal) === filter;
+}
+
+export function countByFilter(goals) {
+  const list = goals || [];
+  const counts = { all: list.length };
+  for (const f of GOAL_FILTERS) {
+    if (f.id === "all") continue;
+    counts[f.id] = 0;
+  }
+  for (const g of list) {
+    const key = goalVerdictKey(g);
+    if (key in counts) counts[key] += 1;
+  }
+  return counts;
+}
+
+export function emptyFilterMessage(filter, { detail = false } = {}) {
+  if (!filter || filter === "all") {
+    return detail
+      ? "选择左侧一场进球查看逐帧判定。"
+      : "暂无进球记录。<br/>等 DQD goal + pitch-gate 采样。";
+  }
+  const row = GOAL_FILTERS.find((f) => f.id === filter);
+  const label = row?.short || stateLabel(filter);
+  return `当前筛选下无「${label}」进球。`;
 }

@@ -30,11 +30,11 @@ QUOTES_PATH = DATA / "quotes.jsonl"
 FRAMES_ROOT = DATA / "dqd_stream_frames"
 
 # Cap how much history we scan for the board.
-_MAX_OBSERVE_LINES = 8000
-_MAX_AF_OBSERVE_LINES = 8000
-_MAX_JUDGE_LINES = 8000
-_MAX_BRIDGE_LINES = 4000
-_MAX_QUOTES_LINES = 4000
+_MAX_OBSERVE_LINES = 50000
+_MAX_AF_OBSERVE_LINES = 25000
+_MAX_JUDGE_LINES = 25000
+_MAX_BRIDGE_LINES = 8000
+_MAX_QUOTES_LINES = 8000
 
 
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
@@ -355,7 +355,7 @@ def _load_reversal_index() -> tuple[
     return recent, by_match, cancel_by_key
 
 
-def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
+def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
     observe = _read_jsonl_tail(OBSERVE_PATH, max_lines=_MAX_OBSERVE_LINES)
     judges = _read_jsonl_tail(JUDGE_PATH, max_lines=_MAX_JUDGE_LINES)
     by_key, by_path = _index_judges(judges)
@@ -601,7 +601,7 @@ def build_goals_payload(*, limit: int = 80) -> dict[str, Any]:
 
 
 def status_payload() -> dict[str, Any]:
-    snap = build_goals_payload(limit=200)
+    snap = build_goals_payload(limit=500)
     latest = None
     if snap["goals"]:
         latest = snap["goals"][0].get("dqd_ts")
@@ -680,10 +680,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/goals":
             try:
-                limit = int((qs.get("limit") or ["80"])[0])
+                limit = int((qs.get("limit") or ["500"])[0])
             except (TypeError, ValueError):
-                limit = 80
-            limit = max(1, min(limit, 300))
+                limit = 500
+            limit = max(1, min(limit, 500))
             json_response(self, 200, build_goals_payload(limit=limit))
             return
 
