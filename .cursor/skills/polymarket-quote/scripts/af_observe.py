@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Observe-only API-Football score sampling beside pitch-gate DOM reads.
 
-After a DQD goal-up, samples AF goals on the same cadence as DOM
-(``+5s``, then every ``5s``) but only for ``90s`` (DOM keeps going to 150s).
+Pitch-gate calls ``sample_once`` on the same +5s / 5s / 120s clock as DOM.
+The independent session thread is unused.
 
 Never buys, never flattens, never runs OCR. Enabled when
 ``QUOTE_AF_OBSERVE=1`` (default) and ``apifootball_key`` is present in ``.env``.
@@ -29,10 +29,10 @@ if str(_AF_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_AF_SCRIPTS))
 import af_bridge_lib as aflib  # noqa: E402
 
-# Same first delay / interval as pitch-gate DOM; shorter hard ceiling.
+# Same first delay / interval / timeout as pitch-gate DOM.
 AF_FIRST_DELAY_S = 5.0
 AF_INTERVAL_S = 5.0
-AF_TIMEOUT_S = 90.0
+AF_TIMEOUT_S = 120.0
 
 _active: "AfScoreObserver | None" = None
 _active_lock = threading.Lock()
@@ -102,8 +102,7 @@ class AfScoreObserver:
         set_active_observer(self)
         print(
             f"af observe → {observe_path(self.root)} "
-            f"(DQD goal +{AF_FIRST_DELAY_S:.0f}s / {AF_INTERVAL_S:.0f}s ≤{AF_TIMEOUT_S:.0f}s · "
-            f"score only · no trade)",
+            f"(same tick as DOM · ≤{AF_TIMEOUT_S:.0f}s · score only · no trade)",
             flush=True,
         )
 
@@ -201,6 +200,88 @@ class AfScoreObserver:
             cache_only=True,
             http_timeout=12.0,
         )
+
+    def sample_once(
+        self,
+        ev: dict[str, Any],
+        *,
+        event_key: str,
+        sample_i: int,
+        elapsed_s: float,
+    ) -> dict[str, Any]:
+        """One AF poll on the pitch-gate clock. Writes jsonl; never trades."""
+        from af_referee import orient_af_goals_to_event
+
+        mid = str(ev.get("match_id") or "").strip()
+        dqd_h = ev.get("home_score")
+        dqd_a = ev.get("away_score")
+        row: dict[str, Any] = {
+            "observed_at": lib.now_cn_iso(),
+            "match_id": mid,
+            "event_key": str(event_key or ""),
+            "dqd_ts": str(ev.get("ts") or ""),
+            "home": str(ev.get("home") or ""),
+            "away": str(ev.get("away") or ""),
+            "home_score": dqd_h,
+            "away_score": dqd_a,
+            "dqd_score": (
+                f"{dqd_h}-{dqd_a}" if dqd_h is not None and dqd_a is not None else None
+            ),
+            "sample_i": int(sample_i),
+            "elapsed_s": round(float(elapsed_s), 3),
+            "source": "af",
+            "gate": True,
+            "observe_only": bool(ev.get("is_reversal")) or bool(ev.get("observe_only")),
+            "is_reversal": bool(ev.get("is_reversal")),
+            "ok": False,
+            "error": None,
+            "af_fixture_id": None,
+            "af_home": None,
+            "af_away": None,
+            "af_home_score": None,
+            "af_away_score": None,
+            "af_score": None,
+            "score_match": None,
+        }
+        try:
+            out = self._poll(mid)
+        except Exception as e:  # noqa: BLE001
+            row["error"] = str(e).splitlines()[0][:160]
+            out = {}
+        entry = (out or {}).get("cache_entry") or {}
+        goals = (out or {}).get("goals") or {}
+        af_h_name = str(entry.get("af_home") or "")
+        af_a_name = str(entry.get("af_away") or "")
+        gh, ga = orient_af_goals_to_event(
+            goals.get("home"),
+            goals.get("away"),
+            af_home=af_h_name,
+            af_away=af_a_name,
+            event_home=str(ev.get("home") or ""),
+            event_away=str(ev.get("away") or ""),
+        )
+        row["af_fixture_id"] = (out or {}).get("af_fixture_id")
+        row["af_home"] = af_h_name or None
+        row["af_away"] = af_a_name or None
+        row["ok"] = bool((out or {}).get("ok")) and gh is not None and ga is not None
+        if not (out or {}).get("ok"):
+            row["error"] = str((out or {}).get("error") or "af_poll_failed")[:160]
+        if gh is not None and ga is not None:
+            try:
+                ih, ia = int(gh), int(ga)
+                row["af_home_score"] = ih
+                row["af_away_score"] = ia
+                row["af_score"] = f"{ih}-{ia}"
+                if dqd_h is not None and dqd_a is not None:
+                    row["score_match"] = ih == int(dqd_h) and ia == int(dqd_a)
+            except (TypeError, ValueError):
+                row["ok"] = False
+                row["error"] = "af_score_parse_failed"
+        try:
+            lib.append_jsonl(observe_path(self.root), [row])
+        except Exception:  # noqa: BLE001
+            logger.exception("af observe write failed")
+        return row
 
     def _run_session(self, session: _AfSession) -> None:
         from af_referee import orient_af_goals_to_event

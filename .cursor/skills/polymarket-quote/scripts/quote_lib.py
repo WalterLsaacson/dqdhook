@@ -1254,17 +1254,21 @@ def flag_misprice(
 
 
 def event_key(ev: dict[str, Any]) -> str:
-    """Semantic identity for score/FT (no wall-clock ts — avoids duplicate buys)."""
+    """Semantic identity for score/FT. Score changes include ``dqd_ts`` so
+    two identical transitions (re-awarded goals) are distinct knives."""
     typ = ev.get("type") or ""
     mid = ev.get("match_id") or ""
     if typ == "score_change":
         prev = ev.get("prev") or {}
         curr = ev.get("curr") or {}
-        return (
-            f"score_change|{mid}|"
+        trans = (
             f"{prev.get('home')}-{prev.get('away')}->"
             f"{curr.get('home')}-{curr.get('away')}"
         )
+        ts = str(ev.get("ts") or "").strip()
+        if ts:
+            return f"score_change|{mid}|{trans}|{ts}"
+        return f"score_change|{mid}|{trans}"
     return f"{typ}|{mid}|{ev.get('home_score')}-{ev.get('away_score')}"
 
 
@@ -2007,11 +2011,10 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into quotes/trades.
 
-    Goal-ups wait for pitch-state ``in_play`` (first frame @+5s, then every 5s
-    until 150s; buy once, keep capturing) before one ``_quote_one``. DQD reversals
-    cancel rest orders and open pitch-gate sessions, then start an observe-only
-    AF/DOM trail (no buy) on the reversal event_key **only if that goal already
-    reached in_play**.
+    Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` (first
+    frame @+5s, then every 5s until 120s) before one ``_quote_one``, then stop
+    capture. DQD reversals cancel rest and open gates; if lots are open they
+    start an AF∨DOM trail (no immediate flatten).
     """
     from score_events import (
         event_is_goal_up,
@@ -2107,20 +2110,6 @@ def process_bridge_events(
                 bundle["flatten_attempts"] = flatten_rows
                 bundle["flatten_count"] = len(flatten_rows)
             bundles.append(bundle)
-            try:
-                from post_goal_sampler import get_active_sampler
-
-                sampler = get_active_sampler()
-                if sampler is not None:
-                    sampler.enqueue_from_bundle(
-                        bundle,
-                        eps=eps,
-                        fee_rate=fee_rate,
-                        min_net=min_net,
-                        proxy=proxy,
-                    )
-            except Exception as e:  # noqa: BLE001
-                print(f"post-goal sampler enqueue failed: {e}", flush=True)
             seen.add(key)
             if market_cache is not None and work_ev.get("type") == "match_finished":
                 mid = str(work_ev.get("match_id") or bundle.get("match_id") or "")
@@ -2182,6 +2171,60 @@ def process_bridge_events(
             if not key:
                 continue
             observe_only = bool(item.get("observe_only")) or bool(ev.get("is_reversal"))
+            if status == "flatten_or":
+                flatten_rows: list[dict[str, Any]] = []
+                if trade_executor is not None:
+                    try:
+                        flatten_rows = list(
+                            trade_executor.maybe_flatten_for_event(
+                                ev, require_protect_window=False
+                            )
+                            or []
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        flatten_rows = [
+                            {
+                                "quoted_at": now_cn_iso(),
+                                "status": "flatten_error",
+                                "error": str(e),
+                                "match_id": mid,
+                                "event_key": key,
+                            }
+                        ]
+                        print(
+                            f"ALERT AF∨DOM flatten failed match={mid}: {e}",
+                            flush=True,
+                        )
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "pitch_gate_flatten_or",
+                        "event_key": key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "flatten_attempts": flatten_rows,
+                        "flatten_count": len(flatten_rows),
+                        "pitch_gate": {
+                            "status": "flatten_or",
+                            "reason": item.get("reason"),
+                            "elapsed_s": item.get("elapsed_s"),
+                            "sample_i": item.get("sample_i"),
+                            "observe_only": True,
+                        },
+                    }
+                )
+                print(
+                    f"pitch-gate → FLATTEN_OR match_id={mid} key={key} "
+                    f"reason={item.get('reason')} flatten={len(flatten_rows)}",
+                    flush=True,
+                )
+                continue
             if observe_only:
                 if status == "in_play":
                     print(
@@ -2287,12 +2330,12 @@ def process_bridge_events(
                     flush=True,
                 )
                 continue
-            if status == "complete":
-                # Remaining frames finished after a prior in_play buy.
+            if status == "complete" or status == "aligned_buy":
+                # Capture stopped after aligned buy (or leftover complete).
                 if key not in seen:
                     seen.add(key)
                 print(
-                    f"pitch-gate → COMPLETE match_id={mid} key={key} "
+                    f"pitch-gate → {status.upper()} match_id={mid} key={key} "
                     f"reason={item.get('reason')} "
                     f"(frames done; buy_emitted={item.get('buy_emitted')})",
                     flush=True,
@@ -2387,13 +2430,14 @@ def process_bridge_events(
                             f"ALERT rest cancel on reversal failed match={mid_rev}: {e}",
                             flush=True,
                         )
-                observe_ok = False
-                try:
-                    observe_ok = bool(
-                        gate.should_observe_reversal(key, match_id=mid_rev)
-                    )
-                except Exception:  # noqa: BLE001
-                    observe_ok = False
+                has_lots = False
+                if mid_rev and trade_executor is not None:
+                    try:
+                        has_lots = bool(
+                            trade_executor.ledger.open_for_match(mid_rev)
+                        )
+                    except Exception:  # noqa: BLE001
+                        has_lots = False
                 try:
                     gate.cancel_match(mid_rev, reason="dqd_reversal")
                 except Exception as e:  # noqa: BLE001
@@ -2401,27 +2445,6 @@ def process_bridge_events(
                         f"ALERT pitch-gate cancel on reversal failed match={mid_rev}: {e}",
                         flush=True,
                     )
-                # Post-buy protection window: exit gate lots the reversal undoes.
-                rev_flatten: list[dict[str, Any]] = []
-                if trade_executor is not None:
-                    try:
-                        rev_flatten = list(
-                            trade_executor.maybe_flatten_for_event(ev) or []
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        rev_flatten = [
-                            {
-                                "quoted_at": now_cn_iso(),
-                                "status": "flatten_error",
-                                "error": str(e),
-                                "match_id": mid_rev,
-                                "event_key": key,
-                            }
-                        ]
-                        print(
-                            f"ALERT gate-protect flatten failed match={mid_rev}: {e}",
-                            flush=True,
-                        )
                 try:
                     from livescore_observe import get_active_observer as get_lsa_observer
 
@@ -2435,9 +2458,9 @@ def process_bridge_events(
                         )
                 except Exception as e:  # noqa: BLE001
                     print(f"ALERT livescore observe reversal failed: {e}", flush=True)
-                # Trade already 认. Observe only if this reverse undoes an in_play goal.
+                # Only trail+flatten when lots already exist. Never flatten on DQD alone.
                 obs_started = False
-                if observe_ok:
+                if has_lots:
                     obs_ev = dict(ev)
                     obs_ev["is_reversal"] = True
                     obs_ev["observe_only"] = True
@@ -2462,8 +2485,8 @@ def process_bridge_events(
                         "away": ev.get("away"),
                         "home_score": ev.get("home_score"),
                         "away_score": ev.get("away_score"),
-                        "flatten_attempts": rev_flatten,
-                        "flatten_count": len(rev_flatten),
+                        "flatten_attempts": [],
+                        "flatten_count": 0,
                         "pitch_gate": {
                             "status": "cancel_requested",
                             "observe_started": obs_started,
@@ -2473,8 +2496,8 @@ def process_bridge_events(
                 seen.add(key)
                 print(
                     f"dqd-reversal → cancel pitch-gate match_id={mid_rev} key={key} "
-                    f"flatten={len(rev_flatten)} · observe trail "
-                    f"{'started' if obs_started else 'skipped (not in_play)'}",
+                    f"observe trail "
+                    f"{'started' if obs_started else 'skipped (no open lots)'}",
                     flush=True,
                 )
                 continue

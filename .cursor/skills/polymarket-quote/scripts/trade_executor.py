@@ -2017,12 +2017,25 @@ class TradeExecutor:
             pitch_gate=_trade_context_pitch_gate(meta),
         )
 
-    def maybe_flatten_for_event(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
-        """Flatten FT corrections, plus DQD reversals inside the gate window."""
-        with self._lock:
-            return self._maybe_flatten_for_event_locked(ev)
+    def maybe_flatten_for_event(
+        self, ev: dict[str, Any], *, require_protect_window: bool = True
+    ) -> list[dict[str, Any]]:
+        """Flatten FT corrections, plus DQD reversals.
 
-    def _maybe_flatten_for_event_locked(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
+        Raw DQD reverse (default) only sells pitch-gate lots inside
+        ``QUOTE_GATE_PROTECT_S``. AF∨DOM ``flatten_or`` passes
+        ``require_protect_window=False`` so a confirmed reverse sells those
+        lots regardless of age (``QUOTE_GATE_PROTECT_S=0`` still blocks the
+        unconfirmed DQD path only).
+        """
+        with self._lock:
+            return self._maybe_flatten_for_event_locked(
+                ev, require_protect_window=require_protect_window
+            )
+
+    def _maybe_flatten_for_event_locked(
+        self, ev: dict[str, Any], *, require_protect_window: bool = True
+    ) -> list[dict[str, Any]]:
         if not self.settings.enabled:
             return []
         mid = str(ev.get("match_id") or "")
@@ -2039,28 +2052,33 @@ class TradeExecutor:
         protect_only = False
 
         if typ == "score_change" and event_signals_reversal(ev):
-            window_s = gate_protect_window_s()
             curr = ev.get("curr") if isinstance(ev.get("curr"), dict) else {}
             after = score_pair(
                 curr.get("home", ev.get("home_score")),
                 curr.get("away", ev.get("away_score")),
             )
-            if window_s <= 0 or after is None:
-                logger.info(
-                    "defer score_change reversal flatten match=%s score=%s-%s "
-                    "(window=%.0fs after=%s)",
-                    mid,
-                    ev.get("home_score"),
-                    ev.get("away_score"),
-                    window_s,
-                    after,
-                )
+            if after is None:
                 return []
-            protect_only = True
-            reason = (
-                f"gate_protect_reversal window={window_s:g}s "
-                f"after={after[0]}-{after[1]}"
-            )
+            if require_protect_window:
+                window_s = gate_protect_window_s()
+                if window_s <= 0:
+                    logger.info(
+                        "defer score_change reversal flatten match=%s score=%s-%s "
+                        "(window=%.0fs after=%s)",
+                        mid,
+                        ev.get("home_score"),
+                        ev.get("away_score"),
+                        window_s,
+                        after,
+                    )
+                    return []
+                protect_only = True
+                reason = (
+                    f"gate_protect_reversal window={window_s:g}s "
+                    f"after={after[0]}-{after[1]}"
+                )
+            else:
+                reason = f"gate_or_confirm after={after[0]}-{after[1]}"
         elif typ == "match_finished":
             after = score_pair(ev.get("home_score"), ev.get("away_score"))
             reason = (
@@ -2091,6 +2109,9 @@ class TradeExecutor:
                     window_s,
                 )
             affected = in_window
+        else:
+            # Confirmed reverse: pitch-gate lots only, any age. FT lots wait FT.
+            affected = [lot for lot in affected if lot.get("pitch_gate")]
         if not affected:
             return []
 

@@ -2,6 +2,6 @@
   "name": "@dongqiudi/pitch-gate-board",
   "version": "1.0.0",
   "private": true,
-  "description": "Read-only board: per-goal pitch-gate screenshots and play_state judgments.",
+  "description": "Read-only board: per-goal DOM play_state, AF score, and Odds grade.",
   "type": "module"
 }

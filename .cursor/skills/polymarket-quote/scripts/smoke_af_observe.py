@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: AF observe samples on the same clock as DOM (+5s / 5s ≤90s)."""
+"""Smoke: AF observe samples on the same clock as DOM (+5s / 5s / 120s)."""
 
 from __future__ import annotations
 
@@ -51,6 +51,21 @@ def main() -> int:
             # Bypass key load in try_create — construct directly.
             obs = ao.AfScoreObserver(root)
             obs.start()
+            once = obs.sample_once(
+                {
+                    "match_id": "m0",
+                    "home": "Home FC",
+                    "away": "Away United",
+                    "home_score": 1,
+                    "away_score": 0,
+                    "ts": "2026-08-21T11:00:00+08:00",
+                },
+                event_key="m0|1-0",
+                sample_i=0,
+                elapsed_s=5.0,
+            )
+            assert once.get("ok") is True and once.get("score_match") is True, once
+            assert once.get("elapsed_s") == 5.0
             t0 = time.monotonic()
             assert obs.start_session(
                 {
@@ -66,8 +81,14 @@ def main() -> int:
             deadline = time.monotonic() + 3.0
             path = ao.observe_path(root)
             while time.monotonic() < deadline:
-                if path.is_file() and path.read_text(encoding="utf-8").count("\n") >= 3:
-                    break
+                if path.is_file():
+                    n = sum(
+                        1
+                        for ln in path.read_text(encoding="utf-8").splitlines()
+                        if '"event_key": "m1|1-0"' in ln or '"event_key":"m1|1-0"' in ln
+                    )
+                    if n >= 3:
+                        break
                 time.sleep(0.05)
 
             rows = [
@@ -75,19 +96,20 @@ def main() -> int:
                 for ln in path.read_text(encoding="utf-8").splitlines()
                 if ln.strip()
             ]
-            assert len(rows) >= 3, rows
-            assert all(r.get("source") == "af" for r in rows)
-            assert all(r.get("af_score") == "1-0" for r in rows)
-            assert all(r.get("score_match") is True for r in rows)
+            sess_rows = [r for r in rows if r.get("event_key") == "m1|1-0"]
+            assert len(sess_rows) >= 3, sess_rows
+            assert all(r.get("source") == "af" for r in sess_rows)
+            assert all(r.get("af_score") == "1-0" for r in sess_rows)
+            assert all(r.get("score_match") is True for r in sess_rows)
             # First sample near first_delay; last within timeout.
-            assert abs(rows[0]["elapsed_s"] - 0.15) < 0.12, rows[0]
-            assert rows[-1]["elapsed_s"] <= 0.45 + 0.12, rows[-1]
+            assert abs(sess_rows[0]["elapsed_s"] - 0.15) < 0.12, sess_rows[0]
+            assert sess_rows[-1]["elapsed_s"] <= 0.45 + 0.12, sess_rows[-1]
             assert polls, "expected AF polls"
             # Spaced roughly by interval after first.
-            if len(polls) >= 2:
-                gaps = [b - a for a, b in zip(polls, polls[1:])]
+            if len(polls) >= 3:
+                gaps = [b - a for a, b in zip(polls[1:], polls[2:])]
                 assert all(g >= 0.05 for g in gaps), gaps
-            assert all(r.get("is_reversal") is not True for r in rows)
+            assert all(r.get("is_reversal") is not True for r in sess_rows)
 
             assert obs.start_session(
                 {
@@ -125,8 +147,8 @@ def main() -> int:
             assert rev_rows[0].get("observe_only") is True
 
             print(
-                f"ok af_observe samples={len(rows)} "
-                f"elapsed={[round(r['elapsed_s'], 3) for r in rows]} "
+                f"ok af_observe samples={len(sess_rows)} "
+                f"elapsed={[round(r['elapsed_s'], 3) for r in sess_rows]} "
                 f"wall={time.monotonic() - t0:.2f}s reversal_rows={len(rev_rows)}",
                 flush=True,
             )

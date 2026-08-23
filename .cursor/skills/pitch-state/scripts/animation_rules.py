@@ -354,6 +354,27 @@ def parse_dom_center(center_box: Any) -> dict[str, Any]:
     return out
 
 
+def board_score_match(
+    dom: dict[str, Any] | None,
+    *,
+    expected_home: Any = None,
+    expected_away: Any = None,
+) -> bool:
+    """True when ``.center-box`` equals the expected score.
+
+    Ignores play-state overlays (celebration / VAR / frozen clock). Used for
+    reversal flatten, not for opening a buy.
+    """
+    exp_h = _as_int(expected_home)
+    exp_a = _as_int(expected_away)
+    if exp_h is None or exp_a is None:
+        return False
+    center = parse_dom_center((dom or {}).get("center_box") if isinstance(dom, dict) else None)
+    if center["home"] is None or center["away"] is None:
+        return False
+    return int(center["home"]) == exp_h and int(center["away"]) == exp_a
+
+
 def judge_dom(
     dom: dict[str, Any] | None,
     *,

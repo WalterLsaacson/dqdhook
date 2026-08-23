@@ -18,6 +18,7 @@ _PITCH_STATE = _SCRIPTS.parents[1] / "pitch-state" / "scripts"
 if str(_PITCH_STATE) not in sys.path:
     sys.path.insert(0, str(_PITCH_STATE))
 
+import af_observe as af_mod  # noqa: E402
 import animation_rules as rules  # noqa: E402
 import pitch_gate as pg  # noqa: E402
 from dqd_stream_observe import observe_path, set_active_observer  # noqa: E402
@@ -135,6 +136,21 @@ def check_judge_dom() -> None:
     j = rules.judge_dom(_dom("阿森纳 进攻", "35:13 1 : 0"), prev_clock="35:12", **exp)
     assert j["play_state"] == "in_play", j
 
+    # Celebration / VAR / stale clock: play_state is not in_play, but the board
+    # score is still usable for reversal flatten.
+    assert rules.board_score_match(
+        _dom("阿森纳 进球", "35:12 1 : 0"), expected_home=1, expected_away=0
+    ) is True
+    assert rules.board_score_match(
+        _dom("VAR 回看中", "35:12 1 : 0"), expected_home=1, expected_away=0
+    ) is True
+    stale = _dom("阿森纳 进攻", "35:12 1 : 0")
+    assert rules.judge_dom(stale, prev_clock="35:12", **exp)["score_match"] is None
+    assert rules.board_score_match(stale, expected_home=1, expected_away=0) is True
+    assert rules.board_score_match(
+        _dom("阿森纳 进攻", "35:12 0 : 0"), expected_home=1, expected_away=0
+    ) is False
+
     # Empty / missing DOM must never open the gate.
     for bad in (None, {}, _dom("", "")):
         j = rules.judge_dom(bad, **exp)
@@ -152,15 +168,15 @@ def check_judge_dom() -> None:
 def check_gate_source_env() -> None:
     old = os.environ.get("QUOTE_GATE_SOURCE")
     try:
-        for raw, want in (("", "dom"), ("dom", "dom"), ("OCR", "ocr"), ("bogus", "dom")):
+        for raw in ("", "dom", "OCR", "bogus"):
             os.environ["QUOTE_GATE_SOURCE"] = raw
-            assert pg.gate_source() == want, (raw, pg.gate_source())
-        # DOM mode does not need the OCR model to be enabled.
-        os.environ["QUOTE_GATE_SOURCE"] = "dom"
+            assert pg.gate_source() == "dom", (raw, pg.gate_source())
         os.environ["QUOTE_PITCH_STATE"] = "0"
+        os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
         assert pg.gate_ready()[0] is True, pg.gate_ready()
-        os.environ["QUOTE_GATE_SOURCE"] = "ocr"
-        assert pg.gate_ready() == (False, "QUOTE_PITCH_STATE=0"), pg.gate_ready()
+        os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "0"
+        assert pg.gate_ready() == (False, "QUOTE_DQD_STREAM_OBSERVE=0"), pg.gate_ready()
+        os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
     finally:
         os.environ["QUOTE_PITCH_STATE"] = "1"
         if old is None:
@@ -207,6 +223,17 @@ def check_dom_session() -> None:
             frames, baseline=_dom("H 进球", "44:56 1 : 0")
         )
         pg.reset_coordinator_for_tests()
+
+        class _AfOk:
+            def sample_once(self, ev, **_kw):  # noqa: ANN001
+                return {
+                    "ok": True,
+                    "score_match": True,
+                    "af_score": "1-0",
+                    "error": None,
+                }
+
+        af_mod.set_active_observer(_AfOk())  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
@@ -226,7 +253,7 @@ def check_dom_session() -> None:
             assert coord.start_gate(ev, event_key="k1")
             done = _wait_done(coord, n=2)
             statuses = [d["status"] for d in done]
-            assert "in_play" in statuses and "complete" in statuses, done
+            assert "in_play" in statuses and "aligned_buy" in statuses, done
             assert sum(1 for d in done if d["status"] == "in_play") == 1, done
 
             buy = next(d for d in done if d["status"] == "in_play")
@@ -266,7 +293,7 @@ def check_dom_session() -> None:
             assert [d["status"] for d in done] == ["timeout"], done
             assert done[0].get("buy_emitted") is False, done[0]
 
-        # Reader that cannot open → unavailable, never a buy.
+        # Reader that cannot open: keep sampling AF, never buy.
         def _fail_open(_self, _session, _observer):
             return None, "playwright_browser_missing", {}
 
@@ -279,8 +306,8 @@ def check_dom_session() -> None:
             coord = pg.get_coordinator(root)
             assert coord.start_gate({**ev, "match_id": "m3"}, event_key="k3")
             done = _wait_done(coord, n=1)
-            assert len(done) == 1 and done[0]["status"] == "unavailable", done
-            assert "playwright_browser_missing" in str(done[0].get("reason")), done
+            assert [d["status"] for d in done] == ["timeout"], done
+            assert done[0].get("buy_emitted") is False, done[0]
     finally:
         pg.PitchGateCoordinator._open_dom_reader = orig_open  # type: ignore[assignment]
         set_active_observer(None)
@@ -290,118 +317,28 @@ def check_dom_session() -> None:
 def main() -> int:
     os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
     os.environ["QUOTE_GATE_SOURCE"] = "dom"
-    # Store-only ref shots need a real tracker page; keep smokes on DOM-only.
-    os.environ["QUOTE_GATE_REF_SCREENSHOT"] = "0"
 
     check_parse_center()
     check_judge_dom()
     check_gate_source_env()
 
-    old = (pg.GATE_FIRST_DELAY_S, pg.GATE_INTERVAL_S, pg.GATE_TIMEOUT_S, pg.GATE_MIN_FRAMES)
+    old = (pg.GATE_FIRST_DELAY_S, pg.GATE_INTERVAL_S, pg.GATE_TIMEOUT_S)
     pg.GATE_FIRST_DELAY_S = 0.05
     pg.GATE_INTERVAL_S = 0.05
     pg.GATE_TIMEOUT_S = 0.3
-    pg.GATE_MIN_FRAMES = 3
     try:
         check_dom_session()
-        check_ref_shot_enqueue()
     finally:
         (
             pg.GATE_FIRST_DELAY_S,
             pg.GATE_INTERVAL_S,
             pg.GATE_TIMEOUT_S,
-            pg.GATE_MIN_FRAMES,
         ) = old
+        af_mod.set_active_observer(None)
 
     print("ok: pitch_gate DOM mode (no screenshot/OCR) + judge_dom rules")
     return 0
 
-
-def check_ref_shot_enqueue() -> None:
-    """Ref-shot worker writes store-only amendments and never invents a judge."""
-    os.environ["QUOTE_GATE_REF_SCREENSHOT"] = "1"
-    shots: list[Any] = []
-
-    class _ShotReader:
-        def __init__(self) -> None:
-            self.closed = False
-
-        def open(self) -> tuple[bool, str | None]:
-            return True, None
-
-        def screenshot(self, path: Path) -> tuple[bool, str | None]:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"jpeg")
-            shots.append(path)
-            return True, None
-
-        def close(self) -> None:
-            self.closed = True
-
-    orig_reader = None
-    try:
-        import dqd_stream_observe as dso
-
-        orig_reader = dso.DomReader
-        dso.DomReader = lambda *_a, **_k: _ShotReader()  # type: ignore[misc, assignment]
-
-        pg.reset_coordinator_for_tests()
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "data" / "pm-quote").mkdir(parents=True)
-            obs = _FakeObserver(root)
-            set_active_observer(obs)  # type: ignore[arg-type]
-            coord = pg.get_coordinator(root)
-            coord._enqueue_ref(
-                pg._RefShotJob(
-                    op="open",
-                    event_key="k_ref",
-                    page_url="https://tracker.example/x",
-                    match_id="m_ref",
-                    root=root,
-                )
-            )
-            coord._enqueue_ref(
-                pg._RefShotJob(
-                    op="shot",
-                    event_key="k_ref",
-                    page_url="https://tracker.example/x",
-                    match_id="m_ref",
-                    sample_i=3,
-                    elapsed_s=20.0,
-                    home="H",
-                    away="A",
-                    home_score=1,
-                    away_score=0,
-                    root=root,
-                )
-            )
-            coord._enqueue_ref(pg._RefShotJob(op="close", event_key="k_ref", root=root))
-            deadline = time.time() + 3.0
-            while time.time() < deadline and not shots:
-                time.sleep(0.05)
-            assert shots, "ref worker should write a JPEG"
-            assert shots[0].is_file() and shots[0].name.endswith("_ref.jpg"), shots[0]
-            # Wait for close + jsonl
-            time.sleep(0.2)
-            rows = [
-                json.loads(line)
-                for line in observe_path(root).read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            assert len(rows) == 1, rows
-            assert rows[0]["screenshot_only"] is True
-            assert rows[0]["no_ocr"] is True
-            assert rows[0].get("judge") is None
-            assert rows[0]["frame_path"] and Path(rows[0]["frame_path"]).is_file()
-    finally:
-        if orig_reader is not None:
-            import dqd_stream_observe as dso
-
-            dso.DomReader = orig_reader  # type: ignore[misc]
-        os.environ["QUOTE_GATE_REF_SCREENSHOT"] = "0"
-        pg.reset_coordinator_for_tests()
-        set_active_observer(None)
 
 
 if __name__ == "__main__":

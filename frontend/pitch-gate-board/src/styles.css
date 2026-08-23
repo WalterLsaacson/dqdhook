@@ -570,17 +570,6 @@ button.pill {
   text-align: center;
 }
 
-/* When a reference screenshot sits under the DOM card, shrink the text block. */
-.frame__dom + .frame__img-wrap {
-  border-top: 1px solid var(--line);
-}
-
-.frame:has(.frame__dom):has(.frame__img-wrap) .frame__dom {
-  aspect-ratio: auto;
-  min-height: 72px;
-  padding: 10px 12px;
-}
-
 .frame__dom-state {
   font-size: 15px;
   font-weight: 600;
@@ -651,117 +640,25 @@ button.pill {
   color: #38bdf8;
 }
 
-.goal-item__nami {
-  color: #a3e635;
+.goal-item__grade {
+  color: #c4b5fd;
 }
 
-.nami-trail {
-  margin: 0 0 16px;
-  padding: 12px 14px;
-  border: 1px solid rgba(163, 230, 53, 0.28);
-  border-radius: 10px;
-  background: rgba(77, 124, 15, 0.12);
+.goal-item__grade.is-a {
+  color: #34d399;
 }
 
-.nami-pitch {
-  display: block;
-  width: 100%;
-  max-width: 420px;
-  height: auto;
-  background: #0a1a12;
-  border-radius: 8px;
+.goal-item__grade.is-b {
+  color: #fbbf24;
 }
 
-.nami-pitch__field {
-  fill: rgba(6, 78, 59, 0.55);
-  stroke: rgba(167, 243, 208, 0.45);
-  stroke-width: 0.6;
+.goal-item__grade.is-c {
+  color: #94a3b8;
 }
 
-.nami-pitch__line {
-  stroke: rgba(167, 243, 208, 0.35);
-  stroke-width: 0.5;
-  fill: none;
-}
-
-.nami-dot {
-  fill: rgba(226, 232, 240, 0.45);
-}
-
-.nami-dot--trail {
-  opacity: 0.45;
-}
-
-.nami-num {
-  fill: #ecfdf5;
-  font-size: 3.4px;
-  font-weight: 700;
-  font-family: var(--font-display), sans-serif;
-  text-anchor: middle;
-  paint-order: stroke;
-  stroke: #041018;
-  stroke-width: 0.6px;
-  pointer-events: none;
-}
-
-.nami-dot.is-box {
-  fill: #fbbf24;
-}
-
-.nami-dot.is-center {
-  fill: #38bdf8;
-}
-
-.nami-dot.is-last {
-  fill: #e2e8f0;
-}
-
-.nami-dot.is-inplay {
-  fill: #34d399;
-  stroke: #ecfdf5;
-  stroke-width: 0.5;
-}
-
-.nami-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 14px;
-  margin: 10px 0 0;
-  color: var(--muted);
-  font-size: 11px;
-  align-items: center;
-}
-
-.nami-legend__swatch {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 99px;
-  margin-right: 4px;
-  background: rgba(226, 232, 240, 0.45);
-}
-
-.nami-legend__swatch.is-inplay {
-  background: #34d399;
-}
-
-.nami-legend__swatch.is-center {
-  background: #38bdf8;
-}
-
-.nami-legend__swatch.is-box {
-  background: #fbbf24;
-}
-
-.nami-legend__swatch.is-last {
-  background: #e2e8f0;
-}
-
-.nami-empty {
-  margin: 8px 0 0;
-  color: var(--muted);
+.detail__grade {
+  margin: 6px 0 0;
   font-size: 12px;
-  line-height: 1.45;
 }
 
 .af-trail {

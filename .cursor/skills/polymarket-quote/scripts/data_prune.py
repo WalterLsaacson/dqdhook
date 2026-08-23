@@ -249,12 +249,6 @@ def prune_runtime_data(
             "opportunities.jsonl",
         ),
         (lib.data_dir(root) / "trades.jsonl", ("quoted_at", "ts"), None, "trades.jsonl"),
-        (
-            lib.data_dir(root) / "post_goal_samples.jsonl",
-            ("sampled_at", "quoted_at", "ts"),
-            None,
-            "post_goal_samples.jsonl",
-        ),
         # Observe jsonl retained indefinitely (book/goal/livescore) — not pruned.
         (
             lib.bridge_dir(root) / "events.jsonl",

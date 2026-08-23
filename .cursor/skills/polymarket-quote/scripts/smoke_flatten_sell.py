@@ -224,6 +224,37 @@ def main() -> int:
         assert ex.maybe_flatten_for_event(reversal_ev) == []
         assert len(ex.ledger.open_for_match(rev_mid)) == 1
 
+        # AF∨DOM confirm sells pitch-gate lots even outside QUOTE_GATE_PROTECT_S.
+        old_mid = "m_or_confirm"
+        ex.ledger.register_buy(
+            match_id=old_mid,
+            token_id="tok_or",
+            market_key="home_yes",
+            shares=1.02,
+            usdc=1.0,
+            home_score=1,
+            away_score=0,
+            live=False,
+            event_key="score_change|m_or|0-0->1-0",
+            pitch_gate=True,
+            opened_at="2020-01-01T00:00:00+08:00",
+        )
+        old_ev = {
+            "type": "score_change",
+            "match_id": old_mid,
+            "is_reversal": True,
+            "prev": {"home": 1, "away": 0},
+            "curr": {"home": 0, "away": 0},
+            "home_score": 0,
+            "away_score": 0,
+        }
+        assert ex.maybe_flatten_for_event(old_ev) == []
+        confirmed = ex.maybe_flatten_for_event(
+            old_ev, require_protect_window=False
+        )
+        assert confirmed, confirmed
+        assert len(ex.ledger.open_for_match(old_mid)) == 0
+
     # Accepted DELAYED sell: retry ticks reconcile the exact order instead of
     # asset-wide cancel/repost.  Once balance reaches zero, write one settlement
     # row and close the lot without posting another sell.

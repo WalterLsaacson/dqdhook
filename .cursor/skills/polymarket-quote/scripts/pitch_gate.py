@@ -1,39 +1,29 @@
-"""Pitch-screenshot gate: first frame @+5s, then every 5s until 2.5min; buy once on in_play.
+"""Pitch-gate: same-tick DOM∧AF buy, then stop; reversal AF∨DOM flatten.
 
-Reversal sessions use the same cadence with ``observe_only=True`` (no buy).
+Cadence: first sample @+5s, then every 5s until 120s (or buy / flatten / cancel).
+No screenshots. No nami ball-xy. Odds observe rides the same clock.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger("pm_quote.pitch_gate")
 
 GATE_INTERVAL_S = 5.0
-# First capture is delayed so celebration/VAR overlays can clear.
 GATE_FIRST_DELAY_S = 5.0
-# Minimum captures for the board / research trail (keep going after early in_play).
-GATE_MIN_FRAMES = 5
-# Hard ceiling for the whole session (not a max frame count).
-GATE_TIMEOUT_S = 150.0
-# Pitch-gate buys require board OCR == expected DQD score on every in_play.
+GATE_TIMEOUT_S = 120.0
 GATE_REQUIRE_SCORE = True
-# Consecutive in_play(+score) frames required before the one-shot buy.
-# 1 = buy on the first confirmed frame; delayed reversals are handled after the
-# buy by the post-buy protection window (QUOTE_GATE_PROTECT_S) instead.
 GATE_CONFIRM_FRAMES = 1
-# Backward-compat alias used by older smokes/docs.
+# Unused for capture length (buy/flatten stop the session). Kept for older smokes.
+GATE_MIN_FRAMES = 1
 GATE_FRAME_COUNT = GATE_MIN_FRAMES
-
-OnInPlay = Callable[[dict[str, Any]], None]
-# result payload: {status, event_key, match_id, ev, judge?, reason?, elapsed_s?}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -43,28 +33,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-@dataclass
-class _RefShotJob:
-    """Background screenshot work — never feeds OCR or the buy path."""
-
-    op: str  # open | shot | close
-    event_key: str
-    page_url: str = ""
-    match_id: str = ""
-    sample_i: int = 0
-    elapsed_s: float = 0.0
-    dqd_ts: str = ""
-    home: str = ""
-    away: str = ""
-    home_score: Any = None
-    away_score: Any = None
-    surface: Any = None
-    nami_id: Any = None
-    root: Path | None = None
-    observe_only: bool = False
-    is_reversal: bool = False
-
-
 def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
     """True when pitch-state marked this frame as a VAR review overlay."""
     if not isinstance(judge, dict):
@@ -72,7 +40,6 @@ def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
     reason = str(judge.get("stopped_reason") or "").strip().lower()
     if reason == "var":
         return True
-    # Defensive: evidence sometimes carries the token without stopped_reason.
     for item in judge.get("evidence") or []:
         text = str(item or "")
         if "VAR" in text or text.strip().lower() == "var":
@@ -93,24 +60,13 @@ def _animation_rules() -> Any:
 
 
 def gate_source() -> str:
-    """`dom` reads the animation's own text; `ocr` is the legacy screenshot path."""
-    raw = str(os.getenv("QUOTE_GATE_SOURCE") or "").strip().lower()
-    return "ocr" if raw == "ocr" else "dom"
-
-
-def ref_screenshot_enabled() -> bool:
-    """DOM mode: async store-only tracker screenshots for side-by-side对照."""
-    if gate_source() != "dom":
-        return False
-    return _env_bool("QUOTE_GATE_REF_SCREENSHOT", True)
+    """Live gate is DOM-only. ``ocr`` is rejected."""
+    return "dom"
 
 
 def gate_ready() -> tuple[bool, str]:
-    """Stream observe is always needed; OCR mode additionally needs pitch-state."""
     if not _env_bool("QUOTE_DQD_STREAM_OBSERVE", False):
         return False, "QUOTE_DQD_STREAM_OBSERVE=0"
-    if gate_source() == "ocr" and not _env_bool("QUOTE_PITCH_STATE", False):
-        return False, "QUOTE_PITCH_STATE=0"
     return True, ""
 
 
@@ -125,14 +81,9 @@ class _GateSession:
     thread: threading.Thread | None = None
     finished: bool = False
     buy_emitted: bool = False
-    # Always on for gate: board OCR must match expected score for in_play.
     require_score: bool = True
     confirm_streak: int = 0
-    # Any VAR frame during this goal's capture → never buy for this session.
     var_seen: bool = False
-    # Nami tracker id, only used to tag the observe-only feed recording.
-    nami_id: str = ""
-    # Reversal trail: same capture cadence, never queues a buy.
     observe_only: bool = False
 
 
@@ -145,139 +96,8 @@ class PitchGateCoordinator:
         self._by_event: dict[str, _GateSession] = {}
         self._by_match: dict[str, set[str]] = {}
         self._done: list[dict[str, Any]] = []
-        # Goal event_keys that already queued/emitted in_play (survives revoke).
         self._in_play_keys: set[str] = set()
-        # Async store-only screenshots (DOM mode对照); never touch OCR / buys.
-        self._ref_q: queue.Queue[_RefShotJob | None] = queue.Queue()
-        self._ref_stop = threading.Event()
-        self._ref_thread: threading.Thread | None = None
-        self._ref_readers: dict[str, Any] = {}
-
-    def _ensure_ref_worker(self) -> None:
-        if self._ref_thread is not None and self._ref_thread.is_alive():
-            return
-        self._ref_stop.clear()
-        self._ref_thread = threading.Thread(
-            target=self._ref_worker_loop,
-            name="pitch-gate-ref-shot",
-            daemon=True,
-        )
-        self._ref_thread.start()
-
-    def _enqueue_ref(self, job: _RefShotJob) -> None:
-        if not ref_screenshot_enabled():
-            return
-        self._ensure_ref_worker()
-        self._ref_q.put(job)
-
-    def _ref_worker_loop(self) -> None:
-        while not self._ref_stop.is_set():
-            try:
-                job = self._ref_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if job is None:
-                break
-            try:
-                self._ref_handle(job)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "ref screenshot failed op=%s key=%s", job.op, job.event_key
-                )
-        for reader in list(self._ref_readers.values()):
-            try:
-                reader.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._ref_readers.clear()
-
-    def _ref_handle(self, job: _RefShotJob) -> None:
-        from dqd_stream_observe import (
-            DomReader,
-            _safe_part,
-            frames_dir,
-            get_active_observer,
-        )
-        import quote_lib as lib
-
-        key = job.event_key
-        if job.op == "open":
-            old = self._ref_readers.pop(key, None)
-            if old is not None:
-                old.close()
-            if not job.page_url:
-                return
-            reader = DomReader(job.page_url)
-            ok, err = reader.open()
-            if not ok:
-                reader.close()
-                logger.debug("ref DomReader open failed key=%s err=%s", key, err)
-                return
-            self._ref_readers[key] = reader
-            return
-
-        if job.op == "close":
-            reader = self._ref_readers.pop(key, None)
-            if reader is not None:
-                reader.close()
-            return
-
-        if job.op != "shot":
-            return
-
-        reader = self._ref_readers.get(key)
-        if reader is None and job.page_url:
-            reader = DomReader(job.page_url)
-            ok, err = reader.open()
-            if ok:
-                self._ref_readers[key] = reader
-            else:
-                reader.close()
-                logger.debug("ref shot open-on-demand failed key=%s err=%s", key, err)
-                return
-        if reader is None:
-            return
-
-        root = Path(job.root or self.root)
-        frame_dir = (
-            frames_dir(root) / _safe_part(job.match_id) / _safe_part(job.event_key)
-        )
-        frame_path = frame_dir / (
-            f"{int(job.sample_i):02d}_{int(round(job.elapsed_s)):02d}s_ref.jpg"
-        )
-        ok, err = reader.screenshot(frame_path)
-        observer = get_active_observer()
-        if observer is None:
-            return
-        row = {
-            "observed_at": lib.now_cn_iso(),
-            "match_id": job.match_id,
-            "event_key": job.event_key,
-            "dqd_ts": job.dqd_ts,
-            "home": job.home,
-            "away": job.away,
-            "home_score": job.home_score,
-            "away_score": job.away_score,
-            "sample_i": job.sample_i,
-            "elapsed_s": job.elapsed_s,
-            "surface": job.surface,
-            "page_url": job.page_url or None,
-            "nami_id": job.nami_id,
-            "capture_method": "dom_ref_shot",
-            "frame_kind": "animation",
-            "frame_path": str(frame_path) if ok else None,
-            "ok": bool(ok),
-            "error": None if ok else (err or "ref_screenshot_failed"),
-            "screenshot_only": True,
-            "no_ocr": True,
-            "gate": True,
-            "observe_only": bool(job.observe_only),
-            "is_reversal": bool(job.is_reversal),
-        }
-        try:
-            observer._write_rows([row])
-        except Exception:  # noqa: BLE001
-            logger.exception("ref screenshot observe write failed")
+        self._bought_matches: set[str] = set()
 
     def pending_event_keys(self) -> set[str]:
         with self._lock:
@@ -288,6 +108,13 @@ class PitchGateCoordinator:
             out = list(self._done)
             self._done.clear()
             return out
+
+    def has_bought_match(self, match_id: str) -> bool:
+        mid = str(match_id or "").strip()
+        if not mid:
+            return False
+        with self._lock:
+            return mid in self._bought_matches
 
     def start_gate(
         self,
@@ -305,8 +132,6 @@ class PitchGateCoordinator:
             return False
         observer = get_active_observer()
         if observer is None:
-            # Still sample AF scores for research when DOM gate cannot run.
-            self._af_observe_start(ev, event_key=key)
             self._push_done(
                 {
                     "status": "unavailable",
@@ -321,7 +146,6 @@ class PitchGateCoordinator:
 
         ok, reason = gate_ready()
         if not ok:
-            self._af_observe_start(ev, event_key=key)
             self._push_done(
                 {
                     "status": "unavailable",
@@ -342,23 +166,17 @@ class PitchGateCoordinator:
             observe_only=bool(observe_only),
         )
         with self._lock:
-            # New goal/reversal on same match cancels prior open gates.
-            # Do not overwrite a reason already set by cancel_match.
             prior_keys = list(self._by_match.get(mid) or ())
             for pk in prior_keys:
                 old = self._by_event.get(pk)
                 if old is not None and not old.finished and not old.cancel.is_set():
                     old.cancel_reason = "superseded_by_new_goal"
                     old.cancel.set()
-            # Also drop any undrained buy for those prior goals.
             self._revoke_pending_buys_locked(
                 match_id=mid, reason="superseded_by_new_goal"
             )
             self._by_event[key] = session
             self._by_match.setdefault(mid, set()).add(key)
-        # AF + DOM share this t0 (+5s / 5s); AF stops at 90s.
-        self._af_observe_start(ev, event_key=key)
-        self._nami_observe_start(session)
 
         thread = threading.Thread(
             target=self._run_session,
@@ -368,22 +186,21 @@ class PitchGateCoordinator:
         )
         session.thread = thread
         thread.start()
-        if session.observe_only:
-            print(
-                f"pitch-gate → OBSERVE START match_id={mid} key={key} "
-                f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
-                f"timeout={GATE_TIMEOUT_S:g}s (reversal trail; no buy)",
-                flush=True,
+        kind = "OBSERVE START" if session.observe_only else "START"
+        extra = (
+            "reversal trail; flatten on AF∨DOM score_match"
+            if session.observe_only
+            else (
+                f"DOM in_play ∧ AF score_match; VAR→no buy; "
+                f"stop on aligned_buy / {GATE_TIMEOUT_S:g}s"
             )
-        else:
-            print(
-                f"pitch-gate → START match_id={mid} key={key} "
-                f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
-                f"min_frames={GATE_MIN_FRAMES} timeout={GATE_TIMEOUT_S:g}s "
-                f"(in_play+score×{GATE_CONFIRM_FRAMES}; VAR→no buy; "
-                f"keep capturing until timeout)",
-                flush=True,
-            )
+        )
+        print(
+            f"pitch-gate → {kind} match_id={mid} key={key} "
+            f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
+            f"timeout={GATE_TIMEOUT_S:g}s ({extra})",
+            flush=True,
+        )
         return True
 
     def cancel_match(self, match_id: str, *, reason: str = "dqd_reversal") -> int:
@@ -400,18 +217,9 @@ class PitchGateCoordinator:
                     sess.cancel_reason = reason
                     sess.cancel.set()
                     n += 1
-            # Drop queued buys that have not been drained yet (same-tick race).
             revoked = self._revoke_pending_buys_locked(
                 match_id=mid, reason=reason or "dqd_reversal"
             )
-        try:
-            from af_observe import get_active_observer as get_af
-
-            af = get_af()
-            if af is not None:
-                af.cancel_match(mid, reason=reason or "dqd_reversal")
-        except Exception:  # noqa: BLE001
-            logger.debug("af observe cancel skipped", exc_info=True)
         if n or revoked:
             print(
                 f"pitch-gate → CANCEL match_id={mid} sessions={n} "
@@ -423,27 +231,13 @@ class PitchGateCoordinator:
     def should_observe_reversal(
         self, reversal_event_key: str, *, match_id: str = ""
     ) -> bool:
-        """True when this reverse undoes a goal that already reached in_play."""
-        inv = invert_score_change_key(reversal_event_key)
+        """True when this match already emitted a buy (lots may still be open)."""
         mid = str(match_id or "").strip()
+        if mid:
+            return self.has_bought_match(mid)
+        inv = invert_score_change_key(reversal_event_key)
         with self._lock:
             if inv and inv in self._in_play_keys:
-                return True
-            for sess in self._by_event.values():
-                if sess.observe_only or not sess.buy_emitted:
-                    continue
-                if mid and sess.match_id != mid:
-                    continue
-                if inv and sess.event_key != inv:
-                    continue
-                return True
-            for row in self._done:
-                if str(row.get("status") or "") != "in_play":
-                    continue
-                if inv and str(row.get("event_key") or "") != inv:
-                    continue
-                if mid and str(row.get("match_id") or "") != mid:
-                    continue
                 return True
         return False
 
@@ -476,7 +270,6 @@ class PitchGateCoordinator:
             revoked += 1
             sess = self._by_event.get(row_ek)
             if sess is not None:
-                # Buy never executed — allow finish status to reflect cancel, not complete.
                 sess.buy_emitted = False
             kept.append(
                 {
@@ -507,8 +300,9 @@ class PitchGateCoordinator:
         judge: dict[str, Any] | None,
         elapsed_s: float,
         sample_i: int,
+        af_row: dict[str, Any] | None = None,
     ) -> bool:
-        """Queue a one-shot buy signal without ending the capture session."""
+        """Queue a one-shot buy. Caller must then finish the session."""
         with self._lock:
             if (
                 session.finished
@@ -520,6 +314,7 @@ class PitchGateCoordinator:
                 return False
             session.buy_emitted = True
             self._in_play_keys.add(session.event_key)
+            self._bought_matches.add(session.match_id)
             self._done.append(
                 {
                     "status": "in_play",
@@ -527,16 +322,51 @@ class PitchGateCoordinator:
                     "match_id": session.match_id,
                     "ev": dict(session.ev),
                     "judge": judge,
-                    "reason": "play_state_in_play",
+                    "af": af_row,
+                    "reason": "dom_in_play_and_af_score_match",
                     "elapsed_s": elapsed_s,
                     "sample_i": sample_i,
                 }
             )
             print(
-                f"pitch-gate → IN_PLAY (buy once) match_id={session.match_id} "
+                f"pitch-gate → IN_PLAY (aligned buy) match_id={session.match_id} "
                 f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
-                f"· confirmed×{max(1, int(GATE_CONFIRM_FRAMES))} "
-                f"· continue ≥{GATE_MIN_FRAMES} frames / ≤{GATE_TIMEOUT_S:g}s",
+                f"· stop capture",
+                flush=True,
+            )
+        return True
+
+    def _emit_flatten_or(
+        self,
+        session: _GateSession,
+        *,
+        judge: dict[str, Any] | None,
+        elapsed_s: float,
+        sample_i: int,
+        af_row: dict[str, Any] | None,
+        source: str,
+    ) -> bool:
+        with self._lock:
+            if session.finished or session.cancel.is_set():
+                return False
+            self._done.append(
+                {
+                    "status": "flatten_or",
+                    "event_key": session.event_key,
+                    "match_id": session.match_id,
+                    "ev": dict(session.ev),
+                    "judge": judge,
+                    "af": af_row,
+                    "reason": f"reversal_{source}_score_match",
+                    "elapsed_s": elapsed_s,
+                    "sample_i": sample_i,
+                    "observe_only": True,
+                }
+            )
+            print(
+                f"pitch-gate → FLATTEN_OR match_id={session.match_id} "
+                f"key={session.event_key} via={source} sample={sample_i} "
+                f"elapsed={elapsed_s:.1f}s",
                 flush=True,
             )
         return True
@@ -577,92 +407,81 @@ class PitchGateCoordinator:
                     "frames": frames,
                     "buy_emitted": bool(session.buy_emitted),
                     "var_seen": bool(session.var_seen),
-                    "nami_id": session.nami_id or None,
                     "observe_only": bool(session.observe_only),
                 }
             )
-        self._nami_observe_stop(session)
 
-    def _af_observe_start(self, ev: dict[str, Any], *, event_key: str) -> None:
-        """Kick AF score sampling for this goal. Observe-only, never fatal."""
+    def _sample_af(
+        self,
+        session: _GateSession,
+        *,
+        sample_i: int,
+        elapsed_s: float,
+    ) -> dict[str, Any] | None:
         try:
             from af_observe import get_active_observer as get_af
 
             observer = get_af()
             if observer is None:
-                return
-            observer.start_session(ev, event_key=event_key)
-        except Exception:  # noqa: BLE001
-            logger.debug("af observe start skipped", exc_info=True)
-
-    def _nami_observe_start(self, session: _GateSession) -> None:
-        """Tap the nami live feed for this goal. Observe-only, never fatal."""
-        try:
-            from nami_observe import get_active_observer as get_nami
-
-            observer = get_nami()
-            if observer is None:
-                return
-            import dqd_live  # type: ignore
-            import dqd_lib  # type: ignore
-
-            url = dqd_live.animation_url_from_snapshot(session.match_id, self.root)
-            nami_id = dqd_lib.nami_id_from_url(url) or ""
-            if not nami_id:
-                return
-            session.nami_id = nami_id
-            observer.observe_match(
-                nami_id,
-                {
-                    "match_id": session.match_id,
-                    "event_key": session.event_key,
-                    "home": session.ev.get("home"),
-                    "away": session.ev.get("away"),
-                    "dqd_score": (
-                        f"{session.ev.get('home_score')}-{session.ev.get('away_score')}"
-                    ),
-                },
-                ttl_s=GATE_TIMEOUT_S,
+                return None
+            return observer.sample_once(
+                session.ev,
+                event_key=session.event_key,
+                sample_i=sample_i,
+                elapsed_s=elapsed_s,
             )
         except Exception:  # noqa: BLE001
-            logger.debug("nami observe start skipped", exc_info=True)
+            logger.debug("af gate sample skipped", exc_info=True)
+            return None
 
-    def _nami_observe_stop(self, session: _GateSession) -> None:
-        if not session.nami_id:
-            return
-        try:
-            from nami_observe import get_active_observer as get_nami
-
-            observer = get_nami()
-            if observer is not None:
-                observer.release_match(session.nami_id)
-        except Exception:  # noqa: BLE001
-            logger.debug("nami observe stop skipped", exc_info=True)
-
-    def _nami_on_dom_sample(
+    def _sample_odds(
         self,
         session: _GateSession,
-        row: dict[str, Any],
-        judged: dict[str, Any] | None,
-    ) -> None:
-        """Stamp this DOM sample with the current MQTT ball. Observe-only."""
+        *,
+        sample_i: int,
+        elapsed_s: float,
+    ) -> dict[str, Any] | None:
         try:
-            from nami_observe import get_active_observer as get_nami
+            from book_context_observe import get_active_observer as get_book
 
-            observer = get_nami()
+            observer = get_book()
             if observer is None:
-                return
-            nid = str(session.nami_id or row.get("nami_id") or "").strip()
-            snap = observer.write_dom_sample(
-                nid,
-                sample_i=int(row.get("sample_i") or 0),
-                elapsed_s=float(row.get("elapsed_s") or 0),
-                play_state=str((judged or {}).get("play_state") or "") or None,
+                return None
+            return observer.sample_gate_tick(
+                session.ev,
+                event_key=session.event_key,
+                sample_i=sample_i,
+                elapsed_s=elapsed_s,
+                observe_only=bool(session.observe_only),
             )
-            if snap:
-                row["nami"] = snap
         except Exception:  # noqa: BLE001
-            logger.debug("nami DOM sample skipped", exc_info=True)
+            logger.debug("odds gate sample skipped", exc_info=True)
+            return None
+
+    def _kick_odds(
+        self,
+        session: _GateSession,
+        *,
+        sample_i: int,
+        elapsed_s: float,
+        holder: dict[str, Any],
+    ) -> threading.Thread:
+        """Odds is observe-only: never block AND buy / OR flatten."""
+
+        def _run() -> None:
+            grade = self._sample_odds(
+                session, sample_i=sample_i, elapsed_s=elapsed_s
+            )
+            if grade:
+                holder["grade"] = grade
+
+        thread = threading.Thread(
+            target=_run,
+            name=f"odds-gate-{session.match_id}",
+            daemon=True,
+        )
+        thread.start()
+        return thread
 
     def _open_dom_reader(self, session: _GateSession, observer: Any) -> Any:
         """Resolve the tracker URL once and keep that page open for the session."""
@@ -703,8 +522,6 @@ class PitchGateCoordinator:
         import quote_lib as lib
 
         rules = _animation_rules()
-
-        dom, err = reader.read()
         row: dict[str, Any] = {
             "observed_at": lib.now_cn_iso(),
             "match_id": session.match_id,
@@ -723,13 +540,19 @@ class PitchGateCoordinator:
             "capture_method": "dom",
             "frame_kind": "dom",
             "frame_path": None,
-            "ok": dom is not None,
-            "error": err,
-            "dom_state": dom,
+            "ok": False,
+            "error": "no_dom_reader",
+            "dom_state": None,
             "gate": True,
             "observe_only": bool(session.observe_only),
             "is_reversal": bool(session.ev.get("is_reversal")),
         }
+        if reader is None:
+            return row, None
+        dom, err = reader.read()
+        row["ok"] = dom is not None
+        row["error"] = err
+        row["dom_state"] = dom
         if dom is None:
             return row, None
         judged = rules.judge_dom(
@@ -740,47 +563,35 @@ class PitchGateCoordinator:
             prev_clock=prev_clock,
         )
         row["judge"] = judged
+        row["board_score_match"] = bool(
+            rules.board_score_match(
+                dom,
+                expected_home=session.ev.get("home_score"),
+                expected_away=session.ev.get("away_score"),
+            )
+        )
         return row, judged
 
     def _run_session(self, session: _GateSession, observer: Any) -> None:
         captured = 0
         sample_i = 0
-        source = gate_source()
         reader: Any = None
         surface_info: dict[str, Any] = {}
         prev_clock: str | None = None
+        flatten_emitted = False
         try:
-            # Load the page inside the first-frame delay so the wait is not
-            # spent twice: the browser is ready by the time sampling starts.
-            if source == "dom" and not session.cancel.is_set():
+            if not session.cancel.is_set():
                 reader, open_err, surface_info = self._open_dom_reader(session, observer)
                 if reader is None:
-                    self._finish_session(
-                        session,
-                        status="unavailable",
-                        reason=f"dom_reader: {open_err}",
-                        elapsed_s=round(time.monotonic() - session.t0_mono, 3),
-                        frames=0,
-                    )
                     print(
                         f"pitch-gate → DOM_UNAVAILABLE match_id={session.match_id} "
-                        f"key={session.event_key} reason={open_err} (no buy)",
+                        f"key={session.event_key} reason={open_err} "
+                        f"(continue AF; no DOM buy)",
                         flush=True,
                     )
-                    return
-                prev_clock = self._baseline_clock(reader)
-                if ref_screenshot_enabled():
-                    self._enqueue_ref(
-                        _RefShotJob(
-                            op="open",
-                            event_key=session.event_key,
-                            page_url=str((surface_info or {}).get("page_url") or ""),
-                            match_id=session.match_id,
-                            root=self.root,
-                        )
-                    )
+                else:
+                    prev_clock = self._baseline_clock(reader)
 
-            # First frame at t0 + GATE_FIRST_DELAY_S (default +5s after goal).
             first_t = session.t0_mono + max(0.0, float(GATE_FIRST_DELAY_S))
             while not session.cancel.is_set():
                 now = time.monotonic()
@@ -794,43 +605,55 @@ class PitchGateCoordinator:
                 if session.cancel.is_set():
                     break
                 elapsed = time.monotonic() - session.t0_mono
-                # Stop starting new captures after the hard timeout.
                 if elapsed > GATE_TIMEOUT_S + 1e-9:
                     break
 
-                if source == "dom":
-                    row, judged = self._sample_dom(
-                        session,
-                        reader,
-                        surface_info,
-                        sample_i=sample_i,
-                        elapsed_s=round(elapsed, 3),
-                        prev_clock=prev_clock,
+                row, judged = self._sample_dom(
+                    session,
+                    reader,
+                    surface_info,
+                    sample_i=sample_i,
+                    elapsed_s=round(elapsed, 3),
+                    prev_clock=prev_clock,
+                )
+                clock = str((judged or {}).get("dom_clock") or "")
+                if clock:
+                    prev_clock = clock
+                has_reading = row.get("ok") is True
+                board_match = bool(row.get("board_score_match"))
+                if not board_match and isinstance(row.get("dom_state"), dict):
+                    board_match = bool(
+                        _animation_rules().board_score_match(
+                            row.get("dom_state"),
+                            expected_home=session.ev.get("home_score"),
+                            expected_away=session.ev.get("away_score"),
+                        )
                     )
-                    clock = str((judged or {}).get("dom_clock") or "")
-                    if clock:
-                        prev_clock = clock
-                    has_reading = row.get("ok") is True
-                    self._nami_on_dom_sample(session, row, judged)
-                else:
-                    job = _CaptureJob(
-                        match_id=session.match_id,
-                        event_key=session.event_key,
-                        dqd_ts=str(session.ev.get("ts") or ""),
-                        home=str(session.ev.get("home") or ""),
-                        away=str(session.ev.get("away") or ""),
-                        home_score=session.ev.get("home_score"),
-                        away_score=session.ev.get("away_score"),
-                        t0_mono=session.t0_mono,
-                    )
-                    row = observer._capture_row(
-                        job, sample_i=sample_i, elapsed_s=round(elapsed, 3)
-                    )
-                    row["gate"] = True
-                    row["observe_only"] = bool(session.observe_only)
-                    row["is_reversal"] = bool(session.ev.get("is_reversal"))
-                    judged = None
-                    has_reading = bool(row.get("ok") is True and row.get("frame_path"))
+
+                odds_holder: dict[str, Any] = {}
+                self._kick_odds(
+                    session,
+                    sample_i=sample_i,
+                    elapsed_s=round(elapsed, 3),
+                    holder=odds_holder,
+                )
+
+                af_row = self._sample_af(
+                    session, sample_i=sample_i, elapsed_s=round(elapsed, 3)
+                )
+                if af_row:
+                    row["af"] = {
+                        "ok": af_row.get("ok"),
+                        "score_match": af_row.get("score_match"),
+                        "af_score": af_row.get("af_score"),
+                        "error": af_row.get("error"),
+                    }
+                if odds_holder.get("grade"):
+                    grade = odds_holder["grade"]
+                    row["odds_grade"] = {
+                        "level": grade.get("level"),
+                        "reason": grade.get("reason"),
+                    }
 
                 try:
                     observer._write_rows([row])
@@ -838,45 +661,44 @@ class PitchGateCoordinator:
                     logger.exception("pitch-gate observe write failed")
                 captured += 1
 
-                if has_reading:
-                    if source == "ocr":
-                        row["require_score"] = bool(
-                            session.require_score and GATE_REQUIRE_SCORE
+                af_ok = bool(af_row and af_row.get("ok") and af_row.get("score_match") is True)
+                play_state = str((judged or {}).get("play_state") or "")
+
+                if session.observe_only:
+                    if af_ok or board_match:
+                        self._emit_flatten_or(
+                            session,
+                            judge=judged,
+                            elapsed_s=round(time.monotonic() - session.t0_mono, 3),
+                            sample_i=sample_i,
+                            af_row=af_row,
+                            source="af" if af_ok else "dom",
                         )
-                        judged = _judge_frame_sync(row)
-                        _write_dom_vs_ocr(self.root, session, row, judged)
-                    play_state = str((judged or {}).get("play_state") or "")
-                    if session.observe_only:
-                        # Trail only: record VAR / in_play on the frame, never buy.
-                        if _judge_shows_var(judged) and not session.var_seen:
-                            session.var_seen = True
-                            print(
-                                f"pitch-gate → OBSERVE VAR match_id={session.match_id} "
-                                f"key={session.event_key} sample={sample_i} "
-                                f"(trail only; no buy)",
-                                flush=True,
-                            )
-                    elif _judge_shows_var(judged):
+                        flatten_emitted = True
+                        break
+                elif has_reading:
+                    if _judge_shows_var(judged):
                         if not session.var_seen:
                             session.var_seen = True
                             print(
                                 f"pitch-gate → VAR_VETO match_id={session.match_id} "
                                 f"key={session.event_key} sample={sample_i} "
-                                f"(no buy for this goal; keep capturing)",
-                                flush=True,
-                            )
-                        if session.confirm_streak:
-                            print(
-                                f"pitch-gate → CONFIRM_RESET "
-                                f"match_id={session.match_id} key={session.event_key} "
-                                f"was={session.confirm_streak} play_state={play_state} "
-                                f"reason=var",
+                                f"(no buy for this goal)",
                                 flush=True,
                             )
                         session.confirm_streak = 0
                     elif play_state == "in_play":
                         if session.var_seen:
-                            # Later in_play after VAR still must not buy.
+                            session.confirm_streak = 0
+                        elif not af_ok:
+                            print(
+                                f"pitch-gate → WAIT_AF match_id={session.match_id} "
+                                f"key={session.event_key} sample={sample_i} "
+                                f"af_ok={bool(af_row and af_row.get('ok'))} "
+                                f"score_match={(af_row or {}).get('score_match')} "
+                                f"err={(af_row or {}).get('error')}",
+                                flush=True,
+                            )
                             session.confirm_streak = 0
                         else:
                             session.confirm_streak += 1
@@ -885,9 +707,7 @@ class PitchGateCoordinator:
                                 print(
                                     f"pitch-gate → CONFIRM {session.confirm_streak}/{need} "
                                     f"match_id={session.match_id} key={session.event_key} "
-                                    f"sample={sample_i} score="
-                                    f"{session.ev.get('home_score')}-"
-                                    f"{session.ev.get('away_score')}",
+                                    f"sample={sample_i}",
                                     flush=True,
                                 )
                             elif session.cancel.is_set():
@@ -900,39 +720,11 @@ class PitchGateCoordinator:
                                         time.monotonic() - session.t0_mono, 3
                                     ),
                                     sample_i=sample_i,
+                                    af_row=af_row,
                                 )
-                                # Keep capturing until timeout; do not return.
+                                break
                     else:
-                        if session.confirm_streak:
-                            print(
-                                f"pitch-gate → CONFIRM_RESET "
-                                f"match_id={session.match_id} key={session.event_key} "
-                                f"was={session.confirm_streak} play_state={play_state}",
-                                flush=True,
-                            )
                         session.confirm_streak = 0
-
-                if source == "dom" and ref_screenshot_enabled():
-                    self._enqueue_ref(
-                        _RefShotJob(
-                            op="shot",
-                            event_key=session.event_key,
-                            page_url=str((surface_info or {}).get("page_url") or ""),
-                            match_id=session.match_id,
-                            sample_i=sample_i,
-                            elapsed_s=round(elapsed, 3),
-                            dqd_ts=str(session.ev.get("ts") or ""),
-                            home=str(session.ev.get("home") or ""),
-                            away=str(session.ev.get("away") or ""),
-                            home_score=session.ev.get("home_score"),
-                            away_score=session.ev.get("away_score"),
-                            surface=(surface_info or {}).get("surface"),
-                            nami_id=(surface_info or {}).get("nami_id"),
-                            root=self.root,
-                            observe_only=bool(session.observe_only),
-                            is_reversal=bool(session.ev.get("is_reversal")),
-                        )
-                    )
 
                 sample_i += 1
                 next_t = (
@@ -940,7 +732,6 @@ class PitchGateCoordinator:
                     + max(0.0, float(GATE_FIRST_DELAY_S))
                     + sample_i * GATE_INTERVAL_S
                 )
-                # Next slot past the timeout ceiling → done.
                 if next_t - session.t0_mono > GATE_TIMEOUT_S + 1e-9:
                     break
                 while not session.cancel.is_set():
@@ -962,18 +753,28 @@ class PitchGateCoordinator:
                 )
                 return
 
+            if flatten_emitted:
+                self._finish_session(
+                    session,
+                    status="observe_complete",
+                    reason="flatten_or",
+                    elapsed_s=elapsed_end,
+                    frames=captured,
+                )
+                return
+
             if session.observe_only:
                 self._finish_session(
                     session,
                     status="observe_complete",
-                    reason=f"captured_{captured}_frames",
+                    reason=f"no_or_confirm_in_{captured}_frames",
                     elapsed_s=elapsed_end,
                     frames=captured,
                 )
                 print(
                     f"pitch-gate → OBSERVE_COMPLETE match_id={session.match_id} "
                     f"key={session.event_key} frames={captured} "
-                    f"elapsed={elapsed_end:.1f}s (no buy)",
+                    f"elapsed={elapsed_end:.1f}s (hold; no flatten)",
                     flush=True,
                 )
                 return
@@ -981,15 +782,15 @@ class PitchGateCoordinator:
             if session.buy_emitted:
                 self._finish_session(
                     session,
-                    status="complete",
-                    reason=f"captured_{captured}_frames",
+                    status="aligned_buy",
+                    reason="stop_after_aligned_buy",
                     elapsed_s=elapsed_end,
                     frames=captured,
                 )
                 print(
-                    f"pitch-gate → COMPLETE match_id={session.match_id} "
+                    f"pitch-gate → ALIGNED_BUY match_id={session.match_id} "
                     f"key={session.event_key} frames={captured} "
-                    f"elapsed={elapsed_end:.1f}s (buy already emitted)",
+                    f"elapsed={elapsed_end:.1f}s (capture stopped)",
                     flush=True,
                 )
             elif session.var_seen:
@@ -1011,7 +812,7 @@ class PitchGateCoordinator:
                     session,
                     status="timeout",
                     reason=(
-                        f"no_in_play_in_{captured}_frames"
+                        f"no_aligned_buy_in_{captured}_frames"
                         if captured
                         else "pitch_gate_timeout"
                     ),
@@ -1019,7 +820,7 @@ class PitchGateCoordinator:
                     frames=captured,
                 )
                 print(
-                    f"pitch-gate → NO_IN_PLAY match_id={session.match_id} "
+                    f"pitch-gate → NO_ALIGNED_BUY match_id={session.match_id} "
                     f"key={session.event_key} frames={captured} "
                     f"elapsed={elapsed_end:.1f}s",
                     flush=True,
@@ -1038,125 +839,8 @@ class PitchGateCoordinator:
                 frames=captured,
             )
         finally:
-            if source == "dom" and ref_screenshot_enabled():
-                self._enqueue_ref(
-                    _RefShotJob(op="close", event_key=session.event_key, root=self.root)
-                )
             if reader is not None:
                 reader.close()
-
-
-@dataclass
-class _CaptureJob:
-    """Duck-type for DqdStreamObserver._capture_row."""
-
-    match_id: str
-    event_key: str
-    dqd_ts: str
-    home: str
-    away: str
-    home_score: Any
-    away_score: Any
-    t0_mono: float
-
-
-def dom_vs_ocr_path(root: Path) -> Path:
-    import quote_lib as lib
-
-    return lib.data_dir(root) / "dom_vs_ocr.jsonl"
-
-
-def _write_dom_vs_ocr(
-    root: Path,
-    session: _GateSession,
-    row: dict[str, Any],
-    judged: dict[str, Any] | None,
-) -> None:
-    """Pair the DOM readout with the OCR verdict for the same frame.
-
-    Research trail only: it answers whether reading the overlay text off the
-    page could replace OCR, which cannot be settled without both sides of the
-    same frame side by side.
-    """
-    try:
-        import quote_lib as lib
-
-        dom = row.get("dom_state")
-        if not isinstance(dom, dict):
-            dom = {}
-        judged = judged if isinstance(judged, dict) else {}
-        lib.append_jsonl(
-            dom_vs_ocr_path(root),
-            [
-                {
-                    "observed_at": lib.now_cn_iso(),
-                    "match_id": session.match_id,
-                    "event_key": session.event_key,
-                    "nami_id": session.nami_id or None,
-                    "sample_i": row.get("sample_i"),
-                    "elapsed_s": row.get("elapsed_s"),
-                    "expected_score": (
-                        f"{session.ev.get('home_score')}-{session.ev.get('away_score')}"
-                    ),
-                    "page_url": row.get("page_url"),
-                    "frame_kind": row.get("frame_kind"),
-                    "dom_pop_box": dom.get("pop_box"),
-                    "dom_pop_class": dom.get("pop_class"),
-                    "dom_center_box": dom.get("center_box"),
-                    "dom_marks": dom.get("marks"),
-                    "ocr_play_state": judged.get("play_state"),
-                    "ocr_stopped_reason": judged.get("stopped_reason"),
-                    "ocr_confidence": judged.get("confidence"),
-                    "ocr_score": judged.get("score") or judged.get("board_score"),
-                }
-            ],
-        )
-    except Exception:  # noqa: BLE001
-        logger.debug("dom_vs_ocr write skipped", exc_info=True)
-
-
-def _judge_frame_sync(row: dict[str, Any]) -> dict[str, Any] | None:
-    import sys
-
-    try:
-        pitch_state_scripts = (
-            Path(__file__).resolve().parents[2] / "pitch-state" / "scripts"
-        )
-        if str(pitch_state_scripts) not in sys.path:
-            sys.path.insert(0, str(pitch_state_scripts))
-        from pipeline import judge_inputs  # type: ignore
-
-        result = judge_inputs(
-            image=Path(str(row["frame_path"])),
-            match_id=str(row.get("match_id") or "") or None,
-            event_key=str(row.get("event_key") or "") or None,
-            frame_meta={
-                "sample_i": row.get("sample_i"),
-                "elapsed_s": row.get("elapsed_s"),
-                "surface": row.get("surface"),
-                "stream_url": row.get("stream_url"),
-                "page_url": row.get("page_url"),
-                "frame_kind": row.get("frame_kind"),
-                "match_id": row.get("match_id"),
-                "event_key": row.get("event_key"),
-                "gate": True,
-                "home_score": row.get("home_score"),
-                "away_score": row.get("away_score"),
-                "require_score": bool(row.get("require_score")),
-            },
-            append_output=True,
-            write_sidecars=True,
-        )
-        if isinstance(result, dict):
-            return result
-        return None
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "pitch-gate judge failed match=%s sample=%s",
-            row.get("match_id"),
-            row.get("sample_i"),
-        )
-        return None
 
 
 _coordinator: PitchGateCoordinator | None = None
@@ -1164,18 +848,15 @@ _coord_lock = threading.Lock()
 
 
 def invert_score_change_key(event_key: str) -> str | None:
-    """``…|1-0->2-0`` → ``…|2-0->1-0`` (the reverse that undoes this goal)."""
+    """Swap the ``from->to`` segment; keep match id and optional ``dqd_ts``."""
     parts = str(event_key or "").split("|")
-    if len(parts) < 3:
+    trans_i = next((i for i, p in enumerate(parts) if "->" in p), None)
+    if trans_i is None:
         return None
-    trans = parts[-1]
-    if "->" not in trans:
-        return None
-    left, right = trans.split("->", 1)
+    left, right = parts[trans_i].split("->", 1)
     if not left.strip() or not right.strip():
         return None
-    parts = list(parts)
-    parts[-1] = f"{right}->{left}"
+    parts[trans_i] = f"{right}->{left}"
     return "|".join(parts)
 
 
@@ -1192,10 +873,4 @@ def get_coordinator(root: Path | None = None) -> PitchGateCoordinator:
 def reset_coordinator_for_tests() -> None:
     global _coordinator
     with _coord_lock:
-        if _coordinator is not None:
-            try:
-                _coordinator._ref_stop.set()
-                _coordinator._ref_q.put(None)
-            except Exception:  # noqa: BLE001
-                pass
         _coordinator = None

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pitch Gate Board: read-only view of goal screenshots + pitch-state judgments."""
+"""Pitch Gate Board: read-only view of DOM play_state + AF trails."""
 
 from __future__ import annotations
 
@@ -25,16 +25,13 @@ DATA = ROOT / "data" / "pm-quote"
 BRIDGE_EVENTS_PATH = ROOT / "data" / "bridge" / "events.jsonl"
 OBSERVE_PATH = DATA / "dqd_stream_observe.jsonl"
 AF_OBSERVE_PATH = DATA / "af_observe.jsonl"
-NAMI_OBSERVE_PATH = DATA / "nami_observe.jsonl"
 JUDGE_PATH = DATA / "pitch_state_judge.jsonl"
 QUOTES_PATH = DATA / "quotes.jsonl"
-FRAMES_ROOT = DATA / "dqd_stream_frames"
 
 # Cap how much history we scan for the board.
 _MAX_GOALS = 5000
 _MAX_OBSERVE_LINES = 250000
 _MAX_AF_OBSERVE_LINES = 120000
-_MAX_NAMI_OBSERVE_LINES = 200000
 _MAX_JUDGE_LINES = 50000
 _MAX_BRIDGE_LINES = 20000
 _MAX_QUOTES_LINES = 20000
@@ -117,18 +114,6 @@ def _norm_path(raw: Any) -> str:
         return text
 
 
-def _rel_frame_url(abs_path: str) -> str | None:
-    if not abs_path:
-        return None
-    try:
-        p = Path(abs_path).resolve()
-        root = FRAMES_ROOT.resolve()
-        rel = p.relative_to(root)
-    except (OSError, ValueError):
-        return None
-    return f"/api/frame?rel={rel.as_posix()}"
-
-
 def _index_judges(rows: list[dict[str, Any]]) -> tuple[dict[tuple[str, str, Any], dict], dict[str, dict]]:
     """Latest judge per (match_id, event_key, sample_i) and by absolute frame path."""
     by_key: dict[tuple[str, str, Any], dict[str, Any]] = {}
@@ -191,42 +176,6 @@ def _lookup_judge(
     return None
 
 
-def _nami_nearest(frames: list[dict[str, Any]], elapsed: Any) -> dict[str, Any] | None:
-    """Sample closest to ``elapsed`` seconds, if within 6s."""
-    if elapsed is None or not frames:
-        return None
-    try:
-        t = float(elapsed)
-    except (TypeError, ValueError):
-        return None
-    best: dict[str, Any] | None = None
-    best_d: float | None = None
-    for f in frames:
-        if f.get("ball_x") is None:
-            continue
-        try:
-            e = float(f.get("elapsed_s"))
-        except (TypeError, ValueError):
-            continue
-        d = abs(e - t)
-        if best_d is None or d < best_d:
-            best_d = d
-            best = f
-    if best is None or best_d is None or best_d > 6.0:
-        return None
-    return best
-
-
-def _cap_nami_frames(frames: list[dict[str, Any]], *, limit: int = 240) -> list[dict[str, Any]]:
-    if len(frames) <= limit:
-        return frames
-    step = max(1, len(frames) // limit)
-    out = frames[::step]
-    if out[-1] is not frames[-1]:
-        out.append(frames[-1])
-    return out[: limit + 1]
-
-
 def _goal_verdict(frames: list[dict[str, Any]]) -> str:
     """Aggregate badge: prefer specific wait reasons over opaque 'waiting'."""
     judges = [
@@ -270,7 +219,7 @@ def _parse_score_transition(
     parts = str(event_key or "").split("|")
     if len(parts) < 3:
         return None, None
-    trans = parts[-1]
+    trans = next((p for p in parts if "->" in p), "")
     if "->" not in trans:
         return None, None
     left, right = trans.split("->", 1)
@@ -293,11 +242,14 @@ def _invert_score_change_key(event_key: str) -> str | None:
     parts = str(event_key or "").split("|")
     if len(parts) < 3:
         return None
+    trans_i = next((i for i, p in enumerate(parts) if "->" in p), None)
+    if trans_i is None:
+        return None
     prev, curr = _parse_score_transition(event_key)
     if prev is None or curr is None:
         return None
     parts = list(parts)
-    parts[-1] = f"{curr[0]}-{curr[1]}->{prev[0]}-{prev[1]}"
+    parts[trans_i] = f"{curr[0]}-{curr[1]}->{prev[0]}-{prev[1]}"
     return "|".join(parts)
 
 
@@ -354,7 +306,8 @@ def _load_reversal_index() -> tuple[
             "event_key": (
                 f"score_change|{mid}|"
                 f"{prev.get('home')}-{prev.get('away')}->"
-                f"{curr.get('home')}-{curr.get('away')}"
+                f"{curr.get('home')}-{curr.get('away')}|"
+                f"{row.get('ts') or ''}"
             ),
         }
         recent.append(item)
@@ -462,39 +415,26 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             "frame_kind": row.get("frame_kind"),
             "capture_method": row.get("capture_method"),
             "page_url": row.get("page_url"),
-            "frame_path": frame_path,
-            "thumb_url": _rel_frame_url(frame_path) if frame_path else None,
+            "frame_path": None,
+            "thumb_url": None,
             "judge": judge,
             "dom_pop_box": (dom or {}).get("pop_box"),
             "dom_pop_class": (dom or {}).get("pop_class"),
             "dom_center_box": (dom or {}).get("center_box"),
             "dom_marks": (dom or {}).get("marks"),
-            "nami": row.get("nami") if isinstance(row.get("nami"), dict) else None,
+            "af": row.get("af") if isinstance(row.get("af"), dict) else None,
+            "odds_grade": row.get("odds_grade")
+            if isinstance(row.get("odds_grade"), dict)
+            else None,
         }
 
         # Upsert by sample_i so re-reads / retries replace.
-        # screenshot_only amendments only attach the JPEG — keep DOM judge text.
         frames: list[dict[str, Any]] = g["frames"]
         replaced = False
         if sample_i is not None:
             for i, prev in enumerate(frames):
                 if prev.get("sample_i") == sample_i:
-                    if row.get("screenshot_only") is True:
-                        if frame_path:
-                            prev["frame_path"] = frame_path
-                            prev["thumb_url"] = _rel_frame_url(frame_path)
-                        if row.get("error"):
-                            prev["ref_error"] = row.get("error")
-                        prev["ref_capture_method"] = row.get("capture_method")
-                        frames[i] = prev
-                    elif prev.get("thumb_url") and not frame.get("thumb_url"):
-                        # DOM row arriving after a late ref shot — keep the image.
-                        frame["frame_path"] = prev.get("frame_path")
-                        frame["thumb_url"] = prev.get("thumb_url")
-                        frame["ref_capture_method"] = prev.get("ref_capture_method")
-                        frames[i] = frame
-                    else:
-                        frames[i] = frame
+                    frames[i] = frame
                     replaced = True
                     break
         if not replaced:
@@ -552,29 +492,6 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             }
         )
 
-    nami_rows = _read_jsonl_tail(NAMI_OBSERVE_PATH, max_lines=_MAX_NAMI_OBSERVE_LINES)
-    nami_by_key: dict[str, list[dict[str, Any]]] = {}
-    for row in nami_rows:
-        ek = str(row.get("event_key") or "").strip()
-        if not ek or ek not in groups:
-            continue
-        if row.get("ball_x") is None:
-            continue
-        nami_by_key.setdefault(ek, []).append(
-            {
-                "sample_i": row.get("sample_i"),
-                "elapsed_s": row.get("elapsed_s"),
-                "observed_at": row.get("observed_at"),
-                "score_raw": row.get("score_raw"),
-                "ball_xy": row.get("ball_xy"),
-                "ball_x": row.get("ball_x"),
-                "ball_y": row.get("ball_y"),
-                "zone": row.get("zone"),
-                "restart_center": row.get("restart_center"),
-                "in_box": row.get("in_box"),
-            }
-        )
-
     goals: list[dict[str, Any]] = []
     for ek in reversed(order):
         g = groups[ek]
@@ -614,79 +531,16 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 in_play_at = f.get("elapsed_s")
                 break
         g["in_play_elapsed_s"] = in_play_at
-        nami_frames = list(nami_by_key.get(ek) or [])
-        nami_frames.sort(
-            key=lambda f: (
-                int(f.get("sample_i") or 0),
-                float(f.get("elapsed_s") or 0),
-            )
+        g["odds_grade"] = next(
+            (
+                f.get("odds_grade")
+                for f in reversed(frames)
+                if isinstance(f.get("odds_grade"), dict) and f["odds_grade"].get("level")
+            ),
+            None,
         )
-        nami_frames = _cap_nami_frames(nami_frames)
-        nami_by_si: dict[int, dict[str, Any]] = {}
-        for nf in nami_frames:
-            si = nf.get("sample_i")
-            if si is None:
-                continue
-            try:
-                nami_by_si[int(si)] = nf
-            except (TypeError, ValueError):
-                continue
         for i, f in enumerate(frames):
             f["dom_seq"] = i + 1
-            if not isinstance(f.get("nami"), dict) or f["nami"].get("ball_x") is None:
-                hit = None
-                si = f.get("sample_i")
-                if si is not None:
-                    try:
-                        hit = nami_by_si.get(int(si))
-                    except (TypeError, ValueError):
-                        hit = None
-                if hit is None:
-                    hit = _nami_nearest(nami_frames, f.get("elapsed_s"))
-                f["nami"] = (
-                    {
-                        "elapsed_s": hit.get("elapsed_s"),
-                        "ball_x": hit.get("ball_x"),
-                        "ball_y": hit.get("ball_y"),
-                        "zone": hit.get("zone"),
-                        "restart_center": hit.get("restart_center"),
-                        "in_box": hit.get("in_box"),
-                    }
-                    if hit
-                    else None
-                )
-        # Carry last known xy along the DOM sequence so commentary-only MQTT
-        # ticks still show a numbered point (already-written unknown rows).
-        last_nami: dict[str, Any] | None = None
-        for f in frames:
-            n = f.get("nami") if isinstance(f.get("nami"), dict) else None
-            if n and n.get("ball_x") is not None:
-                last_nami = n
-                continue
-            if last_nami is None:
-                continue
-            carried = dict(last_nami)
-            carried["carried"] = True
-            f["nami"] = carried
-        # Do not ship the MQTT trail — board only draws numbered DOM samples.
-        g["nami_frames"] = []
-        g["nami_frame_count"] = 0
-        g["nami_in_play"] = next(
-            (
-                f.get("nami")
-                for f in frames
-                if (f.get("judge") or {}).get("play_state") == "in_play"
-                and (f.get("nami") or {}).get("ball_x") is not None
-            ),
-            _nami_nearest(nami_frames, in_play_at),
-        )
-        g["nami_saw_center"] = any(
-            (f.get("nami") or {}).get("restart_center") for f in frames
-        )
-        g["nami_saw_box"] = any((f.get("nami") or {}).get("in_box") for f in frames)
-        g["nami_dom_points"] = sum(
-            1 for f in frames if (f.get("nami") or {}).get("ball_x") is not None
-        )
 
         mid = str(g.get("match_id") or "")
         ek = str(g.get("event_key") or "")
@@ -760,9 +614,7 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
         "updated_at": None,
         "observe_path": str(OBSERVE_PATH),
         "af_observe_path": str(AF_OBSERVE_PATH),
-        "nami_observe_path": str(NAMI_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
-        "frames_root": str(FRAMES_ROOT),
         "goal_count": len(goals),
         "gate_goal_count": gate_n,
         "in_play_count": in_play_n,
@@ -770,7 +622,6 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
         "reversal_observe_count": rev_obs_n,
         "observe_rows": len(observe),
         "af_observe_rows": len(af_rows),
-        "nami_observe_rows": len(nami_rows),
         "judge_rows": len(judges),
         "goals": goals,
         "recent_reversals": recent_reversals[:40],
@@ -788,12 +639,9 @@ def status_payload() -> dict[str, Any]:
         "viewer": True,
         "observe_path": str(OBSERVE_PATH),
         "af_observe_path": str(AF_OBSERVE_PATH),
-        "nami_observe_path": str(NAMI_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
-        "frames_root": str(FRAMES_ROOT),
         "observe_exists": OBSERVE_PATH.is_file(),
         "af_observe_exists": AF_OBSERVE_PATH.is_file(),
-        "nami_observe_exists": NAMI_OBSERVE_PATH.is_file(),
         "judge_exists": JUDGE_PATH.is_file(),
         "goal_count": snap["goal_count"],
         "gate_goal_count": snap["gate_goal_count"],
@@ -866,23 +714,10 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 200, build_goals_payload(limit=limit))
             return
 
-        if path == "/api/frame":
-            rel = unquote((qs.get("rel") or [""])[0]).lstrip("/")
-            if not rel:
-                json_response(self, 400, {"error": "missing_rel"})
-                return
-            file_path = _safe_under(FRAMES_ROOT, FRAMES_ROOT / rel)
-            if not file_path:
-                json_response(self, 404, {"error": "frame_not_found"})
-                return
-            serve_file(self, file_path)
-            return
-
         json_response(self, 404, {"error": "not_found", "path": path})
 
 
 def main() -> int:
-    FRAMES_ROOT.mkdir(parents=True, exist_ok=True)
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Pitch Gate Board → http://{HOST}:{PORT}/", flush=True)
     print(f"  observe → {OBSERVE_PATH}", flush=True)

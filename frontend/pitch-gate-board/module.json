@@ -17,8 +17,7 @@
       "GET /api/health",
       "GET /api/module",
       "GET /api/status",
-      "GET /api/goals",
-      "GET /api/frame"
+      "GET /api/goals"
     ]
   },
   "defaults": {

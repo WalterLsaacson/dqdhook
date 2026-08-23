@@ -28,9 +28,8 @@ import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from dqd_stream_observe import try_create_observer as try_create_dqd_stream_observer  # noqa: E402
 from af_observe import try_create_observer as try_create_af_observer  # noqa: E402
+from book_context_observe import try_create_observer as try_create_book_observer  # noqa: E402
 from livescore_observe import try_create_observer as try_create_lsa_observer  # noqa: E402
-from nami_observe import try_create_observer as try_create_nami_observer  # noqa: E402
-from post_goal_sampler import PostGoalSampler  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import (  # noqa: E402
     load_trade_settings,
@@ -102,7 +101,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
         f"size_tiers={size_tiers_label(settings)} "
-        f"(pitch-gate: first @+5s, every 5s until 150s; first in_play → one buy)",
+        f"(pitch-gate: first @+5s, every 5s until 120s; DOM∧AF same tick → one buy)",
         file=sys.stderr,
         flush=True,
     )
@@ -281,20 +280,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
         stop_event=stop_warm,
         run_immediately=True,
     )
-    sampler = PostGoalSampler(rt)
-    sampler.start()
-    print(
-        f"post-goal sampler → {lib.data_dir(rt) / 'post_goal_samples.jsonl'} "
-        f"(buy tokens · 10s × 6 · jsonl only)",
-        file=sys.stderr,
-        flush=True,
-    )
     dqd_stream_obs = try_create_dqd_stream_observer(rt)
     if dqd_stream_obs is not None:
         dqd_stream_obs.start()
         print(
             f"dqd-stream observe → {lib.data_dir(rt) / 'dqd_stream_observe.jsonl'} "
-            f"(DQD goal t0/+10..50s · page/video screenshot · observe-only)",
+            f"(DOM play_state · no screenshots)",
             file=sys.stderr,
             flush=True,
         )
@@ -304,21 +295,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-    nami_obs = try_create_nami_observer(rt)
-    if nami_obs is not None:
-        nami_obs.start()
-    else:
-        print(
-            "nami observe skipped (QUOTE_NAMI_OBSERVE=0)",
-            file=sys.stderr,
-            flush=True,
-        )
     af_obs = try_create_af_observer(rt)
     if af_obs is not None:
         af_obs.start()
     else:
         print(
             "af observe skipped (QUOTE_AF_OBSERVE=0 or missing apifootball_key)",
+            file=sys.stderr,
+            flush=True,
+        )
+    book_obs = try_create_book_observer(rt)
+    if book_obs is not None:
+        book_obs.start()
+        print(
+            f"odds observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
+            f"(same DOM clock · grade A/B/C · no size)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "odds observe skipped (no ODDS_API_IO_KEY)",
             file=sys.stderr,
             flush=True,
         )
@@ -421,13 +418,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nbye", file=sys.stderr)
         stop_warm.set()
-        sampler.stop()
         if lsa_obs is not None:
             lsa_obs.stop()
         if dqd_stream_obs is not None:
             dqd_stream_obs.stop()
-        if nami_obs is not None:
-            nami_obs.stop()
+        if book_obs is not None:
+            book_obs.stop()
         if af_obs is not None:
             af_obs.stop()
         if not args.no_upstream:

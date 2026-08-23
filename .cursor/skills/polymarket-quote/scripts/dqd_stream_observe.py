@@ -146,25 +146,6 @@ class DomReader:
             return None, "no_animation_root"
         return dom, None
 
-    def screenshot(self, frame_path: Path) -> tuple[bool, str | None]:
-        """Grab the animation element; store-only (no OCR)."""
-        if self._frame is None and self._page is None:
-            return False, "not_open"
-        try:
-            frame_path = Path(frame_path)
-            frame_path.parent.mkdir(parents=True, exist_ok=True)
-            target = self._frame if self._frame is not None else self._page
-            loc = target.locator(".football-animate")
-            if loc.count() > 0:
-                loc.first.screenshot(path=str(frame_path))
-            elif self._page is not None:
-                self._page.screenshot(path=str(frame_path), full_page=False)
-            else:
-                return False, "no_animation_for_screenshot"
-            return frame_path.is_file(), None if frame_path.is_file() else "screenshot_failed"
-        except Exception as e:  # noqa: BLE001
-            return False, str(e).splitlines()[0][:200] if str(e) else "screenshot_failed"
-
     def close(self) -> None:
         for attr in ("_context", "_browser"):
             obj = getattr(self, attr, None)

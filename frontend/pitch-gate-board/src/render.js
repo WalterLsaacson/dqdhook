@@ -32,106 +32,11 @@ const MARK_LABELS = {
   "penalty-box": "禁区",
 };
 
-const NAMI_ZONE_LABELS = {
-  center: "中圈开球",
-  box_l: "左禁区",
-  box_r: "右禁区",
-  third_l: "左三分之一",
-  third_r: "右三分之一",
-  mid: "中场",
-  unknown: "未知",
-};
-
-function namiZoneLabel(zone) {
-  return NAMI_ZONE_LABELS[zone] || zone || "—";
-}
-
-function pitchPct(v) {
-  return Math.max(1, Math.min(99, Number(v) * 100));
-}
-
-function namiDotClass(f, { isIp = false, last = false } = {}) {
-  if (isIp) return "is-inplay";
-  if (last) return "is-last";
-  if (f.in_box) return "is-box";
-  if (f.restart_center) return "is-center";
-  return "";
-}
-
-function renderNamiTrail(goal) {
-  const ip = goal.nami_in_play;
-  const allFrames = goal.frames || [];
-  const seenSi = new Set();
-  const domPts = allFrames.filter((f) => {
-    if (f.nami?.ball_x == null) return false;
-    const si = f.sample_i;
-    if (si == null) return true;
-    if (seenSi.has(si)) return false;
-    seenSi.add(si);
-    return true;
-  });
-  const used = new Map();
-  const numbered = domPts
-    .map((f, i, arr) => {
-      const n = f.nami;
-      let x = pitchPct(n.ball_x);
-      let y = pitchPct(n.ball_y);
-      const cell = `${Math.round(x)}:${Math.round(y)}`;
-      const stack = used.get(cell) || 0;
-      used.set(cell, stack + 1);
-      if (stack) {
-        const ang = stack * 0.95;
-        const r = 3.4 + (stack % 4) * 1.5;
-        x = Math.max(3, Math.min(97, x + Math.cos(ang) * r));
-        y = Math.max(4, Math.min(60, y + Math.sin(ang) * r));
-      }
-      const ps = playStateOf(f);
-      const isIp = ps === "in_play" && Number(f.elapsed_s) === Number(goal.in_play_elapsed_s);
-      const last = !isIp && i === arr.length - 1;
-      const cls = namiDotClass(n, { isIp, last });
-      const seq = f.dom_seq || i + 1;
-      const ty = Math.max(5, y - 3.4);
-      const stale = n.carried ? " · 沿用上次坐标" : "";
-      return `<g class="nami-mark">
-        <circle class="nami-dot ${cls}" cx="${x}" cy="${y}" r="2.3">
-          <title>#${seq} t+${f.elapsed_s ?? "?"}s ${namiZoneLabel(n.zone)} · ${ps}${stale}</title>
-        </circle>
-        <text class="nami-num" x="${x}" y="${ty}">${seq}</text>
-      </g>`;
-    })
-    .join("");
-  let ipLine = "重启 run_main 之后的新球才会有点";
-  if (domPts.length && ip) {
-    ipLine = `DOM 共 ${domPts.length} 个采样点 · 买入(#${
-      allFrames.find((f) => playStateOf(f) === "in_play")?.dom_seq || "?"
-    }) 在「${namiZoneLabel(ip.zone)}」`;
-  } else if (domPts.length) {
-    ipLine = `DOM 共 ${domPts.length} 个采样点`;
-  }
-  const body = numbered
-    ? `<svg class="nami-pitch" viewBox="0 0 100 64" role="img" aria-label="DOM sample ball positions">
-      <rect class="nami-pitch__field" x="1" y="1" width="98" height="62" rx="1.5" />
-      <line class="nami-pitch__line" x1="50" y1="1" x2="50" y2="63" />
-      <circle class="nami-pitch__line" cx="50" cy="32" r="8" fill="none" />
-      <rect class="nami-pitch__line" x="1" y="18" width="16" height="28" fill="none" />
-      <rect class="nami-pitch__line" x="83" y="18" width="16" height="28" fill="none" />
-      ${numbered}
-    </svg>
-    <p class="nami-legend">
-      <span class="nami-legend__swatch is-inplay"></span>买入（首个 in_play）
-      <span class="nami-legend__swatch is-center"></span>中圈
-      <span class="nami-legend__swatch is-box"></span>禁区
-      <span class="nami-legend__swatch is-last"></span>最后一次 DOM
-      · 序号 = 第几次 DOM 采样（约 5s 一拍）
-    </p>`
-    : `<p class="nami-empty">还没有球位点。重启后每个 DOM 采样会记下当时球位并标序号（不再画全程轨迹）。</p>`;
-  return `<section class="nami-trail">
-    <div class="af-trail__head">
-      <h3>Nami 球位（只观察，不下单）</h3>
-      <span>${escapeHtml(ipLine)}</span>
-    </div>
-    ${body}
-  </section>`;
+function gradeChip(grade) {
+  const level = String(grade?.level || "").toUpperCase();
+  if (!level) return "";
+  const reason = grade?.reason ? ` · ${grade.reason}` : "";
+  return `<span class="goal-item__grade is-${escapeHtml(level.toLowerCase())}">Odds ${escapeHtml(level)}${escapeHtml(reason)}</span>`;
 }
 
 /** DOM-mode frames have no screenshot; show the text the gate actually read. */
@@ -320,11 +225,9 @@ export function renderRail(goals) {
                 : ""
             }
             ${
-              g.nami_in_play?.zone
-                ? `<span class="goal-item__nami">${escapeHtml(NAMI_ZONE_LABELS[g.nami_in_play.zone] || g.nami_in_play.zone)}</span>`
-                : g.nami_dom_points
-                  ? `<span class="goal-item__nami">球位 ${g.nami_dom_points}</span>`
-                  : ""
+              g.odds_grade?.level
+                ? gradeChip({ level: g.odds_grade.level })
+                : ""
             }
             <span>${g.gate ? (revObs ? "observe" : "gate") : "observe"}</span>
             <span>${escapeHtml(formatBeijing(g.dqd_ts))}</span>
@@ -431,17 +334,11 @@ export function renderDetail(goal) {
           const evidence = Array.isArray(f.judge?.evidence)
             ? f.judge.evidence.slice(0, 3).join(" · ")
             : "";
-          const visual = [
-            f.dom_pop_box || f.dom_center_box ? renderDomCard(f) : "",
-            f.thumb_url
-              ? `<div class="frame__img-wrap"><img src="${escapeHtml(f.thumb_url)}" alt="frame ${f.sample_i}" loading="lazy" /></div>`
-              : "",
-          ]
-            .filter(Boolean)
-            .join("") ||
-            `<div class="frame__img-wrap"><div class="frame__placeholder">${escapeHtml(
-              f.error || "no reading",
-            )}</div></div>`;
+          const visual = f.dom_pop_box || f.dom_center_box
+            ? renderDomCard(f)
+            : `<div class="frame__img-wrap"><div class="frame__placeholder">${escapeHtml(
+                f.error || "no reading",
+              )}</div></div>`;
           return `
             <article class="frame ${ps === "in_play" ? "is-in_play" : ""}">
               ${visual}
@@ -452,8 +349,12 @@ export function renderDetail(goal) {
                 </div>
                 <div class="frame__row">
                   <span>#${escapeHtml(String(f.dom_seq ?? f.sample_i ?? "?"))}${
-                    f.nami?.zone
-                      ? ` · ${escapeHtml(namiZoneLabel(f.nami.zone))}`
+                    f.odds_grade?.level
+                      ? ` · Odds ${escapeHtml(String(f.odds_grade.level))}`
+                      : ""
+                  }${
+                    f.af?.af_score
+                      ? ` · AF ${escapeHtml(String(f.af.af_score))}`
                       : ""
                   }</span>
                   <span>conf ${escapeHtml(conf)}</span>
@@ -491,11 +392,11 @@ export function renderDetail(goal) {
           }
         </p>
         ${revLine}
+        ${goal.odds_grade ? `<p class="detail__grade">${gradeChip(goal.odds_grade)}</p>` : ""}
       </div>
       <span class="${stateBadgeClass(vKey)}">${escapeHtml(stateLabel(vKey))}</span>
     </div>
     ${afHtml}
-    ${renderNamiTrail(goal)}
     ${framesHtml}`;
 
   board.querySelectorAll("[data-link-key]").forEach((btn) => {

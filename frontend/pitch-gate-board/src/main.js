@@ -1,5 +1,5 @@
 /**
- * @dongqiudi/pitch-gate-board — per-goal screenshot + play_state judgments.
+ * @dongqiudi/pitch-gate-board — per-goal DOM play_state + AF / Odds trails.
  */
 import { state } from "./state.js";
 import { $, escapeHtml } from "./utils.js";
