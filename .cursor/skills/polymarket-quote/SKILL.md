@@ -65,7 +65,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
    - `match_finished` → immediate quote (default live; stale / once-per-match skip)
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: one CLOB `/books` POST; totals/BTTS before exact.
-5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` or live `posted`). Pitch-gate buys skip `min_buy_price` and size/$1 floors (fee/`min_net` + `QUOTE_MAX_USDC` remain).
+5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` or live `posted`). Pitch-gate and FT buys skip `min_buy_price`; pitch-gate also skips size/$1 floors (fee/`min_net` + `QUOTE_MAX_USDC` remain).
 6. **No post-goal CLOB re-quotes.** One `quote_bridge_event` per aligned buy.
 
 ## Trading flags
@@ -80,7 +80,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--max-levels` | 5 | Walk depth cap |
 | `--max-usdc` / `--max-shares` | 1 / 25 | Hard caps; **`.env` `QUOTE_MAX_*` wins** |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
-| `--min-buy-price` | 0.6 | `buy_win` when `best_ask ≥` this; **skipped** for pitch-gate |
+| `--min-buy-price` | 0.6 | leftover non-gate path only; **skipped** for pitch-gate and FT |
 | `--allow-extreme-prices` | off | Allow ≤0.01 / >0.992 |
 | `sell_lose` | off | Disabled — only `buy_win` |
 

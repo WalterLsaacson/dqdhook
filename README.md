@@ -148,7 +148,7 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 3. **只交易 `buy_win`**（买已锁定为 WIN 的一侧）；`sell_lose` 已关闭。  
 4. CLOB：`POST /books` 批量吃盘；默认 **`walk`** 深度（受 `max_levels` / `max_usdc` / `max_shares` / `max_slippage` 约束），FAK 市价。  
 5. 手续费模型：`fee ≈ feeRate × p × (1−p)`（默认 `feeRate=0.05`）；需 `net_edge ≥ min_net`（默认约 0.0076）才算 misprice。  
-6. **Pitch-gate 确认单**跳过 `min_buy_price`（默认 0.6）以及部分 $1 尺寸地板；仍受 `QUOTE_MAX_USDC` / fee / `min_net` 约束。  
+6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_MAX_USDC` / fee / `min_net` 约束。  
 7. 极端价（≤0.01 或 >0.992）默认跳过，除非 `--allow-extreme-prices`。  
 
 **涵盖盘口（有则报）：** 胜平负六 token、大小球（含球队/半场）、BTTS、准确比分等（见 `polymarket-quote/reference.md`）。
@@ -218,7 +218,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_DOM_OPEN_TIMEOUT_S` | 打开动画页的上限，默认 15 |
 | `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` | 未设则均为 `live` |
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
-| `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控确认单跳过** |
+| `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控和终场都跳过** |
 | `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
 | `QUOTE_REST_ENABLED` | `1` 才挂 0.99 rest（金额跟 `QUOTE_MAX_USDC`，默认 $1） |
 | `QUOTE_REST_EXPIRE_S` | rest 过期秒数，默认 3600 |

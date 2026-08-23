@@ -119,23 +119,22 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "data" / "pm-quote").mkdir(parents=True)
-        # floor off (0): any ask allowed
         ex = TradeExecutor(root, _settings(goals=False, ft=True))
-        assert ex._min_buy_price_blocked(0.05) is None
-        assert ex._min_buy_price_blocked(0.79) is None
-        # explicit floor still works
         from dataclasses import replace
 
-        ex.settings = replace(ex.settings, min_buy_price=0.8)
-        assert ex._min_buy_price_blocked(0.79) is not None
-        assert ex._min_buy_price_blocked(0.8) is None
-        assert "buy_price_below_min" in (ex._min_buy_price_blocked(0.5) or "")
-        # 0.6 floor blocks very cheap legs, allows mid-range asks
         ex.settings = replace(ex.settings, min_buy_price=0.6)
+        # FT skips the ask floor (same as pitch-gate).
+        assert (
+            ex._min_buy_price_blocked(0.05, event_key="match_finished|m1|1-0")
+            is None
+        )
+        assert (
+            ex._min_buy_price_blocked(0.59, event_type="match_finished") is None
+        )
+        # leftover non-FT / non-gate path still honors the floor
         assert ex._min_buy_price_blocked(0.59) is not None
         assert ex._min_buy_price_blocked(0.6) is None
-        assert ex._min_buy_price_blocked(0.79) is None
-        assert ex._min_buy_price_blocked(0.97) is None
+        assert "buy_price_below_min" in (ex._min_buy_price_blocked(0.5) or "")
 
     print("ok: split goals/ft trade modes")
     return 0

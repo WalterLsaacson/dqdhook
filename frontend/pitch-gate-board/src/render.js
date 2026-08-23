@@ -10,7 +10,7 @@ import {
   goalVerdictKey,
   isGoalFilter,
   isReversalObserve,
-  reversedAfterInPlay,
+  reversedAfterBuy,
   scoreLabel,
   stateBadgeClass,
   stateLabel,
@@ -136,8 +136,8 @@ export function renderMeta(snap) {
     if (countPill) {
       countPill.textContent = `${f.short} ${n}`;
       countPill.classList.toggle("is-rev", f.id === "reversed" && n > 0);
-      countPill.classList.toggle("is-rev-hard", f.id === "reversed_after_in_play" && n > 0);
-      countPill.classList.toggle("is-obs", f.id === "reversal_observe" && n > 0);
+      countPill.classList.toggle("is-rev-hard", f.id === "reversed_after_buy" && n > 0);
+      countPill.classList.toggle("is-obs", (f.id === "reversal_observe" || f.id === "flatten_or" || f.id === "hold") && n > 0);
     }
     const btn = document.querySelector(`.filter__btn[data-filter="${f.id}"]`);
     if (btn) btn.textContent = `${f.short} ${n}`;
@@ -169,7 +169,7 @@ export function pushReversalToast(ev) {
         match ${escapeHtml(ev.match_id || "")}
         ${ev.league ? ` · ${escapeHtml(ev.league)}` : ""}
         ${ev.ts ? ` · ${escapeHtml(formatBeijing(ev.ts))}` : ""}
-        · 门控已取消
+        · 取消门控/rest · 有仓才开观察
       </div>
     </div>`;
   stack.prepend(el);
@@ -202,13 +202,17 @@ export function renderRail(goals) {
   rail.innerHTML = goals
     .map((g) => {
       const active = g.event_key === state.selectedKey ? "is-active" : "";
-      const afterIp = reversedAfterInPlay(g);
+      const afterBuy = reversedAfterBuy(g);
       const revObs = isReversalObserve(g);
       const revClass = revObs
-        ? "is-reversal-observe"
+        ? g.verdict === "flatten_or"
+          ? "is-reversal-observe is-flatten"
+          : g.verdict === "hold"
+            ? "is-reversal-observe is-hold"
+            : "is-reversal-observe"
         : g.reversed
-          ? afterIp
-            ? "is-reversed is-reversed-after-inplay"
+          ? afterBuy
+            ? "is-reversed is-reversed-after-buy"
             : "is-reversed"
           : "";
       const vKey = goalVerdictKey(g);
@@ -256,23 +260,29 @@ export function renderDetail(goal) {
   const afFrames = goal.af_frames || [];
   const title = `${escapeHtml(goal.home || "?")} ${escapeHtml(scoreLabel(goal))} ${escapeHtml(goal.away || "?")}`;
   const rev = goal.reversal;
-  const afterIp = reversedAfterInPlay(goal);
+  const afterBuy = reversedAfterBuy(goal);
   const revObs = isReversalObserve(goal);
   const vKey = goalVerdictKey(goal);
   let revLine = "";
   if (revObs) {
     const from = goal.score_from || "?-?";
     const to = goal.score_to || scoreLabel(goal);
-    revLine = `<p class="detail__rev detail__rev--observe">回撤观察 · 期望比分 ${escapeHtml(String(to))}（懂球帝 ${escapeHtml(String(from))}→${escapeHtml(String(to))}）· AF/DOM score_match 对照该比分</p>`;
+    const outcome =
+      goal.verdict === "flatten_or"
+        ? " · AF∨DOM 已认分 → flatten"
+        : goal.verdict === "hold"
+          ? " · 120s 未认分 → 持仓"
+          : " · 等 AF∨DOM 认回撤后比分";
+    revLine = `<p class="detail__rev detail__rev--observe">回撤观察 · 期望 ${escapeHtml(String(to))}（懂球帝 ${escapeHtml(String(from))}→${escapeHtml(String(to))}）${outcome}</p>`;
   } else if (goal.reversed && rev) {
-    const revCls = afterIp ? "detail__rev detail__rev--after-inplay" : "detail__rev";
+    const revCls = afterBuy ? "detail__rev detail__rev--after-inplay" : "detail__rev";
     if (rev.source === "dqd_reversal") {
-      revLine = `<p class="${revCls}">比分回撤 ${escapeHtml(scorePair(rev.prev))} → ${escapeHtml(scorePair(rev.curr))} · 门控已取消 · ${escapeHtml(formatBeijing(rev.ts))}${
-        afterIp ? " · 曾判定 in_play" : ""
+      revLine = `<p class="${revCls}">比分回撤 ${escapeHtml(scorePair(rev.prev))} → ${escapeHtml(scorePair(rev.curr))} · 取消门控/rest · ${escapeHtml(formatBeijing(rev.ts))}${
+        afterBuy ? " · 曾 aligned 买入" : " · 未买入"
       }</p>`;
     } else {
       revLine = `<p class="${revCls}">门控取消 · ${escapeHtml(rev.reason || rev.mode || "canceled")} · ${escapeHtml(formatBeijing(rev.ts))}${
-        afterIp ? " · 曾判定 in_play" : ""
+        afterBuy ? " · 曾 aligned 买入" : ""
       }</p>`;
     }
   }
@@ -285,7 +295,7 @@ export function renderDetail(goal) {
     ? `<section class="af-trail">
         <div class="af-trail__head">
           <h3>API-Football observe</h3>
-          <span>${afFrames.length} samples · ≤90s @ 5s
+          <span>${afFrames.length} samples · ≤120s @ 5s
           ${
             goal.af_first_match_elapsed_s != null
               ? ` · match @ t+${escapeHtml(String(goal.af_first_match_elapsed_s))}s`
@@ -339,13 +349,40 @@ export function renderDetail(goal) {
             : `<div class="frame__img-wrap"><div class="frame__placeholder">${escapeHtml(
                 f.error || "no reading",
               )}</div></div>`;
+          const aligned = Boolean(f.aligned);
+          const waitAf = ps === "in_play" && !aligned;
+          const orFlat = Boolean(f.or_flatten);
+          const frameCls = [
+            aligned ? "is-aligned" : "",
+            waitAf ? "is-wait-af" : "",
+            orFlat && revObs ? "is-or-flatten" : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          const gateBadge = aligned
+            ? "aligned_buy"
+            : waitAf
+              ? "wait_af"
+              : orFlat && revObs
+                ? "flatten_or"
+                : ps;
+          const afBit =
+            f.af?.score_match === true
+              ? "AF ✓"
+              : f.af?.score_match === false
+                ? "AF ≠"
+                : f.af?.ok === false
+                  ? "AF err"
+                  : f.af?.af_score
+                    ? `AF ${f.af.af_score}`
+                    : "";
           return `
-            <article class="frame ${ps === "in_play" ? "is-in_play" : ""}">
+            <article class="frame ${frameCls}">
               ${visual}
               <div class="frame__body">
                 <div class="frame__row">
                   <span class="frame__elapsed">t+${escapeHtml(String(f.elapsed_s ?? "?"))}s</span>
-                  <span class="${stateBadgeClass(ps)}">${escapeHtml(stateLabel(ps))}</span>
+                  <span class="${stateBadgeClass(gateBadge)}">${escapeHtml(stateLabel(gateBadge))}</span>
                 </div>
                 <div class="frame__row">
                   <span>#${escapeHtml(String(f.dom_seq ?? f.sample_i ?? "?"))}${
@@ -355,7 +392,11 @@ export function renderDetail(goal) {
                   }${
                     f.af?.af_score
                       ? ` · AF ${escapeHtml(String(f.af.af_score))}`
-                      : ""
+                      : afBit
+                        ? ` · ${escapeHtml(afBit)}`
+                        : ""
+                  }${
+                    f.board_score_match === true && revObs ? " · 比分条✓" : ""
                   }</span>
                   <span>conf ${escapeHtml(conf)}</span>
                 </div>
@@ -386,8 +427,15 @@ export function renderDetail(goal) {
               : ""
           }
           ${
-            goal.in_play_elapsed_s != null
-              ? ` · in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s`
+            goal.aligned_elapsed_s != null
+              ? ` · aligned @ t+${escapeHtml(String(goal.aligned_elapsed_s))}s`
+              : goal.in_play_elapsed_s != null
+                ? ` · DOM in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s (等AF)`
+                : ""
+          }
+          ${
+            goal.flatten_elapsed_s != null && revObs
+              ? ` · flatten @ t+${escapeHtml(String(goal.flatten_elapsed_s))}s`
               : ""
           }
         </p>

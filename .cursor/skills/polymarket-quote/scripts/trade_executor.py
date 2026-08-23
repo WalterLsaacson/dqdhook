@@ -737,12 +737,19 @@ class TradeExecutor:
         price: float | None,
         *,
         match_meta: dict[str, Any] | None = None,
+        event_key: str = "",
+        event_type: str = "",
     ) -> str | None:
-        """buy_win: require best_ask >= min_buy_price (default 0.6; 0=off).
+        """buy_win ask floor (default 0.6; 0=off).
 
-        Pitch-gate confirmed buys skip this floor (fee/min_net still apply).
+        Pitch-gate and FT both skip this floor (fee/min_net + 0.992 still apply).
         """
         if _trade_context_pitch_gate(match_meta):
+            return None
+        typ = self._resolve_event_type(
+            event_type=event_type, event_key=event_key, match_meta=match_meta
+        )
+        if typ == "match_finished":
             return None
         floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
         if floor <= 0 or price is None:
@@ -1680,7 +1687,12 @@ class TradeExecutor:
                     live=channel_live,
                 )
                 return row
-            below_min = self._min_buy_price_blocked(ref_f, match_meta=match_meta)
+            below_min = self._min_buy_price_blocked(
+                ref_f,
+                match_meta=match_meta,
+                event_key=event_key,
+                event_type=typ,
+            )
             if below_min:
                 row = self._record(
                     quote,

@@ -60,7 +60,7 @@ function render(st) {
             (b.pm_ticks != null ? ` · PM ${b.pm_ticks}` : "")
           : b.id === "pitch-gate-board" && b.goal_count != null
             ? ` · goals ${b.goal_count}` +
-              (b.in_play_count != null ? ` · in_play ${b.in_play_count}` : "") +
+              (b.aligned_buy_count != null ? ` · 买入 ${b.aligned_buy_count}` : b.in_play_count != null ? ` · in_play ${b.in_play_count}` : "") +
               (b.reversed_count != null ? ` · 回撤 ${b.reversed_count}` : "")
             : "";
       return `

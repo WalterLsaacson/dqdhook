@@ -644,9 +644,11 @@ def status() -> dict[str, Any]:
             if st:
                 extra = {
                     "goal_count": st.get("goal_count"),
-                    "in_play_count": st.get("in_play_count"),
+                    "aligned_buy_count": st.get("aligned_buy_count"),
+                    "in_play_count": st.get("aligned_buy_count") or st.get("in_play_count"),
                     "gate_goal_count": st.get("gate_goal_count"),
                     "reversed_count": st.get("reversed_count"),
+                    "flatten_count": st.get("flatten_count"),
                 }
         if up and board["id"] == "af-bridge-board":
             st = _http_json(f"http://{HOST}:{port}/api/status")
@@ -929,7 +931,7 @@ def main(argv: list[str] | None = None) -> int:
         "--min-buy-price",
         type=float,
         default=None,
-        help="buy_win floor (default 0.6; 0=off; env QUOTE_MIN_BUY_PRICE)",
+        help="buy_win floor unused on pitch-gate and FT (default 0.6; 0=off)",
     )
     parser.add_argument(
         "--interval",
@@ -990,7 +992,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(pitch-gate: DOM state @ 5s; first in_play → one buy)",
+        f"(pitch-gate: DOM∧AF @ 5s; aligned buy then stop; DQD reverse → AF∨DOM flatten)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pitch Gate Board: read-only view of DOM play_state + AF trails."""
+"""Pitch Gate Board: DOM∧AF buy and AF∨DOM flatten trails (no screenshots)."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ DATA = ROOT / "data" / "pm-quote"
 BRIDGE_EVENTS_PATH = ROOT / "data" / "bridge" / "events.jsonl"
 OBSERVE_PATH = DATA / "dqd_stream_observe.jsonl"
 AF_OBSERVE_PATH = DATA / "af_observe.jsonl"
+BOOK_OBSERVE_PATH = DATA / "book_context_observe.jsonl"
 JUDGE_PATH = DATA / "pitch_state_judge.jsonl"
 QUOTES_PATH = DATA / "quotes.jsonl"
 
@@ -32,9 +33,15 @@ QUOTES_PATH = DATA / "quotes.jsonl"
 _MAX_GOALS = 5000
 _MAX_OBSERVE_LINES = 250000
 _MAX_AF_OBSERVE_LINES = 120000
+_MAX_BOOK_OBSERVE_LINES = 120000
 _MAX_JUDGE_LINES = 50000
 _MAX_BRIDGE_LINES = 20000
 _MAX_QUOTES_LINES = 20000
+
+_QUOTE_CANCEL_MODES = {
+    "pitch_gate_canceled",
+    "dqd_reversal_pitch_gate_canceled",
+}
 
 
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
@@ -176,16 +183,63 @@ def _lookup_judge(
     return None
 
 
-def _goal_verdict(frames: list[dict[str, Any]]) -> str:
-    """Aggregate badge: prefer specific wait reasons over opaque 'waiting'."""
+def _frame_af(frame: dict[str, Any]) -> dict[str, Any]:
+    af = frame.get("af")
+    return af if isinstance(af, dict) else {}
+
+
+def _frame_var(frame: dict[str, Any]) -> bool:
+    judge = frame.get("judge")
+    if not isinstance(judge, dict):
+        return False
+    reason = str(judge.get("stopped_reason") or "").strip().lower()
+    if reason == "var":
+        return True
+    for item in judge.get("evidence") or []:
+        text = str(item or "")
+        if "VAR" in text or text.strip().lower() == "var":
+            return True
+    return False
+
+
+def _frame_dom_in_play(frame: dict[str, Any]) -> bool:
+    judge = frame.get("judge")
+    return isinstance(judge, dict) and str(judge.get("play_state") or "") == "in_play"
+
+
+def _frame_aligned_buy(frame: dict[str, Any]) -> bool:
+    """Same-tick DOM in_play ∧ AF score_match (the live buy condition)."""
+    return _frame_dom_in_play(frame) and _frame_af(frame).get("score_match") is True
+
+
+def _frame_or_flatten(frame: dict[str, Any]) -> bool:
+    """Reversal flatten: AF score_match ∨ DOM board score (not in_play)."""
+    if _frame_af(frame).get("score_match") is True:
+        return True
+    return frame.get("board_score_match") is True
+
+
+def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None) -> str:
+    """Aggregate badge for a buy-side goal (not a reversal-observe row)."""
+    mode = str(quote_mode or "")
+    if mode == "pitch_gate_confirmed":
+        return "aligned_buy"
+    if mode == "pitch_gate_var_veto":
+        return "var_veto"
+    if mode == "pitch_gate_buy_revoked":
+        return "reversed"
     judges = [
         f.get("judge")
         for f in frames
         if isinstance(f.get("judge"), dict)
     ]
     states = [str(j.get("play_state") or "") for j in judges]
-    if any(s == "in_play" for s in states):
-        return "in_play"
+    if any(_frame_var(f) for f in frames):
+        return "var_veto"
+    if any(_frame_aligned_buy(f) for f in frames):
+        return "aligned_buy"
+    if any(_frame_dom_in_play(f) for f in frames):
+        return "wait_af"
     if frames and all(f.get("ok") is False for f in frames):
         return "capture_failed"
     if not states:
@@ -194,7 +248,6 @@ def _goal_verdict(frames: list[dict[str, Any]]) -> str:
         s in ("stopped", "unclear", "") for s in states
     ):
         return "stopped"
-    # All unclear/empty — still waiting for in_play tokens.
     if states and all(s in ("unclear", "") for s in states):
         return "waiting_in_play"
     return "mixed"
@@ -238,19 +291,35 @@ def _parse_score_transition(
 
 
 def _invert_score_change_key(event_key: str) -> str | None:
-    """``…|1-0->2-0`` → ``…|2-0->1-0`` (the DQD reversal that undoes this goal)."""
+    """Swap ``from->to``; keep match id and optional ``dqd_ts``."""
     parts = str(event_key or "").split("|")
-    if len(parts) < 3:
-        return None
     trans_i = next((i for i, p in enumerate(parts) if "->" in p), None)
     if trans_i is None:
         return None
-    prev, curr = _parse_score_transition(event_key)
-    if prev is None or curr is None:
+    left, right = parts[trans_i].split("->", 1)
+    if not left.strip() or not right.strip():
         return None
     parts = list(parts)
-    parts[trans_i] = f"{curr[0]}-{curr[1]}->{prev[0]}-{prev[1]}"
+    parts[trans_i] = f"{right}->{left}"
     return "|".join(parts)
+
+
+def _event_key_stem(event_key: str) -> str:
+    """``score_change|{mid}|{from}->{to}|{ts}`` → drop the timestamp."""
+    parts = str(event_key or "").split("|")
+    trans_i = next((i for i, p in enumerate(parts) if "->" in p), None)
+    if trans_i is None:
+        return str(event_key or "")
+    if parts[0] == "score_change" and len(parts) > 1:
+        return f"score_change|{parts[1]}|{parts[trans_i]}"
+    return "|".join(parts[: trans_i + 1])
+
+
+def _invert_event_key_stem(event_key: str) -> str | None:
+    inv = _invert_score_change_key(event_key)
+    if not inv:
+        return None
+    return _event_key_stem(inv)
 
 
 def _reversal_undoes_goal(
@@ -271,13 +340,19 @@ def _load_reversal_index() -> tuple[
     list[dict[str, Any]],
     dict[str, list[dict[str, Any]]],
     dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
 ]:
-    """Bridge reversals + quote gate-cancel rows.
+    """Bridge reversals + quote rows (cancel / confirm / flatten / hold).
 
     Returns:
       recent_reversals (newest first),
       reversals_by_match_id (all, chronological),
-      gate_cancel_by_event_key (goal key and/or reverse key)
+      cancel_by_event_key,
+      cancel_by_stem (timestamp-stripped, plus invert),
+      quote_by_event_key,
+      quote_by_stem
     """
     recent: list[dict[str, Any]] = []
     by_match: dict[str, list[dict[str, Any]]] = {}
@@ -315,15 +390,16 @@ def _load_reversal_index() -> tuple[
     recent.reverse()  # newest first for UI toasts
 
     cancel_by_key: dict[str, dict[str, Any]] = {}
+    cancel_by_stem: dict[str, dict[str, Any]] = {}
+    quote_by_key: dict[str, dict[str, Any]] = {}
+    quote_by_stem: dict[str, dict[str, Any]] = {}
     for row in _read_jsonl_tail(QUOTES_PATH, max_lines=_MAX_QUOTES_LINES):
         mode = str(row.get("mode") or "")
-        if mode not in {
-            "pitch_gate_canceled",
-            "dqd_reversal_pitch_gate_canceled",
-        } and "pitch_gate_canceled" not in mode:
-            continue
         key = str(row.get("event_key") or "").strip()
         mid = str(row.get("match_id") or "").strip()
+        if not key:
+            continue
+        pg = row.get("pitch_gate") if isinstance(row.get("pitch_gate"), dict) else {}
         item = {
             "mode": mode,
             "ts": row.get("quoted_at") or row.get("ts"),
@@ -333,25 +409,115 @@ def _load_reversal_index() -> tuple[
             "away": row.get("away") or "",
             "home_score": row.get("home_score"),
             "away_score": row.get("away_score"),
-            "pitch_gate": row.get("pitch_gate"),
-            "reason": (row.get("pitch_gate") or {}).get("reason")
-            if isinstance(row.get("pitch_gate"), dict)
-            else mode,
+            "pitch_gate": pg,
+            "flatten_count": row.get("flatten_count"),
+            "reason": pg.get("reason") if pg else mode,
         }
-        if key:
+        stem = _event_key_stem(key)
+        prev = quote_by_key.get(key)
+        keep_flatten = (
+            prev
+            and prev.get("mode") == "pitch_gate_flatten_or"
+            and mode != "pitch_gate_flatten_or"
+        )
+        if not keep_flatten:
+            quote_by_key[key] = item
+            if stem:
+                quote_by_stem[stem] = item
+        is_cancel = mode in _QUOTE_CANCEL_MODES or "pitch_gate_canceled" in mode
+        if is_cancel:
             cancel_by_key[key] = item
-            # Also index under the goal key this reverse undoes.
-            inv = _invert_score_change_key(key)
-            if inv and inv not in cancel_by_key:
-                cancel_by_key[inv] = item
-    return recent, by_match, cancel_by_key
+            if stem:
+                cancel_by_stem[stem] = item
+            inv = _invert_event_key_stem(key)
+            if inv and inv not in cancel_by_stem:
+                cancel_by_stem[inv] = item
+    return recent, by_match, cancel_by_key, cancel_by_stem, quote_by_key, quote_by_stem
+
+
+def _lookup_quote(
+    event_key: str,
+    by_key: dict[str, dict[str, Any]],
+    by_stem: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if event_key in by_key:
+        return by_key[event_key]
+    stem = _event_key_stem(event_key)
+    if stem and stem in by_stem:
+        return by_stem[stem]
+    return None
+
+
+def _lookup_cancel(
+    event_key: str,
+    by_key: dict[str, dict[str, Any]],
+    by_stem: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    hit = _lookup_quote(event_key, by_key, by_stem)
+    if hit:
+        return hit
+    inv = _invert_event_key_stem(event_key)
+    if inv and inv in by_stem:
+        return by_stem[inv]
+    return None
+
+
+def _find_linked_event_key(
+    event_key: str,
+    *,
+    match_id: str,
+    groups: dict[str, dict[str, Any]],
+    prefer_observe: bool,
+) -> str | None:
+    inv = _invert_event_key_stem(event_key)
+    if not inv:
+        return None
+    candidates = [
+        ek
+        for ek, g in groups.items()
+        if ek != event_key
+        and str(g.get("match_id") or "") == match_id
+        and _event_key_stem(ek) == inv
+    ]
+    if not candidates:
+        return None
+    if prefer_observe:
+        obs = [ek for ek in candidates if groups[ek].get("kind") == "reversal_observe"]
+        if obs:
+            return obs[-1]
+    else:
+        goals = [ek for ek in candidates if groups[ek].get("kind") != "reversal_observe"]
+        if goals:
+            return goals[-1]
+    return candidates[-1]
+
+
+def _index_odds_grades() -> dict[tuple[str, Any], dict[str, Any]]:
+    """Latest Odds grade per (event_key, sample_i) from the sidecar jsonl."""
+    by_tick: dict[tuple[str, Any], dict[str, Any]] = {}
+    for row in _read_jsonl_tail(BOOK_OBSERVE_PATH, max_lines=_MAX_BOOK_OBSERVE_LINES):
+        ek = str(row.get("event_key") or "").strip()
+        sample_i = row.get("sample_i")
+        grade = row.get("odds_grade") if isinstance(row.get("odds_grade"), dict) else None
+        if not ek or sample_i is None or not grade:
+            continue
+        by_tick[(ek, sample_i)] = grade
+    return by_tick
 
 
 def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
     observe = _read_jsonl_tail(OBSERVE_PATH, max_lines=_MAX_OBSERVE_LINES)
     judges = _read_jsonl_tail(JUDGE_PATH, max_lines=_MAX_JUDGE_LINES)
     by_key, by_path = _index_judges(judges)
-    recent_reversals, rev_by_match, cancel_by_key = _load_reversal_index()
+    (
+        recent_reversals,
+        rev_by_match,
+        cancel_by_key,
+        cancel_by_stem,
+        quote_by_key,
+        quote_by_stem,
+    ) = _load_reversal_index()
+    odds_by_tick = _index_odds_grades()
 
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -426,6 +592,7 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             "odds_grade": row.get("odds_grade")
             if isinstance(row.get("odds_grade"), dict)
             else None,
+            "board_score_match": row.get("board_score_match"),
         }
 
         # Upsert by sample_i so re-reads / retries replace.
@@ -492,6 +659,19 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             }
         )
 
+    af_by_tick: dict[tuple[str, Any], dict[str, Any]] = {}
+    for ek, rows in af_by_key.items():
+        for row in rows:
+            sample_i = row.get("sample_i")
+            if sample_i is None:
+                continue
+            af_by_tick[(ek, sample_i)] = {
+                "ok": row.get("ok"),
+                "score_match": row.get("score_match"),
+                "af_score": row.get("af_score"),
+                "error": row.get("error"),
+            }
+
     goals: list[dict[str, Any]] = []
     for ek in reversed(order):
         g = groups[ek]
@@ -502,6 +682,21 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 int(f.get("sample_i") or 0),
             )
         )
+        for f in frames:
+            sample_i = f.get("sample_i")
+            if not isinstance(f.get("af"), dict):
+                sidecar = af_by_tick.get((ek, sample_i))
+                if sidecar:
+                    f["af"] = sidecar
+            if not isinstance(f.get("odds_grade"), dict) or not f["odds_grade"].get("level"):
+                grade = odds_by_tick.get((ek, sample_i))
+                if grade:
+                    f["odds_grade"] = {
+                        "level": grade.get("level"),
+                        "reason": grade.get("reason"),
+                    }
+            f["aligned"] = _frame_aligned_buy(f)
+            f["or_flatten"] = _frame_or_flatten(f)
         g["frames"] = frames
         g["frame_count"] = len(frames)
         g["ok_count"] = sum(1 for f in frames if f.get("ok") is True)
@@ -523,14 +718,22 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             ),
             None,
         )
-        verdict = _goal_verdict(frames)
+        quote = _lookup_quote(ek, quote_by_key, quote_by_stem)
+        quote_mode = str((quote or {}).get("mode") or "")
+        verdict = _goal_verdict(frames, quote_mode=quote_mode)
         in_play_at = None
+        aligned_at = None
+        flatten_at = None
         for f in frames:
-            j = f.get("judge") or {}
-            if j.get("play_state") == "in_play":
+            if in_play_at is None and _frame_dom_in_play(f):
                 in_play_at = f.get("elapsed_s")
-                break
+            if aligned_at is None and f.get("aligned"):
+                aligned_at = f.get("elapsed_s")
+            if flatten_at is None and f.get("or_flatten"):
+                flatten_at = f.get("elapsed_s")
         g["in_play_elapsed_s"] = in_play_at
+        g["aligned_elapsed_s"] = aligned_at
+        g["flatten_elapsed_s"] = flatten_at
         g["odds_grade"] = next(
             (
                 f.get("odds_grade")
@@ -549,26 +752,40 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             g["score_from"] = f"{goal_prev[0]}-{goal_prev[1]}"
         if goal_curr is not None:
             g["score_to"] = f"{goal_curr[0]}-{goal_curr[1]}"
-        inv = _invert_score_change_key(ek)
-        if inv and inv in groups:
-            g["linked_event_key"] = inv
-
         is_rev_obs = (
             g.get("kind") == "reversal_observe"
             or bool(g.get("is_reversal"))
             or bool(g.get("observe_only"))
         )
+        linked = _find_linked_event_key(
+            ek,
+            match_id=mid,
+            groups=groups,
+            prefer_observe=not is_rev_obs,
+        )
+        if linked:
+            g["linked_event_key"] = linked
+
         if is_rev_obs:
             g["kind"] = "reversal_observe"
             g["reversed"] = False
             g["reversal"] = None
-            g["verdict"] = "reversal_observe"
+            if quote_mode == "pitch_gate_flatten_or" or any(f.get("or_flatten") for f in frames):
+                g["verdict"] = "flatten_or"
+            elif quote_mode in {
+                "reversal_observe_complete",
+                "pitch_gate_timeout",
+            } or str((quote or {}).get("reason") or "").startswith("no_or_confirm"):
+                g["verdict"] = "hold"
+            else:
+                g["verdict"] = "reversal_observe"
+            g["quote_mode"] = quote_mode or None
             goals.append(g)
             if len(goals) >= max(1, limit):
                 break
             continue
 
-        cancel = cancel_by_key.get(ek)
+        cancel = _lookup_cancel(ek, cancel_by_key, cancel_by_stem)
         reversed_flag = False
         reversal_info: dict[str, Any] | None = None
         if cancel:
@@ -599,27 +816,38 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             break
         g["reversed"] = reversed_flag
         g["reversal"] = reversal_info
+        g["quote_mode"] = quote_mode or None
+        had_buy = verdict == "aligned_buy" or aligned_at is not None
+        g["had_aligned_buy"] = had_buy
         if reversed_flag:
-            verdict = "reversed"
+            verdict = "reversed_after_buy" if had_buy else "reversed"
         g["verdict"] = verdict
         goals.append(g)
         if len(goals) >= max(1, limit):
             break
 
-    in_play_n = sum(1 for g in goals if g.get("verdict") == "in_play")
+    aligned_n = sum(1 for g in goals if g.get("verdict") == "aligned_buy")
+    wait_af_n = sum(1 for g in goals if g.get("verdict") == "wait_af")
     rev_n = sum(1 for g in goals if g.get("reversed"))
     rev_obs_n = sum(1 for g in goals if g.get("kind") == "reversal_observe")
+    flatten_n = sum(1 for g in goals if g.get("verdict") == "flatten_or")
+    hold_n = sum(1 for g in goals if g.get("verdict") == "hold")
     gate_n = sum(1 for g in goals if g.get("gate"))
     return {
         "updated_at": None,
         "observe_path": str(OBSERVE_PATH),
         "af_observe_path": str(AF_OBSERVE_PATH),
+        "book_observe_path": str(BOOK_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
         "goal_count": len(goals),
         "gate_goal_count": gate_n,
-        "in_play_count": in_play_n,
+        "aligned_buy_count": aligned_n,
+        "in_play_count": aligned_n,
+        "wait_af_count": wait_af_n,
         "reversed_count": rev_n,
         "reversal_observe_count": rev_obs_n,
+        "flatten_count": flatten_n,
+        "hold_count": hold_n,
         "observe_rows": len(observe),
         "af_observe_rows": len(af_rows),
         "judge_rows": len(judges),
@@ -639,14 +867,20 @@ def status_payload() -> dict[str, Any]:
         "viewer": True,
         "observe_path": str(OBSERVE_PATH),
         "af_observe_path": str(AF_OBSERVE_PATH),
+        "book_observe_path": str(BOOK_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
         "observe_exists": OBSERVE_PATH.is_file(),
         "af_observe_exists": AF_OBSERVE_PATH.is_file(),
+        "book_observe_exists": BOOK_OBSERVE_PATH.is_file(),
         "judge_exists": JUDGE_PATH.is_file(),
         "goal_count": snap["goal_count"],
         "gate_goal_count": snap["gate_goal_count"],
-        "in_play_count": snap["in_play_count"],
+        "aligned_buy_count": snap.get("aligned_buy_count") or 0,
+        "in_play_count": snap.get("aligned_buy_count") or snap.get("in_play_count") or 0,
+        "wait_af_count": snap.get("wait_af_count") or 0,
         "reversed_count": snap.get("reversed_count") or 0,
+        "flatten_count": snap.get("flatten_count") or 0,
+        "hold_count": snap.get("hold_count") or 0,
         "latest_dqd_ts": latest,
         "latest_reversal_ts": (snap.get("recent_reversals") or [{}])[0].get("ts")
         if snap.get("recent_reversals")
@@ -722,6 +956,7 @@ def main() -> int:
     print(f"Pitch Gate Board → http://{HOST}:{PORT}/", flush=True)
     print(f"  observe → {OBSERVE_PATH}", flush=True)
     print(f"  af observe → {AF_OBSERVE_PATH}", flush=True)
+    print(f"  odds observe → {BOOK_OBSERVE_PATH}", flush=True)
     print(f"  judge   → {JUDGE_PATH}", flush=True)
     try:
         httpd.serve_forever()

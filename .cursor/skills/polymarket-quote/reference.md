@@ -92,7 +92,7 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 `sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 
 Price guard: skip when best ≤0.01 or >0.992 unless `--allow-extreme-prices`.  
-`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.6**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`. **Pitch-gate confirmed buys skip this floor.**
+`buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.6**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`. **Pitch-gate and FT buys skip this floor.**
 
 **Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 1/25). `QUOTE_SIZE_TIERS=0.98:1` means **ask ≥ 0.98 → $1**, else **$1** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1) and the $1 marketable bump are **skipped when `trade_context.pitch_gate=true`**. Fee/`min_net` and `QUOTE_MAX_USDC` still apply.  
 Idempotency: `event_key|token_id|trade` — successful live posts are skipped on restart.  

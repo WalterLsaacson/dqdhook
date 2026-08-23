@@ -510,7 +510,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         "--min-buy-price",
         type=float,
         default=0.6,
-        help="buy_win: skip (still log trades.jsonl) when best_ask < this (default 0.6; 0=off)",
+        help="buy_win floor unused on pitch-gate and FT (default 0.6; 0=off)",
     )
     sp.add_argument(
         "--trade-env-file",

@@ -187,10 +187,22 @@ button.pill {
   background: rgba(56, 189, 248, 0.1);
 }
 
-.pill--filter[data-filter="in_play"].is-active {
+.pill--filter[data-filter="aligned_buy"].is-active {
   border-color: rgba(52, 211, 153, 0.55);
   color: var(--live);
   background: rgba(52, 211, 153, 0.12);
+}
+
+.pill--filter[data-filter="wait_af"].is-active {
+  border-color: rgba(56, 189, 248, 0.55);
+  color: var(--accent);
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.pill--filter[data-filter="var_veto"].is-active {
+  border-color: rgba(251, 113, 133, 0.55);
+  color: var(--danger);
+  background: rgba(251, 113, 133, 0.12);
 }
 
 .pill--filter[data-filter="stopped"].is-active {
@@ -200,14 +212,14 @@ button.pill {
 }
 
 .pill--filter[data-filter="reversed"].is-active,
-.pill--filter[data-filter="reversed_after_in_play"].is-active,
+.pill--filter[data-filter="reversed_after_buy"].is-active,
 .pill.is-rev.is-active {
   border-color: rgba(245, 158, 11, 0.6);
   color: var(--warn);
   background: rgba(245, 158, 11, 0.12);
 }
 
-.pill--filter[data-filter="reversed_after_in_play"].is-active,
+.pill--filter[data-filter="reversed_after_buy"].is-active,
 .pill.is-rev-hard.is-active {
   border-color: rgba(251, 113, 133, 0.6);
   color: var(--danger);
@@ -337,9 +349,22 @@ button.pill {
   border: 1px solid var(--line);
 }
 
-.badge--in_play {
+.badge--in_play,
+.badge--aligned_buy {
   color: #062016;
   background: var(--live);
+  border-color: transparent;
+}
+
+.badge--wait_af {
+  color: #041018;
+  background: #38bdf8;
+  border-color: transparent;
+}
+
+.badge--var_veto {
+  color: #fff;
+  background: rgba(251, 113, 133, 0.85);
   border-color: transparent;
 }
 
@@ -370,6 +395,7 @@ button.pill {
   border-color: transparent;
 }
 
+.badge--reversed_after_buy,
 .badge--reversed_after_in_play {
   color: #fff;
   background: rgba(251, 113, 133, 0.9);
@@ -379,6 +405,18 @@ button.pill {
 .badge--reversal_observe {
   color: #041018;
   background: #67e8f9;
+  border-color: transparent;
+}
+
+.badge--flatten_or {
+  color: #062016;
+  background: var(--live);
+  border-color: transparent;
+}
+
+.badge--hold {
+  color: #1a1404;
+  background: var(--stopped);
   border-color: transparent;
 }
 
@@ -402,7 +440,7 @@ button.pill {
   background: rgba(245, 158, 11, 0.08);
 }
 
-.goal-item.is-reversed-after-inplay {
+.goal-item.is-reversed-after-buy {
   border-color: rgba(251, 113, 133, 0.55);
   background: rgba(251, 113, 133, 0.1);
 }
@@ -410,6 +448,16 @@ button.pill {
 .goal-item.is-reversal-observe {
   border-color: rgba(103, 232, 249, 0.5);
   background: rgba(56, 189, 248, 0.08);
+}
+
+.goal-item.is-flatten {
+  border-color: rgba(52, 211, 153, 0.55);
+  background: rgba(6, 95, 70, 0.18);
+}
+
+.goal-item.is-hold {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.08);
 }
 
 .detail__rev {
@@ -530,9 +578,18 @@ button.pill {
   background: rgba(0, 0, 0, 0.25);
 }
 
-.frame.is-in_play {
+.frame.is-aligned {
   border-color: rgba(52, 211, 153, 0.7);
   box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.25);
+}
+
+.frame.is-wait-af {
+  border-color: rgba(56, 189, 248, 0.65);
+}
+
+.frame.is-or-flatten {
+  border-color: rgba(52, 211, 153, 0.7);
+  box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.2);
 }
 
 .frame__img-wrap {

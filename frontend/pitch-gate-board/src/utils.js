@@ -49,58 +49,83 @@ export function stateBadgeClass(state) {
 export function stateLabel(state) {
   const s = String(state || "unclear");
   const map = {
-    in_play: "in_play",
+    in_play: "DOM in_play",
+    aligned_buy: "买入 ∧",
+    wait_af: "等 AF",
+    var_veto: "VAR 否决",
     stopped: "stopped",
     unclear: "unclear",
     waiting: "等待判定",
-    waiting_in_play: "等待进行中信号",
+    waiting_in_play: "等 DOM",
     pending_judge: "待判定",
-    capture_failed: "截帧失败",
-    reversed: "回撤",
-    reversed_after_in_play: "回撤·曾in_play",
+    capture_failed: "读数失败",
+    reversed: "回撤·未买",
+    reversed_after_buy: "回撤·已买",
+    reversed_after_in_play: "回撤·已买",
     reversal_observe: "回撤观察",
+    flatten_or: "已平仓 ∨",
+    hold: "持仓",
     mixed: "mixed",
   };
   return map[s] || s;
 }
 
+const REVERSAL_VERDICTS = new Set(["reversal_observe", "flatten_or", "hold"]);
+
 /** True when this row is the post-reversal AF/DOM trail (not a buyable goal). */
 export function isReversalObserve(goal) {
   return Boolean(
-    goal?.kind === "reversal_observe" || goal?.observe_only || goal?.verdict === "reversal_observe"
+    goal?.kind === "reversal_observe" ||
+      goal?.observe_only ||
+      REVERSAL_VERDICTS.has(String(goal?.verdict || ""))
   );
 }
 
-/** True when this goal was judged in_play on a frame, then later reversed. */
-export function reversedAfterInPlay(goal) {
+/** True when this goal had an aligned buy, then DQD reversed. */
+export function reversedAfterBuy(goal) {
   return Boolean(
-    (goal?.reversed || goal?.verdict === "reversed") && goal?.in_play_elapsed_s != null
+    goal?.verdict === "reversed_after_buy" ||
+      ((goal?.reversed || goal?.verdict === "reversed") &&
+        (goal?.had_aligned_buy || goal?.aligned_elapsed_s != null))
   );
 }
 
-/** Badge key for a goal row (splits plain reverse vs reverse-after-in_play). */
+/** @deprecated use reversedAfterBuy — DOM in_play alone is not a buy. */
+export function reversedAfterInPlay(goal) {
+  return reversedAfterBuy(goal);
+}
+
+/** Badge key for a goal row. */
 export function goalVerdictKey(goal) {
-  if (isReversalObserve(goal)) return "reversal_observe";
-  if (goal?.reversed || goal?.verdict === "reversed") {
-    return reversedAfterInPlay(goal) ? "reversed_after_in_play" : "reversed";
+  if (isReversalObserve(goal)) {
+    const v = String(goal?.verdict || "");
+    if (v === "flatten_or" || v === "hold") return v;
+    return "reversal_observe";
+  }
+  if (goal?.reversed || goal?.verdict === "reversed" || goal?.verdict === "reversed_after_buy") {
+    return reversedAfterBuy(goal) ? "reversed_after_buy" : "reversed";
   }
   const v = goal?.verdict;
-  if (v === "waiting" || v === "unclear") return "waiting_in_play";
+  if (v === "waiting" || v === "unclear" || v === "in_play") return v === "in_play" ? "wait_af" : "waiting_in_play";
   return v;
 }
 
 /** Header / pill filters — one bucket per row badge, plus 全部. */
 export const GOAL_FILTERS = [
   { id: "all", short: "全部" },
-  { id: "in_play", short: "in_play" },
+  { id: "aligned_buy", short: "买入" },
+  { id: "wait_af", short: "等AF" },
+  { id: "waiting_in_play", short: "等DOM" },
+  { id: "var_veto", short: "VAR" },
   { id: "stopped", short: "stopped" },
-  { id: "waiting_in_play", short: "等待信号" },
   { id: "pending_judge", short: "待判定" },
-  { id: "capture_failed", short: "截帧失败" },
+  { id: "capture_failed", short: "读数失败" },
   { id: "mixed", short: "mixed" },
-  { id: "reversed", short: "回撤" },
-  { id: "reversed_after_in_play", short: "回撤·曾in_play" },
+  { id: "reversed", short: "回撤·未买" },
+  { id: "reversed_after_buy", short: "回撤·已买" },
   { id: "reversal_observe", short: "回撤观察" },
+  { id: "flatten_or", short: "已平仓" },
+  { id: "hold", short: "持仓" },
 ];
 
 const FILTER_IDS = new Set(GOAL_FILTERS.map((f) => f.id));
@@ -132,7 +157,7 @@ export function emptyFilterMessage(filter, { detail = false } = {}) {
   if (!filter || filter === "all") {
     return detail
       ? "选择左侧一场进球查看逐帧判定。"
-      : "暂无进球记录。<br/>等 DQD goal / 回撤观察 + pitch-gate 采样。";
+      : "暂无进球记录。<br/>等 DQD 进球门控（DOM∧AF）或回撤观察（AF∨DOM）。";
   }
   const row = GOAL_FILTERS.find((f) => f.id === filter);
   const label = row?.short || stateLabel(filter);
