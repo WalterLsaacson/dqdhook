@@ -2022,7 +2022,7 @@ def process_bridge_events(
         ft_event_is_stale,
         target_score_from_event,
     )
-    from pitch_gate import get_coordinator
+    from pitch_gate import get_coordinator, invert_score_change_key
 
     cursor = load_cursor(root)
     cursor_state_before = {
@@ -2350,7 +2350,9 @@ def process_bridge_events(
                 "buy_revoked": "pitch_gate_buy_revoked",
             }.get(status, f"pitch_gate_{status or 'unknown'}")
             # Already bought this goal: cancel of leftover frames is informational.
-            if status == "canceled" and key in seen:
+            # `key in seen` is no longer a buy signal — start_gate also marks seen
+            # so file-lag cannot reopen AF/DOM after reverse.
+            if status == "canceled" and item.get("buy_emitted"):
                 print(
                     f"pitch-gate → CANCELED (after buy) match_id={mid} key={key} "
                     f"reason={item.get('reason')}",
@@ -2420,6 +2422,18 @@ def process_bridge_events(
         if typ == "score_change":
             if event_is_reversal(ev):
                 mid_rev = str(ev.get("match_id") or "")
+                # Stop AF/DOM first; rest cancel can take seconds on CLOB.
+                try:
+                    gate.cancel_match(mid_rev, reason="dqd_reversal")
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"ALERT pitch-gate cancel on reversal failed match={mid_rev}: {e}",
+                        flush=True,
+                    )
+                seen.update(gate.consumed_event_keys(mid_rev))
+                inv = invert_score_change_key(key)
+                if inv:
+                    seen.add(inv)
                 if mid_rev and trade_executor is not None:
                     try:
                         trade_executor.cancel_rest_orders_for_match(
@@ -2438,13 +2452,6 @@ def process_bridge_events(
                         )
                     except Exception:  # noqa: BLE001
                         has_lots = False
-                try:
-                    gate.cancel_match(mid_rev, reason="dqd_reversal")
-                except Exception as e:  # noqa: BLE001
-                    print(
-                        f"ALERT pitch-gate cancel on reversal failed match={mid_rev}: {e}",
-                        flush=True,
-                    )
                 try:
                     from livescore_observe import get_active_observer as get_lsa_observer
 
@@ -2573,7 +2580,11 @@ def process_bridge_events(
                     )
                     continue
                 # Defer _quote_one until pitch-state in_play (or timeout/cancel).
-                gate.start_gate(ev, event_key=key)
+                # Mark seen on start so a later file copy of the same goal cannot
+                # reopen AF/DOM after reverse / aligned_buy popped the session.
+                started = gate.start_gate(ev, event_key=key)
+                if started or gate.has_consumed_event(key):
+                    seen.add(key)
                 continue
 
             # Non goal-up / non-reversal score_change (e.g. status-only): skip.

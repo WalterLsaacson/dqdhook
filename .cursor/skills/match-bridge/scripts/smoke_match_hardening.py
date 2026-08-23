@@ -178,6 +178,27 @@ def main() -> int:
     _assert(bl.team_similarity("HB Torshavn", "HB") >= 0.92, "HB Torshavn")
     _assert(bl.team_similarity("NSI Runavik", "NSÍ") >= 0.92, "NSI")
     _assert(
+        bl.team_similarity("Liaoning Tieren FC", "Shenyang Urban") >= 0.99,
+        "Liaoning Tieren↔Shenyang Urban",
+    )
+    _assert(bl.team_similarity("Henan FC", "Henan Jianye") >= 0.99, "Henan Jianye")
+    _assert(
+        bl.team_similarity("Foshan Nanshi FC", "Dongguan United") >= 0.99,
+        "Foshan Nanshi↔Dongguan United",
+    )
+    _assert(
+        bl.team_similarity("Chungnam Asan FC", "Asan Mugunghwa") >= 0.99,
+        "Chungnam Asan↔Asan Mugunghwa",
+    )
+    _assert(
+        bl.team_similarity("Shanghai Port", "SHANGHAI SIPG") >= 0.99,
+        "Shanghai Port↔SIPG",
+    )
+    _assert(
+        bl.team_similarity("Qingdao Hainiu FC", "Qingdao Jonoon") >= 0.99,
+        "Qingdao Hainiu↔Jonoon",
+    )
+    _assert(
         bl.normalize_team("Inter Milano")
         == bl.normalize_team("Internazionale"),
         "Inter Milano",

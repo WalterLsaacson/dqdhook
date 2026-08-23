@@ -110,7 +110,7 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 6. DQD reversal → `cancel_match(match_id)` revokes undrained `in_play` rows. Quote tick drains gate results **after** event handling so same-tick reversals win. If **open lots exist**, start a 5s observe trail (never `_quote_one`).
 7. Requires `QUOTE_DQD_STREAM_OBSERVE=1`; else `pitch_gate_unavailable`. No screenshots / OCR / JPEG.
 8. FT path remains immediate quote (default live).
-9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size follows **`QUOTE_MAX_USDC`**. DQD reversal still cancels these rests.
+9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size is **`QUOTE_REST_USDC` (default $5)** so the bid clears the CLOB 5-share floor. DQD reversal still cancels these rests.
 
 **Score reversal / disallowed goal**
 

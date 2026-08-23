@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import sys
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -322,6 +323,48 @@ def _invert_event_key_stem(event_key: str) -> str | None:
     return _event_key_stem(inv)
 
 
+_DT_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _parse_iso_ts(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _event_happened_at(*candidates: Any) -> datetime | None:
+    """First parseable ISO timestamp from event_key tails, dqd_ts, quoted_at, etc."""
+    for raw in candidates:
+        if raw is None or raw == "":
+            continue
+        text = str(raw)
+        if "|" in text:
+            tail = text.rsplit("|", 1)[-1].strip()
+            parsed = _parse_iso_ts(tail)
+            if parsed:
+                return parsed
+        parsed = _parse_iso_ts(text)
+        if parsed:
+            return parsed
+    return None
+
+
+def _ts_on_or_after(later: datetime | None, earlier: datetime | None) -> bool:
+    """True only when both sides parse and later ≥ earlier. Missing ts → False."""
+    if later is None or earlier is None:
+        return False
+    return later >= earlier
+
+
 def _reversal_undoes_goal(
     rev: dict[str, Any],
     *,
@@ -334,6 +377,62 @@ def _reversal_undoes_goal(
     rp = _score_pair(rev.get("prev"))
     rc = _score_pair(rev.get("curr"))
     return rp == goal_curr and rc == goal_prev
+
+
+def _pair_goal_reversals(
+    groups: dict[str, dict[str, Any]],
+    rev_by_match: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Each DQD reverse undoes at most the latest matching goal *before* it.
+
+    Same-score repeats (0-0→0-1 later in the match) must not inherit an earlier
+    0-1→0-0 reverse just because the score pair mirrors.
+    """
+    goals_by_match: dict[str, list[tuple[datetime, str]]] = {}
+    for ek, g in groups.items():
+        if (
+            g.get("kind") == "reversal_observe"
+            or bool(g.get("is_reversal"))
+            or bool(g.get("observe_only"))
+        ):
+            continue
+        mid = str(g.get("match_id") or "")
+        ts = _event_happened_at(ek, g.get("dqd_ts"))
+        if not mid or ts is None:
+            continue
+        goals_by_match.setdefault(mid, []).append((ts, ek))
+
+    paired: dict[str, dict[str, Any]] = {}
+    for mid, goals in goals_by_match.items():
+        goals.sort(key=lambda item: item[0])
+        used: set[str] = set()
+        for rev in rev_by_match.get(mid) or []:
+            rev_ts = _event_happened_at(rev.get("event_key"), rev.get("ts"))
+            if rev_ts is None:
+                continue
+            best_ek: str | None = None
+            for gts, ek in goals:
+                if ek in used or gts > rev_ts:
+                    continue
+                goal_prev, goal_curr = _parse_score_transition(ek)
+                if not _reversal_undoes_goal(
+                    rev, goal_prev=goal_prev, goal_curr=goal_curr
+                ):
+                    continue
+                best_ek = ek
+            if not best_ek:
+                continue
+            used.add(best_ek)
+            paired[best_ek] = {
+                "source": "dqd_reversal",
+                "ts": rev.get("ts"),
+                "prev": rev.get("prev"),
+                "curr": rev.get("curr"),
+                "home_score": rev.get("home_score"),
+                "away_score": rev.get("away_score"),
+                "event_key": rev.get("event_key"),
+            }
+    return paired
 
 
 def _load_reversal_index() -> tuple[
@@ -452,13 +551,28 @@ def _lookup_cancel(
     event_key: str,
     by_key: dict[str, dict[str, Any]],
     by_stem: dict[str, dict[str, Any]],
+    *,
+    goal_ts: datetime | None = None,
 ) -> dict[str, Any] | None:
-    hit = _lookup_quote(event_key, by_key, by_stem)
-    if hit:
-        return hit
+    """Cancel for this goal session only — not an earlier same-stem reverse."""
+    if event_key in by_key:
+        return by_key[event_key]
+    hits: list[dict[str, Any]] = []
+    stem = _event_key_stem(event_key)
+    if stem and stem in by_stem:
+        hits.append(by_stem[stem])
     inv = _invert_event_key_stem(event_key)
     if inv and inv in by_stem:
-        return by_stem[inv]
+        hit = by_stem[inv]
+        if hit not in hits:
+            hits.append(hit)
+    for hit in hits:
+        hit_key = str(hit.get("event_key") or "")
+        if hit_key == event_key:
+            return hit
+        cancel_ts = _event_happened_at(hit_key, hit.get("ts"))
+        if _ts_on_or_after(cancel_ts, goal_ts):
+            return hit
     return None
 
 
@@ -472,24 +586,38 @@ def _find_linked_event_key(
     inv = _invert_event_key_stem(event_key)
     if not inv:
         return None
-    candidates = [
-        ek
-        for ek, g in groups.items()
-        if ek != event_key
-        and str(g.get("match_id") or "") == match_id
-        and _event_key_stem(ek) == inv
-    ]
+    self_ts = _event_happened_at(
+        event_key, (groups.get(event_key) or {}).get("dqd_ts")
+    )
+    candidates: list[str] = []
+    for ek, g in groups.items():
+        if ek == event_key:
+            continue
+        if str(g.get("match_id") or "") != match_id:
+            continue
+        if _event_key_stem(ek) != inv:
+            continue
+        other_ts = _event_happened_at(ek, g.get("dqd_ts"))
+        if self_ts is not None and other_ts is not None:
+            if prefer_observe:
+                if other_ts < self_ts:
+                    continue
+            elif other_ts > self_ts:
+                continue
+        candidates.append(ek)
     if not candidates:
         return None
+
+    def _ts(ek: str) -> datetime:
+        return _event_happened_at(ek, groups[ek].get("dqd_ts")) or _DT_MIN
+
     if prefer_observe:
         obs = [ek for ek in candidates if groups[ek].get("kind") == "reversal_observe"]
-        if obs:
-            return obs[-1]
-    else:
-        goals = [ek for ek in candidates if groups[ek].get("kind") != "reversal_observe"]
-        if goals:
-            return goals[-1]
-    return candidates[-1]
+        pool = obs or candidates
+        return min(pool, key=_ts)
+    goals = [ek for ek in candidates if groups[ek].get("kind") != "reversal_observe"]
+    pool = goals or candidates
+    return max(pool, key=_ts)
 
 
 def _index_odds_grades() -> dict[tuple[str, Any], dict[str, Any]]:
@@ -672,6 +800,13 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 "error": row.get("error"),
             }
 
+    paired_revs = _pair_goal_reversals(groups, rev_by_match)
+    paired_rev_keys = {
+        str(info.get("event_key") or "")
+        for info in paired_revs.values()
+        if info.get("event_key")
+    }
+
     goals: list[dict[str, Any]] = []
     for ek in reversed(order):
         g = groups[ek]
@@ -785,35 +920,32 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 break
             continue
 
-        cancel = _lookup_cancel(ek, cancel_by_key, cancel_by_stem)
+        goal_ts = _event_happened_at(ek, g.get("dqd_ts"))
+        cancel = _lookup_cancel(
+            ek, cancel_by_key, cancel_by_stem, goal_ts=goal_ts
+        )
         reversed_flag = False
         reversal_info: dict[str, Any] | None = None
-        if cancel:
-            # Gate session for THIS goal was canceled (often because its reverse arrived).
+        # Pair each reverse to the latest matching goal before it — an earlier
+        # 0-1→0-0 must not paint a later 0-0→0-1 (Gwangju 20:23 vs 19:51).
+        if ek in paired_revs:
             reversed_flag = True
-            reversal_info = {
-                "source": "pitch_gate_cancel",
-                "ts": cancel.get("ts"),
-                "reason": cancel.get("reason") or cancel.get("mode"),
-                "mode": cancel.get("mode"),
-            }
-        # Only mark reversed when a DQD reverse is the mirror of THIS goal
-        # (1-0→2-0 undone by 2-0→1-0). A later reverse on the same match must
-        # not paint every earlier goal as reversed.
-        for rev in rev_by_match.get(mid) or []:
-            if not _reversal_undoes_goal(rev, goal_prev=goal_prev, goal_curr=goal_curr):
-                continue
-            reversed_flag = True
-            reversal_info = {
-                "source": "dqd_reversal",
-                "ts": rev.get("ts"),
-                "prev": rev.get("prev"),
-                "curr": rev.get("curr"),
-                "home_score": rev.get("home_score"),
-                "away_score": rev.get("away_score"),
-                "event_key": rev.get("event_key"),
-            }
-            break
+            reversal_info = paired_revs[ek]
+        elif cancel:
+            cancel_key = str(cancel.get("event_key") or "")
+            cancel_is_other_rev = (
+                cancel_key
+                and cancel_key != ek
+                and cancel_key in paired_rev_keys
+            )
+            if not cancel_is_other_rev:
+                reversed_flag = True
+                reversal_info = {
+                    "source": "pitch_gate_cancel",
+                    "ts": cancel.get("ts"),
+                    "reason": cancel.get("reason") or cancel.get("mode"),
+                    "mode": cancel.get("mode"),
+                }
         g["reversed"] = reversed_flag
         g["reversal"] = reversal_info
         g["quote_mode"] = quote_mode or None

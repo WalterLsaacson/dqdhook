@@ -24,7 +24,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 - **判定源是动画 DOM，不截图 / 不跑 OCR**：整场门控只开一个 tracker 页面，每次采样读 `.pop-box` 与 `.center-box`。无 JPEG、无 `QUOTE_GATE_REF_SCREENSHOT`。
 - **防僵死**：判定要求 `.center-box` 时钟相对上一次读数有推进；时钟没走 → `unclear`（`stale_page`），不下单。
 - **页面是纳米 tracker**：`animation_live` URL 打开 `tracker.namitiyu.com` 读 DOM，不是懂球帝比赛页。不做 MQTT 球位观察。
-- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **`QUOTE_MAX_USDC`（默认 $1）** / **`QUOTE_REST_EXPIRE_S`（默认 3600）**
+- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **`QUOTE_REST_USDC`（默认 $5）** / **`QUOTE_REST_EXPIRE_S`（默认 3600）**
 - Odds/Bet365：跟 DOM 同一拍后台写入 `book_context_observe.jsonl`（Grade A/B/C 看板旁路），**不挡**买入/flatten，**不改下单 size**。
 
 ## Quick start

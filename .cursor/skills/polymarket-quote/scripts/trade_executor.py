@@ -24,6 +24,7 @@ from rest_ladder import (
     rest_expire_s,
     rest_limit_tick_size,
     rest_min_shares,
+    rest_target_usdc,
 )
 from size_policy import compute_buy_size_caps
 from score_reversal import (
@@ -926,20 +927,14 @@ class TradeExecutor:
                 + self._pending_usdc_total_locked()
                 + self.ledger.rest_reserved_usdc()
             )
-            # Rest size follows QUOTE_MAX_USDC (same as FAK); do not lift to
-            # CLOB min_order_size (~$4.95 @ 5 shares).
-            caps = compute_buy_size_caps(
-                0.99,
-                max_usdc=float(self.settings.max_usdc or 0),
-                max_shares=self.settings.max_shares,
-                tiers=self.settings.size_tiers,
-                open_usdc=open_usdc,
-                max_open_usdc=self.settings.max_open_usdc,
-                floor_usdc=0.0,
-            )
-            if caps.skip_reason:
-                return 0.0, base
-            return float(caps.max_usdc), base
+            target = float(rest_target_usdc())
+            max_open = float(self.settings.max_open_usdc or 0)
+            if max_open > 1e-9:
+                remain = max_open - open_usdc
+                if remain + 1e-9 <= 0:
+                    return 0.0, base
+                target = min(target, remain)
+            return max(0.0, target), base
         if quote_reversal_cushion(quote):
             return float(CUSHION_REST_USDC), base
         return 0.0, ""
@@ -1034,7 +1029,11 @@ class TradeExecutor:
             channel_live = self._live_for_signal(typ)
             tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
             share_floor = rest_min_shares(quote)
-            cap = float(self.settings.max_usdc or 0)
+            cap = (
+                float(rest_target_usdc())
+                if pitch
+                else float(self.settings.max_usdc or 0)
+            )
             floor = max(
                 float(self.settings.size_floor_usdc or 1),
                 MIN_REST_USDC,

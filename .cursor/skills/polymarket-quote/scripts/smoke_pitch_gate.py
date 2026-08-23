@@ -404,13 +404,23 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
-            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
             coord = pg.get_coordinator(root)
+            obs6 = _FakeObserver(root)
+            set_active_observer(obs6)  # type: ignore[arg-type]
+            af6 = _FakeAf([{"ok": False, "score_match": None}])
+            af_mod.set_active_observer(af6)  # type: ignore[arg-type]
             assert coord.start_gate({**ev, "match_id": "m6"}, event_key="k6")
             time.sleep(0.02)
             assert coord.cancel_match("m6") >= 1
             done = _wait_done(coord, n=1)
             assert done[0]["status"] == "canceled", done
+            rows_after_cancel = len(obs6.rows)
+            af_after_cancel = af6.calls
+            assert coord.start_gate({**ev, "match_id": "m6"}, event_key="k6") is False
+            time.sleep(0.12)
+            assert coord.drain_done() == []
+            assert len(obs6.rows) == rows_after_cancel, obs6.rows
+            assert af6.calls == af_after_cancel, af6.calls
 
         # invert keeps ts suffix.
         inv = pg.invert_score_change_key(

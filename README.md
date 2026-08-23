@@ -157,7 +157,7 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 
 - 需 `QUOTE_REST_ENABLED=1`  
 - 门控 WIN 无法 FAK 成交时，挂 **@0.99**、`GTD`，过期默认 3600s  
-- 金额跟 **`QUOTE_MAX_USDC`（默认 $1）**  
+- 金额 **`QUOTE_REST_USDC`（默认 $5）**，满足 CLOB 最低 5 股  
 - DQD 回撤会取消这些 rest  
 
 ### 6. 模式与仓位
@@ -220,7 +220,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控和终场都跳过** |
 | `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
-| `QUOTE_REST_ENABLED` | `1` 才挂 0.99 rest（金额跟 `QUOTE_MAX_USDC`，默认 $1） |
+| `QUOTE_REST_ENABLED` | `1` 才挂 0.99 rest（金额 `QUOTE_REST_USDC` 默认 $5） |
 | `QUOTE_REST_EXPIRE_S` | rest 过期秒数，默认 3600 |
 | `QUOTE_FT_MAX_AGE_S` | 默认 900，过旧事件跳过 |
 | `QUOTE_INTERVAL` | watch 最大空闲间隔，默认 0.25s |
@@ -297,6 +297,7 @@ python3 .cursor/skills/polymarket-quote/scripts/smoke_trade_modes.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate_dom.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_rest_ladder.py
 ```
 
 调试单跑（日常勿与 System Main 并行）：

@@ -98,6 +98,10 @@ class PitchGateCoordinator:
         self._done: list[dict[str, Any]] = []
         self._in_play_keys: set[str] = set()
         self._bought_matches: set[str] = set()
+        # Terminal event_keys (buy / timeout / cancel / supersede). Blocks
+        # file-lag replays from opening a second AF/DOM trail after reverse.
+        self._closed_keys: set[str] = set()
+        self._closed_by_match: dict[str, set[str]] = {}
 
     def pending_event_keys(self) -> set[str]:
         with self._lock:
@@ -116,6 +120,30 @@ class PitchGateCoordinator:
         with self._lock:
             return mid in self._bought_matches
 
+    def has_consumed_event(self, event_key: str) -> bool:
+        key = str(event_key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            return key in self._closed_keys
+
+    def consumed_event_keys(self, match_id: str) -> set[str]:
+        mid = str(match_id or "").strip()
+        if not mid:
+            return set()
+        with self._lock:
+            return set(self._closed_by_match.get(mid) or ())
+
+    def _mark_closed_locked(self, match_id: str, event_key: str) -> None:
+        """Caller must hold ``_lock``."""
+        mid = str(match_id or "").strip()
+        key = str(event_key or "").strip()
+        if not key:
+            return
+        self._closed_keys.add(key)
+        if mid:
+            self._closed_by_match.setdefault(mid, set()).add(key)
+
     def start_gate(
         self,
         ev: dict[str, Any],
@@ -130,6 +158,12 @@ class PitchGateCoordinator:
         key = str(event_key or "").strip()
         if not mid or not key:
             return False
+        with self._lock:
+            if key in self._closed_keys:
+                return False
+            existing = self._by_event.get(key)
+            if existing is not None and not existing.finished:
+                return True
         observer = get_active_observer()
         if observer is None:
             self._push_done(
@@ -166,12 +200,20 @@ class PitchGateCoordinator:
             observe_only=bool(observe_only),
         )
         with self._lock:
+            if key in self._closed_keys:
+                return False
+            existing = self._by_event.get(key)
+            if existing is not None and not existing.finished:
+                return True
             prior_keys = list(self._by_match.get(mid) or ())
             for pk in prior_keys:
+                if pk == key:
+                    continue
                 old = self._by_event.get(pk)
                 if old is not None and not old.finished and not old.cancel.is_set():
                     old.cancel_reason = "superseded_by_new_goal"
                     old.cancel.set()
+                    self._mark_closed_locked(mid, pk)
             self._revoke_pending_buys_locked(
                 match_id=mid, reason="superseded_by_new_goal"
             )
@@ -212,6 +254,7 @@ class PitchGateCoordinator:
         with self._lock:
             keys = list(self._by_match.get(mid) or ())
             for key in keys:
+                self._mark_closed_locked(mid, key)
                 sess = self._by_event.get(key)
                 if sess is not None and not sess.finished:
                     sess.cancel_reason = reason
@@ -389,6 +432,7 @@ class PitchGateCoordinator:
                 reason = getattr(session, "cancel_reason", None) or reason or "canceled"
                 judge = None
             session.finished = True
+            self._mark_closed_locked(session.match_id, session.event_key)
             self._by_event.pop(session.event_key, None)
             keys = self._by_match.get(session.match_id)
             if keys is not None:
@@ -582,7 +626,14 @@ class PitchGateCoordinator:
         try:
             if not session.cancel.is_set():
                 reader, open_err, surface_info = self._open_dom_reader(session, observer)
-                if reader is None:
+                if session.cancel.is_set():
+                    if reader is not None:
+                        try:
+                            reader.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        reader = None
+                elif reader is None:
                     print(
                         f"pitch-gate → DOM_UNAVAILABLE match_id={session.match_id} "
                         f"key={session.event_key} reason={open_err} "
@@ -616,6 +667,8 @@ class PitchGateCoordinator:
                     elapsed_s=round(elapsed, 3),
                     prev_clock=prev_clock,
                 )
+                if session.cancel.is_set():
+                    break
                 clock = str((judged or {}).get("dom_clock") or "")
                 if clock:
                     prev_clock = clock
@@ -641,6 +694,8 @@ class PitchGateCoordinator:
                 af_row = self._sample_af(
                     session, sample_i=sample_i, elapsed_s=round(elapsed, 3)
                 )
+                if session.cancel.is_set():
+                    break
                 if af_row:
                     row["af"] = {
                         "ok": af_row.get("ok"),

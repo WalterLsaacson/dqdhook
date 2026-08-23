@@ -15,9 +15,10 @@ REST_CONCENTRATE_BID = 0.99
 # GTD safety net; 0 → GTC. Reversal/FT still cancel immediately.
 DEFAULT_REST_EXPIRE_S = 3600.0
 MIN_REST_USDC = 1.0
-# Used only when the book does not publish min_order_size. Soccer CLOB books
-# currently report 5; hang ~$1 (≈1 share @ 0.99) when the floor is missing.
-MIN_REST_SHARES = 1.0
+# Soccer CLOB limit bids reject below 5 shares (~$4.95 @ 0.99). Pitch-gate
+# rest therefore spends ``QUOTE_REST_USDC`` (default $5), not ``QUOTE_MAX_USDC``.
+DEFAULT_REST_USDC = 5.0
+MIN_REST_SHARES = 5.0
 _SHARE_Q = Decimal("0.01")
 # CLOB limit orders reject tick_size below 0.01 on many soccer tokens even
 # when the book metadata (or exact-score rows) reports 0.001.
@@ -36,6 +37,17 @@ def _env_bool(name: str, default: bool) -> bool:
 def rest_enabled() -> bool:
     """``QUOTE_REST_ENABLED`` — default off; set 1 to post limit rest bids."""
     return _env_bool("QUOTE_REST_ENABLED", DEFAULT_REST_ENABLED)
+
+
+def rest_target_usdc() -> float:
+    """Pitch-gate rest notional. Default $5 so 0.99 bids clear the 5-share floor."""
+    raw = os.getenv("QUOTE_REST_USDC")
+    if raw is None or str(raw).strip() == "":
+        return float(DEFAULT_REST_USDC)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_REST_USDC)
 
 
 def rest_min_shares(quote: dict[str, Any] | None) -> float:
@@ -228,10 +240,11 @@ def allocate_rest_ladder(
                 shares, cost = bumped, bumped_cost
         if share_floor > 0 and shares + 1e-12 < share_floor:
             lifted_cost = round(float(share_floor) * px, 6)
-            # Never spend more than this level's budget (QUOTE_MAX_USDC).
             if lifted_cost <= usdc + 1e-9:
                 shares = float(share_floor)
                 cost = lifted_cost
+            else:
+                continue
         if shares <= 0 or cost + 1e-12 < need_floor:
             continue
         levels.append(

@@ -200,6 +200,89 @@ def main() -> int:
     wait = next(g for g in snap2["goals"] if g["event_key"] == wait_key)
     assert wait["verdict"] == "wait_af", wait["verdict"]
 
+    # Gwangju: earlier 0-1→0-0 must not paint a later bought 0-0→0-1.
+    early_goal = "score_change|m3|0-0->0-1|2026-08-23T19:49:00+08:00"
+    early_rev = "score_change|m3|0-1->0-0|2026-08-23T19:51:55+08:00"
+    later_goal = "score_change|m3|0-0->0-1|2026-08-23T20:23:00+08:00"
+
+    def _aligned_row(ek: str, home_score: int, away_score: int) -> dict:
+        return {
+            "event_key": ek,
+            "match_id": "m3",
+            "home": "Gwangju FC",
+            "away": "Incheon United FC",
+            "home_score": home_score,
+            "away_score": away_score,
+            "sample_i": 0,
+            "elapsed_s": 5.8,
+            "ok": True,
+            "gate": True,
+            "judge": {"play_state": "in_play", "confidence": 0.9},
+            "af": {
+                "ok": True,
+                "score_match": True,
+                "af_score": f"{home_score}-{away_score}",
+            },
+            "dom_state": {
+                "pop_box": "进攻",
+                "center_box": f"1 : 0 {home_score} : {away_score}",
+            },
+        }
+
+    _write_jsonl(observe, [_aligned_row(early_goal, 0, 1), _aligned_row(later_goal, 0, 1)])
+    _write_jsonl(
+        quotes,
+        [
+            {
+                "mode": "pitch_gate_confirmed",
+                "event_key": early_goal,
+                "match_id": "m3",
+                "quoted_at": "2026-08-23T19:49:10+08:00",
+                "pitch_gate": {"status": "in_play"},
+            },
+            {
+                "mode": "dqd_reversal_pitch_gate_canceled",
+                "event_key": early_rev,
+                "match_id": "m3",
+                "quoted_at": "2026-08-23T19:51:55+08:00",
+                "pitch_gate": {"status": "cancel_requested"},
+            },
+            {
+                "mode": "pitch_gate_confirmed",
+                "event_key": later_goal,
+                "match_id": "m3",
+                "quoted_at": "2026-08-23T20:25:45+08:00",
+                "pitch_gate": {"status": "in_play"},
+            },
+        ],
+    )
+    _write_jsonl(
+        bridge,
+        [
+            {
+                "type": "score_change",
+                "is_reversal": True,
+                "match_id": "m3",
+                "home": "Gwangju FC",
+                "away": "Incheon United FC",
+                "ts": "2026-08-23T19:51:55+08:00",
+                "prev": {"home": 0, "away": 1},
+                "curr": {"home": 0, "away": 0},
+                "home_score": 0,
+                "away_score": 0,
+            }
+        ],
+    )
+    snap3 = board.build_goals_payload(limit=50)
+    by_m3 = {g["event_key"]: g for g in snap3["goals"]}
+    early = by_m3[early_goal]
+    later = by_m3[later_goal]
+    assert early["verdict"] == "reversed_after_buy", early["verdict"]
+    assert later["verdict"] == "aligned_buy", later["verdict"]
+    assert later.get("reversed") is False
+    assert later.get("linked_event_key") != early_rev
+    assert (later.get("reversal") or {}).get("ts") != "2026-08-23T19:51:55+08:00"
+
     print("ok: pitch-gate board verdicts match DOM∧AF / AF∨DOM")
     return 0
 
