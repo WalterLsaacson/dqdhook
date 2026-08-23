@@ -69,8 +69,6 @@ def main() -> int:
                 if path.is_file() and path.read_text(encoding="utf-8").count("\n") >= 3:
                     break
                 time.sleep(0.05)
-            obs.stop()
-            time.sleep(0.05)
 
             rows = [
                 json.loads(ln)
@@ -89,11 +87,47 @@ def main() -> int:
             if len(polls) >= 2:
                 gaps = [b - a for a, b in zip(polls, polls[1:])]
                 assert all(g >= 0.05 for g in gaps), gaps
+            assert all(r.get("is_reversal") is not True for r in rows)
+
+            assert obs.start_session(
+                {
+                    "match_id": "m2",
+                    "home": "Home FC",
+                    "away": "Away United",
+                    "home_score": 0,
+                    "away_score": 0,
+                    "is_reversal": True,
+                    "observe_only": True,
+                    "ts": "2026-08-21T12:01:00+08:00",
+                },
+                event_key="m2|1-0->0-0",
+            )
+            deadline2 = time.monotonic() + 3.0
+            while time.monotonic() < deadline2:
+                all_rows = [
+                    json.loads(ln)
+                    for ln in path.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                ]
+                if any(r.get("event_key") == "m2|1-0->0-0" for r in all_rows):
+                    break
+                time.sleep(0.05)
+            obs.stop()
+            time.sleep(0.05)
+            all_rows = [
+                json.loads(ln)
+                for ln in path.read_text(encoding="utf-8").splitlines()
+                if ln.strip()
+            ]
+            rev_rows = [r for r in all_rows if r.get("event_key") == "m2|1-0->0-0"]
+            assert rev_rows, all_rows[-3:]
+            assert rev_rows[0].get("is_reversal") is True
+            assert rev_rows[0].get("observe_only") is True
 
             print(
                 f"ok af_observe samples={len(rows)} "
                 f"elapsed={[round(r['elapsed_s'], 3) for r in rows]} "
-                f"wall={time.monotonic() - t0:.2f}s",
+                f"wall={time.monotonic() - t0:.2f}s reversal_rows={len(rev_rows)}",
                 flush=True,
             )
     return 0

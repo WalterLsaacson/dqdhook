@@ -20,10 +20,10 @@ from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
     ask_in_fak_zone,
-    min_rest_usdc,
     rest_enabled,
     rest_expire_s,
     rest_limit_tick_size,
+    rest_min_shares,
 )
 from size_policy import compute_buy_size_caps
 from score_reversal import (
@@ -77,7 +77,7 @@ FLATTEN_ORDER_MAX_WAIT_S = 60.0
 # storm while waiting for the exchange's balance/order views to converge.
 FLATTEN_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_ORDER_RECHECK_INTERVAL_S = 2.0
-CUSHION_REST_USDC = 10.0
+CUSHION_REST_USDC = 1.0
 CUSHION_REST_PRICES = (0.99,)
 # Keep pending_reason bounded (append loops used to grow to 80KB+).
 FLATTEN_REASON_MAX_LEN = 400
@@ -919,11 +919,11 @@ class TradeExecutor:
                 + self._pending_usdc_total_locked()
                 + self.ledger.rest_reserved_usdc()
             )
-            # CLOB limit min is 5 shares → ~$4.95 @ 0.99 (not the $1 FAK tier).
-            rest_floor = min_rest_usdc(0.99)
+            # Rest size follows QUOTE_MAX_USDC (same as FAK); do not lift to
+            # CLOB min_order_size (~$4.95 @ 5 shares).
             caps = compute_buy_size_caps(
                 0.99,
-                max_usdc=max(float(self.settings.max_usdc or 0), rest_floor),
+                max_usdc=float(self.settings.max_usdc or 0),
                 max_shares=self.settings.max_shares,
                 tiers=self.settings.size_tiers,
                 open_usdc=open_usdc,
@@ -932,7 +932,7 @@ class TradeExecutor:
             )
             if caps.skip_reason:
                 return 0.0, base
-            return max(float(caps.max_usdc), rest_floor), base
+            return float(caps.max_usdc), base
         if quote_reversal_cushion(quote):
             return float(CUSHION_REST_USDC), base
         return 0.0, ""
@@ -1026,7 +1026,14 @@ class TradeExecutor:
             )
             channel_live = self._live_for_signal(typ)
             tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
-            floor = max(float(self.settings.size_floor_usdc or 1), MIN_REST_USDC)
+            share_floor = rest_min_shares(quote)
+            cap = float(self.settings.max_usdc or 0)
+            floor = max(
+                float(self.settings.size_floor_usdc or 1),
+                MIN_REST_USDC,
+            )
+            if cap > 1e-9:
+                floor = min(floor, cap)
             gap = remaining
             live_pairs = list(
                 self.ledger.live_rest_orders(match_id=mid, token_id=token_id)
@@ -1067,6 +1074,7 @@ class TradeExecutor:
                     floor_usdc=floor,
                     best_bid=quote.get("best_bid"),
                     best_ask=ask_for_ladder,
+                    min_shares=share_floor,
                 )
                 if not levels and not replace:
                     return None
@@ -1088,6 +1096,7 @@ class TradeExecutor:
                         floor_usdc=floor,
                         best_bid=quote.get("best_bid"),
                         best_ask=ask_for_ladder,
+                        min_shares=share_floor,
                     )
                     if not levels:
                         # Still cancel the old ladder (e.g. target now below floor).

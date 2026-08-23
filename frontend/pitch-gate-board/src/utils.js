@@ -26,6 +26,13 @@ export function formatBeijing(value) {
 }
 
 export function scoreLabel(goal) {
+  if (
+    (goal?.kind === "reversal_observe" || goal?.observe_only) &&
+    goal?.score_from &&
+    goal?.score_to
+  ) {
+    return `${goal.score_from}→${goal.score_to}`;
+  }
   if (goal?.score) return String(goal.score);
   if (goal?.home_score != null && goal?.away_score != null) {
     return `${goal.home_score}-${goal.away_score}`;
@@ -51,9 +58,17 @@ export function stateLabel(state) {
     capture_failed: "截帧失败",
     reversed: "回撤",
     reversed_after_in_play: "回撤·曾in_play",
+    reversal_observe: "回撤观察",
     mixed: "mixed",
   };
   return map[s] || s;
+}
+
+/** True when this row is the post-reversal AF/DOM trail (not a buyable goal). */
+export function isReversalObserve(goal) {
+  return Boolean(
+    goal?.kind === "reversal_observe" || goal?.observe_only || goal?.verdict === "reversal_observe"
+  );
 }
 
 /** True when this goal was judged in_play on a frame, then later reversed. */
@@ -65,6 +80,7 @@ export function reversedAfterInPlay(goal) {
 
 /** Badge key for a goal row (splits plain reverse vs reverse-after-in_play). */
 export function goalVerdictKey(goal) {
+  if (isReversalObserve(goal)) return "reversal_observe";
   if (goal?.reversed || goal?.verdict === "reversed") {
     return reversedAfterInPlay(goal) ? "reversed_after_in_play" : "reversed";
   }
@@ -84,6 +100,7 @@ export const GOAL_FILTERS = [
   { id: "mixed", short: "mixed" },
   { id: "reversed", short: "回撤" },
   { id: "reversed_after_in_play", short: "回撤·曾in_play" },
+  { id: "reversal_observe", short: "回撤观察" },
 ];
 
 const FILTER_IDS = new Set(GOAL_FILTERS.map((f) => f.id));
@@ -115,7 +132,7 @@ export function emptyFilterMessage(filter, { detail = false } = {}) {
   if (!filter || filter === "all") {
     return detail
       ? "选择左侧一场进球查看逐帧判定。"
-      : "暂无进球记录。<br/>等 DQD goal + pitch-gate 采样。";
+      : "暂无进球记录。<br/>等 DQD goal / 回撤观察 + pitch-gate 采样。";
   }
   const row = GOAL_FILTERS.find((f) => f.id === filter);
   const label = row?.short || stateLabel(filter);

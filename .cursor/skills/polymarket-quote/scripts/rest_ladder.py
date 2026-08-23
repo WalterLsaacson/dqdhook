@@ -15,8 +15,9 @@ REST_CONCENTRATE_BID = 0.99
 # GTD safety net; 0 → GTC. Reversal/FT still cancel immediately.
 DEFAULT_REST_EXPIRE_S = 3600.0
 MIN_REST_USDC = 1.0
-# CLOB limit buys reject below this share size on soccer markets.
-MIN_REST_SHARES = 5.0
+# Used only when the book does not publish min_order_size. Soccer CLOB books
+# currently report 5; hang ~$1 (≈1 share @ 0.99) when the floor is missing.
+MIN_REST_SHARES = 1.0
 _SHARE_Q = Decimal("0.01")
 # CLOB limit orders reject tick_size below 0.01 on many soccer tokens even
 # when the book metadata (or exact-score rows) reports 0.001.
@@ -35,6 +36,18 @@ def _env_bool(name: str, default: bool) -> bool:
 def rest_enabled() -> bool:
     """``QUOTE_REST_ENABLED`` — default off; set 1 to post limit rest bids."""
     return _env_bool("QUOTE_REST_ENABLED", DEFAULT_REST_ENABLED)
+
+
+def rest_min_shares(quote: dict[str, Any] | None) -> float:
+    """CLOB share floor from the book; default ``MIN_REST_SHARES`` if unpublished."""
+    raw = (quote or {}).get("min_order_size")
+    if raw is None or str(raw).strip() == "":
+        return float(MIN_REST_SHARES)
+    try:
+        shares = float(raw)
+    except (TypeError, ValueError):
+        return float(MIN_REST_SHARES)
+    return shares if shares > 0 else float(MIN_REST_SHARES)
 
 
 def min_rest_usdc(price: float, *, min_shares: float = MIN_REST_SHARES) -> float:
@@ -172,13 +185,13 @@ def allocate_rest_ladder(
         snapped.append(px)
     if not snapped:
         return []
-    # Raise budget so at least one level clears CLOB min shares (e.g. 5 @ 0.99).
+    # Do not raise spend above the caller budget (QUOTE_MAX_USDC).
     level_floor = floor
     if share_floor > 0:
-        need = max(need, min_rest_usdc(min(snapped), min_shares=share_floor))
-        level_floor = max(
-            floor, min_rest_usdc(min(snapped), min_shares=share_floor)
-        )
+        lifted = min_rest_usdc(min(snapped), min_shares=share_floor)
+        if lifted <= need + 1e-12:
+            need = max(need, lifted)
+            level_floor = max(floor, lifted)
     # Only split when each side can still clear the share floor; otherwise
     # concentrate on the first price (avoids 2× min-share overspend).
     if len(snapped) == 1 or need + 1e-12 < 2.0 * level_floor:
@@ -214,8 +227,11 @@ def allocate_rest_ladder(
             ):
                 shares, cost = bumped, bumped_cost
         if share_floor > 0 and shares + 1e-12 < share_floor:
-            shares = float(share_floor)
-            cost = round(shares * px, 6)
+            lifted_cost = round(float(share_floor) * px, 6)
+            # Never spend more than this level's budget (QUOTE_MAX_USDC).
+            if lifted_cost <= usdc + 1e-9:
+                shares = float(share_floor)
+                cost = lifted_cost
         if shares <= 0 or cost + 1e-12 < need_floor:
             continue
         levels.append(

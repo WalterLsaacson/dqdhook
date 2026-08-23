@@ -1,4 +1,7 @@
-"""Pitch-screenshot gate: first frame @+5s, then every 5s until 2.5min; buy once on in_play."""
+"""Pitch-screenshot gate: first frame @+5s, then every 5s until 2.5min; buy once on in_play.
+
+Reversal sessions use the same cadence with ``observe_only=True`` (no buy).
+"""
 
 from __future__ import annotations
 
@@ -58,6 +61,8 @@ class _RefShotJob:
     surface: Any = None
     nami_id: Any = None
     root: Path | None = None
+    observe_only: bool = False
+    is_reversal: bool = False
 
 
 def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
@@ -127,6 +132,8 @@ class _GateSession:
     var_seen: bool = False
     # Nami tracker id, only used to tag the observe-only feed recording.
     nami_id: str = ""
+    # Reversal trail: same capture cadence, never queues a buy.
+    observe_only: bool = False
 
 
 class PitchGateCoordinator:
@@ -138,6 +145,8 @@ class PitchGateCoordinator:
         self._by_event: dict[str, _GateSession] = {}
         self._by_match: dict[str, set[str]] = {}
         self._done: list[dict[str, Any]] = []
+        # Goal event_keys that already queued/emitted in_play (survives revoke).
+        self._in_play_keys: set[str] = set()
         # Async store-only screenshots (DOM mode对照); never touch OCR / buys.
         self._ref_q: queue.Queue[_RefShotJob | None] = queue.Queue()
         self._ref_stop = threading.Event()
@@ -262,6 +271,8 @@ class PitchGateCoordinator:
             "screenshot_only": True,
             "no_ocr": True,
             "gate": True,
+            "observe_only": bool(job.observe_only),
+            "is_reversal": bool(job.is_reversal),
         }
         try:
             observer._write_rows([row])
@@ -278,8 +289,14 @@ class PitchGateCoordinator:
             self._done.clear()
             return out
 
-    def start_gate(self, ev: dict[str, Any], *, event_key: str) -> bool:
-        """Start (or replace) a gate session for this goal event_key."""
+    def start_gate(
+        self,
+        ev: dict[str, Any],
+        *,
+        event_key: str,
+        observe_only: bool = False,
+    ) -> bool:
+        """Start (or replace) a gate session for this goal / reversal event_key."""
         from dqd_stream_observe import get_active_observer
 
         mid = str(ev.get("match_id") or "").strip()
@@ -297,6 +314,7 @@ class PitchGateCoordinator:
                     "match_id": mid,
                     "ev": dict(ev),
                     "reason": "dqd_stream_observer_missing",
+                    "observe_only": bool(observe_only),
                 }
             )
             return False
@@ -311,6 +329,7 @@ class PitchGateCoordinator:
                     "match_id": mid,
                     "ev": dict(ev),
                     "reason": reason,
+                    "observe_only": bool(observe_only),
                 }
             )
             return False
@@ -320,13 +339,15 @@ class PitchGateCoordinator:
             event_key=key,
             ev=dict(ev),
             t0_mono=time.monotonic(),
+            observe_only=bool(observe_only),
         )
         with self._lock:
-            # New goal on same match cancels prior open gates for that match.
+            # New goal/reversal on same match cancels prior open gates.
+            # Do not overwrite a reason already set by cancel_match.
             prior_keys = list(self._by_match.get(mid) or ())
             for pk in prior_keys:
                 old = self._by_event.get(pk)
-                if old is not None and not old.finished:
+                if old is not None and not old.finished and not old.cancel.is_set():
                     old.cancel_reason = "superseded_by_new_goal"
                     old.cancel.set()
             # Also drop any undrained buy for those prior goals.
@@ -347,14 +368,22 @@ class PitchGateCoordinator:
         )
         session.thread = thread
         thread.start()
-        print(
-            f"pitch-gate → START match_id={mid} key={key} "
-            f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
-            f"min_frames={GATE_MIN_FRAMES} timeout={GATE_TIMEOUT_S:g}s "
-            f"(in_play+score×{GATE_CONFIRM_FRAMES}; VAR→no buy; "
-            f"keep capturing until timeout)",
-            flush=True,
-        )
+        if session.observe_only:
+            print(
+                f"pitch-gate → OBSERVE START match_id={mid} key={key} "
+                f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
+                f"timeout={GATE_TIMEOUT_S:g}s (reversal trail; no buy)",
+                flush=True,
+            )
+        else:
+            print(
+                f"pitch-gate → START match_id={mid} key={key} "
+                f"first_delay={GATE_FIRST_DELAY_S:g}s interval={GATE_INTERVAL_S:g}s "
+                f"min_frames={GATE_MIN_FRAMES} timeout={GATE_TIMEOUT_S:g}s "
+                f"(in_play+score×{GATE_CONFIRM_FRAMES}; VAR→no buy; "
+                f"keep capturing until timeout)",
+                flush=True,
+            )
         return True
 
     def cancel_match(self, match_id: str, *, reason: str = "dqd_reversal") -> int:
@@ -390,6 +419,33 @@ class PitchGateCoordinator:
                 flush=True,
             )
         return n + revoked
+
+    def should_observe_reversal(
+        self, reversal_event_key: str, *, match_id: str = ""
+    ) -> bool:
+        """True when this reverse undoes a goal that already reached in_play."""
+        inv = invert_score_change_key(reversal_event_key)
+        mid = str(match_id or "").strip()
+        with self._lock:
+            if inv and inv in self._in_play_keys:
+                return True
+            for sess in self._by_event.values():
+                if sess.observe_only or not sess.buy_emitted:
+                    continue
+                if mid and sess.match_id != mid:
+                    continue
+                if inv and sess.event_key != inv:
+                    continue
+                return True
+            for row in self._done:
+                if str(row.get("status") or "") != "in_play":
+                    continue
+                if inv and str(row.get("event_key") or "") != inv:
+                    continue
+                if mid and str(row.get("match_id") or "") != mid:
+                    continue
+                return True
+        return False
 
     def _revoke_pending_buys_locked(
         self,
@@ -459,9 +515,11 @@ class PitchGateCoordinator:
                 or session.buy_emitted
                 or session.cancel.is_set()
                 or session.var_seen
+                or session.observe_only
             ):
                 return False
             session.buy_emitted = True
+            self._in_play_keys.add(session.event_key)
             self._done.append(
                 {
                     "status": "in_play",
@@ -520,6 +578,7 @@ class PitchGateCoordinator:
                     "buy_emitted": bool(session.buy_emitted),
                     "var_seen": bool(session.var_seen),
                     "nami_id": session.nami_id or None,
+                    "observe_only": bool(session.observe_only),
                 }
             )
         self._nami_observe_stop(session)
@@ -579,6 +638,31 @@ class PitchGateCoordinator:
                 observer.release_match(session.nami_id)
         except Exception:  # noqa: BLE001
             logger.debug("nami observe stop skipped", exc_info=True)
+
+    def _nami_on_dom_sample(
+        self,
+        session: _GateSession,
+        row: dict[str, Any],
+        judged: dict[str, Any] | None,
+    ) -> None:
+        """Stamp this DOM sample with the current MQTT ball. Observe-only."""
+        try:
+            from nami_observe import get_active_observer as get_nami
+
+            observer = get_nami()
+            if observer is None:
+                return
+            nid = str(session.nami_id or row.get("nami_id") or "").strip()
+            snap = observer.write_dom_sample(
+                nid,
+                sample_i=int(row.get("sample_i") or 0),
+                elapsed_s=float(row.get("elapsed_s") or 0),
+                play_state=str((judged or {}).get("play_state") or "") or None,
+            )
+            if snap:
+                row["nami"] = snap
+        except Exception:  # noqa: BLE001
+            logger.debug("nami DOM sample skipped", exc_info=True)
 
     def _open_dom_reader(self, session: _GateSession, observer: Any) -> Any:
         """Resolve the tracker URL once and keep that page open for the session."""
@@ -643,6 +727,8 @@ class PitchGateCoordinator:
             "error": err,
             "dom_state": dom,
             "gate": True,
+            "observe_only": bool(session.observe_only),
+            "is_reversal": bool(session.ev.get("is_reversal")),
         }
         if dom is None:
             return row, None
@@ -725,6 +811,7 @@ class PitchGateCoordinator:
                     if clock:
                         prev_clock = clock
                     has_reading = row.get("ok") is True
+                    self._nami_on_dom_sample(session, row, judged)
                 else:
                     job = _CaptureJob(
                         match_id=session.match_id,
@@ -740,6 +827,8 @@ class PitchGateCoordinator:
                         job, sample_i=sample_i, elapsed_s=round(elapsed, 3)
                     )
                     row["gate"] = True
+                    row["observe_only"] = bool(session.observe_only)
+                    row["is_reversal"] = bool(session.ev.get("is_reversal"))
                     judged = None
                     has_reading = bool(row.get("ok") is True and row.get("frame_path"))
 
@@ -757,7 +846,17 @@ class PitchGateCoordinator:
                         judged = _judge_frame_sync(row)
                         _write_dom_vs_ocr(self.root, session, row, judged)
                     play_state = str((judged or {}).get("play_state") or "")
-                    if _judge_shows_var(judged):
+                    if session.observe_only:
+                        # Trail only: record VAR / in_play on the frame, never buy.
+                        if _judge_shows_var(judged) and not session.var_seen:
+                            session.var_seen = True
+                            print(
+                                f"pitch-gate → OBSERVE VAR match_id={session.match_id} "
+                                f"key={session.event_key} sample={sample_i} "
+                                f"(trail only; no buy)",
+                                flush=True,
+                            )
+                    elif _judge_shows_var(judged):
                         if not session.var_seen:
                             session.var_seen = True
                             print(
@@ -830,6 +929,8 @@ class PitchGateCoordinator:
                             surface=(surface_info or {}).get("surface"),
                             nami_id=(surface_info or {}).get("nami_id"),
                             root=self.root,
+                            observe_only=bool(session.observe_only),
+                            is_reversal=bool(session.ev.get("is_reversal")),
                         )
                     )
 
@@ -858,6 +959,22 @@ class PitchGateCoordinator:
                     reason=getattr(session, "cancel_reason", None) or "canceled",
                     elapsed_s=elapsed_end,
                     frames=captured,
+                )
+                return
+
+            if session.observe_only:
+                self._finish_session(
+                    session,
+                    status="observe_complete",
+                    reason=f"captured_{captured}_frames",
+                    elapsed_s=elapsed_end,
+                    frames=captured,
+                )
+                print(
+                    f"pitch-gate → OBSERVE_COMPLETE match_id={session.match_id} "
+                    f"key={session.event_key} frames={captured} "
+                    f"elapsed={elapsed_end:.1f}s (no buy)",
+                    flush=True,
                 )
                 return
 
@@ -1044,6 +1161,22 @@ def _judge_frame_sync(row: dict[str, Any]) -> dict[str, Any] | None:
 
 _coordinator: PitchGateCoordinator | None = None
 _coord_lock = threading.Lock()
+
+
+def invert_score_change_key(event_key: str) -> str | None:
+    """``…|1-0->2-0`` → ``…|2-0->1-0`` (the reverse that undoes this goal)."""
+    parts = str(event_key or "").split("|")
+    if len(parts) < 3:
+        return None
+    trans = parts[-1]
+    if "->" not in trans:
+        return None
+    left, right = trans.split("->", 1)
+    if not left.strip() or not right.strip():
+        return None
+    parts = list(parts)
+    parts[-1] = f"{right}->{left}"
+    return "|".join(parts)
 
 
 def get_coordinator(root: Path | None = None) -> PitchGateCoordinator:

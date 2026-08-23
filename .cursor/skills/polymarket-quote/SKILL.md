@@ -13,11 +13,11 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（门控买入 + 买后保护）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 抓一帧，直到 **2.5 分钟超时**（或回撤取消）；需 **进攻/控球等 + 底部比分 OCR=期望**，**首帧合格即 `in_play`** 就 **一刀** `_quote_one`（之后继续抓帧不再下单）。比分未更新 / 不一致 → 不买。截图过程中出现 **VAR** → **该球永久不下单**（继续抓帧，结束 `pitch_gate_var_veto`）。限价 rest 默认关。终场立刻询价。
+**当前策略（门控买入 + 买后保护）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 抓一帧，直到 **2.5 分钟超时**（或回撤取消）；需 **进攻/控球等 + 底部比分 OCR=期望**，**首帧合格即 `in_play`** 就 **一刀** `_quote_one`（之后继续抓帧不再下单）。比分未更新 / 不一致 → 不买。截图过程中出现 **VAR** → **该球永久不下单**（继续抓帧，结束 `pitch_gate_var_veto`）。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。
 
 > 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；这一类风险由**买后保护窗口**（下条）承接，而不是靠拖延买点。
 
-- 懂球帝 **回撤**：取消相关 rest 挂单 + **取消该场 pitch-gate**，并 **撤销尚未 drain 的 `in_play` 买信号**（`buy_revoked`）。询价 tick **先处理事件再 drain 门控**，避免同 tick 回撤输掉竞态。
+- 懂球帝 **回撤**：立刻认——取消相关 rest 挂单 + **取消该场进球 pitch-gate**，并 **撤销尚未 drain 的 `in_play` 买信号**（`buy_revoked`）。询价 tick **先处理事件再 drain 门控**，避免同 tick 回撤输掉竞态。若该球**已经 in_play** 后才回撤，再开 **observe-only** AF/DOM 会话（+5s / 5s / 150s，AF 仍 90s），**不下单**；任意未 in_play 的回撤不观察。Pitch Gate 看板以独立「回撤观察」卡片逐帧展示。
 - **买后保护窗口**：门控买入的 lot 在 **`QUOTE_GATE_PROTECT_S`（默认 300s）** 内遇到 DQD 回撤 → **立即 FAK 平仓**（`gate_protect_reversal`）。超窗、非门控（FT）lot 仍沿用「等终场 `ft_reversal_vs_entry`」（那时基本已归零，只是清仓释放额度）；`QUOTE_GATE_PROTECT_S=0` 关闭该保护。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
@@ -26,9 +26,9 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 - **对照截图（默认开）**：`QUOTE_GATE_REF_SCREENSHOT=1` 时另开一条异步浏览器会话，按同样节奏截动画帧只存盘（`*_ref.jpg`），**不跑模型、不参与买卖**。看板同帧并排显示 DOM 文本 + 截图，用来对照「状态条空白时画面上是否已有可见线索」。
 - **防僵死**：页面卡死会一直渲染最后状态，因此判定要求 `.center-box` 时钟相对上一次读数有推进；开页时先取一次时钟基线，使第 0 帧也受保护。时钟没走 → `unclear`（`stopped_reason=stale_page`），不下单。
 - **抓帧对象是纳米数据动画本身**：`match_list` 每行自带 `animation_live`（`tracker.namitiyu.com/...&id=<nami_id>`），直接截它而不是懂球帝比赛页 → **现场直播场次也有可 OCR 的动画**，且不依赖懂球帝页面 DOM。无该字段的场次退回原路径。纳米对不做动画的比赛显示「暂无动画」，此时门控自然超时不下单。
-- **纳米实时流（observe-only）**：`QUOTE_NAMI_OBSERVE=1` 时订阅纳米 MQTT（比分 + 球场归一化球位）落到 `data/pm-quote/nami_observe.jsonl`，用于评估「用结构化数据替掉 OCR」。**不参与任何下单判断。**
+- **纳米实时流（observe-only，默认开）**：订阅纳米 MQTT（比分 + 球场归一化球位）只留在内存；**每个 DOM 采样**才落一行到 `data/pm-quote/nami_observe.jsonl`（球位 + `sample_i` 序号），看板只画这些点。用来观察「DOM+AF 都认了随后回撤」时球在哪。**不参与任何下单判断。** `QUOTE_NAMI_OBSERVE=0` 关闭。
 - **DOM vs OCR 对照（仅 `QUOTE_GATE_SOURCE=ocr` 时产生）**：OCR 模式下每帧顺带记录 DOM 读数，与该帧 OCR 判定并排写入 `data/pm-quote/dom_vs_ocr.jsonl`，用于回看两者差异。
-- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **≥5 shares** / **`QUOTE_REST_EXPIRE_S`（默认 3600）**
+- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **`QUOTE_MAX_USDC`（默认 $1）** / **`QUOTE_REST_EXPIRE_S`（默认 3600）**
 
 ## Quick start
 
@@ -64,7 +64,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
    - `score_change` goal-up (paired) → **start pitch-gate** (first frame @+5s, then every 5s until 150s); quote on first `in_play`, keep capturing
-   - `score_change` reversal → cancel rest + cancel pitch-gate; no auto-flatten
+   - `score_change` reversal → cancel rest + cancel pitch-gate + protect flatten; observe-only AF/DOM trail only if that goal already reached in_play
    - `match_finished` → immediate quote (default live; stale / once-per-match skip)
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: one CLOB `/books` POST; totals/BTTS before exact.
@@ -103,7 +103,8 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | DQD stream frames | `data/pm-quote/dqd_stream_frames/` | JPEG frames |
 | Pitch-state judge | `data/pm-quote/pitch_state_judge.jsonl` | Per-frame resume-play verdict |
 | Pitch Gate board | http://127.0.0.1:8791/ | Per-goal frames + judgments (System Main) |
-| AF observe | `data/pm-quote/af_observe.jsonl` | AF score trail after DQD goal (+5s/5s ≤90s; research only) |
+| AF observe | `data/pm-quote/af_observe.jsonl` | AF score trail after DQD goal or reversal (+5s/5s ≤90s; research only) |
+| Nami observe | `data/pm-quote/nami_observe.jsonl` | Ball_xy at each DOM sample (`sample_i` + zone); research only |
 | AF Bridge board | http://127.0.0.1:8792/ | DQD→AF fixture cache / events |
 | Live Score observe | `data/pm-quote/livescore_observe.jsonl` | Optional LSA research |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots |

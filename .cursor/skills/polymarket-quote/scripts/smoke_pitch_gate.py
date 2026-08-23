@@ -317,6 +317,150 @@ def main() -> int:
             assert done_v2 and done_v2[0]["status"] == "var_veto", done_v2
             assert done_v2[0].get("buy_emitted") is False
             assert done_v2[0].get("var_seen") is True
+
+            # --- observe_only: in_play frames never queue a buy ---
+            def always_in_play(_row: dict[str, Any]) -> dict[str, Any] | None:
+                return {"play_state": "in_play", "confidence": 0.9}
+
+            pg_mod._judge_frame_sync = always_in_play  # type: ignore[assignment]
+            assert coord.start_gate(
+                {
+                    **ev,
+                    "match_id": "m_obs",
+                    "home_score": 0,
+                    "away_score": 0,
+                    "is_reversal": True,
+                },
+                event_key="k_obs",
+                observe_only=True,
+            )
+            done_obs = _wait_done(coord, n=1, timeout=3.0)
+            assert done_obs and done_obs[0]["status"] == "observe_complete", done_obs
+            assert done_obs[0].get("observe_only") is True
+            assert done_obs[0].get("buy_emitted") is False
+            assert sum(1 for d in done_obs if d["status"] == "in_play") == 0
+            tagged = [
+                r
+                for batch in fake.writes
+                for r in batch
+                if r.get("event_key") == "k_obs"
+            ]
+            assert tagged, fake.writes
+            assert all(r.get("observe_only") for r in tagged), tagged[0]
+            assert tagged[0].get("is_reversal") is True
+
+            # --- cancel a goal then start observe_only on the reversal key ---
+            def always_stopped_obs(_row: dict[str, Any]) -> dict[str, Any] | None:
+                return {"play_state": "stopped", "confidence": 0.5}
+
+            pg_mod._judge_frame_sync = always_stopped_obs  # type: ignore[assignment]
+            assert coord.start_gate(
+                {**ev, "match_id": "m_then"}, event_key="k_goal"
+            )
+            time.sleep(0.02)
+            assert coord.cancel_match("m_then", reason="dqd_reversal") >= 1
+            done_then = _wait_done(coord, n=1, timeout=2.0)
+            assert any(d.get("status") == "canceled" for d in done_then), done_then
+            assert coord.start_gate(
+                {
+                    **ev,
+                    "match_id": "m_then",
+                    "home_score": 0,
+                    "away_score": 0,
+                    "is_reversal": True,
+                },
+                event_key="k_rev",
+                observe_only=True,
+            )
+            done_rev = _wait_done(coord, n=1, timeout=3.0)
+            assert done_rev[-1]["status"] == "observe_complete", done_rev
+            assert done_rev[-1]["event_key"] == "k_rev"
+            assert done_rev[-1].get("observe_only") is True
+
+            # --- quote tick: reversal without in_play does not start observe ---
+            import quote_lib as lib
+
+            pg.reset_coordinator_for_tests()
+            set_active_observer(fake)  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            pg_mod._judge_frame_sync = always_stopped_obs  # type: ignore[assignment]
+            goal_key = "score_change|m_qrev|0-0->1-0"
+            assert coord.start_gate({**ev, "match_id": "m_qrev"}, event_key=goal_key)
+            time.sleep(0.02)
+            rev_ev = {
+                "type": "score_change",
+                "is_reversal": True,
+                "match_id": "m_qrev",
+                "home": "H",
+                "away": "A",
+                "home_score": 0,
+                "away_score": 0,
+                "prev": {"home": 1, "away": 0},
+                "curr": {"home": 0, "away": 0},
+                "ts": datetime.now(TZ_CN).isoformat(timespec="seconds"),
+            }
+            bundles = lib.process_bridge_events(
+                root,
+                events_override=[rev_ev],
+                include_props=False,
+                include_exact=False,
+            )
+            modes = [str(b.get("mode") or "") for b in bundles if isinstance(b, dict)]
+            assert "dqd_reversal_pitch_gate_canceled" in modes, bundles
+            rev_bundle = next(
+                b
+                for b in bundles
+                if isinstance(b, dict)
+                and b.get("mode") == "dqd_reversal_pitch_gate_canceled"
+            )
+            assert (rev_bundle.get("pitch_gate") or {}).get("observe_started") is False
+            rev_key = lib.event_key(rev_ev)
+            assert rev_key not in coord.pending_event_keys(), coord.pending_event_keys()
+            done_q = _wait_done(coord, n=1, timeout=3.0)
+            assert any(d.get("status") == "canceled" for d in done_q), done_q
+            assert sum(1 for d in done_q if d.get("observe_only")) == 0, done_q
+
+            # --- quote tick: in_play then reverse → observe trail, no buy ---
+            pg.reset_coordinator_for_tests()
+            set_active_observer(fake)  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            pg_mod._judge_frame_sync = always_in_play  # type: ignore[assignment]
+            goal_ip = "score_change|m_qrev_ip|0-0->1-0"
+            assert coord.start_gate(
+                {**ev, "match_id": "m_qrev_ip"}, event_key=goal_ip
+            )
+            done_ip = _wait_done(coord, n=1, timeout=3.0)
+            assert any(d.get("status") == "in_play" for d in done_ip), done_ip
+            rev_ip = {
+                **rev_ev,
+                "match_id": "m_qrev_ip",
+            }
+            bundles_ip = lib.process_bridge_events(
+                root,
+                events_override=[rev_ip],
+                include_props=False,
+                include_exact=False,
+            )
+            rev_b = next(
+                b
+                for b in bundles_ip
+                if isinstance(b, dict)
+                and b.get("mode") == "dqd_reversal_pitch_gate_canceled"
+            )
+            assert (rev_b.get("pitch_gate") or {}).get("observe_started") is True, rev_b
+            assert all(
+                "pitch_gate_confirmed" not in str(b.get("mode") or "")
+                for b in bundles_ip
+                if isinstance(b, dict)
+            ), bundles_ip
+            done_ip2 = _wait_done(coord, n=1, timeout=3.0)
+            more_ip = _wait_done(coord, n=1, timeout=3.0)
+            all_ip = done_ip2 + more_ip
+            assert any(
+                d.get("status") == "observe_complete" and d.get("observe_only")
+                for d in all_ip
+            ), all_ip
+            assert sum(1 for d in all_ip if d.get("status") == "in_play") == 0
     finally:
         pg_mod._judge_frame_sync = orig_judge  # type: ignore[assignment]
         set_active_observer(None)
@@ -387,6 +531,7 @@ def main() -> int:
         )
 
         # Pitch-gate: no ask / not misprice → dry rest @0.99 GTD ~1h (opt-in).
+        # Size follows QUOTE_MAX_USDC ($1); do not lift to CLOB min_order_size.
         os.environ["QUOTE_REST_ENABLED"] = "1"
         quote = {
             "token_id": "tok_pitch_rest",
@@ -398,6 +543,7 @@ def main() -> int:
             "best_bid": 0.999,
             "best_ask": None,
             "tick_size": "0.01",
+            "min_order_size": "5",
             "asks_top": [],
             "bids_top": [{"price": 0.999, "size": 10}],
         }
@@ -425,11 +571,38 @@ def main() -> int:
             orders = plan.get("rest_orders") or plan.get("levels") or []
         assert orders, row
         assert abs(float(orders[0].get("price") or 0) - 0.99) < 1e-9, orders
-        assert float(orders[0].get("shares") or 0) + 1e-9 >= 5.0, orders
-        assert float(orders[0].get("usdc") or 0) + 1e-9 >= 4.95, orders
+        assert 0.99 <= float(orders[0].get("usdc") or 0) <= 1.02, orders
+        assert float(orders[0].get("shares") or 0) + 1e-9 >= 1.0, orders
+        assert float(orders[0].get("shares") or 0) < 2.0, orders
         assert str(orders[0].get("order_type") or "") == "GTD", orders
         exp = int(orders[0].get("expiration") or 0)
         assert exp > time.time() + 3000, (exp, time.time())
+
+        cheap = dict(quote)
+        cheap["token_id"] = "tok_pitch_rest_1"
+        cheap.pop("min_order_size", None)
+        meta_cheap = {
+            **meta,
+            "match_id": "m_pitch_rest_1",
+            "event_key": "score_change|m_pitch_rest_1|0-0->1-0",
+            "trade_context": {
+                "pitch_gate": True,
+                "base_event_key": "score_change|m_pitch_rest_1|0-0->1-0",
+            },
+        }
+        row1 = ex.maybe_trade(
+            cheap,
+            event_key=meta_cheap["event_key"],
+            match_meta=meta_cheap,
+            event_type="score_change",
+        )
+        assert row1 is not None and row1.get("status") == "rest_dry_run", row1
+        orders1 = row1.get("rest_orders") or (row1.get("plan") or {}).get("levels") or []
+        assert orders1, row1
+        assert abs(float(orders1[0].get("price") or 0) - 0.99) < 1e-9, orders1
+        assert 0.99 <= float(orders1[0].get("usdc") or 0) <= 1.02, orders1
+        assert float(orders1[0].get("shares") or 0) + 1e-9 >= 1.0, orders1
+        assert float(orders1[0].get("shares") or 0) < 2.0, orders1
 
         # --- post-buy protection window: DQD reversal flattens gate lots ---
         os.environ.pop("QUOTE_REST_ENABLED", None)
@@ -512,7 +685,8 @@ def main() -> int:
     assert obs_mod.get_active_observer() is None
 
     print(
-        "ok: pitch_gate 1-frame buy + var_veto + buy_revoke + gate_protect_flatten"
+        "ok: pitch_gate 1-frame buy + var_veto + buy_revoke + gate_protect_flatten "
+        "+ reversal observe_only"
     )
     return 0
 

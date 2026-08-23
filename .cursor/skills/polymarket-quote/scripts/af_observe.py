@@ -242,6 +242,9 @@ class AfScoreObserver:
                     "elapsed_s": round(elapsed, 3),
                     "source": "af",
                     "gate": True,
+                    "observe_only": bool(session.ev.get("is_reversal"))
+                    or bool(session.ev.get("observe_only")),
+                    "is_reversal": bool(session.ev.get("is_reversal")),
                     "ok": False,
                     "error": None,
                     "af_fixture_id": None,

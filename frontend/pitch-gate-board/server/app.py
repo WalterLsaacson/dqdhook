@@ -25,16 +25,19 @@ DATA = ROOT / "data" / "pm-quote"
 BRIDGE_EVENTS_PATH = ROOT / "data" / "bridge" / "events.jsonl"
 OBSERVE_PATH = DATA / "dqd_stream_observe.jsonl"
 AF_OBSERVE_PATH = DATA / "af_observe.jsonl"
+NAMI_OBSERVE_PATH = DATA / "nami_observe.jsonl"
 JUDGE_PATH = DATA / "pitch_state_judge.jsonl"
 QUOTES_PATH = DATA / "quotes.jsonl"
 FRAMES_ROOT = DATA / "dqd_stream_frames"
 
 # Cap how much history we scan for the board.
-_MAX_OBSERVE_LINES = 50000
-_MAX_AF_OBSERVE_LINES = 25000
-_MAX_JUDGE_LINES = 25000
-_MAX_BRIDGE_LINES = 8000
-_MAX_QUOTES_LINES = 8000
+_MAX_GOALS = 5000
+_MAX_OBSERVE_LINES = 250000
+_MAX_AF_OBSERVE_LINES = 120000
+_MAX_NAMI_OBSERVE_LINES = 200000
+_MAX_JUDGE_LINES = 50000
+_MAX_BRIDGE_LINES = 20000
+_MAX_QUOTES_LINES = 20000
 
 
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
@@ -186,6 +189,42 @@ def _lookup_judge(
     if mid and ek and sample_i is not None:
         return by_key.get((mid, ek, sample_i))
     return None
+
+
+def _nami_nearest(frames: list[dict[str, Any]], elapsed: Any) -> dict[str, Any] | None:
+    """Sample closest to ``elapsed`` seconds, if within 6s."""
+    if elapsed is None or not frames:
+        return None
+    try:
+        t = float(elapsed)
+    except (TypeError, ValueError):
+        return None
+    best: dict[str, Any] | None = None
+    best_d: float | None = None
+    for f in frames:
+        if f.get("ball_x") is None:
+            continue
+        try:
+            e = float(f.get("elapsed_s"))
+        except (TypeError, ValueError):
+            continue
+        d = abs(e - t)
+        if best_d is None or d < best_d:
+            best_d = d
+            best = f
+    if best is None or best_d is None or best_d > 6.0:
+        return None
+    return best
+
+
+def _cap_nami_frames(frames: list[dict[str, Any]], *, limit: int = 240) -> list[dict[str, Any]]:
+    if len(frames) <= limit:
+        return frames
+    step = max(1, len(frames) // limit)
+    out = frames[::step]
+    if out[-1] is not frames[-1]:
+        out.append(frames[-1])
+    return out[: limit + 1]
 
 
 def _goal_verdict(frames: list[dict[str, Any]]) -> str:
@@ -355,7 +394,7 @@ def _load_reversal_index() -> tuple[
     return recent, by_match, cancel_by_key
 
 
-def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
+def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
     observe = _read_jsonl_tail(OBSERVE_PATH, max_lines=_MAX_OBSERVE_LINES)
     judges = _read_jsonl_tail(JUDGE_PATH, max_lines=_MAX_JUDGE_LINES)
     by_key, by_path = _index_judges(judges)
@@ -381,11 +420,18 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
                 "dqd_ts": row.get("dqd_ts") or row.get("sampled_at"),
                 "gate": bool(row.get("gate")),
                 "frames": [],
+                "kind": None,
+                "observe_only": False,
+                "is_reversal": False,
             }
             order.append(ek)
         g = groups[ek]
         if row.get("gate"):
             g["gate"] = True
+        if row.get("is_reversal") or row.get("observe_only"):
+            g["is_reversal"] = True
+            g["observe_only"] = True
+            g["kind"] = "reversal_observe"
         # Prefer latest score/teams from later samples.
         for k in ("home", "away", "home_score", "away_score", "score", "dqd_ts"):
             if row.get(k) is not None and row.get(k) != "":
@@ -423,6 +469,7 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
             "dom_pop_class": (dom or {}).get("pop_class"),
             "dom_center_box": (dom or {}).get("center_box"),
             "dom_marks": (dom or {}).get("marks"),
+            "nami": row.get("nami") if isinstance(row.get("nami"), dict) else None,
         }
 
         # Upsert by sample_i so re-reads / retries replace.
@@ -472,9 +519,16 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
                 "dqd_ts": row.get("dqd_ts") or row.get("observed_at"),
                 "gate": bool(row.get("gate")),
                 "frames": [],
+                "kind": None,
+                "observe_only": False,
+                "is_reversal": False,
             }
             order.append(ek)
         g = groups[ek]
+        if row.get("is_reversal") or row.get("observe_only"):
+            g["is_reversal"] = True
+            g["observe_only"] = True
+            g["kind"] = "reversal_observe"
         for k in ("home", "away", "home_score", "away_score", "dqd_ts"):
             if row.get(k) is not None and row.get(k) != "":
                 g[k] = row.get(k)
@@ -495,6 +549,29 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
                 "af_score": row.get("af_score"),
                 "dqd_score": row.get("dqd_score"),
                 "score_match": row.get("score_match"),
+            }
+        )
+
+    nami_rows = _read_jsonl_tail(NAMI_OBSERVE_PATH, max_lines=_MAX_NAMI_OBSERVE_LINES)
+    nami_by_key: dict[str, list[dict[str, Any]]] = {}
+    for row in nami_rows:
+        ek = str(row.get("event_key") or "").strip()
+        if not ek or ek not in groups:
+            continue
+        if row.get("ball_x") is None:
+            continue
+        nami_by_key.setdefault(ek, []).append(
+            {
+                "sample_i": row.get("sample_i"),
+                "elapsed_s": row.get("elapsed_s"),
+                "observed_at": row.get("observed_at"),
+                "score_raw": row.get("score_raw"),
+                "ball_xy": row.get("ball_xy"),
+                "ball_x": row.get("ball_x"),
+                "ball_y": row.get("ball_y"),
+                "zone": row.get("zone"),
+                "restart_center": row.get("restart_center"),
+                "in_box": row.get("in_box"),
             }
         )
 
@@ -537,10 +614,106 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
                 in_play_at = f.get("elapsed_s")
                 break
         g["in_play_elapsed_s"] = in_play_at
+        nami_frames = list(nami_by_key.get(ek) or [])
+        nami_frames.sort(
+            key=lambda f: (
+                int(f.get("sample_i") or 0),
+                float(f.get("elapsed_s") or 0),
+            )
+        )
+        nami_frames = _cap_nami_frames(nami_frames)
+        nami_by_si: dict[int, dict[str, Any]] = {}
+        for nf in nami_frames:
+            si = nf.get("sample_i")
+            if si is None:
+                continue
+            try:
+                nami_by_si[int(si)] = nf
+            except (TypeError, ValueError):
+                continue
+        for i, f in enumerate(frames):
+            f["dom_seq"] = i + 1
+            if not isinstance(f.get("nami"), dict) or f["nami"].get("ball_x") is None:
+                hit = None
+                si = f.get("sample_i")
+                if si is not None:
+                    try:
+                        hit = nami_by_si.get(int(si))
+                    except (TypeError, ValueError):
+                        hit = None
+                if hit is None:
+                    hit = _nami_nearest(nami_frames, f.get("elapsed_s"))
+                f["nami"] = (
+                    {
+                        "elapsed_s": hit.get("elapsed_s"),
+                        "ball_x": hit.get("ball_x"),
+                        "ball_y": hit.get("ball_y"),
+                        "zone": hit.get("zone"),
+                        "restart_center": hit.get("restart_center"),
+                        "in_box": hit.get("in_box"),
+                    }
+                    if hit
+                    else None
+                )
+        # Carry last known xy along the DOM sequence so commentary-only MQTT
+        # ticks still show a numbered point (already-written unknown rows).
+        last_nami: dict[str, Any] | None = None
+        for f in frames:
+            n = f.get("nami") if isinstance(f.get("nami"), dict) else None
+            if n and n.get("ball_x") is not None:
+                last_nami = n
+                continue
+            if last_nami is None:
+                continue
+            carried = dict(last_nami)
+            carried["carried"] = True
+            f["nami"] = carried
+        # Do not ship the MQTT trail — board only draws numbered DOM samples.
+        g["nami_frames"] = []
+        g["nami_frame_count"] = 0
+        g["nami_in_play"] = next(
+            (
+                f.get("nami")
+                for f in frames
+                if (f.get("judge") or {}).get("play_state") == "in_play"
+                and (f.get("nami") or {}).get("ball_x") is not None
+            ),
+            _nami_nearest(nami_frames, in_play_at),
+        )
+        g["nami_saw_center"] = any(
+            (f.get("nami") or {}).get("restart_center") for f in frames
+        )
+        g["nami_saw_box"] = any((f.get("nami") or {}).get("in_box") for f in frames)
+        g["nami_dom_points"] = sum(
+            1 for f in frames if (f.get("nami") or {}).get("ball_x") is not None
+        )
 
         mid = str(g.get("match_id") or "")
         ek = str(g.get("event_key") or "")
         goal_prev, goal_curr = _parse_score_transition(ek)
+        if goal_prev is not None:
+            g["score_from"] = f"{goal_prev[0]}-{goal_prev[1]}"
+        if goal_curr is not None:
+            g["score_to"] = f"{goal_curr[0]}-{goal_curr[1]}"
+        inv = _invert_score_change_key(ek)
+        if inv and inv in groups:
+            g["linked_event_key"] = inv
+
+        is_rev_obs = (
+            g.get("kind") == "reversal_observe"
+            or bool(g.get("is_reversal"))
+            or bool(g.get("observe_only"))
+        )
+        if is_rev_obs:
+            g["kind"] = "reversal_observe"
+            g["reversed"] = False
+            g["reversal"] = None
+            g["verdict"] = "reversal_observe"
+            goals.append(g)
+            if len(goals) >= max(1, limit):
+                break
+            continue
+
         cancel = cancel_by_key.get(ek)
         reversed_flag = False
         reversal_info: dict[str, Any] | None = None
@@ -581,19 +754,23 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
 
     in_play_n = sum(1 for g in goals if g.get("verdict") == "in_play")
     rev_n = sum(1 for g in goals if g.get("reversed"))
+    rev_obs_n = sum(1 for g in goals if g.get("kind") == "reversal_observe")
     gate_n = sum(1 for g in goals if g.get("gate"))
     return {
         "updated_at": None,
         "observe_path": str(OBSERVE_PATH),
         "af_observe_path": str(AF_OBSERVE_PATH),
+        "nami_observe_path": str(NAMI_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
         "frames_root": str(FRAMES_ROOT),
         "goal_count": len(goals),
         "gate_goal_count": gate_n,
         "in_play_count": in_play_n,
         "reversed_count": rev_n,
+        "reversal_observe_count": rev_obs_n,
         "observe_rows": len(observe),
         "af_observe_rows": len(af_rows),
+        "nami_observe_rows": len(nami_rows),
         "judge_rows": len(judges),
         "goals": goals,
         "recent_reversals": recent_reversals[:40],
@@ -601,7 +778,7 @@ def build_goals_payload(*, limit: int = 500) -> dict[str, Any]:
 
 
 def status_payload() -> dict[str, Any]:
-    snap = build_goals_payload(limit=500)
+    snap = build_goals_payload(limit=_MAX_GOALS)
     latest = None
     if snap["goals"]:
         latest = snap["goals"][0].get("dqd_ts")
@@ -611,10 +788,12 @@ def status_payload() -> dict[str, Any]:
         "viewer": True,
         "observe_path": str(OBSERVE_PATH),
         "af_observe_path": str(AF_OBSERVE_PATH),
+        "nami_observe_path": str(NAMI_OBSERVE_PATH),
         "judge_path": str(JUDGE_PATH),
         "frames_root": str(FRAMES_ROOT),
         "observe_exists": OBSERVE_PATH.is_file(),
         "af_observe_exists": AF_OBSERVE_PATH.is_file(),
+        "nami_observe_exists": NAMI_OBSERVE_PATH.is_file(),
         "judge_exists": JUDGE_PATH.is_file(),
         "goal_count": snap["goal_count"],
         "gate_goal_count": snap["gate_goal_count"],
@@ -680,10 +859,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/goals":
             try:
-                limit = int((qs.get("limit") or ["500"])[0])
+                limit = int((qs.get("limit") or [str(_MAX_GOALS)])[0])
             except (TypeError, ValueError):
-                limit = 500
-            limit = max(1, min(limit, 500))
+                limit = _MAX_GOALS
+            limit = max(1, min(limit, _MAX_GOALS))
             json_response(self, 200, build_goals_payload(limit=limit))
             return
 

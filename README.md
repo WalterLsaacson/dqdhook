@@ -17,7 +17,7 @@
                      │
          ┌───────────┼───────────┐
          ▼           ▼           ▼
-   进球 pitch-gate   终场立刻询价   回撤取消门控/rest
+   进球 pitch-gate   终场立刻询价   回撤立刻认 + 观察 AF/DOM
    （读动画 DOM）     （无门控直接询价）（不自动平仓）
 ```
 
@@ -40,7 +40,7 @@
 | 懂球帝看板 | `:8787` | DQD 赛程 |
 | Polymarket 看板 | `:8788` | Gamma 快照 |
 | Match Bridge 看板 | `:8789` | 配对结果（只读；quote 持有桥） |
-| Pitch Gate 看板 | `:8791` | 每球逐帧 DOM 状态 + AF 比分观察（可筛 in_play / 回撤） |
+| Pitch Gate 看板 | `:8791` | 每球逐帧 DOM 状态 + AF 比分观察（可筛 in_play / 回撤 / 回撤观察） |
 | API-Football Bridge 看板 | `:8792` | DQD→AF fixture 缓存 / events |
 | `pm_quote watch` | — | **进程内持有 match-bridge**，内存队列直达询价 |
 
@@ -58,7 +58,7 @@
 3. **配对**：英队名 + 北京开球时间模糊匹配（`min_score` / `min_side` / 联赛别名等，见 `match-bridge`）。未配对场次**不会**进门控下单。
 4. Bridge 产出事件：
    - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**
-   - `score_change` + 回撤（任一侧比分下降）→ **取消**该场门控与 rest；**不自动 flatten**
+   - `score_change` + 回撤（任一侧比分下降）→ **立刻认**：取消该场门控与 rest（买后保护窗口内会 flatten）；同时开一条 **回撤观察**（AF/DOM，不下单）
    - `match_finished`（`period` 切入 `FT`）→ **立刻询价下单**（不过门控）
 5. 加时中（DQD 仍在踢、`minute>90` 且 `injury_time==0`）的比分抖动**不发事件**，避免误触发。
 
@@ -75,7 +75,7 @@
 | 下单 | `_quote_one`（`trade_context.pitch_gate=true`），**每球最多一刀**；买后仍继续采样直到超时（供看板复盘） |
 | VAR | 采样过程中任一帧判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`），仍采满超时窗口 |
 | 超时 | 全程没有合格 `in_play` → `pitch_gate_timeout`，不买 |
-| 回撤 | DQD 回撤 → 取消会话 `pitch_gate_canceled`；**买后 300s 内**则立即平仓（见下节） |
+| 回撤 | DQD 回撤 → 取消进球会话 `pitch_gate_canceled`；**买后 300s 内**则立即平仓（见下节）；仅当该球**已 in_play** 才对回撤比分开 observe-only 采样（看板「回撤观察」） |
 
 **判定源：读动画 DOM，不再截图、不再跑 OCR**
 
@@ -130,7 +130,7 @@
 
 | 动作 | 行为 |
 |---|---|
-| DQD 回撤 | 取消该场 **rest 限价** + **进行中的 pitch-gate** + 撤销未 drain 的买信号 |
+| DQD 回撤 | 取消该场 **rest 限价** + **进行中的进球 pitch-gate** + 撤销未 drain 的买信号；若该球已 in_play，再开一条 **observe-only** AF/DOM 会话（交易已认，观察不下单） |
 | 回撤发生在门控买入后 **`QUOTE_GATE_PROTECT_S`（默认 300s）** 内 | **立即 FAK 平仓**（`gate_protect_reversal`），dry lot 只记 `flatten_dry_run` |
 | 回撤超出该窗口，或是 FT（非门控）持仓 | 不动，沿用终场 `ft_reversal_vs_entry`（届时已近归零，只是清仓释放额度） |
 | `QUOTE_GATE_PROTECT_S=0` | 关闭买后保护，退回「一律等终场」 |
@@ -138,7 +138,7 @@
 
 平仓卖出沿用既有风控：按 `entry×80%` 设最低卖价，不做 0.01 甩卖；吃不掉的残量留给后续 tick 重试。持仓记录在 `data/pm-quote/open_positions.json`，带 `pitch_gate` 与 `opened_at` 两个字段用于判定窗口。
 
-Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 后又回撤，列表按钮/徽章为**红色**（「回撤·曾in_play」）。
+Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 后又回撤，列表按钮/徽章为**红色**（「回撤·曾in_play」）。回撤后的 AF/DOM 采样是独立的**青色**「回撤观察」卡片（比分变化如 `1-0→0-0`），与原进球卡可互跳对照。
 
 ### 5. 询价与成交规则
 
@@ -157,7 +157,8 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 **限价 rest（可选，默认关）：**
 
 - 需 `QUOTE_REST_ENABLED=1`  
-- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、**≥5 shares**（约 $4.95）、`GTD`，过期默认 3600s  
+- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、`GTD`，过期默认 3600s  
+- 金额跟 **`QUOTE_MAX_USDC`（默认 $1）**  
 - DQD 回撤会取消这些 rest  
 
 ### 6. 模式与仓位
@@ -204,9 +205,9 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 1. Hub：Quote 进程 up · Trade `goals:live ft:live` · Boards 4/4。  
 2. Bridge 看板有配对场次。  
 3. Pitch Gate（`:8791`）在进球后出现帧与 `play_state`。  
-4. `data/pm-quote/watch.log` 可见：`pitch-gate → START` → `CONFIRM` / `IN_PLAY` / `VAR_VETO` / `TIMEOUT` / `CANCEL`。  
+4. `data/pm-quote/watch.log` 可见：`pitch-gate → START` → `CONFIRM` / `IN_PLAY` / `VAR_VETO` / `TIMEOUT` / `CANCEL`；回撤还有 `OBSERVE START` / `OBSERVE_COMPLETE`。  
 5. 成交写入 `data/pm-quote/trades.jsonl`（live 且成功时 `live: true`）。  
-6. 回撤日志为取消门控/rest，**不应**期待自动 flatten。
+6. 回撤立刻取消门控/rest（买后保护窗口内会 flatten）；仅已 in_play 的球才会开「回撤观察」，观察结果不下单。
 
 ---
 
@@ -223,8 +224,8 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控确认单跳过** |
 | `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
-| `QUOTE_NAMI_OBSERVE` | 默认 `0`；`1` 订阅纳米实时流落盘（observe-only，不影响下单） |
-| `QUOTE_REST_ENABLED` | 默认 `0`；`1` 才挂 0.99 rest |
+| `QUOTE_NAMI_OBSERVE` | 默认 `1`；`0` 关闭纳米球位 MQTT 观察（不影响下单） |
+| `QUOTE_REST_ENABLED` | `1` 才挂 0.99 rest（金额跟 `QUOTE_MAX_USDC`，默认 $1） |
 | `QUOTE_REST_EXPIRE_S` | rest 过期秒数，默认 3600 |
 | `QUOTE_FT_MAX_AGE_S` | 默认 900，过旧事件跳过 |
 | `QUOTE_INTERVAL` | watch 最大空闲间隔，默认 0.25s |
@@ -250,7 +251,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `data/pm-quote/dqd_stream_frames/` | JPEG 截帧 |
 | `data/pm-quote/pitch_state_judge.jsonl` | 每帧 OCR 判定（仅 `QUOTE_GATE_SOURCE=ocr`） |
 | `data/pm-quote/af_observe.jsonl` | AF 比分观察（进球后 +5s/5s ≤90s，不下单） |
-| `data/pm-quote/nami_observe.jsonl` | 纳米实时流采样（比分 / 球位 / 原始 payload），仅调研 |
+| `data/pm-quote/nami_observe.jsonl` | 每个 DOM 采样时的纳米球位（xy + 序号 + 分区），仅观察 |
 | `data/pm-quote/dom_vs_ocr.jsonl` | DOM 读数与 OCR 判定并排记录（仅 `QUOTE_GATE_SOURCE=ocr`） |
 | `data/pm-quote/open_positions.json` | 未平 `buy_win` 仓 |
 | `data/pm-quote/cursor.json` | 已处理 key / 终场 id |

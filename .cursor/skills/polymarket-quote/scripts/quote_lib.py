@@ -1669,6 +1669,7 @@ def quote_tokens(
             "bids_top": book.get("bids_top") or [],
             "asks_top": book.get("asks_top") or [],
             "tick_size": book.get("tick_size") or "",
+            "min_order_size": book.get("min_order_size") or "",
             "neg_risk": book.get("neg_risk"),
             "book_ts": book.get("book_ts") or "",
             "book_missing": bool(book.get("book_missing")),
@@ -2008,7 +2009,9 @@ def process_bridge_events(
 
     Goal-ups wait for pitch-state ``in_play`` (first frame @+5s, then every 5s
     until 150s; buy once, keep capturing) before one ``_quote_one``. DQD reversals
-    cancel rest orders and open pitch-gate sessions.
+    cancel rest orders and open pitch-gate sessions, then start an observe-only
+    AF/DOM trail (no buy) on the reversal event_key **only if that goal already
+    reached in_play**.
     """
     from score_events import (
         event_is_goal_up,
@@ -2178,6 +2181,52 @@ def process_bridge_events(
             ev = item.get("ev") if isinstance(item.get("ev"), dict) else {}
             if not key:
                 continue
+            observe_only = bool(item.get("observe_only")) or bool(ev.get("is_reversal"))
+            if observe_only:
+                if status == "in_play":
+                    print(
+                        f"pitch-gate → OBSERVE skip-buy match_id={mid} key={key}",
+                        flush=True,
+                    )
+                    continue
+                mode = {
+                    "observe_complete": "reversal_observe_complete",
+                    "canceled": "reversal_observe_canceled",
+                    "unavailable": "reversal_observe_unavailable",
+                    "error": "reversal_observe_error",
+                    "timeout": "reversal_observe_complete",
+                    "var_veto": "reversal_observe_complete",
+                    "complete": "reversal_observe_complete",
+                }.get(status, f"reversal_observe_{status or 'unknown'}")
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": mode,
+                        "event_key": key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "pitch_gate": {
+                            "status": status,
+                            "reason": item.get("reason"),
+                            "elapsed_s": item.get("elapsed_s"),
+                            "buy_emitted": False,
+                            "var_seen": item.get("var_seen"),
+                            "observe_only": True,
+                        },
+                    }
+                )
+                print(
+                    f"pitch-gate → {status.upper()} (observe only) match_id={mid} "
+                    f"key={key} reason={item.get('reason')}",
+                    flush=True,
+                )
+                continue
             if status == "in_play":
                 work_ev = dict(ev)
                 work_ev["_trade_context"] = {
@@ -2338,6 +2387,13 @@ def process_bridge_events(
                             f"ALERT rest cancel on reversal failed match={mid_rev}: {e}",
                             flush=True,
                         )
+                observe_ok = False
+                try:
+                    observe_ok = bool(
+                        gate.should_observe_reversal(key, match_id=mid_rev)
+                    )
+                except Exception:  # noqa: BLE001
+                    observe_ok = False
                 try:
                     gate.cancel_match(mid_rev, reason="dqd_reversal")
                 except Exception as e:  # noqa: BLE001
@@ -2379,6 +2435,22 @@ def process_bridge_events(
                         )
                 except Exception as e:  # noqa: BLE001
                     print(f"ALERT livescore observe reversal failed: {e}", flush=True)
+                # Trade already 认. Observe only if this reverse undoes an in_play goal.
+                obs_started = False
+                if observe_ok:
+                    obs_ev = dict(ev)
+                    obs_ev["is_reversal"] = True
+                    obs_ev["observe_only"] = True
+                    try:
+                        obs_started = bool(
+                            gate.start_gate(obs_ev, event_key=key, observe_only=True)
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT pitch-gate reversal observe start failed "
+                            f"match={mid_rev}: {e}",
+                            flush=True,
+                        )
                 bundles.append(
                     {
                         "quoted_at": now_cn_iso(),
@@ -2392,13 +2464,17 @@ def process_bridge_events(
                         "away_score": ev.get("away_score"),
                         "flatten_attempts": rev_flatten,
                         "flatten_count": len(rev_flatten),
-                        "pitch_gate": {"status": "cancel_requested"},
+                        "pitch_gate": {
+                            "status": "cancel_requested",
+                            "observe_started": obs_started,
+                        },
                     }
                 )
                 seen.add(key)
                 print(
                     f"dqd-reversal → cancel pitch-gate match_id={mid_rev} key={key} "
-                    f"flatten={len(rev_flatten)}",
+                    f"flatten={len(rev_flatten)} · observe trail "
+                    f"{'started' if obs_started else 'skipped (not in_play)'}",
                     flush=True,
                 )
                 continue

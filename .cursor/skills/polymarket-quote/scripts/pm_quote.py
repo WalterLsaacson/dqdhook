@@ -309,7 +309,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         nami_obs.start()
     else:
         print(
-            "nami observe skipped (set QUOTE_NAMI_OBSERVE=1)",
+            "nami observe skipped (QUOTE_NAMI_OBSERVE=0)",
             file=sys.stderr,
             flush=True,
         )

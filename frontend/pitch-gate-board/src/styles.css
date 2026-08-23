@@ -376,6 +376,12 @@ button.pill {
   border-color: transparent;
 }
 
+.badge--reversal_observe {
+  color: #041018;
+  background: #67e8f9;
+  border-color: transparent;
+}
+
 .pill.is-rev {
   border-color: rgba(245, 158, 11, 0.55);
   color: var(--warn);
@@ -384,6 +390,11 @@ button.pill {
 .pill.is-rev-hard {
   border-color: rgba(251, 113, 133, 0.55);
   color: var(--danger);
+}
+
+.pill.is-obs {
+  border-color: rgba(103, 232, 249, 0.55);
+  color: #67e8f9;
 }
 
 .goal-item.is-reversed {
@@ -396,6 +407,11 @@ button.pill {
   background: rgba(251, 113, 133, 0.1);
 }
 
+.goal-item.is-reversal-observe {
+  border-color: rgba(103, 232, 249, 0.5);
+  background: rgba(56, 189, 248, 0.08);
+}
+
 .detail__rev {
   margin: 8px 0 0;
   color: var(--warn);
@@ -405,6 +421,31 @@ button.pill {
 
 .detail__rev--after-inplay {
   color: var(--danger);
+}
+
+.detail__rev--observe {
+  color: #67e8f9;
+}
+
+.detail__link-wrap {
+  margin: 6px 0 0;
+}
+
+.detail__link {
+  appearance: none;
+  border: 1px solid rgba(103, 232, 249, 0.4);
+  background: transparent;
+  color: #67e8f9;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.detail__link:hover {
+  background: rgba(56, 189, 248, 0.12);
 }
 
 .toast-stack {
@@ -608,6 +649,119 @@ button.pill {
 
 .goal-item__af {
   color: #38bdf8;
+}
+
+.goal-item__nami {
+  color: #a3e635;
+}
+
+.nami-trail {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(163, 230, 53, 0.28);
+  border-radius: 10px;
+  background: rgba(77, 124, 15, 0.12);
+}
+
+.nami-pitch {
+  display: block;
+  width: 100%;
+  max-width: 420px;
+  height: auto;
+  background: #0a1a12;
+  border-radius: 8px;
+}
+
+.nami-pitch__field {
+  fill: rgba(6, 78, 59, 0.55);
+  stroke: rgba(167, 243, 208, 0.45);
+  stroke-width: 0.6;
+}
+
+.nami-pitch__line {
+  stroke: rgba(167, 243, 208, 0.35);
+  stroke-width: 0.5;
+  fill: none;
+}
+
+.nami-dot {
+  fill: rgba(226, 232, 240, 0.45);
+}
+
+.nami-dot--trail {
+  opacity: 0.45;
+}
+
+.nami-num {
+  fill: #ecfdf5;
+  font-size: 3.4px;
+  font-weight: 700;
+  font-family: var(--font-display), sans-serif;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: #041018;
+  stroke-width: 0.6px;
+  pointer-events: none;
+}
+
+.nami-dot.is-box {
+  fill: #fbbf24;
+}
+
+.nami-dot.is-center {
+  fill: #38bdf8;
+}
+
+.nami-dot.is-last {
+  fill: #e2e8f0;
+}
+
+.nami-dot.is-inplay {
+  fill: #34d399;
+  stroke: #ecfdf5;
+  stroke-width: 0.5;
+}
+
+.nami-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  align-items: center;
+}
+
+.nami-legend__swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 99px;
+  margin-right: 4px;
+  background: rgba(226, 232, 240, 0.45);
+}
+
+.nami-legend__swatch.is-inplay {
+  background: #34d399;
+}
+
+.nami-legend__swatch.is-center {
+  background: #38bdf8;
+}
+
+.nami-legend__swatch.is-box {
+  background: #fbbf24;
+}
+
+.nami-legend__swatch.is-last {
+  background: #e2e8f0;
+}
+
+.nami-empty {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .af-trail {

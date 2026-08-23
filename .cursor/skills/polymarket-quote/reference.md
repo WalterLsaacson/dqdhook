@@ -111,13 +111,13 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 7. DQD reversal → `cancel_match(match_id)` → cancels open sessions **and revokes any undrained `in_play` buy rows** (`buy_revoked` / `pitch_gate_buy_revoked`). Quote tick drains gate results **after** event handling so same-tick reversals win the race. (If the buy already executed on a prior tick, cancel cannot unwind it.)
 8. Requires `QUOTE_DQD_STREAM_OBSERVE=1` and `QUOTE_PITCH_STATE=1`; else `pitch_gate_unavailable`.
 9. FT path remains immediate quote (default live), no screenshot gate.
-10. **Rest fallback** (opt-in): when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill (no ask / not misprice), post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size is at least **5 shares** (CLOB limit floor, ≈ **$4.95** @ 0.99). Default **`QUOTE_REST_ENABLED=0`** (no limit posts). Logged as `rest_dry_run` / `rest_posted`; DQD reversal still cancels these rests.
+10. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill (no ask / not misprice), post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size follows **`QUOTE_MAX_USDC`** (default **$1**). Logged as `rest_dry_run` / `rest_posted`; DQD reversal still cancels these rests.
 
 **Score reversal / disallowed goal**
 
 - Bridge emits `score_change` with `is_reversal=true` when either side’s score drops.
 - Goal-ups wait for pitch-gate; FT quotes immediately (default live). Events older than `QUOTE_FT_MAX_AGE_S` (default **900**) are skipped; FT once-per-`match_id` via `cursor.processed_ft_match_ids`.
-- DQD reversal cancels rest orders and open pitch-gate sessions, and revokes undrained buys.
+- DQD reversal cancels rest orders and open pitch-gate sessions, and revokes undrained buys. If that reverse undoes a goal that already reached **in_play**, it then starts an **observe-only** gate on the reversal `event_key` (same DOM +5s/5s/150s and AF 90s cadence; never `_quote_one`). Pitch Gate board shows a separate 「回撤观察」 card so AF/DOM can be compared against the post-reversal DQD score. Reversals that never hit in_play are not observed.
 - **Post-buy protection window**: lots carry `pitch_gate` + `opened_at`. A DQD reversal that undoes the entry score flattens gate lots opened within **`QUOTE_GATE_PROTECT_S`** (default **300s**, `0` disables) as `gate_protect_reversal`. Lots outside the window, and non-gate (FT) lots, stay deferred to the FT `ft_reversal_vs_entry` path — by then the token is near zero, so that exit frees budget rather than recovering value. Top-ups keep the first `opened_at` so the window never extends. The window is bounded because late DQD score drops are more often data noise than real VAR calls, and flattening on noise sells into a bad book for nothing.
 - Live flatten FAK-sells floored shares with entry×80% floor; dry lots never CLOB-sell.
 - Rebuild closes zombie opens when known FT already undoes entry (`stale_ft_reversal`).
@@ -131,7 +131,7 @@ After a `score_change` that successfully `buy_win`s (dry_run or posted), watch w
 
 Pitch-gate drives captures every **5s** for up to **150s** after a paired goal (first frame @ **+5s**; ≥5 frames; continues after first `in_play` buy). Rows still land in `data/pm-quote/dqd_stream_observe.jsonl` / `dqd_stream_frames/` with `gate=true`. Pitch-state judges write `data/pm-quote/pitch_state_judge.jsonl` (and JPEG sidecars). Missing stream/pitch env → gate unavailable (no buy for that goal).
 
-**AF score observe (research only):** on the same goal `t0`, `af_observe.py` polls API-Football events on the **same +5s / 5s clock** but only for **90s**, writing `data/pm-quote/af_observe.jsonl`. Enabled by default when `apifootball_key` is set (`QUOTE_AF_OBSERVE=0` to disable). Never buys. Fixture ids are cache-only from `apifootball-bridge` (`MAIN_AF_WATCH` via af-bridge-board **:8792**).
+**AF score observe (research only):** on the same goal (or reversal) `t0`, `af_observe.py` polls API-Football events on the **same +5s / 5s clock** but only for **90s**, writing `data/pm-quote/af_observe.jsonl`. Reversal rows carry `is_reversal` / `observe_only`. Enabled by default when `apifootball_key` is set (`QUOTE_AF_OBSERVE=0` to disable). Never buys. Fixture ids are cache-only from `apifootball-bridge` (`MAIN_AF_WATCH` via af-bridge-board **:8792**).
 
 **Animation source (纳米数据):** the gate screenshots the nami tracker directly rather than the DQD match page. `match_list` already returns `animation_live` (`https://tracker.namitiyu.com/zh/football?profile=…&id=<nami_id>`) on every row, so `map_match` keeps it and `dqd_live.discover_live_surface` reads it out of `data/snapshot.json` (memoized on mtime) and returns `surface="animation"` with the tracker as `page_url` — no extra request, and no dependency on the DQD page DOM. Rows carry `nami_id`.
 
@@ -141,11 +141,15 @@ Two things this does **not** fix: nami serves 暂无动画 for fixtures it does 
 
 Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_nami_observe.py`, `.../smoke_af_observe.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
 
-**Nami live feed observe (`QUOTE_NAMI_OBSERVE=1`, observe-only)**
+**Nami live feed observe (default on, ``QUOTE_NAMI_OBSERVE=0`` to disable)**
 
-The tracker SPA streams live state over MQTT-on-WebSocket (`wss://trackermq.namitiyu.com/mqtt`, anonymous, topics `live/m1/<nami_id>` and `live/m1/<nami_id>/nft/zh`); payloads are undocumented protobuf. `nami_observe.py` implements just enough MQTT 3.1.1 to subscribe while a match is under gate (plus 60s linger) and appends to `data/pm-quote/nami_observe.jsonl`.
+The tracker SPA streams live state over MQTT-on-WebSocket (`wss://trackermq.namitiyu.com/mqtt`, anonymous, topics `live/m1/<nami_id>` and `live/m1/<nami_id>/nft/zh`); payloads are undocumented protobuf. `nami_observe.py` subscribes while a match is under gate (plus 60s linger) and keeps the latest ball in memory. jsonl is written only when pitch-gate takes a DOM sample (`sample_i`, `elapsed_s`, `play_state`, classified xy). MQTT itself does not append.
 
-Each row keeps `msg_type`, `score_raw` (`"1-0-1-0"` = full/half), `ball_xy` (normalized pitch position), and `payload_hex` so the schema can be reverse-engineered offline. Rather than pin field numbers, `harvest()` scans the wire format for those two value shapes. Observed ~1.7 msgs/s across 5 live matches; `score_raw` agreed with the DQD score on every sample so far.
+Each DOM-sample row keeps `score_raw` (`"1-0-1-0"` = full/half), `ball_xy` plus classified `zone` (`center` / `box_l` / `box_r` / `third_*` / `mid`), `restart_center`, `in_box`, and `mqtt_age_s`. MQTT types without coordinates (nft commentary, 10102, …) keep the last 10101 `ball_xy` instead of wiping it. Pitch-gate board numbers those points (no full-course trail). **Still never buys or flattens.**
+
+Ball motion during celebration/VAR is why coordinates stay observe-only: neither motion nor stillness maps cleanly onto play state. The numbered samples are for reviewing dual AF+DOM confirms that later reversed.
+
+`harvest()` scans the wire format for score/xy shapes rather than pinning field numbers. Observed ~1.7 msgs/s across 5 live matches; `score_raw` agreed with the DQD score on every sample so far. There is also a REST side (`https://tracker-api.namitiyu.com/api/football/{static_detail,variable_detail,progress}?id=<nami_id>`, protobuf, requires `Origin: https://tracker.namitiyu.com`) that is not wired up.
 
 **Gate source: DOM (default) vs OCR (legacy)**
 
@@ -160,17 +164,15 @@ Two failure modes are specific to this source and are guarded:
 - **Frozen page.** A stalled tab keeps rendering its last state forever. `judge_dom` requires the `.center-box` clock to have advanced since the previous read, and the reader takes a clock baseline at open so even sample 0 is covered. No advance → `unclear` with `stopped_reason=stale_page`.
 - **Clock read as score.** `"45:00"` must not become 45-0 — the same confusion that trips OCR. `parse_dom_center` splits on the board's spacing convention (score is `1 : 0`, clock is `78:57`) and falls back to consuming a leading clock before looking for a trailing score.
 
-Ball coordinates from the MQTT feed are deliberately *not* used to infer restart-of-play: the animation moves the ball during celebrations and VAR, and the feed only pushes on change, so neither motion nor stillness maps onto play state.
+Ball coordinates stay observe-only (see Nami section above) — the DOM gate does not use them to infer restart-of-play.
 
 Why the switch: a 24-frame sample across 3 live matches agreed 88%, and all 3 disagreements were OCR failing to read the scoreboard on a frame the DOM read exactly (the reverse never happened). Because the gate needs `in_play` **and** a matching board score, those misses did not open the gate wrongly — they delayed entry to a later 5s sample.
 
 In `ocr` mode each frame still records its DOM readout beside the OCR verdict in `data/pm-quote/dom_vs_ocr.jsonl` for comparison.
 
-This is a research tap for deciding whether ball position can replace OCR. It never feeds pitch-gate or trading. There is also a REST side (`https://tracker-api.namitiyu.com/api/football/{static_detail,variable_detail,progress}?id=<nami_id>`, protobuf, requires `Origin: https://tracker.namitiyu.com`) that is not wired up.
-
 **Pitch Gate board (System Main)**
 
-`frontend/pitch-gate-board` on **:8791** (launched by `run_main`) reads `dqd_stream_observe.jsonl` + `af_observe.jsonl` + `pitch_state_judge.jsonl`, groups by goal `event_key`, and shows each DOM frame with `play_state` plus the AF score trail (match/miss chips). Read-only viewer (no Start/Stop).
+`frontend/pitch-gate-board` on **:8791** (launched by `run_main`) reads `dqd_stream_observe.jsonl` + `af_observe.jsonl` + `nami_observe.jsonl` + `pitch_state_judge.jsonl`, groups by goal `event_key`, and shows each DOM frame with `play_state`, the AF score trail, and numbered Nami ball positions at those DOM samples. Read-only viewer (no Start/Stop).
 
 **Live Score API observe (trial, observe-only)**
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from size_policy import (
+    DEFAULT_MAX_USDC,
     DEFAULT_SIZE_TIERS,
     format_size_tiers,
     parse_size_tiers,
@@ -121,11 +122,11 @@ def load_trade_settings(
 
     # Hard caps: .env QUOTE_MAX_* wins when set; else CLI/hub arg; else defaults.
     if os.getenv("QUOTE_MAX_USDC"):
-        hard_usdc = float(os.getenv("QUOTE_MAX_USDC") or 1)
+        hard_usdc = float(os.getenv("QUOTE_MAX_USDC") or DEFAULT_MAX_USDC)
     elif max_usdc is not None:
         hard_usdc = float(max_usdc)
     else:
-        hard_usdc = 1.0
+        hard_usdc = float(DEFAULT_MAX_USDC)
     if os.getenv("QUOTE_MAX_SHARES"):
         hard_shares = float(os.getenv("QUOTE_MAX_SHARES") or 25)
     elif max_shares is not None:

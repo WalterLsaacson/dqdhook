@@ -7,7 +7,7 @@ import { fetchGoals } from "./api.js";
 import { consumeReversals, ensureFilterUi, render, renderMeta, setFilter } from "./render.js";
 
 async function refresh() {
-  const snap = await fetchGoals(500);
+  const snap = await fetchGoals(5000);
   renderMeta(snap);
   render(snap.goals || []);
   consumeReversals(snap.recent_reversals || [], { toast: true });

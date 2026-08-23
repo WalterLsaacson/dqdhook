@@ -101,40 +101,100 @@ def test_subscription_ttl() -> None:
     assert obs.stats()["wanted"] == 2, obs.stats()
 
 
-def test_record_writes_row() -> None:
+def test_classify_ball() -> None:
+    assert no.classify_ball(None)["zone"] == "unknown"
+    box = no.classify_ball(no.parse_ball_xy("0.09,0.53"))
+    assert box["zone"] == "box_l" and box["in_box"] is True, box
+    assert box["restart_center"] is False
+    mid = no.classify_ball((0.50, 0.50))
+    assert mid["zone"] == "center" and mid["restart_center"] is True, mid
+    right = no.classify_ball((0.92, 0.50))
+    assert right["zone"] == "box_r" and right["in_box"] is True, right
+    third = no.classify_ball((0.25, 0.50))
+    assert third["zone"] == "third_l" and third["in_box"] is False, third
+    assert no.parse_ball_xy("nope") is None
+    assert no.parse_ball_xy("9.0,0.5") is None
+
+
+def test_dom_sample_writes_row() -> None:
     root = Path(tempfile.mkdtemp())
     obs = no.NamiObserver(root)
     obs.observe_match("4473527", {"match_id": "54350954", "home": "H", "away": "A"}, ttl_s=60)
     obs._record("live/m1/4473527", bytes.fromhex(LIVE_FRAME_HEX))
 
+    path = no.observe_path(root)
+    assert not path.is_file(), "MQTT must not write jsonl"
+
+    latest = obs.latest_ball("4473527")
+    assert latest is not None
+    assert latest["ball_xy"] == "0.09,0.53", latest
+    assert latest["zone"] == "box_l", latest
+
+    snap = obs.write_dom_sample(
+        "4473527", sample_i=0, elapsed_s=5.01, play_state="in_play"
+    )
+    assert snap["ball_x"] == 0.09 and snap["zone"] == "box_l", snap
+
     rows = [
         json.loads(line)
-        for line in no.observe_path(root).read_text(encoding="utf-8").splitlines()
+        for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert len(rows) == 1, rows
     row = rows[0]
     assert row["nami_id"] == "4473527", row
     assert row["match_id"] == "54350954", row
+    assert row["sample_i"] == 0, row
+    assert row["elapsed_s"] == 5.01, row
+    assert row["play_state"] == "in_play", row
     assert row["score_raw"] == "0-0-0-0", row
     assert row["ball_xy"] == "0.09,0.53", row
-    assert row["payload_hex"] == LIVE_FRAME_HEX, row
+    assert row["zone"] == "box_l", row
+    assert row["in_box"] is True, row
+    assert "payload_hex" not in row, row
 
-    # Unknown topic still records rather than dropping the sample.
-    obs._record("live/m1/999/nft/zh", b"\x08\x01")
+    # More MQTT traffic still does not write.
+    obs._record("live/m1/4473527", bytes.fromhex(LIVE_FRAME_HEX))
     rows = [
         json.loads(line)
-        for line in no.observe_path(root).read_text(encoding="utf-8").splitlines()
+        for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert len(rows) == 2 and rows[1]["match_id"] is None, rows[1]
+    assert len(rows) == 1, rows
+
+    obs.write_dom_sample("4473527", sample_i=1, elapsed_s=10.0, play_state="stopped")
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 2 and rows[1]["sample_i"] == 1, rows[1]
+
+    # Commentary / types without xy must not wipe the last ball.
+    obs._record("live/m1/4473527/nft/zh", b"\x08\x01")
+    kept = obs.latest_ball("4473527")
+    assert kept["zone"] == "box_l" and kept["ball_x"] == 0.09, kept
+    snap_kept = obs.write_dom_sample(
+        "4473527", sample_i=2, elapsed_s=15.0, play_state="in_play"
+    )
+    assert snap_kept["ball_x"] == 0.09, snap_kept
+
+    # Unknown topic updates memory only.
+    obs._record("live/m1/999/nft/zh", b"\x08\x01")
+    assert obs.latest_ball("999")["zone"] == "unknown"
+    extra = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(extra) == 3, extra
 
 
 def test_env_gate() -> None:
     prev = os.environ.get("QUOTE_NAMI_OBSERVE")
     try:
         os.environ.pop("QUOTE_NAMI_OBSERVE", None)
-        assert no.try_create_observer(Path(tempfile.mkdtemp())) is None
+        assert no.try_create_observer(Path(tempfile.mkdtemp())) is not None
         os.environ["QUOTE_NAMI_OBSERVE"] = "0"
         assert no.try_create_observer(Path(tempfile.mkdtemp())) is None
         os.environ["QUOTE_NAMI_OBSERVE"] = "1"
@@ -152,7 +212,8 @@ def main() -> int:
     test_harvest_live_frame()
     test_harvest_is_total()
     test_subscription_ttl()
-    test_record_writes_row()
+    test_classify_ball()
+    test_dom_sample_writes_row()
     test_env_gate()
     print("smoke_nami_observe OK")
     return 0

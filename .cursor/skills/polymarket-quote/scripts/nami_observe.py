@@ -6,7 +6,11 @@ normalized pitch position directly, i.e. the same facts the OCR gate infers from
 a screenshot. This module only records it so the two can be compared offline; it
 never feeds the trading path.
 
-Enable with ``QUOTE_NAMI_OBSERVE=1``.
+Enabled by default (``QUOTE_NAMI_OBSERVE=0`` to disable). MQTT stays in
+memory; jsonl is written only when pitch-gate takes a DOM sample, with
+that sample's sequence number. Classifies ``ball_xy`` into pitch zones
+(center / box / third) for board observation of in_play-then-reversal
+cases; still never buys or flattens.
 """
 
 from __future__ import annotations
@@ -33,9 +37,66 @@ WS_ORIGIN = "https://tracker.namitiyu.com"
 LINGER_S = 60.0
 RECONNECT_MIN_S = 2.0
 RECONNECT_MAX_S = 60.0
+# Pitch is x along length (0=left goal, 1=right), y across. FIFA 105×68.
+_PENALTY_X = 16.5 / 105.0
+_PENALTY_Y0 = (68.0 - 40.32) / 2.0 / 68.0
+_PENALTY_Y1 = 1.0 - _PENALTY_Y0
+_CENTER_R = 9.15 / 105.0 + 0.015
 
 _SCORE_RE = re.compile(r"^\d{1,3}(?:-\d{1,3}){2,3}$")
 _XY_RE = re.compile(r"^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$")
+
+
+def parse_ball_xy(raw: Any) -> tuple[float, float] | None:
+    """``\"0.09,0.53\"`` → ``(x, y)`` in pitch units, else None."""
+    text = str(raw or "").strip()
+    if not _XY_RE.match(text):
+        return None
+    xs, ys = text.split(",", 1)
+    try:
+        x, y = float(xs), float(ys)
+    except ValueError:
+        return None
+    if not (-0.05 <= x <= 1.05 and -0.05 <= y <= 1.05):
+        return None
+    return x, y
+
+
+def classify_ball(xy: tuple[float, float] | None) -> dict[str, Any]:
+    """Zone labels for a normalized pitch point. Observe-only."""
+    if xy is None:
+        return {
+            "ball_x": None,
+            "ball_y": None,
+            "zone": "unknown",
+            "restart_center": False,
+            "in_box": False,
+        }
+    x, y = xy
+    dist = ((x - 0.5) ** 2 + (y - 0.5) ** 2) ** 0.5
+    restart = dist <= _CENTER_R
+    in_box_l = x <= _PENALTY_X and _PENALTY_Y0 <= y <= _PENALTY_Y1
+    in_box_r = x >= 1.0 - _PENALTY_X and _PENALTY_Y0 <= y <= _PENALTY_Y1
+    in_box = in_box_l or in_box_r
+    if restart:
+        zone = "center"
+    elif in_box_l:
+        zone = "box_l"
+    elif in_box_r:
+        zone = "box_r"
+    elif x < 1.0 / 3.0:
+        zone = "third_l"
+    elif x > 2.0 / 3.0:
+        zone = "third_r"
+    else:
+        zone = "mid"
+    return {
+        "ball_x": round(x, 4),
+        "ball_y": round(y, 4),
+        "zone": zone,
+        "restart_center": bool(restart),
+        "in_box": bool(in_box),
+    }
 
 _active: "NamiObserver | None" = None
 
@@ -200,9 +261,11 @@ class NamiObserver:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self._lock = threading.Lock()
-        # nami_id -> {"meta": {...}, "until": monotonic deadline}
+        # nami_id -> {"meta": {...}, "until": monotonic deadline, "t0_mono": ...}
         self._wanted: dict[str, dict[str, Any]] = {}
         self._subscribed: set[str] = set()
+        # nami_id -> last classified ball from MQTT (memory only)
+        self._latest: dict[str, dict[str, Any]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._packet_id = 1
@@ -221,7 +284,7 @@ class NamiObserver:
         set_active_observer(self)
         print(
             f"nami observe → {observe_path(self.root)} "
-            f"(MQTT {WS_URL} · observe-only)",
+            f"(MQTT memory · jsonl on DOM sample · observe-only)",
             flush=True,
         )
 
@@ -240,10 +303,15 @@ class NamiObserver:
         if not nid or self._stop.is_set():
             return
         deadline = time.monotonic() + max(1.0, float(ttl_s))
+        now = time.monotonic()
         with self._lock:
             cur = self._wanted.get(nid)
             if cur is None:
-                self._wanted[nid] = {"meta": dict(meta), "until": deadline}
+                self._wanted[nid] = {
+                    "meta": dict(meta),
+                    "until": deadline,
+                    "t0_mono": now,
+                }
             else:
                 cur["meta"] = dict(meta)
                 cur["until"] = max(float(cur["until"]), deadline)
@@ -332,6 +400,7 @@ class NamiObserver:
         with self._lock:
             for nid in [k for k, v in self._wanted.items() if v["until"] <= now]:
                 self._wanted.pop(nid, None)
+                self._latest.pop(nid, None)
             wanted = set(self._wanted)
         for nid in wanted - self._subscribed:
             for topic in self._topics(nid):
@@ -342,44 +411,117 @@ class NamiObserver:
             for topic in self._topics(nid):
                 await ws.send(unsubscribe_packet(topic, self._next_packet_id()))
             self._subscribed.discard(nid)
+            self._latest.pop(nid, None)
             logger.info("nami observe unsubscribed nami_id=%s", nid)
 
-    def _record(self, topic: str, payload: bytes) -> None:
-        nid = ""
-        parts = topic.split("/")
-        if len(parts) >= 3:
-            nid = parts[2]
+    def latest_ball(self, nami_id: str) -> dict[str, Any] | None:
+        """In-memory last MQTT ball for this tracker id (not jsonl)."""
+        nid = str(nami_id or "").strip()
+        if not nid:
+            return None
         with self._lock:
-            meta = dict((self._wanted.get(nid) or {}).get("meta") or {})
+            hit = self._latest.get(nid)
+            return dict(hit) if hit else None
+
+    def write_dom_sample(
+        self,
+        nami_id: str,
+        *,
+        sample_i: int,
+        elapsed_s: float,
+        play_state: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist one row at a DOM sample. MQTT itself does not write jsonl."""
+        nid = str(nami_id or "").strip()
+        if not nid:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            wanted = self._wanted.get(nid) or {}
+            meta = dict(wanted.get("meta") or {})
+            latest = dict(self._latest.get(nid) or {})
             self._rows += 1
-        try:
-            fields = harvest(payload)
-        except Exception:  # noqa: BLE001
-            fields = {}
+        ball_ts = latest.get("ball_updated_mono") or latest.get("updated_mono")
+        classified = {
+            "ball_xy": latest.get("ball_xy"),
+            "ball_x": latest.get("ball_x"),
+            "ball_y": latest.get("ball_y"),
+            "zone": latest.get("zone") or "unknown",
+            "restart_center": bool(latest.get("restart_center")),
+            "in_box": bool(latest.get("in_box")),
+            "score_raw": latest.get("score_raw"),
+        }
         row = {
             "observed_at": lib.now_cn_iso(),
-            "topic": topic,
             "nami_id": nid,
             "match_id": meta.get("match_id"),
             "event_key": meta.get("event_key"),
             "home": meta.get("home"),
             "away": meta.get("away"),
             "dqd_score": meta.get("dqd_score"),
-            "msg_type": fields.get("msg_type"),
-            "score_raw": fields.get("score_raw"),
-            "ball_xy": fields.get("ball_xy"),
-            "payload_len": len(payload),
-            # Raw bytes retained so the schema can be reverse-engineered offline
-            # without needing another live match.
-            "payload_hex": payload[:256].hex(),
+            "sample_i": sample_i,
+            "elapsed_s": round(float(elapsed_s), 3),
+            "mqtt_age_s": (
+                round(now - float(ball_ts), 3) if ball_ts is not None else None
+            ),
+            "play_state": play_state,
+            **classified,
         }
         try:
             lib.append_jsonl(observe_path(self.root), [row])
         except Exception:  # noqa: BLE001
             logger.exception("nami observe write failed")
+        return classified
+
+    def _record(self, topic: str, payload: bytes) -> None:
+        """Keep latest ball in memory. jsonl is written only at DOM samples.
+
+        Most MQTT types (nft commentary, 10102, …) have no ``ball_xy``. Those
+        must not wipe the last 10101 coordinate, or DOM samples become unknown.
+        """
+        nid = ""
+        parts = topic.split("/")
+        if len(parts) >= 3:
+            nid = parts[2]
+        if not nid:
+            return
+        try:
+            fields = harvest(payload)
+        except Exception:  # noqa: BLE001
+            fields = {}
+        xy_raw = str(fields.get("ball_xy") or "")
+        classified = classify_ball(parse_ball_xy(xy_raw))
+        now = time.monotonic()
+        with self._lock:
+            prev = dict(self._latest.get(nid) or {})
+            if classified["ball_x"] is None and prev.get("ball_x") is not None:
+                classified = {
+                    "ball_x": prev.get("ball_x"),
+                    "ball_y": prev.get("ball_y"),
+                    "zone": prev.get("zone") or "unknown",
+                    "restart_center": bool(prev.get("restart_center")),
+                    "in_box": bool(prev.get("in_box")),
+                }
+                xy_keep = prev.get("ball_xy")
+                ball_updated = prev.get("ball_updated_mono") or prev.get("updated_mono")
+            else:
+                xy_keep = xy_raw or None
+                ball_updated = (
+                    now
+                    if classified["ball_x"] is not None
+                    else prev.get("ball_updated_mono")
+                )
+            self._latest[nid] = {
+                **classified,
+                "ball_xy": xy_keep,
+                "score_raw": fields.get("score_raw") or prev.get("score_raw"),
+                "msg_type": fields.get("msg_type"),
+                "updated_mono": now,
+                "ball_updated_mono": ball_updated,
+            }
 
 
 def try_create_observer(root: Path) -> NamiObserver | None:
-    if not _env_bool("QUOTE_NAMI_OBSERVE", False):
+    if not _env_bool("QUOTE_NAMI_OBSERVE", True):
         return None
     return NamiObserver(root)
