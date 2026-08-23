@@ -69,7 +69,7 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+5s** 起同拍读 DOM + 打一枪 AF（+ Odds 观察），每 **5s** 一次，直到 **120s** 或买入 |
+| 采样 | 进球后 **+0s** 起同拍读 DOM + 打一枪 AF（+ Odds 观察），每 **5s** 一次，直到 **120s** 或买入 |
 | 买条件 | **同帧** DOM `in_play` **且** AF `ok && score_match`（AF 限流/失败本拍否决） |
 | 下单 | `_quote_one`（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **立刻停采** |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
@@ -88,7 +88,7 @@
 | `.center-box` 文本 | `78:57 1 : 0` | 比赛时钟 + 底部比分（**精确值**，不存在误读） |
 | 状态 class | `possession-rect` / `dangerous-attack-move` | 看板展示；文案闪事件时的补充信息 |
 
-- 整场门控**只开一个页面**：开页 ~1.7–2.4s（与 +5s 首帧延迟重叠），之后每次读数 **2–8ms**。
+- 共用 **一台 Chromium**：进行中已配对场预开 tracker 页，进球后第一拍只读 DOM；同场下一记进球复用标签。冷开页仍约 0.5–2s（仅未预热的场）。之后每次读数 **2–8ms**。
 - 页面来源仍是 `match_list` 每行自带的 `animation_live` 直链（`tracker.namitiyu.com/...&id=<nami_id>`），用来读 DOM，**不做 MQTT 球位观察**。读不到时会回退去找懂球帝页面里的 `iframe.md-anim-iframe`。
 - 15s（`QUOTE_DOM_OPEN_TIMEOUT_S`）内找不到动画 → `unavailable`，不下单。
 - 不截图、不写 JPEG、不跑 OCR。
@@ -215,6 +215,10 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | 变量 | 默认 / 说明 |
 |---|---|
 | `QUOTE_DQD_STREAM_OBSERVE` | 须为 `1`，否则进球门控不可用 |
+| `QUOTE_DOM_POOL_MAX` | 共用 Chromium 标签上限，默认 24；满则踢最久未用的空闲页 |
+| `QUOTE_DOM_WARM` | 默认开：进行中已配对场预开 tracker 页 |
+| `QUOTE_DOM_WARM_INTERVAL_S` | 预热扫描间隔，默认 10s |
+| `QUOTE_DOM_WARM_OPEN_TIMEOUT_S` | 预热开页上限，默认 3s（门控开页仍用 `QUOTE_DOM_OPEN_TIMEOUT_S`） |
 | `QUOTE_DOM_OPEN_TIMEOUT_S` | 打开动画页的上限，默认 15 |
 | `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` | 未设则均为 `live` |
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
@@ -296,6 +300,7 @@ python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_trade_modes.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate_dom.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_dom_page_pool.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_rest_ladder.py
 ```

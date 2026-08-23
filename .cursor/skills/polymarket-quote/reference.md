@@ -103,11 +103,11 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 **Pitch-gate buy (same-tick DOM∧AF, stop after buy)**
 
 1. DQD goal-up + Polymarket paired → `PitchGateCoordinator.start_gate` (no immediate `_quote_one`).
-2. Sample every **5s** for up to **120s**, first tick at **+5s**. Each tick reads DOM, polls AF once, and grades Odds (observe only).
+2. Sample every **5s** for up to **120s**, first tick at **+0s**. Each tick reads DOM, polls AF once, and grades Odds (observe only).
 3. Buy when **this tick** has DOM `play_state==in_play` **and** AF `ok && score_match` → one `_quote_one` with `trade_context.pitch_gate=True`, then **stop capture** (`aligned_buy`). AF rate-limit / error fails closed for that tick. Buy-side AF∨DOM is **rejected** (`design-af-dom-or-gate.md`).
 4. Any tick with **VAR** → **permanent no-buy** (`mode=pitch_gate_var_veto`).
 5. Never aligned before timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
-6. DQD reversal → `cancel_match(match_id)` revokes undrained `in_play` rows. Quote tick drains gate results **after** event handling so same-tick reversals win. If **open lots exist**, start a 5s observe trail (never `_quote_one`).
+6. DQD reversal → in-process bridge **hooks emit** to `cancel_match` immediately (quote tick may be blocked on another match’s CLOB/rest). Quote tick also **pre-pass** reversals **before** rest reconcile / `start_gate`. `block_inverted_goal` keys on the goal stem + reverse ts: older/same-ts 0-1→1-1 is blocked; a re-awarded goal with a newer ts is not. Drain gate results **after** event handling so same-tick reversals revoke queued buys. If **open lots exist**, start a 5s observe trail (never `_quote_one`).
 7. Requires `QUOTE_DQD_STREAM_OBSERVE=1`; else `pitch_gate_unavailable`. No screenshots / OCR / JPEG.
 8. FT path remains immediate quote (default live).
 9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size is **`QUOTE_REST_USDC` (default $5)** so the bid clears the CLOB 5-share floor. DQD reversal still cancels these rests.
@@ -128,17 +128,17 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 
 **DQD stream / DOM gate**
 
-Pitch-gate drives DOM reads every **5s** for up to **120s** after a paired goal (first tick @ **+5s**; stop after aligned buy or flatten). Rows land in `data/pm-quote/dqd_stream_observe.jsonl` with `gate=true` and `frame_path=null`. Missing stream env → gate unavailable.
+Pitch-gate drives DOM reads every **5s** for up to **120s** after a paired goal (first tick @ **+0s**; stop after aligned buy or flatten). Rows land in `data/pm-quote/dqd_stream_observe.jsonl` with `gate=true` and `frame_path=null`. Missing stream env → gate unavailable.
 
-**AF score observe:** `af_observe.sample_once` on the **same +5s / 5s / 120s** clock. Writes `data/pm-quote/af_observe.jsonl`. Enabled by default when `apifootball_key` is set (`QUOTE_AF_OBSERVE=0` to disable). Never buys by itself. Fixture ids are cache-only from `apifootball-bridge`.
+**AF score observe:** `af_observe.sample_once` on the **same +0s / 5s / 120s** clock. Writes `data/pm-quote/af_observe.jsonl`. Enabled by default when `apifootball_key` is set (`QUOTE_AF_OBSERVE=0` to disable). Never buys by itself. Fixture ids are cache-only from `apifootball-bridge`.
 
-**Animation source (纳米 tracker URL only):** the gate opens `animation_live` (`https://tracker.namitiyu.com/zh/football?profile=…&id=<nami_id>`) to **evaluate** `.pop-box` / `.center-box`. No MQTT ball-xy, no `page.screenshot`. Fixtures with no `animation_live` fall back to the DQD page iframe. Missing animation → timeout, no buy.
+**Animation source (纳米 tracker URL only):** one shared Chromium; in-play paired fixtures are pre-opened from `animation_live` (`https://tracker.namitiyu.com/zh/football?profile=…&id=<nami_id>`). A goal **evaluates** `.pop-box` / `.center-box` on that tab (same match reuses it). Cap `QUOTE_DOM_POOL_MAX` (default 24). Warming is on by default (`QUOTE_DOM_WARM`, interval `QUOTE_DOM_WARM_INTERVAL_S` default 10s, open timeout `QUOTE_DOM_WARM_OPEN_TIMEOUT_S` default 3s). While an open waits for the animation root, pending DOM reads are drained so a goal sample is not stuck behind warm. No MQTT ball-xy, no `page.screenshot`. Fixtures with no `animation_live` fall back to the DQD page iframe. Missing animation → timeout, no buy.
 
-Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_pitch_gate_dom.py`, `.../smoke_af_observe.py`, `.../smoke_book_context_observe.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
+Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_pitch_gate_dom.py`, `.../smoke_dom_page_pool.py`, `.../smoke_af_observe.py`, `.../smoke_book_context_observe.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
 
 **Gate source: DOM only**
 
-`gate_source()` is always `dom`. `judge_dom()` applies `IN_PLAY_TOKENS` / `STOPPED_TOKEN_MAP` to overlay text. VAR veto and score matching are unchanged. `DomReader` keeps **one** page open per goal. Frozen page → `stale_page`. Clock must not be parsed as a scoreline.
+`gate_source()` is always `dom`. `judge_dom()` applies `IN_PLAY_TOKENS` / `STOPPED_TOKEN_MAP` to overlay text. VAR veto and score matching are unchanged. `DomPagePool` keeps **one Chromium** and **one tab per in-play match**. Frozen page → `stale_page`. Clock must not be parsed as a scoreline.
 
 **Pitch Gate board (System Main)**
 
@@ -148,7 +148,7 @@ Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.
 
 When `.env` has `LIVESCORE_API_KEY` + `LIVESCORE_API_SECRET`, DQD-reversal may resolve the fixture via `scores/live.json`, then pull **raw** `matches/events.json` (GOAL/score) and `commentary/events.json` (VAR if package allows; errors kept raw) into `data/pm-quote/livescore_observe.jsonl`. DQD→LSA id map cached in `livescore_match_map.json`. Trial is not expected to expose `KICK_OFF`. Does **not** gate buys or flatten.
 
-**System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with default **goals=live / ft=live** (+ repo `.env`). Pitch-gate: first tick @**+5s**, then every 5s until **120s** → same-tick DOM∧AF → one buy and stop. Logs: `data/pm-quote/watch.log`.
+**System Main** (`python3 frontend/run_main.py`) spawns `pm_quote watch` with default **goals=live / ft=live** (+ repo `.env`). Pitch-gate: first tick @**+0s**, then every 5s until **120s** → same-tick DOM∧AF → one buy and stop. Logs: `data/pm-quote/watch.log`.
 
 ## CLOB endpoints
 

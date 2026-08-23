@@ -1995,6 +1995,61 @@ def quote_finished_event(
     )
 
 
+def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
+    """Stop AF/DOM for this match immediately. Safe on the bridge emit thread.
+
+    Does **not** touch CLOB (rest cancel stays on the quote tick). The quote
+    loop can sit in rest-buy for minutes; waiting until then is how Havre 1-1
+    kept sampling after DQD had already reversed.
+    """
+    from score_events import event_is_reversal
+    from pitch_gate import get_coordinator
+
+    if str(ev.get("type") or "") != "score_change":
+        return
+    if not event_is_reversal(ev):
+        return
+    mid = str(ev.get("match_id") or "").strip()
+    if not mid:
+        return
+    try:
+        gate = get_coordinator(root)
+    except RuntimeError:
+        return
+    try:
+        gate.cancel_match(mid, reason="dqd_reversal")
+    except Exception as e:  # noqa: BLE001
+        print(f"ALERT pitch-gate fast-cancel failed match={mid}: {e}", flush=True)
+    try:
+        gate.block_inverted_goal(event_key(ev))
+    except Exception as e:  # noqa: BLE001
+        print(f"ALERT pitch-gate fast-block failed match={mid}: {e}", flush=True)
+    try:
+        from af_observe import get_active_observer as get_af
+
+        af = get_af()
+        if af is not None:
+            af.cancel_match(mid, reason="dqd_reversal")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def install_reversal_fast_cancel(root: Path) -> None:
+    """Hook in-process match-bridge so reversals cancel gates on emit."""
+    owned = get_owned_bridge()
+    if owned is None or not hasattr(owned, "add_event_hook"):
+        return
+    if getattr(owned, "_quote_fast_cancel", False):
+        return
+    rt = Path(root)
+
+    def _hook(ev: dict[str, Any]) -> None:
+        apply_dqd_reversal_cancel(rt, ev)
+
+    owned.add_event_hook(_hook)
+    owned._quote_fast_cancel = True
+
+
 def process_bridge_events(
     root: Path,
     *,
@@ -2012,7 +2067,7 @@ def process_bridge_events(
     """Process bridge score_change / match_finished into quotes/trades.
 
     Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` (first
-    frame @+5s, then every 5s until 120s) before one ``_quote_one``, then stop
+    frame @+0s, then every 5s until 120s) before one ``_quote_one``, then stop
     capture. DQD reversals cancel rest and open gates; if lots are open they
     start an AF∨DOM trail (no immediate flatten).
     """
@@ -2044,6 +2099,36 @@ def process_bridge_events(
         mid = str(match_id or "").strip()
         if mid:
             processed_ft_ids.add(mid)
+
+    # Pull events and cancel reversed gates BEFORE any CLOB flatten/rest work.
+    # Havre 1-1 kept AF/DOM for ~90s because this tick sat in rest-buy first.
+    events_iter: list[dict[str, Any]] = []
+    override_keys: set[str] = set()
+    if events_override:
+        for ev in events_override:
+            if not isinstance(ev, dict):
+                continue
+            events_iter.append(ev)
+            override_keys.add(event_key(ev))
+    file_off = int(cursor.get("events_byte_offset") or 0)
+    file_events, new_file_off = load_bridge_quote_events(root, byte_offset=file_off)
+    for ev in file_events:
+        key = event_key(ev)
+        if key in override_keys:
+            continue
+        events_iter.append(ev)
+    cursor["events_byte_offset"] = new_file_off
+
+    for ev in events_iter:
+        if str(ev.get("type") or "") != "score_change":
+            continue
+        if not event_is_reversal(ev):
+            continue
+        rkey = event_key(ev)
+        if not force and rkey in seen:
+            continue
+        apply_dqd_reversal_cancel(root, ev)
+        seen.update(gate.consumed_event_keys(str(ev.get("match_id") or "")))
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     if trade_executor is not None:
@@ -2388,26 +2473,9 @@ def process_bridge_events(
                 flush=True,
             )
 
-    # Events first, then drain: same-tick DQD reversal → cancel_match revokes
-    # queued in_play rows before any _quote_one.
-
-    # Memory events (in-process bridge) first; file scan for restart / board path.
-    events_iter: list[dict[str, Any]] = []
-    override_keys: set[str] = set()
-    if events_override:
-        for ev in events_override:
-            if not isinstance(ev, dict):
-                continue
-            events_iter.append(ev)
-            override_keys.add(event_key(ev))
-    file_off = int(cursor.get("events_byte_offset") or 0)
-    file_events, new_file_off = load_bridge_quote_events(root, byte_offset=file_off)
-    for ev in file_events:
-        key = event_key(ev)
-        if key in override_keys:
-            continue
-        events_iter.append(ev)
-    cursor["events_byte_offset"] = new_file_off
+    # Events already gathered + reversed gates canceled at tick start.
+    # Drain after the event loop so same-tick reversals revoke queued buys
+    # before _quote_one.
 
     for ev in events_iter:
         key = event_key(ev)
@@ -2434,6 +2502,13 @@ def process_bridge_events(
                 inv = invert_score_change_key(key)
                 if inv:
                     seen.add(inv)
+                try:
+                    gate.block_inverted_goal(key)
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"ALERT pitch-gate block reversed goal failed match={mid_rev}: {e}",
+                        flush=True,
+                    )
                 if mid_rev and trade_executor is not None:
                     try:
                         trade_executor.cancel_rest_orders_for_match(
@@ -2582,6 +2657,13 @@ def process_bridge_events(
                 # Defer _quote_one until pitch-state in_play (or timeout/cancel).
                 # Mark seen on start so a later file copy of the same goal cannot
                 # reopen AF/DOM after reverse / aligned_buy popped the session.
+                if gate.has_consumed_event(key):
+                    seen.add(key)
+                    print(
+                        f"goal → SKIP reversed match_id={mid_up} key={key}",
+                        flush=True,
+                    )
+                    continue
                 started = gate.start_gate(ev, event_key=key)
                 if started or gate.has_consumed_event(key):
                     seen.add(key)
@@ -2620,6 +2702,17 @@ def process_bridge_events(
                 except Exception as e:  # noqa: BLE001
                     print(
                         f"ALERT pitch-gate cancel on FT failed match={mid}: {e}",
+                        flush=True,
+                    )
+                try:
+                    from dqd_stream_observe import get_active_observer as get_dqd_obs
+
+                    obs = get_dqd_obs()
+                    if obs is not None and hasattr(obs, "release_match"):
+                        obs.release_match(mid, reason="match_finished")
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"ALERT dom-pool close on FT failed match={mid}: {e}",
                         flush=True,
                     )
             if mid and mid in processed_ft_ids and not force:
@@ -2830,6 +2923,13 @@ def ensure_upstream_bridge(
     if _OWNED_BRIDGE is None:
         _OWNED_BRIDGE = bridge.BridgeRuntime(root, async_persist=True)
     result = _OWNED_BRIDGE.start()
+    try:
+        from pitch_gate import get_coordinator as _get_gate
+
+        _get_gate(root)
+        install_reversal_fast_cancel(root)
+    except Exception as e:  # noqa: BLE001
+        print(f"ALERT reversal fast-cancel hook failed: {e}", flush=True)
     # Mutual exclusion marker so bridge-board Start refuses dual emit.
     try:
         marker = root / "data" / "bridge" / ".inproc_owner"

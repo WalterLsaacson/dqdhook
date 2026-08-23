@@ -7,8 +7,10 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
@@ -114,6 +116,8 @@ def _open_factory(frames: list[dict[str, Any] | None], *, baseline: dict[str, An
 def main() -> int:
     os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
     os.environ["QUOTE_GATE_SOURCE"] = "dom"
+    assert pg.GATE_FIRST_DELAY_S == 0.0, pg.GATE_FIRST_DELAY_S
+    assert pg.GATE_TIMEOUT_S == 120.0, pg.GATE_TIMEOUT_S
 
     old = (pg.GATE_FIRST_DELAY_S, pg.GATE_INTERVAL_S, pg.GATE_TIMEOUT_S)
     pg.GATE_FIRST_DELAY_S = 0.04
@@ -438,6 +442,151 @@ def main() -> int:
         )
         assert ek.endswith("|2026-08-23T12:00:00+08:00"), ek
         assert "0-0->1-0" in ek
+
+        # Reverse ts must block the undone goal (any earlier ts) but not a re-award.
+        pg.reset_coordinator_for_tests()
+        with tempfile.TemporaryDirectory() as td:
+            coord_b = pg.get_coordinator(Path(td))
+            rev_key = "score_change|54483562|1-1->0-1|2026-08-23T21:51:01+08:00"
+            old_goal = "score_change|54483562|0-1->1-1|2026-08-23T21:50:47+08:00"
+            new_goal = "score_change|54483562|0-1->1-1|2026-08-23T21:55:00+08:00"
+            coord_b.block_inverted_goal(rev_key)
+            assert coord_b.has_consumed_event(old_goal), "undone 1-1 must not reopen AF/DOM"
+            assert not coord_b.has_consumed_event(new_goal), "re-awarded 1-1 must still gate"
+            assert (
+                coord_b.start_gate(
+                    {**ev, "match_id": "54483562"}, event_key=old_goal
+                )
+                is False
+            )
+
+        # Same-tick 0-1→1-1 then 1-1→0-1: never open AF/DOM for the undone goal.
+        factory, readers_rev = _open_factory(
+            [_dom("H 进球", "45:01 1 : 1")] * 20,
+            baseline=_dom("H 进球", "44:56 1 : 1"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_rev = _FakeAf([{"ok": True, "score_match": False, "af_score": "0-1"}] * 20)
+        af_mod.set_active_observer(af_rev)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            t0 = datetime.now(timezone(timedelta(hours=8)))
+            ts_goal = t0.isoformat(timespec="seconds")
+            ts_rev = (t0 + timedelta(seconds=14)).isoformat(timespec="seconds")
+            goal_ev = {
+                **ev,
+                "match_id": "54483562",
+                "home_score": 1,
+                "away_score": 1,
+                "prev": {"home": 0, "away": 1},
+                "curr": {"home": 1, "away": 1},
+                "ts": ts_goal,
+                "polymarket": {"event_id": "e1", "slug": "x"},
+            }
+            rev_ev = {
+                **goal_ev,
+                "home_score": 0,
+                "away_score": 1,
+                "prev": {"home": 1, "away": 1},
+                "curr": {"home": 0, "away": 1},
+                "ts": ts_rev,
+                "is_reversal": True,
+            }
+            with patch.object(lib, "load_bridge_quote_events", return_value=([], 0)):
+                with patch.object(lib, "persist_bundle", return_value=None):
+                    bundles = lib.process_bridge_events(
+                        root, events_override=[goal_ev, rev_ev]
+                    )
+            time.sleep(0.12)
+            assert af_rev.calls == 0, af_rev.calls
+            assert readers_rev == [], readers_rev
+            modes = [b.get("mode") for b in bundles]
+            assert "dqd_reversal_pitch_gate_canceled" in modes, modes
+
+        # Running 1-1 gate + reverse while quote tick is stuck in rest reconcile:
+        # cancel must happen at tick start (not after the sleep).
+        class _SlowEx:
+            def __init__(self) -> None:
+                self.ledger = self
+                self.reconcile_slept = False
+
+            def open_for_match(self, _mid):  # noqa: ANN001
+                return []
+
+            def retry_pending_flattens(self):
+                return []
+
+            def reconcile_rest_orders(self):
+                self.reconcile_slept = True
+                time.sleep(0.25)
+                return []
+
+            def cancel_rest_orders_for_match(self, *_a, **_k):
+                return []
+
+            def clear_rest_block(self, *_a, **_k):
+                return None
+
+            def maybe_flatten_for_event(self, *_a, **_k):
+                return []
+
+        factory, _ = _open_factory(
+            [_dom("H 进球", "45:01 1 : 1")] * 40,
+            baseline=_dom("H 进球", "44:56 1 : 1"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_slow = _FakeAf([{"ok": True, "score_match": False, "af_score": "0-1"}] * 40)
+        af_mod.set_active_observer(af_slow)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            t0 = datetime.now(timezone(timedelta(hours=8)))
+            ts_goal = t0.isoformat(timespec="seconds")
+            ts_rev = (t0 + timedelta(seconds=2)).isoformat(timespec="seconds")
+            goal_ev = {
+                **ev,
+                "match_id": "54473848",
+                "home_score": 1,
+                "away_score": 1,
+                "prev": {"home": 0, "away": 1},
+                "curr": {"home": 1, "away": 1},
+                "ts": ts_goal,
+                "polymarket": {"event_id": "e1", "slug": "x"},
+            }
+            rev_ev = {
+                **goal_ev,
+                "home_score": 0,
+                "away_score": 1,
+                "prev": {"home": 1, "away": 1},
+                "curr": {"home": 0, "away": 1},
+                "ts": ts_rev,
+                "is_reversal": True,
+            }
+            goal_key = lib.event_key(goal_ev)
+            assert coord.start_gate(goal_ev, event_key=goal_key)
+            time.sleep(0.05)
+            n_before = af_slow.calls
+            ex = _SlowEx()
+            pg.GATE_TIMEOUT_S = 2.0
+            with patch.object(lib, "load_bridge_quote_events", return_value=([], 0)):
+                with patch.object(lib, "persist_bundle", return_value=None):
+                    lib.process_bridge_events(
+                        root, events_override=[rev_ev], trade_executor=ex
+                    )
+            assert ex.reconcile_slept
+            time.sleep(0.12)
+            assert af_slow.calls <= n_before + 1, af_slow.calls
+            lib.apply_dqd_reversal_cancel(root, rev_ev)
+            time.sleep(0.12)
+            n_hook = af_slow.calls
+            time.sleep(0.12)
+            assert af_slow.calls == n_hook, af_slow.calls
 
         print("ok: pitch_gate AND buy / stop / AF∨DOM flatten / no JPEG")
         return 0

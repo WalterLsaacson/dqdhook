@@ -16,6 +16,12 @@ from typing import Any, Callable
 
 import quote_lib as lib
 from observe_timing import SAMPLE_COUNT, SAMPLE_INTERVAL_S
+from dom_page_pool import (  # noqa: E402
+    DOM_STATE_JS,
+    DomPagePool,
+    DomReader,
+    warm_open_timeout_s,
+)
 
 logger = logging.getLogger("pm_quote.dqd_stream_observe")
 
@@ -54,115 +60,42 @@ def get_active_observer() -> "DqdStreamObserver | None":
         return _active
 
 
-class DomReader:
-    """One long-lived tracker page the gate polls for structured play state.
-
-    The animation publishes its state as text and CSS classes, so a goal only
-    needs the page loaded once: re-launching Chromium per sample costs seconds
-    while a DOM read costs milliseconds.
-    """
-
-    def __init__(self, page_url: str, *, open_timeout_s: float | None = None) -> None:
-        self.page_url = str(page_url or "")
-        # Must stay well under the gate timeout: a page that will never render
-        # the animation has to fail fast rather than eat the whole session.
-        self.open_timeout_s = float(
-            open_timeout_s
-            if open_timeout_s is not None
-            else os.getenv("QUOTE_DOM_OPEN_TIMEOUT_S", "15") or 15
+def _playing_paired_ids(root: Path) -> set[str]:
+    """Dongqiudi ids that are in-play and already matched to Polymarket."""
+    out: set[str] = set()
+    for row in lib.load_bridge_matches(root):
+        if not isinstance(row, dict):
+            continue
+        dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+        pm = row.get("polymarket") if isinstance(row.get("polymarket"), dict) else {}
+        mid = str(dqd.get("id") or "").strip()
+        if not mid:
+            continue
+        if row.get("finished") or dqd.get("is_finished"):
+            continue
+        status = str(dqd.get("status_raw") or dqd.get("status") or "").lower()
+        disp = str(dqd.get("status") or "")
+        playing = (
+            "playing" in status
+            or "进行中" in disp
+            or str(dqd.get("status_raw") or "").lower() == "playing"
         )
-        self._pw: Any = None
-        self._browser: Any = None
-        self._context: Any = None
-        self._page: Any = None
-        # Tracker pages render the animation inline; DQD pages nest it in an
-        # iframe, whose contents are invisible to a top-frame evaluate().
-        self._frame: Any = None
+        if not playing:
+            continue
+        if not (pm.get("event_id") or pm.get("slug")):
+            continue
+        out.add(mid)
+    return out
 
-    def open(self) -> tuple[bool, str | None]:
-        if not self.page_url:
-            return False, "no_page_url"
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception:  # noqa: BLE001
-            return False, "playwright_not_installed"
-        try:
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=True)
-            self._context = self._browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="zh-CN",
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-            )
-            timeout_ms = int(max(1.0, self.open_timeout_s) * 1000)
-            self._page = self._context.new_page()
-            self._page.goto(
-                self.page_url, wait_until="domcontentloaded", timeout=timeout_ms
-            )
-            self._frame = self._find_animation_frame(deadline=time.monotonic() + self.open_timeout_s)
-            if self._frame is None:
-                self.close()
-                return False, "no_animation_frame"
-            return True, None
-        except Exception as e:  # noqa: BLE001
-            msg = str(e).splitlines()[0][:200] if str(e) else "dom_open_failed"
-            self.close()
-            if "Executable doesn't exist" in msg or "playwright install" in msg:
-                return False, "playwright_browser_missing"
-            return False, msg
 
-    def _find_animation_frame(self, *, deadline: float) -> Any:
-        """Locate the frame that actually holds `.football-animate`."""
-        page = self._page
-        while time.monotonic() < deadline:
-            try:
-                if page.locator(".football-animate").count() > 0:
-                    return page
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                iframe = page.locator("iframe.md-anim-iframe")
-                if iframe.count() > 0:
-                    frame = iframe.first.element_handle().content_frame()
-                    if frame is not None and frame.locator(".football-animate").count() > 0:
-                        return frame
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(0.25)
-        return None
-
-    def read(self) -> tuple[dict[str, Any] | None, str | None]:
-        if self._frame is None:
-            return None, "not_open"
-        try:
-            dom = self._frame.evaluate(DqdStreamObserver._DOM_STATE_JS)
-        except Exception as e:  # noqa: BLE001
-            return None, str(e).splitlines()[0][:200] if str(e) else "dom_read_failed"
-        if not isinstance(dom, dict):
-            return None, "no_animation_root"
-        return dom, None
-
-    def close(self) -> None:
-        for attr in ("_context", "_browser"):
-            obj = getattr(self, attr, None)
-            if obj is not None:
-                try:
-                    obj.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            setattr(self, attr, None)
-        if self._pw is not None:
-            try:
-                self._pw.stop()
-            except Exception:  # noqa: BLE001
-                pass
-            self._pw = None
-        self._page = None
-        self._frame = None
+def _warm_interval_s() -> float:
+    raw = os.getenv("QUOTE_DOM_WARM_INTERVAL_S")
+    if raw is None or str(raw).strip() == "":
+        return 10.0
+    try:
+        return max(2.0, float(raw))
+    except (TypeError, ValueError):
+        return 10.0
 
 
 def _safe_part(raw: Any) -> str:
@@ -190,6 +123,7 @@ class DqdStreamObserver:
         discover_fn: Callable[..., dict[str, Any]] | None = None,
         capture_stream_fn: Callable[[str, Path], tuple[bool, str | None]] | None = None,
         capture_page_fn: Callable[[str, Path], tuple[bool, str | None]] | None = None,
+        page_pool: DomPagePool | None = None,
     ) -> None:
         self.root = Path(root)
         self._q: queue.Queue[_ObserveJob | None] = queue.Queue()
@@ -200,6 +134,8 @@ class DqdStreamObserver:
         self._discover_fn = discover_fn or dqd_live.discover_live_surface
         self._capture_stream_fn = capture_stream_fn or self._capture_stream_ffmpeg
         self._capture_page_fn = capture_page_fn or self._capture_page_playwright
+        self.page_pool = page_pool if page_pool is not None else DomPagePool()
+        self._warm_thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -209,6 +145,14 @@ class DqdStreamObserver:
         self._thread.start()
         set_active_observer(self)
         logger.info("DQD stream observe on → %s", observe_path(self.root))
+        try:
+            self.page_pool.start()
+        except Exception as e:  # noqa: BLE001
+            print(f"dom-pool → chromium start failed: {e}", flush=True)
+        self._warm_thread = threading.Thread(
+            target=self._warm_loop, name="dom-page-warm", daemon=True
+        )
+        self._warm_thread.start()
         # Load PaddleOCR in the background so the first goal frame is not cold-start.
         threading.Thread(
             target=self._warmup_pitch_state,
@@ -226,8 +170,89 @@ class DqdStreamObserver:
             workers = list(self._workers)
         for worker in workers:
             worker.join(timeout=1.0)
+        if self._warm_thread is not None:
+            self._warm_thread.join(timeout=8.0)
+            self._warm_thread = None
+        try:
+            self.page_pool.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug("dom pool shutdown failed", exc_info=True)
         if get_active_observer() is self:
             set_active_observer(None)
+
+    def acquire_dom_reader(
+        self, match_id: str, page_url: str, info: dict[str, Any]
+    ) -> tuple[Any, str | None, dict[str, Any]]:
+        """Open or reuse the pooled tracker tab for this match."""
+        mid = str(match_id or "").strip()
+        url = str(page_url or "").strip()
+        if not url:
+            return None, "no_page_url", info
+        reader = DomReader(url, match_id=mid, pool=self.page_pool)
+        ok, err = reader.open()
+        if not ok:
+            return None, err or "dom_open_failed", info
+        kind = "REUSE" if reader.reused else "OPEN"
+        print(
+            f"dom-pool → {kind} match_id={mid} tabs={len(self.page_pool.opened_ids())}/"
+            f"{self.page_pool.max_pages}",
+            flush=True,
+        )
+        return reader, None, info
+
+    def release_match(self, match_id: str, *, reason: str = "done") -> None:
+        mid = str(match_id or "").strip()
+        if not mid:
+            return
+        closed = self.page_pool.close_page(mid)
+        kind = "CLOSE" if closed else "CLOSE_WAIT"
+        print(f"dom-pool → {kind} match_id={mid} reason={reason}", flush=True)
+
+    def sync_playing_pages(self) -> dict[str, int]:
+        """Pre-open tracker tabs for in-play paired matches; close the rest."""
+        want = _playing_paired_ids(self.root)
+        closed = self.page_pool.close_absent(want)
+        warmed = 0
+        skipped = 0
+        for mid in sorted(want):
+            if mid in self.page_pool.opened_ids():
+                skipped += 1
+                continue
+            info = self._resolve_surface(mid)
+            url = str((info or {}).get("page_url") or "").strip()
+            if not url:
+                skipped += 1
+                continue
+            ok, err, reused, _token = self.page_pool.ensure_open(
+                mid, url, lease=False, timeout_s=warm_open_timeout_s()
+            )
+            if ok and not reused:
+                warmed += 1
+                print(
+                    f"dom-pool → WARM match_id={mid} tabs="
+                    f"{len(self.page_pool.opened_ids())}/{self.page_pool.max_pages}",
+                    flush=True,
+                )
+            elif not ok:
+                skipped += 1
+                logger.debug("dom warm failed match=%s err=%s", mid, err)
+            else:
+                skipped += 1
+        if closed:
+            for mid in closed:
+                print(f"dom-pool → CLOSE match_id={mid} reason=not_playing", flush=True)
+        return {"warmed": warmed, "closed": len(closed), "kept": skipped}
+
+    def _warm_loop(self) -> None:
+        if not _env_bool("QUOTE_DOM_WARM", True):
+            return
+        interval = _warm_interval_s()
+        while not self._stop.is_set():
+            try:
+                self.sync_playing_pages()
+            except Exception:  # noqa: BLE001
+                logger.exception("dom page warm failed")
+            self._stop.wait(interval)
 
     def enqueue_event(self, ev: dict[str, Any], *, event_key: str) -> bool:
         if self._stop.is_set():
@@ -503,38 +528,7 @@ class DqdStreamObserver:
             return False, (proc.stderr or proc.stdout or "ffmpeg_failed").strip()
         return True, None
 
-    # The nami animation renders its play state as text + CSS classes. OCR
-    # recovers that text from pixels; this reads it straight off the DOM so the
-    # two can be compared on the same frame.
-    _DOM_STATE_JS = """
-    () => {
-      const root = document.querySelector('.football-animate');
-      if (!root) return null;
-      const cls = (el) => {
-        if (!el) return '';
-        const c = el.className;
-        return String((c && c.baseVal !== undefined) ? c.baseVal : (c || ''));
-      };
-      const txt = (sel) => {
-        const el = root.querySelector(sel);
-        return el ? (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80) : null;
-      };
-      const pop = root.querySelector('.pop-box');
-      const marks = ['possession-rect', 'attack-move', 'dangerous-attack-move',
-                     'attack', 'dangerous-attack', 'ball', 'net', 'penalty-box'];
-      const present = new Set();
-      root.querySelectorAll('*').forEach((el) => {
-        cls(el).split(/\\s+/).forEach((c) => { if (marks.includes(c)) present.add(c); });
-      });
-      return {
-        pop_box: txt('.pop-box'),
-        pop_class: cls(pop),
-        center_box: txt('.center-box'),
-        root_class: cls(root),
-        marks: Array.from(present).sort(),
-      };
-    }
-    """
+    _DOM_STATE_JS = DOM_STATE_JS
 
     @staticmethod
     def _capture_page_playwright(

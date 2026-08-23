@@ -820,6 +820,7 @@ class BridgeRuntime:
 
         # In-memory hot path for quote (and optional external consumers).
         self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._event_hooks: list[Any] = []
 
         # In-memory prev_* so async disk lag cannot double-emit events.
         self._prev_loaded = False
@@ -896,6 +897,29 @@ class BridgeRuntime:
             str(k): v for k, v in prev_scores.items() if isinstance(v, dict)
         }
         self._prev_loaded = True
+
+    def add_event_hook(self, fn: Any) -> None:
+        """Called on the match-bridge thread as soon as an event is queued.
+
+        Quote uses this to cancel AF/DOM on DQD reversal without waiting for
+        the (possibly multi-minute) CLOB tick.
+        """
+        if fn is None or fn in self._event_hooks:
+            return
+        self._event_hooks.append(fn)
+
+    def _queue_event(self, ev: dict[str, Any]) -> None:
+        payload = dict(ev)
+        self.event_queue.put(payload)
+        for hook in list(self._event_hooks):
+            try:
+                hook(payload)
+            except Exception:  # noqa: BLE001
+                print(
+                    f"ALERT bridge event hook failed type={payload.get('type')}: "
+                    f"{traceback.format_exc().splitlines()[-1]}",
+                    flush=True,
+                )
 
     def drain_event_queue(self, *, max_items: int = 256) -> list[dict[str, Any]]:
         """Non-blocking drain of in-memory bridge events."""
@@ -1019,7 +1043,7 @@ class BridgeRuntime:
 
             # Hot path: memory queue first (quote wakes here, not on file mtime).
             for ev in events:
-                self.event_queue.put(dict(ev))
+                self._queue_event(ev)
 
             with self.lock:
                 self.last_result = payload

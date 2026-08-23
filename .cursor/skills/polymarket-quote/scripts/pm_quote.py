@@ -101,7 +101,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
         f"size_tiers={size_tiers_label(settings)} "
-        f"(pitch-gate: first @+5s, every 5s until 120s; DOM∧AF same tick → one buy)",
+        f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF same tick → one buy)",
         file=sys.stderr,
         flush=True,
     )

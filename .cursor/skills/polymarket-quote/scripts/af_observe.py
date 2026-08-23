@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Observe-only API-Football score sampling beside pitch-gate DOM reads.
 
-Pitch-gate calls ``sample_once`` on the same +5s / 5s / 120s clock as DOM.
+Pitch-gate calls ``sample_once`` on the same +0s / 5s / 120s clock as DOM.
 The independent session thread is unused.
 
 Never buys, never flattens, never runs OCR. Enabled when
@@ -30,7 +30,7 @@ if str(_AF_SCRIPTS) not in sys.path:
 import af_bridge_lib as aflib  # noqa: E402
 
 # Same first delay / interval / timeout as pitch-gate DOM.
-AF_FIRST_DELAY_S = 5.0
+AF_FIRST_DELAY_S = 0.0
 AF_INTERVAL_S = 5.0
 AF_TIMEOUT_S = 120.0
 

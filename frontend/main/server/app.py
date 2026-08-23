@@ -240,12 +240,36 @@ def _now() -> str:
     return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
 
 
-def _port_open(port: int) -> bool:
+def _port_connect(port: int, *, timeout: float = 0.25) -> int:
+    """0 if TCP connected; otherwise errno. Localhost timeout ≠ crashed."""
+    import errno
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.25)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return int(s.connect_ex(("127.0.0.1", port)))
+    except TimeoutError:
+        return errno.ETIMEDOUT
+    except OSError as e:
+        return int(e.errno or errno.EIO)
+
+
+def _port_open(port: int) -> bool:
+    """True unless the port is unused (ECONNREFUSED).
+
+    Pitch-gate ``/api/status`` can hold the GIL for hundreds of ms while
+    scanning jsonl. The accept loop stalls, ``connect`` times out, and an
+    older 0.25s ``connect_ex==0`` check treated that as 'down' — supervisor
+    then spawned a second board every 5s.
+    """
+    import errno
+
+    return _port_connect(port) != errno.ECONNREFUSED
+
+
+def _boards_down() -> list[str]:
+    return [str(b["id"]) for b in BOARDS if not _port_open(int(b["port"]))]
 
 
 def _http_json(url: str, *, timeout: float = 1.5) -> dict[str, Any] | None:
@@ -285,6 +309,7 @@ def _http_post_json(
 
 BRIDGE_BOARD_PORT = 8789
 AF_BRIDGE_BOARD_PORT = 8792
+PITCH_GATE_BOARD_PORT = 8791
 
 
 def _ensure_af_bridge_watch() -> dict[str, Any]:
@@ -343,7 +368,7 @@ def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess
 
 
 def _boards_all_up() -> bool:
-    return all(_port_open(int(b["port"])) for b in BOARDS)
+    return not _boards_down()
 
 
 def _wait_port(port: int, *, timeout_s: float, poll_s: float = 0.15) -> bool:
@@ -469,6 +494,7 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
 
     _wait_port(BRIDGE_BOARD_PORT, timeout_s=20)
     _wait_port(AF_BRIDGE_BOARD_PORT, timeout_s=20)
+    _wait_port(PITCH_GATE_BOARD_PORT, timeout_s=20)
     af_st = _ensure_af_bridge_watch()
 
     with _lock:
@@ -512,9 +538,14 @@ def _supervisor_loop() -> None:
             if _started_at is None or _shutting_down.is_set():
                 continue
             try:
-                healed_boards = not _boards_all_up()
+                down = _boards_down()
+                healed_boards = bool(down)
                 if healed_boards:
-                    print("main → supervisor: board(s) down, restarting…", flush=True)
+                    print(
+                        "main → supervisor: board(s) down, restarting… "
+                        + ", ".join(down),
+                        flush=True,
+                    )
                     _ensure_boards()
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
@@ -992,7 +1023,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(pitch-gate: DOM∧AF @ 5s; aligned buy then stop; DQD reverse → AF∨DOM flatten)",
+        f"(pitch-gate: DOM∧AF first @+0s every 5s until 120s; aligned buy then stop; DQD reverse → AF∨DOM flatten)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

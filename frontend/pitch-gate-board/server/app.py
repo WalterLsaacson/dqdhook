@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import sys
+import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +44,28 @@ _QUOTE_CANCEL_MODES = {
     "pitch_gate_canceled",
     "dqd_reversal_pitch_gate_canceled",
 }
+
+_GOALS_LOCK = threading.Lock()
+# (data_stamp, limit, payload)
+_GOALS_CACHE: tuple[tuple[int, ...], int, dict[str, Any]] | None = None
+
+
+def _observe_stamp() -> tuple[int, ...]:
+    stamp: list[int] = []
+    for path in (
+        OBSERVE_PATH,
+        AF_OBSERVE_PATH,
+        BOOK_OBSERVE_PATH,
+        JUDGE_PATH,
+        QUOTES_PATH,
+        BRIDGE_EVENTS_PATH,
+    ):
+        try:
+            st = path.stat()
+            stamp.extend((int(st.st_mtime_ns), int(st.st_size)))
+        except OSError:
+            stamp.extend((0, 0))
+    return tuple(stamp)
 
 
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
@@ -633,7 +656,7 @@ def _index_odds_grades() -> dict[tuple[str, Any], dict[str, Any]]:
     return by_tick
 
 
-def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
+def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
     observe = _read_jsonl_tail(OBSERVE_PATH, max_lines=_MAX_OBSERVE_LINES)
     judges = _read_jsonl_tail(JUDGE_PATH, max_lines=_MAX_JUDGE_LINES)
     by_key, by_path = _index_judges(judges)
@@ -988,11 +1011,24 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
     }
 
 
-def status_payload() -> dict[str, Any]:
-    snap = build_goals_payload(limit=_MAX_GOALS)
-    latest = None
-    if snap["goals"]:
-        latest = snap["goals"][0].get("dqd_ts")
+def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
+    """Join observe trails. Serialized + mtime cache so hub/UI polls share one scan."""
+    limit = max(1, min(int(limit), _MAX_GOALS))
+    global _GOALS_CACHE
+    with _GOALS_LOCK:
+        stamp = _observe_stamp()
+        cached = _GOALS_CACHE
+        if cached is not None and cached[0] == stamp and cached[1] >= limit:
+            return cached[2]
+        snap = _build_goals_payload_uncached(limit=limit)
+        _GOALS_CACHE = (_observe_stamp(), limit, snap)
+        return snap
+
+
+def _status_from_snap(snap: dict[str, Any] | None) -> dict[str, Any]:
+    goals = list((snap or {}).get("goals") or [])
+    latest = goals[0].get("dqd_ts") if goals else None
+    revs = list((snap or {}).get("recent_reversals") or [])
     return {
         "module": MODULE_ID,
         "running": True,
@@ -1005,19 +1041,28 @@ def status_payload() -> dict[str, Any]:
         "af_observe_exists": AF_OBSERVE_PATH.is_file(),
         "book_observe_exists": BOOK_OBSERVE_PATH.is_file(),
         "judge_exists": JUDGE_PATH.is_file(),
-        "goal_count": snap["goal_count"],
-        "gate_goal_count": snap["gate_goal_count"],
-        "aligned_buy_count": snap.get("aligned_buy_count") or 0,
-        "in_play_count": snap.get("aligned_buy_count") or snap.get("in_play_count") or 0,
-        "wait_af_count": snap.get("wait_af_count") or 0,
-        "reversed_count": snap.get("reversed_count") or 0,
-        "flatten_count": snap.get("flatten_count") or 0,
-        "hold_count": snap.get("hold_count") or 0,
+        "goal_count": (snap or {}).get("goal_count") or 0,
+        "gate_goal_count": (snap or {}).get("gate_goal_count") or 0,
+        "aligned_buy_count": (snap or {}).get("aligned_buy_count") or 0,
+        "in_play_count": (snap or {}).get("aligned_buy_count")
+        or (snap or {}).get("in_play_count")
+        or 0,
+        "wait_af_count": (snap or {}).get("wait_af_count") or 0,
+        "reversed_count": (snap or {}).get("reversed_count") or 0,
+        "flatten_count": (snap or {}).get("flatten_count") or 0,
+        "hold_count": (snap or {}).get("hold_count") or 0,
         "latest_dqd_ts": latest,
-        "latest_reversal_ts": (snap.get("recent_reversals") or [{}])[0].get("ts")
-        if snap.get("recent_reversals")
-        else None,
+        "latest_reversal_ts": revs[0].get("ts") if revs else None,
     }
+
+
+def status_payload() -> dict[str, Any]:
+    """Cheap for hub polls — reuse the last goals snapshot; do not rescan jsonl."""
+    snap = None
+    with _GOALS_LOCK:
+        if _GOALS_CACHE is not None:
+            snap = _GOALS_CACHE[2]
+    return _status_from_snap(snap)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1085,6 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    httpd.daemon_threads = True
     print(f"Pitch Gate Board → http://{HOST}:{PORT}/", flush=True)
     print(f"  observe → {OBSERVE_PATH}", flush=True)
     print(f"  af observe → {AF_OBSERVE_PATH}", flush=True)

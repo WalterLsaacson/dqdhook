@@ -1,6 +1,6 @@
 """Pitch-gate: same-tick DOM∧AF buy, then stop; reversal AF∨DOM flatten.
 
-Cadence: first sample @+5s, then every 5s until 120s (or buy / flatten / cancel).
+Cadence: first sample @+0s, then every 5s until 120s (or buy / flatten / cancel).
 No screenshots. No nami ball-xy. Odds observe rides the same clock.
 """
 
@@ -17,7 +17,7 @@ from typing import Any
 logger = logging.getLogger("pm_quote.pitch_gate")
 
 GATE_INTERVAL_S = 5.0
-GATE_FIRST_DELAY_S = 5.0
+GATE_FIRST_DELAY_S = 0.0
 GATE_TIMEOUT_S = 120.0
 GATE_REQUIRE_SCORE = True
 GATE_CONFIRM_FRAMES = 1
@@ -102,6 +102,9 @@ class PitchGateCoordinator:
         # file-lag replays from opening a second AF/DOM trail after reverse.
         self._closed_keys: set[str] = set()
         self._closed_by_match: dict[str, set[str]] = {}
+        # stem → reverse ts. A later 0-1→1-1 with ts ≤ this must not reopen
+        # AF/DOM; a re-awarded goal with a newer ts still can.
+        self._blocked_until: dict[str, str] = {}
 
     def pending_event_keys(self) -> set[str]:
         with self._lock:
@@ -125,7 +128,37 @@ class PitchGateCoordinator:
         if not key:
             return False
         with self._lock:
-            return key in self._closed_keys
+            return self._gate_blocked_locked(key)
+
+    def _gate_blocked_locked(self, event_key: str) -> bool:
+        """Caller must hold ``_lock``."""
+        key = str(event_key or "").strip()
+        if not key:
+            return False
+        if key in self._closed_keys:
+            return True
+        stem = event_key_stem(key)
+        until = str(self._blocked_until.get(stem) or "")
+        if not until:
+            return False
+        ts = event_key_ts(key)
+        if not ts:
+            return True
+        return ts <= until
+
+    def block_inverted_goal(self, reversal_event_key: str) -> None:
+        """Stop AF/DOM for the undone goal (any ts ≤ this reverse)."""
+        inv = invert_score_change_key(reversal_event_key)
+        if not inv:
+            return
+        stem = event_key_stem(inv)
+        ts = event_key_ts(reversal_event_key) or event_key_ts(inv)
+        if not stem:
+            return
+        with self._lock:
+            prev = str(self._blocked_until.get(stem) or "")
+            if ts >= prev:
+                self._blocked_until[stem] = ts
 
     def consumed_event_keys(self, match_id: str) -> set[str]:
         mid = str(match_id or "").strip()
@@ -159,7 +192,7 @@ class PitchGateCoordinator:
         if not mid or not key:
             return False
         with self._lock:
-            if key in self._closed_keys:
+            if self._gate_blocked_locked(key):
                 return False
             existing = self._by_event.get(key)
             if existing is not None and not existing.finished:
@@ -200,7 +233,7 @@ class PitchGateCoordinator:
             observe_only=bool(observe_only),
         )
         with self._lock:
-            if key in self._closed_keys:
+            if self._gate_blocked_locked(key):
                 return False
             existing = self._by_event.get(key)
             if existing is not None and not existing.finished:
@@ -528,14 +561,17 @@ class PitchGateCoordinator:
         return thread
 
     def _open_dom_reader(self, session: _GateSession, observer: Any) -> Any:
-        """Resolve the tracker URL once and keep that page open for the session."""
+        """Reuse the pooled tracker tab when the observer has one."""
         from dqd_stream_observe import DomReader
 
         info = observer._resolve_surface(session.match_id)
         page_url = str((info or {}).get("page_url") or "")
+        acquire = getattr(observer, "acquire_dom_reader", None)
+        if callable(acquire):
+            return acquire(session.match_id, page_url, info)
         if not page_url:
             return None, "no_page_url", info
-        reader = DomReader(page_url)
+        reader = DomReader(page_url, match_id=str(session.match_id or ""))
         ok, err = reader.open()
         if not ok:
             reader.close()
@@ -900,6 +936,21 @@ class PitchGateCoordinator:
 
 _coordinator: PitchGateCoordinator | None = None
 _coord_lock = threading.Lock()
+
+
+def event_key_stem(event_key: str) -> str:
+    """``score_change|mid|0-1->1-1|ts`` → ``score_change|mid|0-1->1-1``."""
+    parts = str(event_key or "").split("|")
+    if len(parts) >= 3:
+        return "|".join(parts[:3])
+    return str(event_key or "")
+
+
+def event_key_ts(event_key: str) -> str:
+    parts = str(event_key or "").split("|")
+    if len(parts) >= 4:
+        return parts[-1]
+    return ""
 
 
 def invert_score_change_key(event_key: str) -> str | None:

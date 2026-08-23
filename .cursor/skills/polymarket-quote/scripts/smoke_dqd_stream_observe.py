@@ -15,6 +15,7 @@ if str(_SCRIPTS) not in sys.path:
 
 import dqd_stream_observe as obs_mod  # noqa: E402
 from dqd_stream_observe import DqdStreamObserver, observe_path  # noqa: E402
+from dom_page_pool import DomPagePool, MemoryDomBackend  # noqa: E402
 
 
 def check_capture_result_arity(root: Path) -> None:
@@ -123,6 +124,7 @@ def main() -> int:
                 discover_fn=fake_discover,
                 capture_page_fn=fake_capture,
                 capture_stream_fn=lambda *_args, **_kwargs: (False, "unused"),
+                page_pool=DomPagePool(backend=MemoryDomBackend()),
             )
             obs.start()
             ok = obs.enqueue_event(

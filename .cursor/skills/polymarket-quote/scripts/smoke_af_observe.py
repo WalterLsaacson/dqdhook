@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: AF observe samples on the same clock as DOM (+5s / 5s / 120s)."""
+"""Smoke: AF observe samples on the same clock as DOM (+0s / 5s / 120s)."""
 
 from __future__ import annotations
 

@@ -13,15 +13,15 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（同帧 DOM∧AF 买入）**：DQD `score_change` 进球且已配对 → 进球后 **+5s** 起每 **5s** 同拍读 DOM + 打一枪 AF（+ Odds 观察），直到 **120s** 或买入。需 **DOM `in_play` 且 AF `ok && score_match`** 才 **一刀** `_quote_one`，然后 **立刻停采**。AF 限流/失败本拍否决（fail-closed），继续采。DOM 出现 **VAR** → **该球永久不下单**。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。
+**当前策略（同帧 DOM∧AF 买入）**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s** 同拍读 DOM + 打一枪 AF（+ Odds 观察），直到 **120s** 或买入。需 **DOM `in_play` 且 AF `ok && score_match`** 才 **一刀** `_quote_one`，然后 **立刻停采**。AF 限流/失败本拍否决（fail-closed），继续采。DOM 出现 **VAR** → **该球永久不下单**。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。
 
 > 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s AF∨DOM 观察，而不是买后继续抓帧。
 
-- 懂球帝 **回撤**：立刻取消 rest + 未完成进球门控，并撤销尚未 drain 的买信号。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 AF 或 DOM **比分条**对齐（不要求 `in_play`）→ flatten（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。两边都不认直到 120s → **持仓**。未买入的回撤只取消门控。
+- 懂球帝 **回撤**：立刻取消 rest + 未完成进球门控，并撤销尚未 drain 的买信号。**进程内 bridge 入队回撤时就会 `cancel_match`**（不等询价 tick 从别场 CLOB/rest 里回来）。询价 tick **先扫回撤再 rest reconcile / `start_gate`**。回撤 ts 挡住该进球 stem（更早或相同 ts）；同一过渡更晚的 ts 仍可开（重判进球）。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 AF 或 DOM **比分条**对齐（不要求 `in_play`）→ flatten（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。两边都不认直到 120s → **持仓**。未买入的回撤只取消门控。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
 - 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1`（缺则 `pitch_gate_unavailable`，该球不下单）
-- **判定源是动画 DOM，不截图 / 不跑 OCR**：整场门控只开一个 tracker 页面，每次采样读 `.pop-box` 与 `.center-box`。无 JPEG、无 `QUOTE_GATE_REF_SCREENSHOT`。
+- **判定源是动画 DOM，不截图 / 不跑 OCR**：共用一台 Chromium，进行中已配对场预开 tracker 页；同场后续进球复用标签。每次采样读 `.pop-box` 与 `.center-box`。无 JPEG、无 `QUOTE_GATE_REF_SCREENSHOT`。标签上限 `QUOTE_DOM_POOL_MAX`（默认 24）；预热 `QUOTE_DOM_WARM`（默认开）/`QUOTE_DOM_WARM_INTERVAL_S`（默认 10s）/`QUOTE_DOM_WARM_OPEN_TIMEOUT_S`（默认 3s）。开页等待动画时会穿插处理其它场的 DOM 读。
 - **防僵死**：判定要求 `.center-box` 时钟相对上一次读数有推进；时钟没走 → `unclear`（`stale_page`），不下单。
 - **页面是纳米 tracker**：`animation_live` URL 打开 `tracker.namitiyu.com` 读 DOM，不是懂球帝比赛页。不做 MQTT 球位观察。
 - Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **`QUOTE_REST_USDC`（默认 $5）** / **`QUOTE_REST_EXPIRE_S`（默认 3600）**
@@ -60,8 +60,8 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
-   - `score_change` goal-up (paired) → **start pitch-gate** (first frame @+5s, then every 5s until 120s); quote on same-tick DOM `in_play` ∧ AF `score_match`, then stop
-   - `score_change` reversal → cancel rest + cancel pitch-gate; if lots are open, 5s AF∨DOM trail then flatten on first score_match vs post-reverse score
+   - `score_change` goal-up (paired) → **start pitch-gate** (first frame @+0s, then every 5s until 120s); quote on same-tick DOM `in_play` ∧ AF `score_match`, then stop
+   - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF∨DOM trail then flatten on first score_match vs post-reverse score
    - `match_finished` → immediate quote (default live; stale / once-per-match skip)
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: one CLOB `/books` POST; totals/BTTS before exact.
