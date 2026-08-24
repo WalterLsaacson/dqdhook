@@ -767,7 +767,7 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice; pitch-gate may rest @0.99 GTD when rest is enabled."""
+        """FAK a misprice; pitch-gate may rest @0.99 GTC when rest is enabled."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
@@ -922,18 +922,9 @@ class TradeExecutor:
             or ""
         )
         if _trade_context_pitch_gate(match_meta):
-            open_usdc = (
-                sum(float(r.get("usdc") or 0) for r in self.ledger.all_open())
-                + self._pending_usdc_total_locked()
-                + self.ledger.rest_reserved_usdc()
-            )
+            # Per-order size is QUOTE_REST_USDC. Do not clip by QUOTE_MAX_OPEN_USDC —
+            # rest stays until reversal / FT / manual cancel.
             target = float(rest_target_usdc())
-            max_open = float(self.settings.max_open_usdc or 0)
-            if max_open > 1e-9:
-                remain = max_open - open_usdc
-                if remain + 1e-9 <= 0:
-                    return 0.0, base
-                target = min(target, remain)
             return max(0.0, target), base
         if quote_reversal_cushion(quote):
             return float(CUSHION_REST_USDC), base
@@ -1000,7 +991,7 @@ class TradeExecutor:
         event_type: str,
         ignore_ask_zone: bool = False,
     ) -> dict[str, Any] | None:
-        """Post/adjust GTD bids for A/B remainder after FAK."""
+        """Post/adjust GTC (or GTD) bids for A/B remainder after FAK."""
         if not rest_enabled():
             return None
         typ = self._resolve_event_type(
@@ -1063,7 +1054,7 @@ class TradeExecutor:
                     return None
                 place_usdc = gap if replace else add_usdc
                 # Pitch-gate rest is for no-ask / non-FAK books — never treat ask
-                # as blocking the 0.99 GTD fallback.
+                # as blocking the 0.99 GTC fallback.
                 ask_for_ladder = (
                     None
                     if (ignore_ask_zone or pitch)
@@ -1118,20 +1109,16 @@ class TradeExecutor:
         if not levels:
             return None
 
-        # Pitch-gate fallback is always GTD ~1h; cushion-only rests stay GTC.
-        if pitch:
-            expire_s = rest_expire_s()
-        elif cushion:
-            expire_s = 0.0
-        else:
-            expire_s = rest_expire_s()
+        # Default GTC (no clock). QUOTE_REST_EXPIRE_S>0 still posts GTD.
+        expire_s = rest_expire_s()
         ot = "GTC" if expire_s <= 0 else "GTD"
         exp = int(time.time()) + int(expire_s) if ot == "GTD" else 0
         if pitch:
+            extra = ot if ot == "GTC" else f"{ot} expire_s={int(expire_s)}"
             print(
                 f"pitch-gate → REST @{levels[0].get('price')} "
                 f"usdc={sum(float(l.get('usdc') or 0) for l in levels):.2f} "
-                f"token={token_id[:12]}… {ot} expire_s={int(expire_s)}",
+                f"token={token_id[:12]}… {extra}",
                 flush=True,
             )
         posted: list[dict[str, Any]] = []

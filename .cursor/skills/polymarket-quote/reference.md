@@ -110,7 +110,7 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 6. DQD reversal → in-process bridge **hooks emit** to `cancel_match` immediately (quote tick may be blocked on another match’s CLOB/rest). Quote tick also **pre-pass** reversals **before** rest reconcile / `start_gate`. `block_inverted_goal` keys on the goal stem + reverse ts: older/same-ts 0-1→1-1 is blocked; a re-awarded goal with a newer ts is not. Drain gate results **after** event handling so same-tick reversals revoke queued buys. If **open lots exist**, start a 5s observe trail (never `_quote_one`).
 7. Requires `QUOTE_DQD_STREAM_OBSERVE=1`; else `pitch_gate_unavailable`. No screenshots / OCR / JPEG.
 8. FT path remains immediate quote (default live).
-9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid @ **0.99** (`GTD`, expire **`QUOTE_REST_EXPIRE_S`** default **3600s**). Size is **`QUOTE_REST_USDC` (default $5)** so the bid clears the CLOB 5-share floor. DQD reversal still cancels these rests.
+9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid @ **0.99** (`GTC` by default — stays until DQD reversal, FT, or manual cancel). Set **`QUOTE_REST_EXPIRE_S>0`** to use `GTD` instead. Size is **`QUOTE_REST_USDC` (default $5)** so the bid clears the CLOB 5-share floor. Pitch-gate rest is **not** clipped by `QUOTE_MAX_OPEN_USDC`.
 
 **Score reversal / disallowed goal**
 

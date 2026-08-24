@@ -12,8 +12,8 @@ DEFAULT_REST_PRICES = (0.99, 0.98)
 FAK_ZONE_MAX_ASK = 0.992
 # When the book bid already sits here, rest only at 0.99 (skip 0.98).
 REST_CONCENTRATE_BID = 0.99
-# GTD safety net; 0 → GTC. Reversal/FT still cancel immediately.
-DEFAULT_REST_EXPIRE_S = 3600.0
+# 0 → GTC (stay until reversal / FT / manual cancel). >0 → GTD seconds.
+DEFAULT_REST_EXPIRE_S = 0.0
 MIN_REST_USDC = 1.0
 # Soccer CLOB limit bids reject below 5 shares (~$4.95 @ 0.99). Pitch-gate
 # rest therefore spends ``QUOTE_REST_USDC`` (default $5), not ``QUOTE_MAX_USDC``.
@@ -86,6 +86,7 @@ def rest_limit_tick_size(tick_size: str | float | None) -> str:
 
 
 def rest_expire_s() -> float:
+    """Seconds until GTD expiry. ``0`` (default) → GTC, no clock expiry."""
     raw = os.getenv("QUOTE_REST_EXPIRE_S")
     if raw is None or str(raw).strip() == "":
         return float(DEFAULT_REST_EXPIRE_S)

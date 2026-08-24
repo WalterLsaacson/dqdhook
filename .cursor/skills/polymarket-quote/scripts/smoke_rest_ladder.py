@@ -45,7 +45,13 @@ def main() -> int:
     assert len(levels) == 1, levels
     assert abs(float(levels[0]["price"]) - 0.99) < 1e-9
     assert float(levels[0]["shares"]) + 1e-12 >= 5.0, levels[0]
-    print("ok: rest ladder $5 / 5-share floor")
+    os.environ.pop("QUOTE_REST_EXPIRE_S", None)
+    assert abs(rl.rest_expire_s() - 0.0) < 1e-9
+    os.environ["QUOTE_REST_EXPIRE_S"] = "3600"
+    assert abs(rl.rest_expire_s() - 3600.0) < 1e-9
+    os.environ.pop("QUOTE_REST_EXPIRE_S", None)
+
+    print("ok: rest ladder $5 / 5-share floor / GTC default")
     return 0
 
 

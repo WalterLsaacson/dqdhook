@@ -156,9 +156,9 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 **限价 rest（可选，默认关）：**
 
 - 需 `QUOTE_REST_ENABLED=1`  
-- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、`GTD`，过期默认 3600s  
-- 金额 **`QUOTE_REST_USDC`（默认 $5）**，满足 CLOB 最低 5 股  
-- DQD 回撤会取消这些 rest  
+- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、默认 **`GTC`（不设过期）**  
+- 金额 **`QUOTE_REST_USDC`（默认 $5）**，满足 CLOB 最低 5 股；**不受** `QUOTE_MAX_OPEN_USDC` 卡住  
+- DQD 回撤 / 终场 / 手取消才会撤这些 rest；`QUOTE_REST_EXPIRE_S>0` 才改回有时限的 GTD  
 
 ### 6. 模式与仓位
 
@@ -225,7 +225,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控和终场都跳过** |
 | `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
 | `QUOTE_REST_ENABLED` | `1` 才挂 0.99 rest（金额 `QUOTE_REST_USDC` 默认 $5） |
-| `QUOTE_REST_EXPIRE_S` | rest 过期秒数，默认 3600 |
+| `QUOTE_REST_EXPIRE_S` | rest 过期秒数；默认 **0 = GTC**（回撤/终场/手取消才撤） |
 | `QUOTE_FT_MAX_AGE_S` | 默认 900，过旧事件跳过 |
 | `QUOTE_INTERVAL` | watch 最大空闲间隔，默认 0.25s |
 | `ODDS_API_IO_KEY` | 有则同拍写 Odds Grade（观察，不改 size） |
