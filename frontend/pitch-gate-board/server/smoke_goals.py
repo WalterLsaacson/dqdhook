@@ -283,6 +283,53 @@ def main() -> int:
     assert later.get("linked_event_key") != early_rev
     assert (later.get("reversal") or {}).get("ts") != "2026-08-23T19:51:55+08:00"
 
+    var_after_key = "score_change|m4|0-0->1-0|t4"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": var_after_key,
+                "match_id": "m4",
+                "home": "E",
+                "away": "F",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 0,
+                "elapsed_s": 5,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play", "confidence": 0.9},
+                "af": {"ok": True, "score_match": True, "af_score": "1-0"},
+            },
+            {
+                "event_key": var_after_key,
+                "match_id": "m4",
+                "home": "E",
+                "away": "F",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 1,
+                "elapsed_s": 10,
+                "ok": True,
+                "gate": True,
+                "judge": {
+                    "play_state": "stopped",
+                    "stopped_reason": "var",
+                    "confidence": 0.9,
+                },
+                "af": {
+                    "ok": None,
+                    "score_match": None,
+                    "skipped": "after_buy",
+                    "error": "af_stopped_after_buy",
+                },
+            },
+        ],
+    )
+    snap4 = board.build_goals_payload(limit=50)
+    var_after = next(g for g in snap4["goals"] if g["event_key"] == var_after_key)
+    assert var_after["verdict"] == "aligned_buy", var_after["verdict"]
+
     print("ok: pitch-gate board verdicts match DOM∧AF / AF∨DOM")
     return 0
 

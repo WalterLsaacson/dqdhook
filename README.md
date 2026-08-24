@@ -69,9 +69,9 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+0s** 起同拍读 DOM + 打一枪 AF（+ Odds 观察），每 **5s** 一次，直到 **120s** 或买入 |
+| 采样 | 进球后 **+0s** 起同拍读 DOM + 打一枪 AF（+ Odds 观察），每 **5s** 一次，直到 **120s** |
 | 买条件 | **同帧** DOM `in_play` **且** AF `ok && score_match`（AF 限流/失败本拍否决） |
-| 下单 | `_quote_one`（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **立刻停采** |
+| 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s**。询价/挂 rest 不再堵住下一场开 DOM。 |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
 | 回撤 | 取消进球会话；**已有仓**才开 5s AF∨DOM；某一拍 AF 或 DOM `score_match`（回撤后比分）→ flatten；两边都不认 → **持仓** |
@@ -96,7 +96,7 @@
 **门控买入条件（须同时满足）：**
 
 - DOM 状态文本命中「进行中」类关键词（进攻 / 控球 / 任意球等），且非 VAR/换人/庆祝等停止态  
-- 底部比分 = 该球期望的 `home_score-away_score`  
+- 底部比分 = 该球期望比分（Polymarket 主客；若懂球帝/纳米主客对调，按 `sides_swapped` 再和动画比分条比）  
 - 页面时钟相对上一次读数**有推进**  
 - 本会话**从未**出现过 VAR  
 - **同一拍** AF `ok && score_match`  
@@ -156,7 +156,8 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 **限价 rest（可选，默认关）：**
 
 - 需 `QUOTE_REST_ENABLED=1`  
-- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、默认 **`GTC`（不设过期）**  
+- 门控 WIN 无法 FAK 成交、且盘口 **还有 ask** 时，挂 **@0.99**、默认 **`GTC`（不设过期）**  
+- **没有 ask**（只剩 0.99 买盘）不挂 rest  
 - 金额 **`QUOTE_REST_USDC`（默认 $5）**，满足 CLOB 最低 5 股；**不受** `QUOTE_MAX_OPEN_USDC` 卡住  
 - DQD 回撤 / 终场 / 手取消才会撤这些 rest；`QUOTE_REST_EXPIRE_S>0` 才改回有时限的 GTD  
 
@@ -228,7 +229,9 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_REST_EXPIRE_S` | rest 过期秒数；默认 **0 = GTC**（回撤/终场/手取消才撤） |
 | `QUOTE_FT_MAX_AGE_S` | 默认 900，过旧事件跳过 |
 | `QUOTE_INTERVAL` | watch 最大空闲间隔，默认 0.25s |
-| `ODDS_API_IO_KEY` | 有则同拍写 Odds Grade（观察，不改 size） |
+| `ODDS_API_IO_KEY` | 有则同拍写 Odds Grade（观察，不改 size）；开赛前 30 分钟采一次全盘口 |
+| `QUOTE_PREMATCH_ODDS` | 默认开；`0` 关闭开赛前那一枪 |
+| `QUOTE_PREMATCH_LEAD_S` | 触发提前量，默认 1800（开赛前 30 分钟采一次） |
 | `MAIN_BRIDGE_INPROC` | 默认开；`0` 则走 board 文件唤醒 |
 | `PM_PROXY` | CLOB/Gamma 代理 |
 | `PRIVATE_KEY` 等 | live 下单必填；勿提交 |
@@ -250,6 +253,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `data/pm-quote/dqd_stream_observe.jsonl` | 门控 DOM 读数（无 JPEG） |
 | `data/pm-quote/af_observe.jsonl` | AF 比分（与 DOM 同一 5s/120s 节拍） |
 | `data/pm-quote/book_context_observe.jsonl` | Odds/Bet365 Grade（观察） |
+| `data/pm-quote/prematch_odds.jsonl` | 开赛前 30 分钟采一次的 Bet365+1xbet 全盘口 |
 | `data/pm-quote/open_positions.json` | 未平 `buy_win` 仓 |
 | `data/pm-quote/cursor.json` | 已处理 key / 终场 id |
 
@@ -302,6 +306,7 @@ python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate_dom.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_dom_page_pool.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_prematch_odds.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_rest_ladder.py
 ```
 

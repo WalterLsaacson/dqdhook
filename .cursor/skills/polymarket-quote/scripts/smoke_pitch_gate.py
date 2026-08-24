@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: same-tick DOM∧AF buy, stop after buy, AF∨DOM reversal flatten."""
+"""Smoke: same-tick DOM∧AF buy, stop AF after buy / keep DOM, AF∨DOM reversal flatten."""
 
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def main() -> int:
     }
 
     try:
-        # AND buy: DOM in_play + AF score_match on same tick → stop (no extra frames).
+        # AND buy: DOM in_play + AF score_match → stop AF, keep DOM to timeout.
         frames = [
             _dom("H 进球", "45:01 1 : 0"),
             _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
@@ -165,10 +165,53 @@ def main() -> int:
             statuses = [d["status"] for d in done]
             assert "in_play" in statuses and "aligned_buy" in statuses, done
             assert sum(1 for d in done if d["status"] == "in_play") == 1, done
-            assert len(obs.rows) == 2, [r.get("sample_i") for r in obs.rows]
+            assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
             assert af.calls == 2, af.calls
+            skipped = [
+                r for r in obs.rows if (r.get("af") or {}).get("skipped") == "after_buy"
+            ]
+            assert skipped, obs.rows
+            assert all(
+                (r.get("af") or {}).get("skipped") != "after_buy" for r in obs.rows[:2]
+            )
             assert readers[-1].closed
             assert not any(r.get("frame_path") for r in obs.rows)
+            trail = next(d for d in done if d["status"] == "aligned_buy")
+            assert trail.get("reason") == "dom_trail_until_timeout", trail
+
+        # PM 0-1 vs Nami/DQD 1-0 (sides swapped) still buys.
+        factory, _ = _open_factory(
+            [
+                _dom("H 进球", "45:01 1 : 0"),
+                _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
+            ],
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_mod.set_active_observer(
+            _FakeAf([{"ok": True, "score_match": True, "af_score": "0-1"}])  # type: ignore[arg-type]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            swap_ev = {
+                **ev,
+                "match_id": "m_swap",
+                "home": "Paris Saint-Germain FC",
+                "away": "Stade Rennais FC 1901",
+                "home_score": 0,
+                "away_score": 1,
+                "sides_swapped": True,
+                "dqd_home": "Stade Rennais FC",
+                "dqd_away": "Paris Saint Germain",
+            }
+            assert pg.PitchGateCoordinator._expected_for_dom(swap_ev) == (1, 0)
+            assert coord.start_gate(swap_ev, event_key="k_swap")
+            done = _wait_done(coord, n=2)
+            assert "in_play" in [d["status"] for d in done], done
 
         # DOM in_play but AF never matches → no buy.
         factory, _ = _open_factory(
@@ -331,7 +374,7 @@ def main() -> int:
             coord = pg.get_coordinator(root)
             t0 = time.monotonic()
             assert coord.start_gate({**ev, "match_id": "m1o"}, event_key="k1o")
-            done = _wait_done(coord, n=2)
+            done = _wait_done(coord, n=1)
             wall = time.monotonic() - t0
             assert "in_play" in [d["status"] for d in done], done
             assert wall < 0.4, wall
@@ -588,7 +631,7 @@ def main() -> int:
             time.sleep(0.12)
             assert af_slow.calls == n_hook, af_slow.calls
 
-        print("ok: pitch_gate AND buy / stop / AF∨DOM flatten / no JPEG")
+        print("ok: pitch_gate AND buy / stop AF keep DOM / AF∨DOM flatten / no JPEG")
         return 0
     finally:
         pg.PitchGateCoordinator._open_dom_reader = orig_open  # type: ignore[assignment]

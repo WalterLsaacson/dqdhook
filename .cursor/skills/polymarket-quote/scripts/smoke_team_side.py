@@ -91,6 +91,59 @@ def main() -> int:
     assert tots[0]["market_key"] == "away_total_1.5_over"
     assert tots[0]["settlement"] == "LOSE"  # CSKA scored 0
 
+    from quote_lib import halves_in_pm_frame
+
+    # PSG listed home on PM; Rennes is DQD/Nami home. HT 2-0 Rennes → PM 0-2.
+    ctx = {
+        "home": "Paris Saint-Germain FC",
+        "away": "Stade Rennais FC 1901",
+        "dongqiudi": {
+            "home": "Stade Rennais FC",
+            "away": "Paris Saint Germain",
+            "home_half": 2,
+            "away_half": 0,
+        },
+        "event": {
+            "home": "Paris Saint-Germain FC",
+            "away": "Stade Rennais FC 1901",
+            "sides_swapped": True,
+        },
+    }
+    hh, ah = halves_in_pm_frame(ctx)
+    assert (hh, ah) == (0, 2), (hh, ah)
+
+    half_markets = [
+        {
+            "question": "PSG vs. Rennes: Paris Saint-Germain FC 1st Half O/U 0.5",
+            "sports_market_type": "totals",
+            "outcomes": ["Over", "Under"],
+            "clob_token_ids": ["psg_1h_o", "psg_1h_u"],
+            "market_id": "4",
+            "condition_id": "c4",
+        },
+        {
+            "question": "PSG vs. Rennes: Stade Rennais FC 1901 2nd Half O/U 0.5",
+            "sports_market_type": "totals",
+            "outcomes": ["Over", "Under"],
+            "clob_token_ids": ["ren_2h_o", "ren_2h_u"],
+            "market_id": "5",
+            "condition_id": "c5",
+        },
+    ]
+    live = totals_tokens(
+        half_markets,
+        home="Paris Saint-Germain FC",
+        away="Stade Rennais FC 1901",
+        home_score=2,
+        away_score=2,
+        home_half=hh,
+        away_half=ah,
+        mode="live",
+    )
+    keys = {r["market_key"] for r in live}
+    assert "home_1h_total_0.5_over" not in keys, live
+    assert "away_2h_total_0.5_over" not in keys, live
+
     print("ok: ofi/cska team-side mapping")
     return 0
 

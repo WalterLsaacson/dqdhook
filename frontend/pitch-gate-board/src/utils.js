@@ -52,6 +52,7 @@ export function stateLabel(state) {
     in_play: "DOM in_play",
     aligned_buy: "买入 ∧",
     wait_af: "等 AF",
+    after_buy: "买后 DOM",
     var_veto: "VAR 否决",
     stopped: "stopped",
     unclear: "unclear",

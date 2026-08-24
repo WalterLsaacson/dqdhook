@@ -1,6 +1,7 @@
-"""Pitch-gate: same-tick DOM∧AF buy, then stop; reversal AF∨DOM flatten.
+"""Pitch-gate: same-tick DOM∧AF buy; stop AF after buy, keep DOM to timeout.
 
-Cadence: first sample @+0s, then every 5s until 120s (or buy / flatten / cancel).
+Cadence: first sample @+0s, then every 5s until 120s (or flatten / cancel).
+Aligned buy stops AF (quota) but DOM keeps sampling until the original timeout.
 No screenshots. No nami ball-xy. Odds observe rides the same clock.
 """
 
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,7 +23,7 @@ GATE_FIRST_DELAY_S = 0.0
 GATE_TIMEOUT_S = 120.0
 GATE_REQUIRE_SCORE = True
 GATE_CONFIRM_FRAMES = 1
-# Unused for capture length (buy/flatten stop the session). Kept for older smokes.
+# Unused for capture length (flatten / cancel / timeout stop the session).
 GATE_MIN_FRAMES = 1
 GATE_FRAME_COUNT = GATE_MIN_FRAMES
 
@@ -267,7 +269,7 @@ class PitchGateCoordinator:
             if session.observe_only
             else (
                 f"DOM in_play ∧ AF score_match; VAR→no buy; "
-                f"stop on aligned_buy / {GATE_TIMEOUT_S:g}s"
+                f"buy → stop AF, DOM until {GATE_TIMEOUT_S:g}s"
             )
         )
         print(
@@ -378,7 +380,7 @@ class PitchGateCoordinator:
         sample_i: int,
         af_row: dict[str, Any] | None = None,
     ) -> bool:
-        """Queue a one-shot buy. Caller must then finish the session."""
+        """Queue a one-shot buy. Caller keeps the DOM trail until timeout."""
         with self._lock:
             if (
                 session.finished
@@ -407,7 +409,7 @@ class PitchGateCoordinator:
             print(
                 f"pitch-gate → IN_PLAY (aligned buy) match_id={session.match_id} "
                 f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
-                f"· stop capture",
+                f"· stop AF, DOM until {GATE_TIMEOUT_S:g}s",
                 flush=True,
             )
         return True
@@ -487,6 +489,13 @@ class PitchGateCoordinator:
                     "observe_only": bool(session.observe_only),
                 }
             )
+
+    @staticmethod
+    def _af_open(session: _GateSession) -> bool:
+        """AF costs quota. Stop it after an aligned buy; flatten trails keep AF."""
+        if session.observe_only:
+            return True
+        return not session.buy_emitted
 
     def _sample_af(
         self,
@@ -635,10 +644,11 @@ class PitchGateCoordinator:
         row["dom_state"] = dom
         if dom is None:
             return row, None
+        exp_h, exp_a = self._expected_for_dom(session.ev)
         judged = rules.judge_dom(
             dom,
-            expected_home=session.ev.get("home_score"),
-            expected_away=session.ev.get("away_score"),
+            expected_home=exp_h,
+            expected_away=exp_a,
             require_score=bool(session.require_score and GATE_REQUIRE_SCORE),
             prev_clock=prev_clock,
         )
@@ -646,11 +656,37 @@ class PitchGateCoordinator:
         row["board_score_match"] = bool(
             rules.board_score_match(
                 dom,
-                expected_home=session.ev.get("home_score"),
-                expected_away=session.ev.get("away_score"),
+                expected_home=exp_h,
+                expected_away=exp_a,
             )
         )
         return row, judged
+
+    @staticmethod
+    def _expected_for_dom(ev: dict[str, Any]) -> tuple[Any, Any]:
+        """Nami ``.center-box`` is venue/DQD home first; events are PM-oriented."""
+        h, a = ev.get("home_score"), ev.get("away_score")
+        swapped = ev.get("sides_swapped")
+        if swapped is True:
+            return a, h
+        if swapped is False:
+            return h, a
+        dqd_h = str(ev.get("dqd_home") or "")
+        dqd_a = str(ev.get("dqd_away") or "")
+        pm_h = str(ev.get("home") or "")
+        pm_a = str(ev.get("away") or "")
+        if dqd_h and pm_h:
+            try:
+                br = Path(__file__).resolve().parents[2] / "match-bridge" / "scripts"
+                if str(br) not in sys.path:
+                    sys.path.insert(0, str(br))
+                import bridge_lib as bridge  # type: ignore
+
+                if bridge.sides_are_swapped(dqd_h, dqd_a, pm_h, pm_a):
+                    return a, h
+            except Exception:  # noqa: BLE001
+                pass
+        return h, a
 
     def _run_session(self, session: _GateSession, observer: Any) -> None:
         captured = 0
@@ -659,6 +695,7 @@ class PitchGateCoordinator:
         surface_info: dict[str, Any] = {}
         prev_clock: str | None = None
         flatten_emitted = False
+        var_after_buy_logged = False
         try:
             if not session.cancel.is_set():
                 reader, open_err, surface_info = self._open_dom_reader(session, observer)
@@ -711,11 +748,12 @@ class PitchGateCoordinator:
                 has_reading = row.get("ok") is True
                 board_match = bool(row.get("board_score_match"))
                 if not board_match and isinstance(row.get("dom_state"), dict):
+                    exp_h, exp_a = self._expected_for_dom(session.ev)
                     board_match = bool(
                         _animation_rules().board_score_match(
                             row.get("dom_state"),
-                            expected_home=session.ev.get("home_score"),
-                            expected_away=session.ev.get("away_score"),
+                            expected_home=exp_h,
+                            expected_away=exp_a,
                         )
                     )
 
@@ -727,17 +765,26 @@ class PitchGateCoordinator:
                     holder=odds_holder,
                 )
 
-                af_row = self._sample_af(
-                    session, sample_i=sample_i, elapsed_s=round(elapsed, 3)
-                )
-                if session.cancel.is_set():
-                    break
-                if af_row:
+                af_row = None
+                if self._af_open(session):
+                    af_row = self._sample_af(
+                        session, sample_i=sample_i, elapsed_s=round(elapsed, 3)
+                    )
+                    if session.cancel.is_set():
+                        break
+                    if af_row:
+                        row["af"] = {
+                            "ok": af_row.get("ok"),
+                            "score_match": af_row.get("score_match"),
+                            "af_score": af_row.get("af_score"),
+                            "error": af_row.get("error"),
+                        }
+                else:
                     row["af"] = {
-                        "ok": af_row.get("ok"),
-                        "score_match": af_row.get("score_match"),
-                        "af_score": af_row.get("af_score"),
-                        "error": af_row.get("error"),
+                        "ok": None,
+                        "score_match": None,
+                        "skipped": "after_buy",
+                        "error": "af_stopped_after_buy",
                     }
                 if odds_holder.get("grade"):
                     grade = odds_holder["grade"]
@@ -767,6 +814,15 @@ class PitchGateCoordinator:
                         )
                         flatten_emitted = True
                         break
+                elif session.buy_emitted:
+                    if _judge_shows_var(judged) and not var_after_buy_logged:
+                        var_after_buy_logged = True
+                        print(
+                            f"pitch-gate → VAR_AFTER_BUY match_id={session.match_id} "
+                            f"key={session.event_key} sample={sample_i} "
+                            f"(DOM trail only; already bought)",
+                            flush=True,
+                        )
                 elif has_reading:
                     if _judge_shows_var(judged):
                         if not session.var_seen:
@@ -813,7 +869,6 @@ class PitchGateCoordinator:
                                     sample_i=sample_i,
                                     af_row=af_row,
                                 )
-                                break
                     else:
                         session.confirm_streak = 0
 
@@ -874,14 +929,14 @@ class PitchGateCoordinator:
                 self._finish_session(
                     session,
                     status="aligned_buy",
-                    reason="stop_after_aligned_buy",
+                    reason="dom_trail_until_timeout",
                     elapsed_s=elapsed_end,
                     frames=captured,
                 )
                 print(
                     f"pitch-gate → ALIGNED_BUY match_id={session.match_id} "
                     f"key={session.event_key} frames={captured} "
-                    f"elapsed={elapsed_end:.1f}s (capture stopped)",
+                    f"elapsed={elapsed_end:.1f}s (AF stopped after buy; DOM trail done)",
                     flush=True,
                 )
             elif session.var_seen:

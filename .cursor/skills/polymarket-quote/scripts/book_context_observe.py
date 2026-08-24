@@ -11,6 +11,10 @@ Every actual HTTP response body is persisted under ``data/pm-quote/book_context_
 (URLs redact ``apiKey``). Observe rows keep compact request metadata and ``raw_path``;
 the large response body is not duplicated in JSONL.
 
+Paired fixtures get **one** Bet365+1xbet all-markets snapshot when they first
+enter the 30 minutes before kickoff (``data/pm-quote/prematch_odds.jsonl``).
+Same Odds-API.io quota and ``/odds/multi`` coalesce as the gate.
+
 Failures are isolated in ``error`` fields. DQD reversals cancel pending polls/upgrades.
 """
 
@@ -53,6 +57,8 @@ ENV_BOOK_ODDSPAPI_BOOKS = "BOOK_ODDSPAPI_BOOKS"
 ENV_BOOK_THE_ODDS_REGIONS = "BOOK_THE_ODDS_REGIONS"
 ENV_BOOK_THE_ODDS_SPORT_KEYS = "BOOK_THE_ODDS_SPORT_KEYS"
 ENV_BOOK_THE_ODDS_DISCOVER = "BOOK_THE_ODDS_DISCOVER_SPORTS"
+ENV_PREMATCH_ODDS = "QUOTE_PREMATCH_ODDS"
+ENV_PREMATCH_LEAD_S = "QUOTE_PREMATCH_LEAD_S"
 
 SOURCE_ODDSPAPI = "oddspapi"
 SOURCE_ODDSAPIIO = "oddsapiio"
@@ -146,6 +152,8 @@ SOFT_MIN_SIDE_SIM = 0.55
 DEFAULT_EVENTS_CATALOG_TTL_S = 60.0
 DEFAULT_RATE_LIMIT_BACKOFF_S = 60.0
 DEFAULT_EVENT_TIME_TOLERANCE_S = 12 * 3600.0
+DEFAULT_PREMATCH_LEAD_S = 30 * 60.0
+DEFAULT_PREMATCH_SCAN_S = 15.0
 
 PHASE_AF_CONFIRMED = "af_confirmed"
 PHASE_DQD_GOAL = "dqd_goal"
@@ -176,6 +184,10 @@ def get_active_observer() -> "BookContextObserver | None":
 
 def observe_path(root: Path) -> Path:
     return lib.data_dir(root) / "book_context_observe.jsonl"
+
+
+def prematch_path(root: Path) -> Path:
+    return lib.data_dir(root) / "prematch_odds.jsonl"
 
 
 def fixture_cache_path(root: Path) -> Path:
@@ -466,6 +478,7 @@ def try_create_observer(
         source_cfg=cfg,
         poll_interval_s=poll_interval_s,
         poll_timeout_s=poll_timeout_s,
+        env=env,
         **kwargs,
     )
 
@@ -587,6 +600,124 @@ def _event_row_datetime(row: dict[str, Any]) -> datetime | None:
         if dt is not None:
             return dt
     return None
+
+
+def _env_float(src: dict[str, str], name: str, default: float) -> float:
+    raw = str(src.get(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def prematch_lead_s(*, env: dict[str, str] | None = None) -> float:
+    src = env if env is not None else os.environ
+    return max(60.0, _env_float(src, ENV_PREMATCH_LEAD_S, DEFAULT_PREMATCH_LEAD_S))
+
+
+def prematch_enabled(*, env: dict[str, str] | None = None) -> bool:
+    src = env if env is not None else os.environ
+    return _env_flag(src, ENV_PREMATCH_ODDS, True)
+
+
+def load_prematch_sampled_ids(root: Path) -> set[str]:
+    """Match ids that already have a successful one-shot prematch row."""
+    path = prematch_path(root)
+    ids: set[str] = set()
+    if not path.is_file():
+        return ids
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict) or not row.get("ok"):
+                    continue
+                mid = str(row.get("match_id") or "").strip()
+                if mid:
+                    ids.add(mid)
+    except OSError:
+        return ids
+    return ids
+
+
+def kickoff_dt_from_match_row(row: dict[str, Any]) -> datetime | None:
+    """UTC kickoff from a bridge ``matches.json`` row."""
+    dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+    ts = dqd.get("match_timestamp") if isinstance(dqd, dict) else None
+    if ts is None:
+        ts = row.get("match_timestamp")
+    if ts is not None:
+        try:
+            epoch = float(ts)
+            if epoch > 1e12:
+                epoch /= 1000.0
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    for val in (
+        row.get("kickoff_beijing"),
+        (dqd or {}).get("kickoff_beijing"),
+        (dqd or {}).get("start_play"),
+        row.get("kickoff"),
+    ):
+        dt = _parse_match_datetime(val, naive_tz=TZ_CN)
+        if dt is not None:
+            return dt
+    return None
+
+
+def _dqd_already_live(row: dict[str, Any]) -> bool:
+    dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+    if row.get("finished") or (dqd or {}).get("is_finished"):
+        return True
+    st = str((dqd or {}).get("status") or (dqd or {}).get("status_raw") or "").strip().lower()
+    if not st:
+        return False
+    if "played" in st or st in ("finished", "ft"):
+        return True
+    if st.startswith("playing") or "进行" in st:
+        return True
+    return False
+
+
+def prematch_seconds_to_kickoff(
+    row: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    kick = kickoff_dt_from_match_row(row)
+    if kick is None:
+        return None
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (kick - current.astimezone(timezone.utc)).total_seconds()
+
+
+def in_prematch_window(
+    row: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    lead_s: float = DEFAULT_PREMATCH_LEAD_S,
+) -> bool:
+    """True when a paired unfinished fixture is inside (0, lead] before kickoff."""
+    if _dqd_already_live(row):
+        return False
+    dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+    mid = str((dqd or {}).get("id") or row.get("match_id") or "").strip()
+    if not mid:
+        return False
+    remain = prematch_seconds_to_kickoff(row, now=now)
+    if remain is None:
+        return False
+    return 0.0 < remain <= float(lead_s)
 
 
 def _event_terminal(row: dict[str, Any]) -> bool:
@@ -1383,6 +1514,44 @@ def parse_oddsapiio_books(
     return _with_observe_only(rows)
 
 
+def extract_all_book_markets(
+    odds_payload: Any,
+    *,
+    wanted_books: tuple[str, ...] = DEFAULT_ODDS_API_IO_BOOKS,
+    home: str = "",
+    away: str = "",
+) -> list[dict[str, Any]]:
+    """Full per-book market lists (1x2, AH, totals, CS, …), not just ML."""
+    parsed = parse_oddsapiio_books(
+        odds_payload, wanted_books=wanted_books, home=home, away=away
+    )
+    by_book: dict[str, dict[str, Any]] = {}
+    for row in parsed:
+        if isinstance(row, dict) and row.get("book"):
+            by_book[str(row["book"])] = dict(row)
+    out: list[dict[str, Any]] = []
+    for book in wanted_books:
+        entry = dict(by_book.get(book) or {"book": book, "status": "missing"})
+        markets = _book_markets(odds_payload, book)
+        compact: list[dict[str, Any]] = []
+        for mkt in markets:
+            if not isinstance(mkt, dict):
+                continue
+            compact.append(
+                {
+                    "name": mkt.get("name") or mkt.get("key") or "",
+                    "updated_at": mkt.get("updatedAt") or mkt.get("updated_at"),
+                    "odds": mkt.get("odds")
+                    if mkt.get("odds") is not None
+                    else mkt.get("outcomes") or [],
+                }
+            )
+        entry["markets"] = compact
+        entry["market_count"] = len(compact)
+        out.append(entry)
+    return out
+
+
 def parse_theoddsapi_books(
     odds_payload: Any,
     *,
@@ -1579,6 +1748,11 @@ class BookContextObserver:
         self._odds_multi_window_s = ODDS_API_IO_MULTI_WINDOW_S
         self._theodds_sports_keys: list[str] | None = None
         self._theodds_sports_fetched_at: float = 0.0
+        self._prematch_enabled = prematch_enabled(env=env)
+        self._prematch_lead_s = prematch_lead_s(env=env)
+        self._prematch_thread: threading.Thread | None = None
+        self._prematch_closed: set[str] = load_prematch_sampled_ids(self.root)
+        self._prematch_inflight: set[str] = set()
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, int(workers)),
             thread_name_prefix="book-ctx-obs",
@@ -1596,6 +1770,20 @@ class BookContextObserver:
             "odds observe on → %s source=Odds-API.io (gate clock; no 3s timers / no size)",
             observe_path(self.root),
         )
+        if self._prematch_enabled and (
+            self._prematch_thread is None or not self._prematch_thread.is_alive()
+        ):
+            self._prematch_thread = threading.Thread(
+                target=self._prematch_loop,
+                name="book-prematch-odds",
+                daemon=True,
+            )
+            self._prematch_thread.start()
+            logger.info(
+                "prematch odds on → %s (one shot at T-%ss · Bet365+1xbet all markets)",
+                prematch_path(self.root),
+                int(self._prematch_lead_s),
+            )
 
     def sample_gate_tick(
         self,
@@ -1655,6 +1843,147 @@ class BookContextObserver:
         except Exception:  # noqa: BLE001
             logger.exception("gate odds sample failed match=%s", mid)
             return None
+
+    def sample_prematch(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """One full-book snapshot at T-30 (first time the fixture is in window)."""
+        if self._stop.is_set():
+            return None
+        dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+        pm_h = row.get("polymarket") if isinstance(row.get("polymarket"), dict) else {}
+        mid = str((dqd or {}).get("id") or row.get("match_id") or "").strip()
+        if not mid:
+            return None
+        home = str((pm_h or {}).get("home") or (dqd or {}).get("home") or "")
+        away = str((pm_h or {}).get("away") or (dqd or {}).get("away") or "")
+        remain = prematch_seconds_to_kickoff(row)
+        kick = kickoff_dt_from_match_row(row)
+        kickoff_beijing = ""
+        if kick is not None:
+            kickoff_beijing = kick.astimezone(TZ_CN).strftime("%Y-%m-%d %H:%M")
+        elif row.get("kickoff_beijing"):
+            kickoff_beijing = str(row.get("kickoff_beijing"))
+        event_key = f"prematch|{mid}|{kickoff_beijing}"
+        group_id = make_observe_group_id(mid, "pre", "match", event_key)
+        mapping_ctx = {
+            "kickoff_at": row.get("kickoff_beijing") or kickoff_beijing,
+            "league": (dqd or {}).get("league")
+            or (dqd or {}).get("competition")
+            or row.get("league")
+            or "",
+        }
+        try:
+            self._begin_snap_ctx(
+                phase="prematch",
+                observe_group_id=group_id,
+                match_id=mid,
+                event_key=event_key,
+                mapping_ctx=mapping_ctx,
+            )
+            sources = self._fetch_all_sources(mid, home, away)
+            odds_source = sources.get(SOURCE_ODDSAPIIO) if isinstance(sources, dict) else None
+            odds_payload = None
+            if isinstance(odds_source, dict):
+                odds_payload = odds_source.get("raw")
+                if odds_payload is None:
+                    for req in odds_source.get("requests") or []:
+                        if isinstance(req, dict) and req.get("kind") in ("odds",) and req.get("raw"):
+                            odds_payload = req.get("raw")
+                            break
+            books = extract_all_book_markets(
+                odds_payload,
+                wanted_books=self.oddsapiio_books,
+                home=home,
+                away=away,
+            )
+            event_status = None
+            if isinstance(odds_source, dict):
+                event_status = odds_source.get("event_status")
+            if event_status is None and isinstance(odds_payload, dict):
+                event_status = odds_payload.get("status")
+            if event_status is None and isinstance(odds_source, dict):
+                for b in odds_source.get("books") or []:
+                    if isinstance(b, dict) and b.get("event_status"):
+                        event_status = b.get("event_status")
+                        break
+            raw_path = None
+            if isinstance(odds_source, dict):
+                raw_path = odds_source.get("raw_path")
+                if not raw_path:
+                    for req in odds_source.get("requests") or []:
+                        if isinstance(req, dict) and req.get("raw_path"):
+                            raw_path = req.get("raw_path")
+                            if req.get("kind") in ("odds",):
+                                break
+            ok = bool(isinstance(odds_source, dict) and odds_source.get("ok"))
+            rec: dict[str, Any] = {
+                "quoted_at": lib.now_cn_iso(),
+                "phase": "prematch",
+                "match_id": mid,
+                "home": home,
+                "away": away,
+                "kickoff_beijing": kickoff_beijing,
+                "minutes_to_kickoff": round(remain / 60.0, 2) if remain is not None else None,
+                "event_status": event_status,
+                "oddsapiio_event_id": (odds_source or {}).get("event_id")
+                if isinstance(odds_source, dict)
+                else None,
+                "ok": ok,
+                "error": (odds_source or {}).get("error") if isinstance(odds_source, dict) else None,
+                "books": books,
+                "market_count": sum(int(b.get("market_count") or 0) for b in books),
+                "raw_path": raw_path,
+                "observe_only": True,
+            }
+            lib.append_jsonl(prematch_path(self.root), [rec])
+            if ok:
+                with self._lock:
+                    self._prematch_closed.add(mid)
+            return rec
+        except Exception:  # noqa: BLE001
+            logger.exception("prematch odds sample failed match=%s", mid)
+            return None
+        finally:
+            self._snap_local.mapping_ctx = {}
+            with self._lock:
+                self._prematch_inflight.discard(mid)
+
+    def _prematch_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._prematch_tick()
+            except Exception:  # noqa: BLE001
+                logger.exception("prematch odds tick failed")
+            self._stop.wait(DEFAULT_PREMATCH_SCAN_S)
+
+    def _prematch_tick(self) -> None:
+        if not self._prematch_enabled or self._stop.is_set():
+            return
+        due: list[dict[str, Any]] = []
+        for row in lib.load_bridge_matches(self.root):
+            dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+            mid = str((dqd or {}).get("id") or "").strip()
+            if not mid:
+                continue
+            with self._lock:
+                if mid in self._prematch_closed or mid in self._prematch_inflight:
+                    continue
+            if not in_prematch_window(row, lead_s=self._prematch_lead_s):
+                remain = prematch_seconds_to_kickoff(row)
+                if remain is not None and remain <= 0:
+                    with self._lock:
+                        self._prematch_closed.add(mid)
+                continue
+            with self._lock:
+                self._prematch_inflight.add(mid)
+            due.append(row)
+        if not due:
+            return
+        futs = [self._pool.submit(self.sample_prematch, row) for row in due]
+        for fut in futs:
+            try:
+                fut.result(timeout=max(10.0, self.http_timeout_s + 8.0))
+            except Exception:  # noqa: BLE001
+                logger.debug("prematch worker failed", exc_info=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -2124,6 +2453,9 @@ class BookContextObserver:
         self._persist_fixture_cache()
 
     def _mapping_context(self, match_id: str) -> dict[str, Any]:
+        local = getattr(self._snap_local, "mapping_ctx", None)
+        if isinstance(local, dict) and (local.get("kickoff_at") or local.get("league")):
+            return dict(local)
         with self._lock:
             state = self._by_match.get(str(match_id))
             ev = dict(state.ev) if state is not None else {}
@@ -2147,6 +2479,7 @@ class BookContextObserver:
         observe_group_id: str,
         match_id: str,
         event_key: str,
+        mapping_ctx: dict[str, Any] | None = None,
     ) -> None:
         ctx = {
             "phase": phase,
@@ -2155,6 +2488,7 @@ class BookContextObserver:
             "event_key": event_key,
         }
         self._snap_local.ctx = ctx
+        self._snap_local.mapping_ctx = dict(mapping_ctx) if mapping_ctx else {}
         with self._lock:
             # Kept for diagnostics/tests; request code uses thread-local context.
             self._snap_ctx = dict(ctx)

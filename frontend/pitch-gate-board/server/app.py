@@ -258,10 +258,10 @@ def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None
         if isinstance(f.get("judge"), dict)
     ]
     states = [str(j.get("play_state") or "") for j in judges]
-    if any(_frame_var(f) for f in frames):
-        return "var_veto"
     if any(_frame_aligned_buy(f) for f in frames):
         return "aligned_buy"
+    if any(_frame_var(f) for f in frames):
+        return "var_veto"
     if any(_frame_dom_in_play(f) for f in frames):
         return "wait_af"
     if frames and all(f.get("ok") is False for f in frames):

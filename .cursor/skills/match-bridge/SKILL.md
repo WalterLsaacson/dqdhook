@@ -47,7 +47,7 @@ Full-time: `period=FT` edge (not mere `Played`); see [reference.md](reference.md
 1. Prefer `once` for a single JSON handoff, or `start --foreground` for continuous updates.
 2. Read matched rows from stdout or `data/bridge/matches.json`.
 3. For each match, give downstream consumers `polymarket.url` / `polymarket.slug` / `polymarket.event_id` / `polymarket.condition_ids` (see [reference.md](reference.md)).
-4. **进球 / 终场 / 回撤**：read `score_change` and `match_finished` from that tick’s `events` or `data/bridge/events.jsonl`. Goals rise → `is_goal`; score drop → `is_reversal` (quote skill flattens). **Extra time** (DQD playing, `minute>90`, `injury_time==0`) score swings are **not** emitted — `prev_scores` still updates so ET flicker does not reach quote.
+4. **进球 / 终场 / 回撤**：read `score_change` and `match_finished` from that tick’s `events` or `data/bridge/events.jsonl`. Goals rise → `is_goal`; score drop → `is_reversal` (quote skill flattens). Scores on the event are **Polymarket home/away**. If Dongqiudi lists the sides opposite PM, the event sets `sides_swapped=true` and PM-oriented `home_half` / `away_half` (Nami DOM still shows venue order). **Extra time** (DQD playing, `minute>90`, `injury_time==0`) score swings are **not** emitted — `prev_scores` still updates so ET flicker does not reach quote.
 5. Do not invent markets when `count` is 0 — coverage is the intersection of DQD today’s list and PM’s 48h window.
 
 ## Cooperation contract

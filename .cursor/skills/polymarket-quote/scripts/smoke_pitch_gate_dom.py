@@ -225,7 +225,11 @@ def check_dom_session() -> None:
         pg.reset_coordinator_for_tests()
 
         class _AfOk:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def sample_once(self, ev, **_kw):  # noqa: ANN001
+                self.calls += 1
                 return {
                     "ok": True,
                     "score_match": True,
@@ -233,7 +237,8 @@ def check_dom_session() -> None:
                     "error": None,
                 }
 
-        af_mod.set_active_observer(_AfOk())  # type: ignore[arg-type]
+        af = _AfOk()
+        af_mod.set_active_observer(af)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
@@ -255,6 +260,11 @@ def check_dom_session() -> None:
             statuses = [d["status"] for d in done]
             assert "in_play" in statuses and "aligned_buy" in statuses, done
             assert sum(1 for d in done if d["status"] == "in_play") == 1, done
+            assert af.calls == 2, af.calls
+            assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
+            assert any(
+                (r.get("af") or {}).get("skipped") == "after_buy" for r in obs.rows
+            )
 
             buy = next(d for d in done if d["status"] == "in_play")
             assert buy["judge"]["source"] == "dom", buy

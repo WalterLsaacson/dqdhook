@@ -429,6 +429,52 @@ def main() -> int:
         evs[0]["prev"] == {"home": 2, "away": 1},
         f"prev also oriented, got {evs[0]['prev']}",
     )
+    _assert(evs[0]["sides_swapped"] is True, evs[0])
+    _assert(evs[0]["dqd_home"] == "BG Pathum United", evs[0])
+
+    # Ligue 1: PM lists PSG first, DQD/Nami list Rennes as venue home.
+    _assert(
+        bl.sides_are_swapped(
+            "Stade Rennais FC",
+            "Paris Saint Germain",
+            "Paris Saint-Germain FC",
+            "Stade Rennais FC 1901",
+        ),
+        "PSG/Rennes sides swapped",
+    )
+    psg_h, psg_a = bl.orient_scores(
+        "Stade Rennais FC",
+        "Paris Saint Germain",
+        1,
+        0,
+        "Paris Saint-Germain FC",
+        "Stade Rennais FC 1901",
+    )
+    _assert((psg_h, psg_a) == (0, 1), f"Rennes-home 1-0 → PSG-home got {psg_h}-{psg_a}")
+    ht_h, ht_a = bl.orient_scores(
+        "Stade Rennais FC",
+        "Paris Saint Germain",
+        2,
+        0,
+        "Paris Saint-Germain FC",
+        "Stade Rennais FC 1901",
+    )
+    _assert((ht_h, ht_a) == (0, 2), f"HT Rennes 2-0 → PM {ht_h}-{ht_a}")
+    meta = bl.pm_side_fields(
+        {
+            "home": "Stade Rennais FC",
+            "away": "Paris Saint Germain",
+            "home_half": 2,
+            "away_half": 0,
+        },
+        {
+            "home": "Paris Saint-Germain FC",
+            "away": "Stade Rennais FC 1901",
+        },
+    )
+    _assert(meta["sides_swapped"] is True, meta)
+    _assert((meta["home_half"], meta["away_half"]) == (0, 2), meta)
+
     lec_dqd = {
         "home": "Cincinnati",
         "away": "Pachuca",

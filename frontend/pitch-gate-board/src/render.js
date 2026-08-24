@@ -350,24 +350,34 @@ export function renderDetail(goal) {
                 f.error || "no reading",
               )}</div></div>`;
           const aligned = Boolean(f.aligned);
-          const waitAf = ps === "in_play" && !aligned;
+          const alignedAt = goal.aligned_elapsed_s;
+          const trailAfterBuy =
+            !aligned &&
+            alignedAt != null &&
+            Number(f.elapsed_s) >= Number(alignedAt);
+          const waitAf = ps === "in_play" && !aligned && !trailAfterBuy;
           const orFlat = Boolean(f.or_flatten);
           const frameCls = [
             aligned ? "is-aligned" : "",
             waitAf ? "is-wait-af" : "",
+            trailAfterBuy ? "is-after-buy" : "",
             orFlat && revObs ? "is-or-flatten" : "",
           ]
             .filter(Boolean)
             .join(" ");
           const gateBadge = aligned
             ? "aligned_buy"
-            : waitAf
+            : trailAfterBuy
+              ? "after_buy"
+              : waitAf
               ? "wait_af"
               : orFlat && revObs
                 ? "flatten_or"
                 : ps;
           const afBit =
-            f.af?.score_match === true
+            f.af?.skipped === "after_buy"
+              ? "AF 停"
+              : f.af?.score_match === true
               ? "AF ✓"
               : f.af?.score_match === false
                 ? "AF ≠"

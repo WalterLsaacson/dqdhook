@@ -20,6 +20,7 @@ from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
     ask_in_fak_zone,
+    book_has_ask,
     rest_enabled,
     rest_expire_s,
     rest_limit_tick_size,
@@ -767,7 +768,7 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice; pitch-gate may rest @0.99 GTC when rest is enabled."""
+        """FAK a misprice; pitch-gate may rest @0.99 GTC when rest is enabled and the book has an ask."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
@@ -1047,14 +1048,34 @@ class TradeExecutor:
                 cancel_ids = live_oids
                 levels = []
                 replace = True
+            elif not book_has_ask(quote):
+                # One-sided 0.99 bid book: rest behind the bid does not fill.
+                if pitch:
+                    print(
+                        f"pitch-gate → REST skip no_ask "
+                        f"token={token_id[:12]}… bid={quote.get('best_bid')}",
+                        flush=True,
+                    )
+                return self._record(
+                    quote,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    plan=None,
+                    status="skipped",
+                    skip_reason="rest_no_ask",
+                    response=None,
+                    success=False,
+                    idempotency_key=f"rest|{event_key}|{token_id}|no_ask",
+                    live=channel_live,
+                )
             else:
                 replace = working + 1e-9 > gap and working > 1e-9
                 add_usdc = 0.0 if replace else max(0.0, gap - working)
                 if not replace and add_usdc + 1e-12 < floor:
                     return None
                 place_usdc = gap if replace else add_usdc
-                # Pitch-gate rest is for no-ask / non-FAK books — never treat ask
-                # as blocking the 0.99 GTC fallback.
+                # Pitch-gate still ignores FAK-zone so a stub ask (0.999×5)
+                # can rest @0.99. Empty ask side is skipped above.
                 ask_for_ladder = (
                     None
                     if (ignore_ask_zone or pitch)

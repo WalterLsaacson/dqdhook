@@ -540,6 +540,37 @@ def _parse_total_market(
     return {"line": line, "period": period, "side": side}
 
 
+def _bridge_lib() -> Any:
+    """Lazy import: match-bridge owns home/away swap detection."""
+    bridge_scripts = Path(__file__).resolve().parents[2] / "match-bridge" / "scripts"
+    if str(bridge_scripts) not in sys.path:
+        sys.path.insert(0, str(bridge_scripts))
+    import bridge_lib as bridge  # type: ignore
+
+    return bridge
+
+
+def halves_in_pm_frame(ctx: dict[str, Any]) -> tuple[Any, Any]:
+    """DQD ``home_half`` is venue order; Polymarket totals use event home/away."""
+    ev = ctx.get("event") if isinstance(ctx.get("event"), dict) else {}
+    dqd = ctx.get("dongqiudi") if isinstance(ctx.get("dongqiudi"), dict) else {}
+    dst_h = str(ctx.get("home") or (ev or {}).get("home") or "")
+    dst_a = str(ctx.get("away") or (ev or {}).get("away") or "")
+    src_h = str((dqd or {}).get("home") or (ev or {}).get("dqd_home") or "")
+    src_a = str((dqd or {}).get("away") or (ev or {}).get("dqd_away") or "")
+    raw_hh = (dqd or {}).get("home_half")
+    raw_ah = (dqd or {}).get("away_half")
+    if src_h and dst_h:
+        try:
+            return _bridge_lib().orient_scores(src_h, src_a, raw_hh, raw_ah, dst_h, dst_a)
+        except Exception:  # noqa: BLE001
+            pass
+    swapped = (ev or {}).get("sides_swapped")
+    if swapped is True:
+        return raw_ah, raw_hh
+    return raw_hh, raw_ah
+
+
 def _goals_for_total(
     *,
     side: str,
@@ -1354,7 +1385,7 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         dqd["home_score"] = ev.get("home_score")
     if ev.get("away_score") is not None:
         dqd["away_score"] = ev.get("away_score")
-    return {
+    ctx = {
         "event": ev,
         "match_row": row,
         "dongqiudi": dqd,
@@ -1364,6 +1395,10 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         "home": ev.get("home") or pm.get("home") or dqd.get("home") or "",
         "away": ev.get("away") or pm.get("away") or dqd.get("away") or "",
     }
+    hh, ah = halves_in_pm_frame(ctx)
+    ctx["home_half"] = hh
+    ctx["away_half"] = ah
+    return ctx
 
 
 def markets_from_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1557,7 +1592,10 @@ def collect_target_tokens(
                 tokens.extend(
                     spread_tokens(prop_markets, home=home, away=away, home_score=hs, away_score=aws)
                 )
-            dqd = ctx.get("dongqiudi") or {}
+            hh = ctx.get("home_half")
+            ah = ctx.get("away_half")
+            if hh is None and ah is None:
+                hh, ah = halves_in_pm_frame(ctx)
             tokens.extend(
                 totals_tokens(
                     prop_markets,
@@ -1565,8 +1603,8 @@ def collect_target_tokens(
                     away=away,
                     home_score=hs,
                     away_score=aws,
-                    home_half=dqd.get("home_half"),
-                    away_half=dqd.get("away_half"),
+                    home_half=hh,
+                    away_half=ah,
                     mode=mode,
                 )
             )
@@ -1575,8 +1613,8 @@ def collect_target_tokens(
                     prop_markets,
                     home_score=hs,
                     away_score=aws,
-                    home_half=dqd.get("home_half"),
-                    away_half=dqd.get("away_half"),
+                    home_half=hh,
+                    away_half=ah,
                     mode=mode,
                 )
             )
@@ -1998,9 +2036,8 @@ def quote_finished_event(
 def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
     """Stop AF/DOM for this match immediately. Safe on the bridge emit thread.
 
-    Does **not** touch CLOB (rest cancel stays on the quote tick). The quote
-    loop can sit in rest-buy for minutes; waiting until then is how Havre 1-1
-    kept sampling after DQD had already reversed.
+    Does **not** call CLOB from this thread. Rest cancel is queued onto the
+    quote worker (watch tick no longer sits in rest-buy).
     """
     from score_events import event_is_reversal
     from pitch_gate import get_coordinator
@@ -2032,6 +2069,24 @@ def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
             af.cancel_match(mid, reason="dqd_reversal")
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from quote_worker import get_quote_worker
+
+        worker = get_quote_worker()
+        if worker is not None:
+            from pitch_gate import invert_score_change_key
+
+            inv = invert_score_change_key(event_key(ev))
+            if inv:
+                worker.revoke_event(inv)
+            try:
+                for k in gate.consumed_event_keys(mid):
+                    worker.revoke_event(k)
+            except Exception:  # noqa: BLE001
+                pass
+            worker.submit_rest_cancel(mid, reason="dqd_reversal")
+    except Exception as e:  # noqa: BLE001
+        print(f"ALERT clob-worker rest-cancel enqueue failed match={mid}: {e}", flush=True)
 
 
 def install_reversal_fast_cancel(root: Path) -> None:
@@ -2067,9 +2122,13 @@ def process_bridge_events(
     """Process bridge score_change / match_finished into quotes/trades.
 
     Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` (first
-    frame @+0s, then every 5s until 120s) before one ``_quote_one``, then stop
-    capture. DQD reversals cancel rest and open gates; if lots are open they
-    start an AF∨DOM trail (no immediate flatten).
+    frame @+0s, then every 5s until 120s) before one quote job. Aligned
+    buy stops AF (quota) and keeps DOM until timeout. DQD reversals cancel
+    rest and open gates; if lots are open they start an AF∨DOM trail (no
+    immediate flatten).
+
+    When the CLOB quote worker is running, this tick only starts/cancels
+    gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
     """
     from score_events import (
         event_is_goal_up,
@@ -2078,6 +2137,7 @@ def process_bridge_events(
         target_score_from_event,
     )
     from pitch_gate import get_coordinator, invert_score_change_key
+    from quote_worker import get_quote_worker
 
     cursor = load_cursor(root)
     cursor_state_before = {
@@ -2094,11 +2154,21 @@ def process_bridge_events(
     bundles: list[dict[str, Any]] = []
     tick_t0 = time.monotonic()
     gate = get_coordinator(root)
+    clob = get_quote_worker()
 
     def _mark_ft_done(match_id: str) -> None:
         mid = str(match_id or "").strip()
         if mid:
             processed_ft_ids.add(mid)
+
+    if clob is not None:
+        for res in clob.drain_results():
+            bundles.extend(res.bundles)
+            for k in res.seen_keys:
+                if k:
+                    seen.add(k)
+            for mid in res.ft_match_ids:
+                _mark_ft_done(mid)
 
     # Pull events and cancel reversed gates BEFORE any CLOB flatten/rest work.
     # Havre 1-1 kept AF/DOM for ~90s because this tick sat in rest-buy first.
@@ -2131,7 +2201,8 @@ def process_bridge_events(
         seen.update(gate.consumed_event_keys(str(ev.get("match_id") or "")))
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
-    if trade_executor is not None:
+    # Off-thread when the CLOB worker is running (idle sweep).
+    if clob is None and trade_executor is not None:
         try:
             retried = list(trade_executor.retry_pending_flattens() or [])
             if retried:
@@ -2161,6 +2232,12 @@ def process_bridge_events(
 
     def _quote_one(work_ev: dict[str, Any], key: str) -> bool:
         nonlocal bundles, seen
+        if clob is not None:
+            extra: dict[str, Any] = {}
+            if str(work_ev.get("type") or "") == "match_finished":
+                extra["mode"] = "ft"
+            clob.submit_quote(work_ev, event_key=key, extra=extra)
+            return True
         flatten_rows: list[dict[str, Any]] = []
         if trade_executor is not None:
             try:
@@ -2257,6 +2334,18 @@ def process_bridge_events(
                 continue
             observe_only = bool(item.get("observe_only")) or bool(ev.get("is_reversal"))
             if status == "flatten_or":
+                flatten_extra = {
+                    "pitch_gate": {
+                        "status": "flatten_or",
+                        "reason": item.get("reason"),
+                        "elapsed_s": item.get("elapsed_s"),
+                        "sample_i": item.get("sample_i"),
+                        "observe_only": True,
+                    }
+                }
+                if clob is not None:
+                    clob.submit_flatten(ev, event_key=key, extra=flatten_extra)
+                    continue
                 flatten_rows: list[dict[str, Any]] = []
                 if trade_executor is not None:
                     try:
@@ -2369,6 +2458,20 @@ def process_bridge_events(
                     f"elapsed={item.get('elapsed_s')} sample={item.get('sample_i')}",
                     flush=True,
                 )
+                pitch_extra = {
+                    "mode": "pitch_gate_confirmed",
+                    "pitch_gate": {
+                        "status": "in_play",
+                        "elapsed_s": item.get("elapsed_s"),
+                        "sample_i": item.get("sample_i"),
+                        "judge": item.get("judge"),
+                    },
+                }
+                if clob is not None:
+                    clob.submit_quote(work_ev, event_key=key, extra=pitch_extra)
+                    if key not in seen:
+                        seen.add(key)
+                    continue
                 n_before = len(bundles)
                 _quote_one(work_ev, key)
                 # One knife only — do not retry this goal on later ticks.
@@ -2376,12 +2479,7 @@ def process_bridge_events(
                     seen.add(key)
                 if len(bundles) > n_before and isinstance(bundles[-1], dict):
                     bundles[-1]["mode"] = "pitch_gate_confirmed"
-                    bundles[-1]["pitch_gate"] = {
-                        "status": "in_play",
-                        "elapsed_s": item.get("elapsed_s"),
-                        "sample_i": item.get("sample_i"),
-                        "judge": item.get("judge"),
-                    }
+                    bundles[-1]["pitch_gate"] = pitch_extra["pitch_gate"]
                 continue
             if status == "buy_revoked":
                 # Queued buy invalidated by cancel/reversal before drain.
@@ -2416,13 +2514,13 @@ def process_bridge_events(
                 )
                 continue
             if status == "complete" or status == "aligned_buy":
-                # Capture stopped after aligned buy (or leftover complete).
+                # Buy already drained on in_play; this is the DOM trail ending.
                 if key not in seen:
                     seen.add(key)
                 print(
                     f"pitch-gate → {status.upper()} match_id={mid} key={key} "
                     f"reason={item.get('reason')} "
-                    f"(frames done; buy_emitted={item.get('buy_emitted')})",
+                    f"(DOM trail done; buy_emitted={item.get('buy_emitted')})",
                     flush=True,
                 )
                 continue
@@ -2481,6 +2579,8 @@ def process_bridge_events(
         key = event_key(ev)
         if not force and key in seen:
             continue
+        if not force and clob is not None and clob.is_in_flight(key):
+            continue
         # Gate session still running for this goal — wait for drain.
         if not force and key in gate.pending_event_keys():
             continue
@@ -2509,7 +2609,9 @@ def process_bridge_events(
                         f"ALERT pitch-gate block reversed goal failed match={mid_rev}: {e}",
                         flush=True,
                     )
-                if mid_rev and trade_executor is not None:
+                if mid_rev and clob is not None:
+                    clob.submit_rest_cancel(mid_rev, reason="dqd_reversal")
+                elif mid_rev and trade_executor is not None:
                     try:
                         trade_executor.cancel_rest_orders_for_match(
                             mid_rev, reason="dqd_reversal"
@@ -2686,7 +2788,9 @@ def process_bridge_events(
 
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
-            if mid and trade_executor is not None:
+            if mid and clob is not None:
+                clob.submit_rest_cancel(mid, reason="match_finished")
+            elif mid and trade_executor is not None:
                 try:
                     trade_executor.cancel_rest_orders_for_match(
                         mid, reason="match_finished"

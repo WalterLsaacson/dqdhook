@@ -101,7 +101,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
         f"size_tiers={size_tiers_label(settings)} "
-        f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF same tick → one buy)",
+        f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF → enqueue CLOB worker; stop AF, DOM to timeout)",
         file=sys.stderr,
         flush=True,
     )
@@ -271,6 +271,19 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"proxy setup warning: {e}", file=sys.stderr, flush=True)
 
     mcache.start_warmer(cache, proxy=proxy, interval_s=5.0, stop_event=stop_warm)
+    from quote_worker import start_quote_worker, stop_quote_worker
+
+    clob_worker = start_quote_worker(
+        rt,
+        proxy=proxy,
+        include_props=include_props,
+        include_exact=include_exact,
+        eps=float(args.eps),
+        fee_rate=float(args.fee_rate),
+        min_net=float(args.min_net),
+        trade_executor=executor,
+        market_cache=cache,
+    )
     retain_h = float(getattr(args, "retain_hours", data_prune.DEFAULT_RETAIN_HOURS))
     data_prune.start_pruner(
         rt,
@@ -313,6 +326,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
+        if getattr(book_obs, "_prematch_enabled", False):
+            print(
+                f"prematch odds → {lib.data_dir(rt) / 'prematch_odds.jsonl'} "
+                f"(one shot at T-{int(getattr(book_obs, '_prematch_lead_s', 1800))}s · "
+                f"Bet365+1xbet all markets)",
+                file=sys.stderr,
+                flush=True,
+            )
     else:
         print(
             "odds observe skipped (no ODDS_API_IO_KEY)",
@@ -418,6 +439,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nbye", file=sys.stderr)
         stop_warm.set()
+        stop_quote_worker()
         if lsa_obs is not None:
             lsa_obs.stop()
         if dqd_stream_obs is not None:

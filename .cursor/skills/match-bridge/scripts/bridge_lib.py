@@ -175,6 +175,37 @@ def orient_scores(
     return home_score, away_score
 
 
+def pm_side_fields(dqd: dict[str, Any], pm: dict[str, Any]) -> dict[str, Any]:
+    """Polymarket-frame labels so quote/DOM do not mix DQD home/away.
+
+    Nami ``.center-box`` and DQD ``home_half`` stay in venue/DQD order. Events
+    already emit PM-oriented ``home_score``; this stamps ``sides_swapped`` and
+    PM-oriented halves for totals.
+    """
+    pm_home = str(pm.get("home") or dqd.get("home") or "")
+    pm_away = str(pm.get("away") or dqd.get("away") or "")
+    dqd_home = str(dqd.get("home") or "")
+    dqd_away = str(dqd.get("away") or "")
+    swapped = False
+    if dqd_home and pm_home:
+        swapped = sides_are_swapped(dqd_home, dqd_away, pm_home, pm_away)
+    hh, ah = orient_scores(
+        dqd_home,
+        dqd_away,
+        dqd.get("home_half"),
+        dqd.get("away_half"),
+        pm_home,
+        pm_away,
+    )
+    return {
+        "sides_swapped": bool(swapped),
+        "dqd_home": dqd_home,
+        "dqd_away": dqd_away,
+        "home_half": hh,
+        "away_half": ah,
+    }
+
+
 def normalize_league(name: str = "", league_id: str = "") -> str:
     """Map DQD/PM league labels to a comparable string (prefer alias codes)."""
     for raw in (league_id, name):
@@ -626,6 +657,7 @@ def detect_score_changes(
                     "official_clock": dqd.get("official_clock") or "",
                     "kickoff_beijing": row.get("kickoff_beijing") or "",
                     "polymarket": _pm_event_handle(pm),
+                    **pm_side_fields(dqd, pm),
                 }
             )
         # Disallowed / correction: either side's score drops (includes mixed up+down).
@@ -679,6 +711,7 @@ def detect_score_changes(
                     "official_clock": dqd.get("official_clock") or "",
                     "kickoff_beijing": row.get("kickoff_beijing") or "",
                     "polymarket": _pm_event_handle(pm),
+                    **pm_side_fields(dqd, pm),
                 }
             )
     return events
@@ -750,6 +783,7 @@ def detect_match_finished(
                     "kickoff_beijing": row.get("kickoff_beijing") or "",
                     "official_clock": dqd.get("official_clock") or "FT",
                     "polymarket": _pm_event_handle(pm),
+                    **pm_side_fields(dqd, pm),
                 }
             )
             row["finished_at"] = ts
