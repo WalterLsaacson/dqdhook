@@ -357,9 +357,10 @@ export function renderDetail(goal) {
             Number(f.elapsed_s) >= Number(alignedAt);
           const waitShot =
             ps === "in_play" &&
-            f.af?.score_match === true &&
             !aligned &&
-            !trailAfterBuy;
+            !trailAfterBuy &&
+            !f.shot_seen &&
+            !f.shot_this_frame;
           const waitAf = ps === "in_play" && !aligned && !trailAfterBuy && !waitShot;
           const orFlat = Boolean(f.or_flatten);
           const shotThis = Boolean(f.shot_this_frame);
@@ -390,6 +391,8 @@ export function renderDetail(goal) {
               ? "AF VAR"
               : f.af?.skipped === "before_in_play"
               ? "AF 未开"
+              : f.af?.skipped === "before_shot"
+              ? "AF 等射门"
               : f.af?.score_match === true
               ? "AF ✓"
               : f.af?.score_match === false

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: pitch-gate rest uses $5 so 0.99 bids clear the 5-share CLOB floor."""
+"""Smoke: pitch-gate rest uses $5 so 0.995 bids clear the 5-share CLOB floor."""
 
 from __future__ import annotations
 
@@ -48,13 +48,16 @@ def main() -> int:
     assert abs(rl.rest_target_usdc() - 7.0) < 1e-9
     os.environ.pop("QUOTE_REST_USDC", None)
 
-    # $1 @ 0.99 with a 5-share floor must not emit an undersized bid.
+    assert abs(rl.FAK_ZONE_MAX_ASK - 0.995) < 1e-12
+    assert abs(rl.REST_CONCENTRATE_BID - 0.995) < 1e-12
+
+    # $1 @ 0.995 with a 5-share floor must not emit an undersized bid.
     tiny = rl.allocate_rest_ladder(
         1.0,
-        prices=(0.99,),
+        prices=(0.995,),
         tick_size="0.01",
         floor_usdc=1.0,
-        best_bid=0.99,
+        best_bid=0.995,
         best_ask=None,
         min_shares=5.0,
     )
@@ -62,16 +65,39 @@ def main() -> int:
 
     levels = rl.allocate_rest_ladder(
         rl.rest_target_usdc(),
-        prices=(0.99,),
+        prices=(0.995,),
         tick_size="0.01",
         floor_usdc=1.0,
-        best_bid=0.99,
+        best_bid=0.995,
         best_ask=None,
         min_shares=5.0,
     )
     assert len(levels) == 1, levels
-    assert abs(float(levels[0]["price"]) - 0.99) < 1e-9
+    # 0.01 books cannot represent 0.995; floor to 0.99, post with book tick.
+    assert abs(float(levels[0]["price"]) - 0.99) < 1e-9, levels[0]
+    assert levels[0].get("tick_size") == "0.01", levels[0]
     assert float(levels[0]["shares"]) + 1e-12 >= 5.0, levels[0]
+
+    fine = rl.allocate_rest_ladder(
+        rl.rest_target_usdc(),
+        prices=(0.995,),
+        tick_size="0.001",
+        floor_usdc=1.0,
+        best_bid=0.995,
+        best_ask=None,
+        min_shares=5.0,
+    )
+    assert len(fine) == 1, fine
+    assert abs(float(fine[0]["price"]) - 0.995) < 1e-9, fine[0]
+    assert fine[0].get("tick_size") == "0.001", fine[0]
+
+    resolved_coarse = rl.resolve_rest_price(0.995, "0.01")
+    assert resolved_coarse is not None and abs(resolved_coarse[0] - 0.99) < 1e-9
+    assert resolved_coarse[1] == "0.01"
+    resolved_fine = rl.resolve_rest_price(0.995, "0.001")
+    assert resolved_fine is not None and abs(resolved_fine[0] - 0.995) < 1e-9
+    assert resolved_fine[1] == "0.001"
+
     os.environ.pop("QUOTE_REST_EXPIRE_S", None)
     assert abs(rl.rest_expire_s() - 0.0) < 1e-9
     os.environ["QUOTE_REST_EXPIRE_S"] = "3600"
@@ -113,6 +139,9 @@ def main() -> int:
                 q_no, event_key=ek, match_meta=meta, event_type="score_change"
             )
             assert posted_empty and posted_empty.get("status") == "rest_dry_run", posted_empty
+            plan = posted_empty.get("plan") or {}
+            levels_out = plan.get("levels") or []
+            assert levels_out and abs(float(levels_out[0]["price"]) - 0.99) < 1e-9, plan
 
             q_stub = dict(q_no)
             q_stub["token_id"] = "tok2"
@@ -126,7 +155,7 @@ def main() -> int:
     finally:
         os.environ.pop("QUOTE_REST_ENABLED", None)
 
-    print("ok: rest ladder $5 / 5-share floor / GTC default")
+    print("ok: rest ladder $5 / 0.01→0.99 / 0.001→0.995 / GTC default")
     return 0
 
 

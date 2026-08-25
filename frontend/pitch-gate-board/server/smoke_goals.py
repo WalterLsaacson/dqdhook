@@ -199,6 +199,8 @@ def main() -> int:
                 "judge": {"play_state": "in_play"},
                 "af": {"ok": True, "score_match": False, "af_score": "0-0"},
                 "dom_state": {"pop_box": "进攻", "center_box": "1 : 0"},
+                "shot_seen": True,
+                "shot_this_frame": True,
             }
         ],
     )
@@ -224,8 +226,10 @@ def main() -> int:
                 "ok": True,
                 "gate": True,
                 "judge": {"play_state": "in_play"},
-                "af": {"ok": True, "score_match": True, "af_score": "1-0"},
+                "af": {"ok": None, "score_match": None, "skipped": "before_shot"},
                 "dom_state": {"pop_box": "进攻", "center_box": "1 : 0"},
+                "shot_seen": False,
+                "shot_this_frame": False,
             }
         ],
     )
@@ -400,6 +404,81 @@ def main() -> int:
     snap5 = board.build_goals_payload(limit=50)
     skipped = next(g for g in snap5["goals"] if g["event_key"] == skip_key)
     assert skipped["verdict"] == "reversal_risk_skip", skipped["verdict"]
+
+    # Late 射门 must not back-date aligned @ to an earlier AF-green frame.
+    late_shot_key = "score_change|m6|2-1->2-2|2026-08-25T23:10:05+08:00"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": late_shot_key,
+                "match_id": "m6",
+                "home": "Tobol",
+                "away": "Kaysar",
+                "home_score": 2,
+                "away_score": 2,
+                "sample_i": 6,
+                "elapsed_s": 30.005,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {"ok": True, "score_match": True, "af_score": "2-2"},
+                "dom_state": {
+                    "pop_box": "卡伊萨尔 危险进攻",
+                    "marks": ["dangerous-attack"],
+                },
+                "shot_seen": False,
+                "shot_this_frame": False,
+            },
+            {
+                "event_key": late_shot_key,
+                "match_id": "m6",
+                "home": "Tobol",
+                "away": "Kaysar",
+                "home_score": 2,
+                "away_score": 2,
+                "sample_i": 10,
+                "elapsed_s": 50.005,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "unclear"},
+                "af": {"ok": True, "score_match": True, "af_score": "2-2"},
+                "dom_state": {
+                    "pop_box": "卡伊萨尔 48'射正",
+                    "marks": ["ball", "net"],
+                },
+                "shot_seen": True,
+                "shot_this_frame": True,
+            },
+            {
+                "event_key": late_shot_key,
+                "match_id": "m6",
+                "home": "Tobol",
+                "away": "Kaysar",
+                "home_score": 2,
+                "away_score": 2,
+                "sample_i": 11,
+                "elapsed_s": 55.004,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {"ok": True, "score_match": True, "af_score": "2-2"},
+                "dom_state": {"pop_box": "杜保尔 进攻", "marks": ["attack"]},
+                "shot_seen": True,
+                "shot_this_frame": False,
+            },
+        ],
+    )
+    _write_jsonl(quotes, [])
+    snap6 = board.build_goals_payload(limit=50)
+    late = next(g for g in snap6["goals"] if g["event_key"] == late_shot_key)
+    assert late["verdict"] == "aligned_buy", late["verdict"]
+    assert abs(float(late["aligned_elapsed_s"]) - 55.004) < 1e-6, late.get(
+        "aligned_elapsed_s"
+    )
+    assert late["frames"][0].get("aligned") is False
+    assert late["frames"][1].get("aligned") is False
+    assert late["frames"][2].get("aligned") is True
 
     print("ok: pitch-gate board verdicts match DOM∧AF∧射门 / AF∨DOM")
     return 0

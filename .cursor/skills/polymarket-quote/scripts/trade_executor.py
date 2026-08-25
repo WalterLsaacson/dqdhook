@@ -79,7 +79,7 @@ FLATTEN_ORDER_MAX_WAIT_S = 60.0
 FLATTEN_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_ORDER_RECHECK_INTERVAL_S = 2.0
 CUSHION_REST_USDC = 1.0
-CUSHION_REST_PRICES = (0.99,)
+CUSHION_REST_PRICES = (0.995,)
 # Keep pending_reason bounded (append loops used to grow to 80KB+).
 FLATTEN_REASON_MAX_LEN = 400
 _TERMINAL_FLATTEN_ERR_RE = re.compile(
@@ -727,8 +727,8 @@ class TradeExecutor:
             return None
         if price <= 0.01 + 1e-12:
             return f"extreme_price={price} (<=0.01)"
-        # Cap aligned with quote_lib.DEFAULT_MAX_BUY_ASK (ask≤0.992).
-        max_ask = float(getattr(lib, "DEFAULT_MAX_BUY_ASK", 0.992))
+        # Cap aligned with quote_lib.DEFAULT_MAX_BUY_ASK (ask≤0.995).
+        max_ask = float(getattr(lib, "DEFAULT_MAX_BUY_ASK", 0.995))
         if price > max_ask + 1e-12:
             return f"extreme_price={price} (>{max_ask})"
         return None
@@ -743,7 +743,7 @@ class TradeExecutor:
     ) -> str | None:
         """buy_win ask floor (default 0.6; 0=off).
 
-        Pitch-gate and FT both skip this floor (fee/min_net + 0.992 still apply).
+        Pitch-gate and FT both skip this floor (fee/min_net + 0.995 still apply).
         """
         if _trade_context_pitch_gate(match_meta):
             return None
@@ -767,7 +767,7 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice; pitch-gate may rest @0.99 GTC when rest is enabled and the book has an ask."""
+        """FAK a misprice; pitch-gate may rest @0.995 GTC when rest is enabled."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
@@ -910,7 +910,7 @@ class TradeExecutor:
         quote: dict[str, Any],
         match_meta: dict[str, Any] | None,
     ) -> tuple[float, str]:
-        """Rest target: pitch-gate size @0.99, or cushion rest."""
+        """Rest target: pitch-gate size @0.995, or cushion rest."""
         ctx = (
             (match_meta or {}).get("trade_context")
             if isinstance((match_meta or {}).get("trade_context"), dict)
@@ -1005,7 +1005,7 @@ class TradeExecutor:
             return None
         cushion = quote_reversal_cushion(quote)
         pitch = _trade_context_pitch_gate(match_meta)
-        # Pitch-gate: single 0.99 bid (equivalent size); cushion also 0.99-only.
+        # Pitch-gate: single 0.995 bid (equivalent size); cushion also 0.995-only.
         rest_prices = CUSHION_REST_PRICES if (cushion or pitch) else None
         with self._lock:
             if self._match_buy_blocked_locked(mid) or mid in self._rest_blocked_matches:
@@ -1054,7 +1054,7 @@ class TradeExecutor:
                     return None
                 place_usdc = gap if replace else add_usdc
                 # Pitch-gate ignores FAK-zone so a stub ask (0.999×5) or an
-                # empty ask side still rests @0.99 (wait for a dump).
+                # empty ask side still rests @0.995 (wait for a dump).
                 ask_for_ladder = (
                     None
                     if (ignore_ask_zone or pitch)
@@ -1150,11 +1150,12 @@ class TradeExecutor:
                     if not callable(post_fn):
                         logger.warning("trader has no post_limit_buy; skip rest")
                         break
+                    lvl_tick = str(lvl.get("tick_size") or tick)
                     resp = post_fn(
                         token_id,
                         Decimal(str(lvl["shares"])),
                         Decimal(str(lvl["price"])),
-                        tick,
+                        lvl_tick,
                         order_type=ot,
                         expiration=exp,
                         neg_risk=neg_risk,

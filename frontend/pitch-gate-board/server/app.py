@@ -253,9 +253,22 @@ def _frame_dom_af_green(frame: dict[str, Any]) -> bool:
     return _frame_dom_in_play(frame) and _frame_af(frame).get("score_match") is True
 
 
-def _frame_aligned_buy(frame: dict[str, Any], *, shot_seen: bool = False) -> bool:
-    """Same-tick DOM in_play ∧ AF score_match ∧ latched 射门."""
-    if not (shot_seen or frame.get("shot_seen") or _frame_shows_shot(frame)):
+def _frame_aligned_buy(frame: dict[str, Any], *, shot_seen: bool | None = None) -> bool:
+    """Same-tick DOM in_play ∧ AF score_match ∧ latched 射门.
+
+    ``shot_seen`` must reflect this frame's latch state (or earlier). Never pass a
+    goal-wide flag that includes *future* shot frames — that back-dates
+    ``aligned @ t+…`` before 射门 actually appeared.
+    """
+    if shot_seen is None:
+        latched = bool(
+            frame.get("shot_seen")
+            or frame.get("shot_this_frame")
+            or _frame_shows_shot(frame)
+        )
+    else:
+        latched = bool(shot_seen)
+    if not latched:
         return False
     return _frame_dom_af_green(frame)
 
@@ -284,12 +297,12 @@ def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None
         if isinstance(f.get("judge"), dict)
     ]
     states = [str(j.get("play_state") or "") for j in judges]
-    shot_seen = _goal_shot_seen(frames)
-    if any(_frame_aligned_buy(f, shot_seen=shot_seen) for f in frames):
+    # Per-frame latch only — do not let a late 射门 rewrite earlier WAIT_SHOT ticks.
+    if any(_frame_aligned_buy(f) for f in frames):
         return "aligned_buy"
     if any(_frame_var(f) for f in frames):
         return "var_veto"
-    if any(_frame_dom_af_green(f) for f in frames):
+    if any(_frame_dom_in_play(f) for f in frames) and not _goal_shot_seen(frames):
         return "wait_shot"
     if any(_frame_dom_in_play(f) for f in frames):
         return "wait_af"
@@ -872,6 +885,7 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             )
         )
         shot_seen = _goal_shot_seen(frames)
+        latched = False
         for f in frames:
             sample_i = f.get("sample_i")
             if not isinstance(f.get("af"), dict):
@@ -888,7 +902,17 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             f["shot_this_frame"] = bool(
                 f.get("shot_this_frame") or _frame_shows_shot(f)
             )
-            f["aligned"] = _frame_aligned_buy(f, shot_seen=shot_seen)
+            # Runtime ``shot_seen`` is authoritative per tick. Only synthesize a
+            # forward latch when older rows omitted the field.
+            if f.get("shot_seen") is not None:
+                frame_latched = bool(f.get("shot_seen"))
+                if frame_latched:
+                    latched = True
+            else:
+                if f["shot_this_frame"]:
+                    latched = True
+                frame_latched = latched
+            f["aligned"] = _frame_aligned_buy(f, shot_seen=frame_latched)
             f["or_flatten"] = _frame_or_flatten(f)
         g["frames"] = frames
         g["shot_seen"] = shot_seen

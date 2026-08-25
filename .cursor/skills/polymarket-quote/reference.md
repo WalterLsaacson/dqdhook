@@ -64,13 +64,15 @@ Sports taker fee (2026): `fee = feeRate × p × (1 − p)` with default `feeRate
 | Buy WIN at ask `p` | `1 − p` | `gross − fee(p)` |
 | Sell LOSE into bid `p` | — | **disabled** (not traded) |
 
-Only rows with **`net_edge ≥ min_net`** (default **0.0076** USDC/share ≈ ask≤**0.992**) go to `opportunities.jsonl`.  
+Only rows with **`net_edge ≥ min_net`** (default **0.00475** USDC/share ≈ ask≤**0.995**) go to `opportunities.jsonl`.  
 Quotes still record all tokens; dust / fee-insufficient edges stay out of oppo.  
 CLI: `--fee-rate`, `--min-net`.
 
 ## In-process trading (low latency)
 
 After `flag_misprice` returns true inside `quote_tokens`, `TradeExecutor` runs **in the same process** on the **CLOB worker thread** (watch tick only enqueues the event payload; it does not wait for `/books` or rest posts).
+
+**Gate prewarm** (`QUOTE_GATE_PREWARM`, default on): on pitch-gate `start_gate` (buy path), a background thread warms Gamma catalog + refreshes `POST /books` every `QUOTE_GATE_PREWARM_INTERVAL_S` (default 3s). On BUY, `quote_bridge_event` prefers that snapshot when age ≤ `QUOTE_GATE_PREWARM_MAX_AGE_S` (default 4s); otherwise fetches. Cuts ~0.5–1s books RTT after BUY — does **not** shorten DOM/AF/shot wait.
 
 | Mode | Behavior |
 |---|---|
@@ -91,7 +93,7 @@ Flatten uses **`lot.live`**, not the global session flag — mixed dry/live sess
 
 `sell_lose` is **disabled at source**: settled `LOSE` tokens are dropped before CLOB `/books` (only `WIN` / non-LOSE legs are quoted; only `buy_win` is traded).
 
-Price guard: skip when best ≤0.01 or >0.992 unless `--allow-extreme-prices`.  
+Price guard: skip when best ≤0.01 or >0.995 unless `--allow-extreme-prices`.  
 `buy_win` floor: skip (still append `trades.jsonl` with `skip_reason=buy_price_below_min=…`) when `best_ask < --min-buy-price` (default **0.6**; **0** = off). Env: `QUOTE_MIN_BUY_PRICE`. **Pitch-gate and FT buys skip this floor.**
 
 **Size policy (`.env`)**: hard caps `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` (default 1/25). `QUOTE_SIZE_TIERS=0.98:1` means **ask ≥ 0.98 → $1**, else **$1** (hard-capped); **shares scale with that usdc**. Concurrent open cost capped by `QUOTE_MAX_OPEN_USDC` (default **1000**). Floor `QUOTE_SIZE_FLOOR_USDC` (default 1) and the $1 marketable bump are **skipped when `trade_context.pitch_gate=true`**. Fee/`min_net` and `QUOTE_MAX_USDC` still apply.  
@@ -103,14 +105,14 @@ Modules: `trade_settings.py`, `clob_trader.py`, `fill_planner.py`, `trade_execut
 **Pitch-gate buy (DOM first; same-tick in_play ∧ AF ∧ shot; stop AF after buy)**
 
 1. DQD goal-up + Polymarket paired → `PitchGateCoordinator.start_gate` (no immediate `_quote_one`).
-2. Sample DOM every **5s** for up to **120s**, first tick at **+0s**. AF starts on the first DOM `in_play` tick (same tick), then every later tick samples AF+DOM until buy / timeout / cancel. Odds grade on every DOM tick (including before AF arms).
-3. Buy when **this tick** has DOM `play_state==in_play` **and** AF `ok && score_match` **and** this goal latched a 射门 since t0 (pop contains `射门`, or DOM marks `ball`/`net`). 射门 is **not** an `in_play` token. Then one `_quote_one` with `trade_context.pitch_gate=True`. Then **stop AF** (quota) and **keep DOM** until the original 120s timeout (`aligned_buy` when the trail ends). AF rate-limit / error fails closed for that tick. in_play∧AF without a shot logs `WAIT_SHOT`. Buy-side AF∨DOM is **rejected** (`design-af-dom-or-gate.md`).
+2. Sample DOM every **5s** for up to **120s**, first tick at **+0s**. AF starts only when this goal has latched a 射门 **and** the current tick is DOM `in_play`; then later ticks sample AF+DOM until buy / timeout / cancel. Odds grade on every DOM tick (including before AF arms).
+3. Buy when **this tick** has DOM `play_state==in_play` **and** AF `ok && score_match` **and** this goal latched a 射门 since t0 (pop contains `射门`, or DOM marks `ball`/`net`). 射门 is **not** an `in_play` token. Then one `_quote_one` with `trade_context.pitch_gate=True`. Then **stop AF** (quota) and **keep DOM** until the original 120s timeout (`aligned_buy` when the trail ends). AF rate-limit / error fails closed for that tick. `in_play` without a shot logs `WAIT_SHOT` and **does not call AF**. Buy-side AF∨DOM is **rejected** (`design-af-dom-or-gate.md`).
 4. Any tick with **VAR before buy** → **permanent no-buy** (`mode=pitch_gate_var_veto`), even if a shot was seen. VAR after buy is logged on the DOM trail only.
 5. Never aligned before timeout → `mode=pitch_gate_timeout`, mark seen, no buy.
 6. DQD reversal → in-process bridge **hooks emit** to `cancel_match` immediately; rest cancel is queued onto the CLOB worker (`rest_cancel` priority beats idle housekeep). The worker revokes **submitted `event_key`s** for that match, not the whole `match_id` (a later non-opening re-award with a new ts can still quote). **Opening** 0-0→1-0 / 0-0→0-1 skips `start_gate` when that transition was already reversed on the match, or when the DQD clock is ≥90' (`pitch_gate_reversal_risk_skip`). Ordinary ~35' opening goals stay full size. Quote tick also **pre-pass** reversals **before** `start_gate`. `block_inverted_goal` keys on the goal stem + reverse ts: older/same-ts 0-1→1-1 is blocked; a re-awarded non-opening goal with a newer ts is not. Drain gate results **after** event handling so same-tick reversals revoke queued buys. If **open lots exist**, start a 5s AF∨DOM confirm trail (never `_quote_one`); on first score match → flatten and **stop the trail** (no DOM drag to 120s).
 7. Requires `QUOTE_DQD_STREAM_OBSERVE=1`; else `pitch_gate_unavailable`. No screenshots / OCR / JPEG.
 8. FT path remains immediate quote (default live).
-9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid @ **0.99** (`GTC` by default — stays until DQD reversal, FT, or manual cancel), including one-sided 0.99 bid books with no ask. Set **`QUOTE_REST_EXPIRE_S>0`** to use `GTD` instead. Size is **`QUOTE_REST_USDC` (default $5)** so the bid clears the CLOB 5-share floor. Pitch-gate rest is **not** clipped by `QUOTE_MAX_OPEN_USDC`.
+9. **Rest fallback**: when **`QUOTE_REST_ENABLED=1`**, if pitch-gate WIN has no FAK fill, post a limit bid at **min(0.995, book tick grid)** (`GTC` by default — stays until DQD reversal, FT, or manual cancel), including one-sided bid books with no ask. On **0.01** soccer ticks that is **0.99**; on published **0.001** ticks it stays **0.995**. Do not invent `tick=0.001` on a 0.01 book (CLOB rejects it). Set **`QUOTE_REST_EXPIRE_S>0`** to use `GTD` instead. Size is **`QUOTE_REST_USDC` (default $5)** so the bid clears the CLOB 5-share floor. Pitch-gate rest is **not** clipped by `QUOTE_MAX_OPEN_USDC`.
 
 **Score reversal / disallowed goal**
 

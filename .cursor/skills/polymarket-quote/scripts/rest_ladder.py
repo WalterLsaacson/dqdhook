@@ -6,28 +6,31 @@ import os
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
-# Willing-to-pay bids after FAK: 0.99 first, then 0.98.
-DEFAULT_REST_PRICES = (0.99, 0.98)
+# Willing-to-pay bids after FAK: 0.995 first, then 0.99.
+DEFAULT_REST_PRICES = (0.995, 0.99)
 # Align with quote_lib.DEFAULT_MAX_BUY_ASK — ask at or below this is FAK, not rest.
-FAK_ZONE_MAX_ASK = 0.992
-# When the book bid already sits here, rest only at 0.99 (skip 0.98).
-REST_CONCENTRATE_BID = 0.99
+FAK_ZONE_MAX_ASK = 0.995
+# When the book bid already sits here, rest only at 0.995 (skip 0.99).
+REST_CONCENTRATE_BID = 0.995
 # 0 → GTC (stay until reversal / FT / manual cancel). >0 → GTD seconds.
 DEFAULT_REST_EXPIRE_S = 0.0
 MIN_REST_USDC = 1.0
-# Soccer CLOB limit bids reject below 5 shares (~$4.95 @ 0.99). Pitch-gate
+# Soccer CLOB limit bids reject below 5 shares (~$4.975 @ 0.995). Pitch-gate
 # rest therefore spends ``QUOTE_REST_USDC`` (default $5), not ``QUOTE_MAX_USDC``.
 DEFAULT_REST_USDC = 5.0
 MIN_REST_SHARES = 5.0
 _SHARE_Q = Decimal("0.01")
 # CLOB limit orders reject tick_size below 0.01 on many soccer tokens even
-# when the book metadata (or exact-score rows) reports 0.001.
+# when exact-score metadata reports 0.001. Never post finer than the book tick,
+# and never invent 0.001 on a 0.01 book just to represent 0.995.
 REST_LIMIT_MIN_TICK = 0.01
+REST_FINE_TICK = 0.001
+REST_FALLBACK_TICK = 0.01
 # Master switch for GTD/GTC rest bids (pitch-gate fallback + cushion). Off until stable.
 DEFAULT_REST_ENABLED = False
 
 
-def _env_bool(name: str, default: bool) -> bool:
+def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
         return default
@@ -40,7 +43,7 @@ def rest_enabled() -> bool:
 
 
 def rest_target_usdc() -> float:
-    """Pitch-gate rest notional. Default $5 so 0.99 bids clear the 5-share floor."""
+    """Pitch-gate rest notional. Default $5 so 0.995 bids clear the 5-share floor."""
     raw = os.getenv("QUOTE_REST_USDC")
     if raw is None or str(raw).strip() == "":
         return float(DEFAULT_REST_USDC)
@@ -73,16 +76,28 @@ def min_rest_usdc(price: float, *, min_shares: float = MIN_REST_SHARES) -> float
     return round(max(float(min_shares), 0.0) * px, 6)
 
 
-def rest_limit_tick_size(tick_size: str | float | None) -> str:
-    """Tick string for GTD/GTC limit posts — never below REST_LIMIT_MIN_TICK."""
-    try:
-        tick = float(tick_size or REST_LIMIT_MIN_TICK)
-    except (TypeError, ValueError):
-        tick = REST_LIMIT_MIN_TICK
-    tick = max(REST_LIMIT_MIN_TICK, tick)
+def format_rest_tick(tick: float) -> str:
     if abs(tick - round(tick, 2)) < 1e-9:
         return f"{tick:.2f}"
+    if abs(tick - round(tick, 3)) < 1e-9:
+        return f"{tick:.3f}"
     return str(tick)
+
+
+def rest_limit_tick_size(tick_size: str | float | None) -> str:
+    """Tick string for GTD/GTC limit posts.
+
+    Honor a published 0.001 book tick (0.995 is then legal). Otherwise never
+    go below 0.01 — soccer CLOB rejects finer ticks.
+    """
+    try:
+        tick = float(tick_size or REST_FALLBACK_TICK)
+    except (TypeError, ValueError):
+        tick = REST_FALLBACK_TICK
+    if abs(tick - REST_FINE_TICK) < 1e-9:
+        return format_rest_tick(REST_FINE_TICK)
+    tick = max(REST_LIMIT_MIN_TICK, tick)
+    return format_rest_tick(tick)
 
 
 def rest_expire_s() -> float:
@@ -145,18 +160,32 @@ def rest_prices() -> tuple[float, ...]:
 
 
 def snap_rest_price(price: float, tick_size: str | float | None) -> float | None:
-    """Tick-snap a rest bid; drop at/above par or unsnappable ticks."""
+    """Tick-snap a rest bid **down** (never pay above the target)."""
     try:
         px = float(price)
-        tick = float(tick_size or 0.01)
+        tick = float(tick_size or REST_FALLBACK_TICK)
     except (TypeError, ValueError):
         return None
     if tick <= 0 or px <= 0:
         return None
-    snapped = round(round(px / tick) * tick, 6)
+    steps = (Decimal(str(px)) / Decimal(str(tick))).to_integral_value(
+        rounding=ROUND_DOWN
+    )
+    snapped = float((steps * Decimal(str(tick))).quantize(Decimal("0.000001")))
     if snapped <= 0 or snapped >= 1.0 - 1e-12:
         return None
     return snapped
+
+
+def resolve_rest_price(
+    price: float, tick_size: str | float | None
+) -> tuple[float, str] | None:
+    """Snap ``price`` onto the book's CLOB-legal tick (no invented finer grid)."""
+    tick = rest_limit_tick_size(tick_size)
+    snapped = snap_rest_price(price, tick)
+    if snapped is None:
+        return None
+    return snapped, tick
 
 
 def shares_for_usdc(usdc: float, price: float) -> float:
@@ -178,8 +207,7 @@ def allocate_rest_ladder(
     best_ask: Any = None,
     min_shares: float = MIN_REST_SHARES,
 ) -> list[dict[str, Any]]:
-    """Split remaining USDC across rest prices (0.99 only when bid≥0.99, else 0.99+0.98)."""
-    tick_size = rest_limit_tick_size(tick_size)
+    """Split remaining USDC across rest prices (0.995 when bid high, else ladder)."""
     need = max(0.0, float(remaining_usdc))
     floor = max(0.0, float(floor_usdc))
     share_floor = max(0.0, float(min_shares))
@@ -188,20 +216,23 @@ def allocate_rest_ladder(
     chosen = select_rest_prices(best_bid=best_bid, best_ask=best_ask, prices=prices)
     if not chosen:
         return []
-    snapped: list[float] = []
+    snapped: list[tuple[float, str]] = []
     seen: set[float] = set()
     for raw in chosen:
-        px = snap_rest_price(raw, tick_size)
-        if px is None or px in seen:
+        resolved = resolve_rest_price(raw, tick_size)
+        if resolved is None:
+            continue
+        px, tick = resolved
+        if px in seen:
             continue
         seen.add(px)
-        snapped.append(px)
+        snapped.append((px, tick))
     if not snapped:
         return []
     # Do not raise spend above the caller budget (QUOTE_MAX_USDC).
     level_floor = floor
     if share_floor > 0:
-        lifted = min_rest_usdc(min(snapped), min_shares=share_floor)
+        lifted = min_rest_usdc(min(p for p, _ in snapped), min_shares=share_floor)
         if lifted <= need + 1e-12:
             need = max(need, lifted)
             level_floor = max(floor, lifted)
@@ -217,19 +248,19 @@ def allocate_rest_ladder(
             snapped = snapped[:1]
         else:
             chunks = [need - half, half]
-            # First price (0.99) gets the larger leftover.
+            # First price (0.995) gets the larger leftover.
             if chunks[0] + 1e-12 < level_floor:
                 chunks = [need]
                 snapped = snapped[:1]
     levels: list[dict[str, Any]] = []
     share_tick = float(_SHARE_Q)
-    for px, usdc in zip(snapped, chunks):
+    for (px, tick), usdc in zip(snapped, chunks):
         if usdc + 1e-12 < floor:
             continue
         shares = shares_for_usdc(usdc, px)
         cost = round(shares * px, 6)
         need_floor = min(floor, usdc)
-        # ROUND_DOWN at 0.99 can leave $1 → 0.9999; bump one share tick so the
+        # ROUND_DOWN can leave $1 → 0.9999; bump one share tick so the
         # notional still clears the floor (slight overspend ≤ one tick).
         if shares > 0 and cost + 1e-12 < need_floor:
             bumped = round(shares + share_tick, 6)
@@ -253,6 +284,7 @@ def allocate_rest_ladder(
                 "price": px,
                 "shares": round(shares, 6),
                 "usdc": cost,
+                "tick_size": tick,
             }
         )
     return levels

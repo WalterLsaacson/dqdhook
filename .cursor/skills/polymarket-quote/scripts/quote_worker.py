@@ -40,7 +40,7 @@ def start_quote_worker(
     include_exact: bool = True,
     eps: float = 0.005,
     fee_rate: float = 0.05,
-    min_net: float = 0.0076,
+    min_net: float = 0.00475,
     trade_executor: Any | None = None,
     market_cache: Any | None = None,
 ) -> "QuoteWorker":

@@ -271,6 +271,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"proxy setup warning: {e}", file=sys.stderr, flush=True)
 
     mcache.start_warmer(cache, proxy=proxy, interval_s=5.0, stop_event=stop_warm)
+    try:
+        from gate_prewarm import configure_prewarm
+
+        configure_prewarm(
+            rt,
+            market_cache=cache,
+            proxy=proxy,
+            include_props=include_props,
+            include_exact=include_exact,
+        )
+        print(
+            "gate-prewarm · catalog+books while pitch-gate waits (QUOTE_GATE_PREWARM)",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"gate-prewarm setup warning: {e}", file=sys.stderr, flush=True)
     from quote_worker import start_quote_worker, stop_quote_worker
 
     clob_worker = start_quote_worker(
@@ -526,7 +543,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument(
         "--allow-extreme-prices",
         action="store_true",
-        help="Allow orders when best price <=0.01 or >0.992 (default blocked)",
+        help="Allow orders when best price <=0.01 or >0.995 (default blocked)",
     )
     sp.add_argument(
         "--min-buy-price",

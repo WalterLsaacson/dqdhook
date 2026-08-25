@@ -222,7 +222,7 @@ def check_dom_session() -> None:
     orig_open = pg.PitchGateCoordinator._open_dom_reader
     try:
         # Frame 0 stopped (celebration, 射门 mark), frame 1 in_play → one buy.
-        # AF is skipped on the celebration frame and starts on first in_play.
+        # AF is skipped on the celebration frame and starts on first in_play∧射门.
         frames = [
             _dom("H 进球", "45:01 1 : 0", ["ball"]),
             _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),

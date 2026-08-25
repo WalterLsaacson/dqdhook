@@ -138,7 +138,7 @@ def main() -> int:
     }
 
     try:
-        # AND buy: celebration skips AF; first in_play arms AF; shot latched.
+        # AND buy: celebration skips AF; in_play∧射门 arms AF.
         frames = [
             _dom("H 进球", "45:01 1 : 0", ["ball"]),
             _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
@@ -259,16 +259,15 @@ def main() -> int:
             assert done[0].get("buy_emitted") is False
             assert "no_aligned_buy" in str(done[0].get("reason") or ""), done[0]
 
-        # in_play + AF aligned but never 射门 → no buy.
+        # in_play + AF aligned but never 射门 → no buy (and no AF calls).
         factory, _ = _open_factory(
             [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
             baseline=_dom("H 进球", "44:56 1 : 0"),
         )
         pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
         pg.reset_coordinator_for_tests()
-        af_mod.set_active_observer(
-            _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])  # type: ignore[arg-type]
-        )
+        af_noshot = _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])
+        af_mod.set_active_observer(af_noshot)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
@@ -281,6 +280,12 @@ def main() -> int:
             assert done[0].get("buy_emitted") is False
             assert "no_shot" in str(done[0].get("reason") or ""), done[0]
             assert all(not r.get("shot_seen") for r in obs_shot.rows)
+            assert all(
+                (r.get("af") or {}).get("skipped") == "before_shot"
+                for r in obs_shot.rows
+                if (r.get("judge") or {}).get("play_state") == "in_play"
+            )
+            assert af_noshot.calls == 0, af_noshot.calls
 
         # Unclear 射门 (pop) then 进攻 + AF → buy. Celebration/unclear skips AF.
         factory, _ = _open_factory(

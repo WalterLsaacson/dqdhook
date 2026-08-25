@@ -47,10 +47,10 @@ DEFAULT_EPS = 0.005
 # Polymarket sports taker feeRate (2026): fee/share = feeRate * p * (1-p)
 SPORTS_TAKER_FEE_RATE = 0.05
 # Max buy ask we will trade (executor also hard-blocks above this).
-DEFAULT_MAX_BUY_ASK = 0.992
+DEFAULT_MAX_BUY_ASK = 0.995
 # Min net edge per share after fee before writing opportunities.jsonl.
-# 0.0076 ≈ allow ask≤0.992 (fee-aware); ask 0.993 net≈0.0067 is blocked.
-DEFAULT_MIN_NET = 0.0076
+# 0.00475 ≈ allow ask≤0.995 (fee-aware); ask 0.996 net≈0.0038 is blocked.
+DEFAULT_MIN_NET = 0.00475
 TOP_N = 5
 
 
@@ -1226,7 +1226,7 @@ def flag_misprice(
     """Return (is_opp, reason, economics).
 
     Only flag opportunities whose net edge after sports taker fee covers
-    `min_net` (default 0.0076 USDC/share ≈ ask≤0.992). Economics always filled when priced.
+    `min_net` (default 0.00475 USDC/share ≈ ask≤0.995). Economics always filled when priced.
     """
     meta: dict[str, Any] = {
         "fee_rate": fee_rate,
@@ -1975,8 +1975,35 @@ def quote_bridge_event(
         phase_b = [t for t in tokens if id(t) not in phase_a_ids]
         all_ids = [t["token_id"] for t in tokens if t.get("token_id")]
         t_books = time.monotonic()
-        book_map = fetch_books(all_ids, proxy=proxy) if all_ids else {}
+        book_map: dict[str, dict[str, Any]] = {}
+        prewarm_meta: dict[str, Any] = {"hit": False}
+        if all_ids:
+            try:
+                from gate_prewarm import get_prewarm
+
+                book_map, prewarm_meta = get_prewarm().take_books(
+                    all_ids,
+                    event_key=ek,
+                    match_id=str(match_meta.get("match_id") or ""),
+                )
+                if book_map is None:
+                    book_map = {}
+            except Exception as e:  # noqa: BLE001
+                prewarm_meta = {"hit": False, "reason": f"error:{e}"}
+                book_map = {}
+            if not book_map:
+                book_map = fetch_books(all_ids, proxy=proxy)
+                prewarm_meta = dict(prewarm_meta or {})
+                prewarm_meta.setdefault("hit", False)
+                prewarm_meta["fetched"] = True
+            else:
+                prewarm_meta = dict(prewarm_meta or {})
+                prewarm_meta["hit"] = True
+                prewarm_meta["fetched"] = False
         latency_ms["books"] = int((time.monotonic() - t_books) * 1000)
+        if prewarm_meta:
+            discovery["gate_prewarm"] = prewarm_meta
+            latency_ms["books_prewarm_hit"] = 1 if prewarm_meta.get("hit") else 0
         quotes: list[dict[str, Any]] = []
         t_trade = time.monotonic()
         if phase_a:
@@ -2126,7 +2153,7 @@ def process_bridge_events(
     """Process bridge score_change / match_finished into quotes/trades.
 
     Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` ∧ a
-    latched 射门 (DOM-first: AF starts on the first ``in_play`` tick, then
+    latched 射门 (DOM-first: AF starts only after 射门∧``in_play``, then
     every 5s until 120s) before one quote job. Aligned buy stops AF (quota)
     and keeps DOM until timeout. DQD reversals cancel rest and open gates;
     if lots are open they start an AF∨DOM trail from t0 (no shot gate);

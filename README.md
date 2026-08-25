@@ -69,7 +69,7 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；第一次 `in_play` 才打 AF，之后同拍 AF+DOM（+ Odds 观察），直到 **120s** |
+| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**射门 latch 且本拍 `in_play` 才打 AF**，之后同拍 AF+DOM（+ Odds 观察），直到 **120s** |
 | 买条件 | **同帧** DOM `in_play` **且** AF `ok && score_match` **且** 本球从 t0 起见过射门（pop「射门」或 `ball`/`net`） |
 | 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s**。询价/挂 rest 不再堵住下一场开 DOM。 |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
@@ -148,9 +148,9 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 2. 按当前比分结算各 token：`WIN` / `LOSE` / `PENDING`。  
 3. **只交易 `buy_win`**（买已锁定为 WIN 的一侧）；`sell_lose` 已关闭。  
 4. CLOB：`POST /books` 批量吃盘；默认 **`walk`** 深度（受 `max_levels` / `max_usdc` / `max_shares` / `max_slippage` 约束），FAK 市价。  
-5. 手续费模型：`fee ≈ feeRate × p × (1−p)`（默认 `feeRate=0.05`）；需 `net_edge ≥ min_net`（默认约 0.0076）才算 misprice。  
+5. 手续费模型：`fee ≈ feeRate × p × (1−p)`（默认 `feeRate=0.05`）；需 `net_edge ≥ min_net`（默认约 0.00475，对应 ask≤0.995）才算 misprice。  
 6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_MAX_USDC` / fee / `min_net` 约束。  
-7. 极端价（≤0.01 或 >0.992）默认跳过，除非 `--allow-extreme-prices`。  
+7. 极端价（≤0.01 或 >0.995）默认跳过，除非 `--allow-extreme-prices`。  
 
 **涵盖盘口（有则报）：** 胜平负六 token、大小球（含球队/半场）、BTTS、准确比分等（见 `polymarket-quote/reference.md`）。
 

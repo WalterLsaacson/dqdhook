@@ -13,9 +13,9 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（同帧 DOM∧AF∧射门）**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。第一次 DOM `in_play` 才打 AF，之后同拍 AF+DOM 直到买入/超时。买入需 **DOM `in_play` 且 AF `ok && score_match` 且本球从 t0 起见过射门**（pop「射门」或 marks `ball`/`net`；不把射门当 `in_play`）。买入后 **立刻停 AF**（省额度），**DOM 继续抓到 120s** 再停。第一次 `in_play` 前不打 AF（观察行 `af.skipped=before_in_play`）。AF 限流/失败本拍否决（fail-closed），继续采。AF+DOM 已绿但还没射门 → `WAIT_SHOT`。买入前 DOM 出现 **VAR** → **该球永久不下单**（即使见过射门）。开场球若**同一过渡刚被回撤过**，或时钟 **≥90′**，`start_gate` 直接 skip；约 35′ 的普通开场球仍走完整门控。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。回撤确认轨从 t0 每 5s AF∨DOM（不要求射门、不推迟 AF）；**认分 flatten 后立刻停轨**（不像买入那样再 DOM 拖到 120s）。
+**当前策略（同帧 DOM∧AF∧射门）**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。**见过射门且本拍 `in_play` 才打 AF**，之后同拍 AF+DOM 直到买入/超时。买入需 **DOM `in_play` 且 AF `ok && score_match` 且本球从 t0 起见过射门**（pop「射门」或 marks `ball`/`net`；不把射门当 `in_play`）。买入后 **立刻停 AF**（省额度），**DOM 继续抓到 120s** 再停。没射门或未 `in_play` 不打 AF（观察行 `af.skipped=before_shot` / `before_in_play`）。AF 限流/失败本拍否决（fail-closed），继续采。`in_play` 但还没射门 → `WAIT_SHOT`（此时不拉 AF）。买入前 DOM 出现 **VAR** → **该球永久不下单**（即使见过射门）。开场球若**同一过渡刚被回撤过**，或时钟 **≥90′**，`start_gate` 直接 skip；约 35′ 的普通开场球仍走完整门控。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。回撤确认轨从 t0 每 5s AF∨DOM（不要求射门、不推迟 AF）；**认分 flatten 后立刻停轨**（不像买入那样再 DOM 拖到 120s）。
 
-> 询价、挂 rest、flatten、rest 对账在 **CLOB worker 线程**；watch tick 只 `start_gate` / 取消门控 / 把事件载荷入队。别场的 `/books` 和 GTC 不再堵住新球开 DOM。
+> 询价、挂 rest、flatten、rest 对账在 **CLOB worker 线程**；watch tick 只 `start_gate` / 取消门控 / 把事件载荷入队。别场的 `/books` 和 GTC 不再堵住新球开 DOM。**`start_gate` 后并行预热** Gamma catalog + 周期 `POST /books`（`QUOTE_GATE_PREWARM`，默认开）；BUY 询价优先吃新鲜预热盘口，省掉热路径上约 0.5–1s 的 books RTT（**不缩短** DOM/AF/射门等待）。
 
 > 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s AF∨DOM 确认。**认分 flatten 后立刻停 AF+DOM**（买入后则仍抓 DOM 到原超时，便于事后看 VAR/庆祝，不再打 AF）。
 
@@ -26,7 +26,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 - **判定源是动画 DOM，不截图 / 不跑 OCR**：共用一台 Chromium，进行中已配对场预开 tracker 页；同场后续进球复用标签。每次采样读 `.pop-box` 与 `.center-box`。无 JPEG、无 `QUOTE_GATE_REF_SCREENSHOT`。标签上限 `QUOTE_DOM_POOL_MAX`（默认 24）；预热 `QUOTE_DOM_WARM`（默认开）/`QUOTE_DOM_WARM_INTERVAL_S`（默认 10s）/`QUOTE_DOM_WARM_OPEN_TIMEOUT_S`（默认 3s）。开页等待动画时会穿插处理其它场的 DOM 读。
 - **防僵死**：判定要求 `.center-box` 时钟相对上一次读数有推进；时钟没走 → `unclear`（`stale_page`），不下单。
 - **页面是纳米 tracker**：`animation_live` URL 打开 `tracker.namitiyu.com` 读 DOM，不是懂球帝比赛页。不做 MQTT 球位观察。
-- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → @**0.99** / **`QUOTE_REST_USDC`（默认 $5）** / **`GTC` 一直挂着**（回撤、终场、手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改回 GTD）。门控 rest **不受** `QUOTE_MAX_OPEN_USDC` 限制。没有卖盘（一边倒 0.99 买盘）也挂，等砸盘。
+- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → 目标 @**0.995**（账面 tick=0.01 时向下收到 **0.99**，不伪造 0.001 tick）/ **`QUOTE_REST_USDC`（默认 $5）** / **`GTC` 一直挂着**（回撤、终场、手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改回 GTD）。门控 rest **不受** `QUOTE_MAX_OPEN_USDC` 限制。没有卖盘（一边倒买盘）也挂，等砸盘。FAK / misprice 上限 **ask≤0.995**（fee 后 `min_net≈0.00475`）。
 - Odds/Bet365：跟 DOM 同一拍后台写入 `book_context_observe.jsonl`（Grade A/B/C 看板旁路），**不挡**买入/flatten，**不改下单 size**。已配对场在距开球 **30 分钟**时 **采一次** Bet365+1xbet 全盘口，写入 `data/pm-quote/prematch_odds.jsonl`。
 - **主客对调**：懂球帝/纳米主场与 Polymarket 相反时，事件带 `sides_swapped`；门控用动画主场比分条，半场大小球用 PM 方向的 `home_half`/`away_half`，避免把雷恩的半场算到巴黎头上。
 
@@ -84,7 +84,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | `--max-usdc` / `--max-shares` | 1 / 25 | Hard caps; **`.env` `QUOTE_MAX_*` wins** |
 | `--max-slippage` | 0.03 | Walk adverse price cap |
 | `--min-buy-price` | 0.6 | leftover non-gate path only; **skipped** for pitch-gate and FT |
-| `--allow-extreme-prices` | off | Allow ≤0.01 / >0.992 |
+| `--allow-extreme-prices` | off | Allow ≤0.01 / >0.995 |
 | `sell_lose` | off | Disabled — only `buy_win` |
 
 ## Cooperation
