@@ -13,13 +13,13 @@ description: >-
 
 Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB token 询价；判定 `misprice` 后可在**同一进程内**下单（不经 `opportunities.jsonl` 二次消费）。
 
-**当前策略（同帧 DOM∧AF∧射门）**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。第一次 DOM `in_play` 才打 AF，之后同拍 AF+DOM 直到买入/超时。买入需 **DOM `in_play` 且 AF `ok && score_match` 且本球从 t0 起见过射门**（pop「射门」或 marks `ball`/`net`；不把射门当 `in_play`）。买入后 **立刻停 AF**（省额度），**DOM 继续抓到 120s** 再停。第一次 `in_play` 前不打 AF（观察行 `af.skipped=before_in_play`）。AF 限流/失败本拍否决（fail-closed），继续采。AF+DOM 已绿但还没射门 → `WAIT_SHOT`。买入前 DOM 出现 **VAR** → **该球永久不下单**（即使见过射门）。开场球若**同一过渡刚被回撤过**，或时钟 **≥90′**，`start_gate` 直接 skip；约 35′ 的普通开场球仍走完整门控。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。回撤观察轨仍从 t0 每 5s AF∨DOM，不要求射门、不推迟 AF。
+**当前策略（同帧 DOM∧AF∧射门）**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。第一次 DOM `in_play` 才打 AF，之后同拍 AF+DOM 直到买入/超时。买入需 **DOM `in_play` 且 AF `ok && score_match` 且本球从 t0 起见过射门**（pop「射门」或 marks `ball`/`net`；不把射门当 `in_play`）。买入后 **立刻停 AF**（省额度），**DOM 继续抓到 120s** 再停。第一次 `in_play` 前不打 AF（观察行 `af.skipped=before_in_play`）。AF 限流/失败本拍否决（fail-closed），继续采。AF+DOM 已绿但还没射门 → `WAIT_SHOT`。买入前 DOM 出现 **VAR** → **该球永久不下单**（即使见过射门）。开场球若**同一过渡刚被回撤过**，或时钟 **≥90′**，`start_gate` 直接 skip；约 35′ 的普通开场球仍走完整门控。限价 rest 需 `QUOTE_REST_ENABLED=1`。终场立刻询价。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。回撤确认轨从 t0 每 5s AF∨DOM（不要求射门、不推迟 AF）；**认分 flatten 后立刻停轨**（不像买入那样再 DOM 拖到 120s）。
 
 > 询价、挂 rest、flatten、rest 对账在 **CLOB worker 线程**；watch tick 只 `start_gate` / 取消门控 / 把事件载荷入队。别场的 `/books` 和 GTC 不再堵住新球开 DOM。
 
-> 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s AF∨DOM 观察。买入后仍抓 DOM（免费）到原超时，便于事后看 VAR/庆祝，不再打 AF。
+> 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s AF∨DOM 确认。**认分 flatten 后立刻停 AF+DOM**（买入后则仍抓 DOM 到原超时，便于事后看 VAR/庆祝，不再打 AF）。
 
-- 懂球帝 **回撤**：立刻取消未完成进球门控，并按 **event_key** 撤销已入队的询价（不按 `match_id` 永久拉黑）。rest 取消入队优先级高于 idle flatten/rest 对账，对账不挡 `rest_cancel`。**进程内 bridge 入队回撤时就会 `cancel_match`**。询价 tick **先扫回撤再 `start_gate`**。回撤 ts 挡住该进球 stem（更早或相同 ts）。非开场的重判进球（更晚 ts）仍可开；**开场球**（0-0→1-0 / 0-0→0-1）若同一过渡刚被撤过，或时钟 ≥90′，不再开闸（`pitch_gate_reversal_risk_skip`）。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 AF 或 DOM **比分条**对齐（不要求 `in_play`）→ flatten（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。两边都不认直到 120s → **持仓**。未买入的回撤只取消门控。
+- 懂球帝 **回撤**：立刻取消未完成进球门控，并按 **event_key** 撤销已入队的询价（不按 `match_id` 永久拉黑）。rest 取消入队优先级高于 idle flatten/rest 对账，对账不挡 `rest_cancel`。**进程内 bridge 入队回撤时就会 `cancel_match`**。询价 tick **先扫回撤再 `start_gate`**。回撤 ts 挡住该进球 stem（更早或相同 ts）。非开场的重判进球（更晚 ts）仍可开；**开场球**（0-0→1-0 / 0-0→0-1）若同一过渡刚被撤过，或时钟 ≥90′，不再开闸（`pitch_gate_reversal_risk_skip`）。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 AF 或 DOM **比分条**对齐（不要求 `in_play`）→ flatten（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）并 **立刻停 5s 轨**。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。两边都不认直到 120s → **持仓**。未买入的回撤只取消门控。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
 - 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1`（缺则 `pitch_gate_unavailable`，该球不下单）
@@ -64,7 +64,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
    - `score_change` goal-up (paired) → **start pitch-gate** (DOM @+0s every 5s; AF from first `in_play`); quote on same-tick DOM `in_play` ∧ AF `score_match` ∧ latched 射门; stop AF after buy, keep DOM until 120s
-   - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF∨DOM trail then flatten on first score_match vs post-reverse score
+   - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF∨DOM trail → flatten on first score_match vs post-reverse score **then stop the trail**
    - `match_finished` → immediate quote (default live; stale / once-per-match skip)
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: CLOB worker thread (not the watch tick) runs one `/books` POST; totals/BTTS before exact.

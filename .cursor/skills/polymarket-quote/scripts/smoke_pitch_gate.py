@@ -333,23 +333,27 @@ def main() -> int:
             assert done[0].get("buy_emitted") is False
             assert af_var.calls == 0, af_var.calls
 
-        # Reversal observe: DOM score_match vs post-reverse → flatten_or.
+        # Reversal observe: DOM score_match → flatten_or, then stop the 5s trail
+        # (no further DOM/AF samples — unlike buy which keeps DOM to timeout).
         rev_frames = [
             _dom("H 控球", "70:01 1 : 0", ["possession-rect"]),
             _dom("H 控球", "70:06 1 : 0", ["possession-rect"]),
+            _dom("H 控球", "70:11 1 : 0", ["possession-rect"]),
         ]
-        factory, _ = _open_factory(
+        factory, readers_rev_stop = _open_factory(
             rev_frames, baseline=_dom("H 控球", "69:56 1 : 0", ["possession-rect"])
         )
         pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
         pg.reset_coordinator_for_tests()
-        af_mod.set_active_observer(
-            _FakeAf([{"ok": False, "score_match": None, "error": "rate_limit"}])  # type: ignore[arg-type]
+        af_rev_stop = _FakeAf(
+            [{"ok": False, "score_match": None, "error": "rate_limit"}]
         )
+        af_mod.set_active_observer(af_rev_stop)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
-            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            obs_rev = _FakeObserver(root)
+            set_active_observer(obs_rev)  # type: ignore[arg-type]
             coord = pg.get_coordinator(root)
             rev = {
                 **ev,
@@ -366,6 +370,19 @@ def main() -> int:
             assert "observe_complete" in statuses, done
             flat = next(d for d in done if d["status"] == "flatten_or")
             assert "dom" in str(flat.get("reason")), flat
+            complete = next(d for d in done if d["status"] == "observe_complete")
+            assert complete.get("reason") == "flatten_or_stop_trail", complete
+            assert complete.get("frames") == 1, complete
+            assert flat.get("sample_i") == 0, flat
+            # Trail stopped: only the confirming tick was sampled.
+            assert len(obs_rev.rows) == 1, [r.get("sample_i") for r in obs_rev.rows]
+            assert af_rev_stop.calls == 1, af_rev_stop.calls
+            rows_n = len(obs_rev.rows)
+            af_n = af_rev_stop.calls
+            time.sleep(0.2)
+            assert len(obs_rev.rows) == rows_n, obs_rev.rows
+            assert af_rev_stop.calls == af_n, af_rev_stop.calls
+            assert readers_rev_stop and readers_rev_stop[-1].closed
 
         # Reversal: celebration overlay still showing post-reverse board score → flatten.
         factory, _ = _open_factory(
@@ -402,9 +419,8 @@ def main() -> int:
 
         pg.PitchGateCoordinator._open_dom_reader = _fail_open  # type: ignore[assignment]
         pg.reset_coordinator_for_tests()
-        af_mod.set_active_observer(
-            _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])  # type: ignore[arg-type]
-        )
+        af_dom_miss = _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])
+        af_mod.set_active_observer(af_dom_miss)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
@@ -423,6 +439,13 @@ def main() -> int:
             assert "flatten_or" in [d["status"] for d in done], done
             flat = next(d for d in done if d["status"] == "flatten_or")
             assert "af" in str(flat.get("reason")), flat
+            complete = next(d for d in done if d["status"] == "observe_complete")
+            assert complete.get("reason") == "flatten_or_stop_trail", complete
+            assert complete.get("frames") == 1, complete
+            assert af_dom_miss.calls == 1, af_dom_miss.calls
+            af_n = af_dom_miss.calls
+            time.sleep(0.2)
+            assert af_dom_miss.calls == af_n, af_dom_miss.calls
 
         # Odds HTTP must not stall the AND buy.
         def _slow_odds(self, session, *, sample_i, elapsed_s):  # noqa: ANN001

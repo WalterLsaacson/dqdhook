@@ -74,7 +74,7 @@
 | 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s**。询价/挂 rest 不再堵住下一场开 DOM。 |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
-| 回撤 | 取消进球会话；**已有仓**才开 5s AF∨DOM；某一拍 AF 或 DOM `score_match`（回撤后比分）→ flatten；两边都不认 → **持仓** |
+| 回撤 | 取消进球会话；**已有仓**才开 5s AF∨DOM；某一拍 AF 或 DOM `score_match`（回撤后比分）→ flatten 并**立刻停轨**；两边都不认 → **持仓** |
 
 买入侧 **AF∨DOM 或门否决、不实现**（见 `design-af-dom-or-gate.md`）。
 
@@ -114,7 +114,7 @@
 | 抓帧中出现 VAR | `var_veto`，该球不买 |
 | 开场球刚被同一过渡回撤过，或开场球时钟 ≥90′ | `pitch_gate_reversal_risk_skip`，不开闸（约 35′ 普通开场球仍买） |
 | 懂球帝回撤该球（买入前） | 取消门控 + 撤销未 drain 的买信号 |
-| 懂球帝回撤该球（已有仓） | 5s AF∨DOM 认回撤比分才 flatten；120s 都不认 → 持仓 |
+| 懂球帝回撤该球（已有仓） | 5s AF∨DOM 认回撤比分才 flatten，**认分后立刻停轨**；120s 都不认 → 持仓 |
 | 动画已改比分、随后 DQD 才长延迟回撤 | 买入时无法预知；出口靠回撤后再开 5s 轨 |
 | VAR 出现在**已经下单之后** | 拦不住该刀（除非随后 DQD 回撤且 AF/DOM 认分）
 
@@ -126,13 +126,13 @@
 
 ### 4. 回撤、买后保护与持仓
 
-懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开与买入相同的 5s 轨：某一拍 AF **或** DOM **比分条**对齐（回撤后比分，不要求 `in_play`，庆祝/VAR/卡死时钟仍认）→ flatten，**不受** 300s 保护窗限制。AF 单独报错不平仓。动画页打不开仍继续采 AF。120s 两边都不认 → **持仓**。未买入的回撤只取消门控。
+懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开 5s AF∨DOM 确认轨：某一拍 AF **或** DOM **比分条**对齐（回撤后比分，不要求 `in_play`，庆祝/VAR/卡死时钟仍认）→ flatten，**不受** 300s 保护窗限制，并**立刻停 AF+DOM**（与买入后 DOM 拖到 120s 不同）。AF 单独报错不平仓。动画页打不开仍继续采 AF。120s 两边都不认 → **持仓**。未买入的回撤只取消门控。
 
 | 动作 | 行为 |
 |---|---|
 | DQD 回撤 | 取消 **rest** + **进行中的进球 pitch-gate** + 撤销未 drain 的买信号 |
-| 已有仓 | 新开 5s AF+DOM+Odds；AF∨DOM 认回撤比分 → flatten；超时持仓 |
-| 无仓 | 只取消门控，不开观察轨 |
+| 已有仓 | 新开 5s AF+DOM+Odds；AF∨DOM 认回撤比分 → flatten → **停轨**；超时持仓 |
+| 无仓 | 只取消门控，不开确认轨 |
 | 未确认的回撤 / FT 持仓 | 仍受 `QUOTE_GATE_PROTECT_S`（默认 300s）；超窗或 `=0` 等终场 `ft_reversal_vs_entry` |
 | 同场新进球 | 取消该场先前未完成的门控会话（`superseded_by_new_goal`） |
 
@@ -207,7 +207,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 3. Pitch Gate（`:8791`）在进球后出现帧与 `play_state`。  
 4. `data/pm-quote/watch.log` 可见：`pitch-gate → START` → `IN_PLAY` / `ALIGNED_BUY` / `WAIT_AF` / `VAR_VETO` / `NO_ALIGNED_BUY` / `CANCEL`；回撤还有 `OBSERVE START` / `FLATTEN_OR` / `OBSERVE_COMPLETE`。  
 5. 成交写入 `data/pm-quote/trades.jsonl`（live 且成功时 `live: true`）。  
-6. 回撤立刻取消门控/rest；已有仓才开 5s AF∨DOM，认分后 flatten，否则持仓。
+6. 回撤立刻取消门控/rest；已有仓才开 5s AF∨DOM，认分后 flatten 并停轨，否则持仓。
 
 ---
 

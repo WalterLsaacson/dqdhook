@@ -3,9 +3,14 @@
 Buy path samples DOM every 5s from +0s; AF starts on the first ``in_play``
 tick and then rides the same clock until buy / timeout / cancel. Aligned buy
 also requires a latched 射门 (pop text or ball/net marks) since t0. Buy stops
-AF (quota); DOM keeps sampling until the original timeout. Flatten trails poll
-AF∨DOM from t0 with no shot gate and no AF delay.
-No screenshots. No nami ball-xy. Odds observe rides every DOM tick.
+AF (quota); DOM keeps sampling until the original timeout.
+
+Flatten (reversal) trails poll AF∨DOM from t0 with no shot gate and no AF
+delay. On the first AF or DOM board-score match they emit flatten and **stop
+the 5s trail immediately** (unlike buy, which keeps DOM to 120s).
+
+No screenshots. No nami ball-xy. Odds observe rides every DOM tick until the
+session stops.
 """
 
 from __future__ import annotations
@@ -350,7 +355,7 @@ class PitchGateCoordinator:
         thread.start()
         kind = "OBSERVE START" if session.observe_only else "START"
         extra = (
-            "reversal trail; flatten on AF∨DOM score_match"
+            "reversal trail; flatten on AF∨DOM then stop (no 120s DOM drag)"
             if session.observe_only
             else (
                 f"DOM first; in_play ∧ AF ∧ shot; VAR→no buy; "
@@ -529,7 +534,7 @@ class PitchGateCoordinator:
             print(
                 f"pitch-gate → FLATTEN_OR match_id={session.match_id} "
                 f"key={session.event_key} via={source} sample={sample_i} "
-                f"elapsed={elapsed_s:.1f}s",
+                f"elapsed={elapsed_s:.1f}s · stop AF+DOM trail",
                 flush=True,
             )
         return True
@@ -950,6 +955,8 @@ class PitchGateCoordinator:
                 af_ok = bool(af_row and af_row.get("ok") and af_row.get("score_match") is True)
 
                 if session.observe_only:
+                    # Unlike buy (DOM continues to timeout), reverse confirm
+                    # stops the 5s AF+DOM clock on this same tick.
                     if af_ok or board_match:
                         self._emit_flatten_or(
                             session,
@@ -1060,9 +1067,15 @@ class PitchGateCoordinator:
                 self._finish_session(
                     session,
                     status="observe_complete",
-                    reason="flatten_or",
+                    reason="flatten_or_stop_trail",
                     elapsed_s=elapsed_end,
                     frames=captured,
+                )
+                print(
+                    f"pitch-gate → OBSERVE_COMPLETE match_id={session.match_id} "
+                    f"key={session.event_key} frames={captured} "
+                    f"elapsed={elapsed_end:.1f}s (flattened; trail stopped)",
+                    flush=True,
                 )
                 return
 

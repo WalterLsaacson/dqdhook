@@ -131,7 +131,7 @@ def main() -> int:
                 "event_key": rev_key,
                 "match_id": "m1",
                 "quoted_at": "2026-08-23T10:02:07+08:00",
-                "pitch_gate": {"status": "observe_complete", "reason": "flatten_or"},
+                "pitch_gate": {"status": "observe_complete", "reason": "flatten_or_stop_trail"},
             },
         ],
     )

@@ -2129,7 +2129,8 @@ def process_bridge_events(
     latched 射门 (DOM-first: AF starts on the first ``in_play`` tick, then
     every 5s until 120s) before one quote job. Aligned buy stops AF (quota)
     and keeps DOM until timeout. DQD reversals cancel rest and open gates;
-    if lots are open they start an AF∨DOM trail from t0 (no shot gate).
+    if lots are open they start an AF∨DOM trail from t0 (no shot gate);
+    flatten on first score match then stop the trail.
 
     When the CLOB quote worker is running, this tick only starts/cancels
     gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
