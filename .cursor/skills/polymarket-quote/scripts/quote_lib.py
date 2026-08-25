@@ -2062,6 +2062,10 @@ def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
     except Exception as e:  # noqa: BLE001
         print(f"ALERT pitch-gate fast-block failed match={mid}: {e}", flush=True)
     try:
+        gate.note_reversal(ev)
+    except Exception as e:  # noqa: BLE001
+        print(f"ALERT pitch-gate note-reversal failed match={mid}: {e}", flush=True)
+    try:
         from af_observe import get_active_observer as get_af
 
         af = get_af()
@@ -2121,11 +2125,11 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into quotes/trades.
 
-    Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` (first
-    frame @+0s, then every 5s until 120s) before one quote job. Aligned
-    buy stops AF (quota) and keeps DOM until timeout. DQD reversals cancel
-    rest and open gates; if lots are open they start an AF∨DOM trail (no
-    immediate flatten).
+    Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` ∧ a
+    latched 射门 (DOM-first: AF starts on the first ``in_play`` tick, then
+    every 5s until 120s) before one quote job. Aligned buy stops AF (quota)
+    and keeps DOM until timeout. DQD reversals cancel rest and open gates;
+    if lots are open they start an AF∨DOM trail from t0 (no shot gate).
 
     When the CLOB quote worker is running, this tick only starts/cancels
     gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
@@ -2531,6 +2535,7 @@ def process_bridge_events(
                 "error": "pitch_gate_error",
                 "var_veto": "pitch_gate_var_veto",
                 "buy_revoked": "pitch_gate_buy_revoked",
+                "reversal_risk_skip": "pitch_gate_reversal_risk_skip",
             }.get(status, f"pitch_gate_{status or 'unknown'}")
             # Already bought this goal: cancel of leftover frames is informational.
             # `key in seen` is no longer a buy signal — start_gate also marks seen
@@ -2604,6 +2609,7 @@ def process_bridge_events(
                     seen.add(inv)
                 try:
                     gate.block_inverted_goal(key)
+                    gate.note_reversal(ev)
                 except Exception as e:  # noqa: BLE001
                     print(
                         f"ALERT pitch-gate block reversed goal failed match={mid_rev}: {e}",

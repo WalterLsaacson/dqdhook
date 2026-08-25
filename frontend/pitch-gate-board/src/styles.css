@@ -199,6 +199,12 @@ button.pill {
   background: rgba(56, 189, 248, 0.12);
 }
 
+.pill--filter[data-filter="wait_shot"].is-active {
+  border-color: rgba(251, 191, 36, 0.55);
+  color: var(--stopped);
+  background: rgba(251, 191, 36, 0.12);
+}
+
 .pill--filter[data-filter="var_veto"].is-active {
   border-color: rgba(251, 113, 133, 0.55);
   color: var(--danger);
@@ -359,6 +365,13 @@ button.pill {
 .badge--wait_af {
   color: #041018;
   background: #38bdf8;
+  border-color: transparent;
+}
+
+.badge--wait_shot,
+.badge--shot {
+  color: #1a1404;
+  background: #fbbf24;
   border-color: transparent;
 }
 
@@ -585,6 +598,10 @@ button.pill {
 
 .frame.is-wait-af {
   border-color: rgba(56, 189, 248, 0.65);
+}
+
+.frame.is-wait-shot {
+  border-color: rgba(251, 191, 36, 0.7);
 }
 
 .frame.is-or-flatten {

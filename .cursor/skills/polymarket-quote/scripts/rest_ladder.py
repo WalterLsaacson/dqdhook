@@ -106,33 +106,6 @@ def ask_in_fak_zone(best_ask: Any) -> bool:
         return False
 
 
-def book_has_ask(quote: dict[str, Any] | None) -> bool:
-    """True when the CLOB has at least one sell (ask) on this token.
-
-    Empty ask side + a 0.99 bid stack is already locked; rest behind that
-    bid does not fill. A stub ask (e.g. 5 sh @ 0.999) still counts.
-    """
-    q = quote if isinstance(quote, dict) else {}
-    raw = q.get("best_ask")
-    if raw is not None and str(raw).strip() != "":
-        try:
-            if float(raw) > 0:
-                return True
-        except (TypeError, ValueError):
-            pass
-    for row in q.get("asks_top") or []:
-        if not isinstance(row, dict):
-            continue
-        try:
-            px = float(row.get("price"))
-            sz = float(row.get("size"))
-        except (TypeError, ValueError):
-            continue
-        if px > 0 and sz > 0:
-            return True
-    return False
-
-
 def select_rest_prices(
     *,
     best_bid: Any = None,

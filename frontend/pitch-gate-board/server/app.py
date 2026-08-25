@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pitch Gate Board: DOM∧AF buy and AF∨DOM flatten trails (no screenshots)."""
+"""Pitch Gate Board: DOM∧AF∧射门 buy and AF∨DOM flatten trails (no screenshots)."""
 
 from __future__ import annotations
 
@@ -231,9 +231,33 @@ def _frame_dom_in_play(frame: dict[str, Any]) -> bool:
     return isinstance(judge, dict) and str(judge.get("play_state") or "") == "in_play"
 
 
-def _frame_aligned_buy(frame: dict[str, Any]) -> bool:
-    """Same-tick DOM in_play ∧ AF score_match (the live buy condition)."""
+def _frame_shows_shot(frame: dict[str, Any]) -> bool:
+    """True when this frame's overlay is a 射门 (pop text or ball/net marks)."""
+    if frame.get("shot_this_frame") is True:
+        return True
+    pop = str(frame.get("dom_pop_box") or "")
+    judge = frame.get("judge") if isinstance(frame.get("judge"), dict) else {}
+    if not pop:
+        pop = str(judge.get("dom_pop_box") or "")
+    if "射门" in pop:
+        return True
+    marks = frame.get("dom_marks") or judge.get("dom_marks") or []
+    return any(str(m) in ("ball", "net") for m in marks)
+
+
+def _goal_shot_seen(frames: list[dict[str, Any]]) -> bool:
+    return any(f.get("shot_seen") is True or _frame_shows_shot(f) for f in frames)
+
+
+def _frame_dom_af_green(frame: dict[str, Any]) -> bool:
     return _frame_dom_in_play(frame) and _frame_af(frame).get("score_match") is True
+
+
+def _frame_aligned_buy(frame: dict[str, Any], *, shot_seen: bool = False) -> bool:
+    """Same-tick DOM in_play ∧ AF score_match ∧ latched 射门."""
+    if not (shot_seen or frame.get("shot_seen") or _frame_shows_shot(frame)):
+        return False
+    return _frame_dom_af_green(frame)
 
 
 def _frame_or_flatten(frame: dict[str, Any]) -> bool:
@@ -250,6 +274,8 @@ def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None
         return "aligned_buy"
     if mode == "pitch_gate_var_veto":
         return "var_veto"
+    if mode == "pitch_gate_reversal_risk_skip":
+        return "reversal_risk_skip"
     if mode == "pitch_gate_buy_revoked":
         return "reversed"
     judges = [
@@ -258,10 +284,13 @@ def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None
         if isinstance(f.get("judge"), dict)
     ]
     states = [str(j.get("play_state") or "") for j in judges]
-    if any(_frame_aligned_buy(f) for f in frames):
+    shot_seen = _goal_shot_seen(frames)
+    if any(_frame_aligned_buy(f, shot_seen=shot_seen) for f in frames):
         return "aligned_buy"
     if any(_frame_var(f) for f in frames):
         return "var_veto"
+    if any(_frame_dom_af_green(f) for f in frames):
+        return "wait_shot"
     if any(_frame_dom_in_play(f) for f in frames):
         return "wait_af"
     if frames and all(f.get("ok") is False for f in frames):
@@ -744,6 +773,8 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             if isinstance(row.get("odds_grade"), dict)
             else None,
             "board_score_match": row.get("board_score_match"),
+            "shot_seen": row.get("shot_seen"),
+            "shot_this_frame": row.get("shot_this_frame"),
         }
 
         # Upsert by sample_i so re-reads / retries replace.
@@ -840,6 +871,7 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 int(f.get("sample_i") or 0),
             )
         )
+        shot_seen = _goal_shot_seen(frames)
         for f in frames:
             sample_i = f.get("sample_i")
             if not isinstance(f.get("af"), dict):
@@ -853,9 +885,13 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                         "level": grade.get("level"),
                         "reason": grade.get("reason"),
                     }
-            f["aligned"] = _frame_aligned_buy(f)
+            f["shot_this_frame"] = bool(
+                f.get("shot_this_frame") or _frame_shows_shot(f)
+            )
+            f["aligned"] = _frame_aligned_buy(f, shot_seen=shot_seen)
             f["or_flatten"] = _frame_or_flatten(f)
         g["frames"] = frames
+        g["shot_seen"] = shot_seen
         g["frame_count"] = len(frames)
         g["ok_count"] = sum(1 for f in frames if f.get("ok") is True)
         af_frames = list(af_by_key.get(ek) or [])

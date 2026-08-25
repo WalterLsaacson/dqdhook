@@ -52,8 +52,10 @@ export function stateLabel(state) {
     in_play: "DOM in_play",
     aligned_buy: "买入 ∧",
     wait_af: "等 AF",
+    wait_shot: "无射门",
     after_buy: "买后 DOM",
     var_veto: "VAR 否决",
+    reversal_risk_skip: "开场跳过",
     stopped: "stopped",
     unclear: "unclear",
     waiting: "等待判定",
@@ -116,8 +118,10 @@ export const GOAL_FILTERS = [
   { id: "all", short: "全部" },
   { id: "aligned_buy", short: "买入" },
   { id: "wait_af", short: "等AF" },
+  { id: "wait_shot", short: "无射门" },
   { id: "waiting_in_play", short: "等DOM" },
   { id: "var_veto", short: "VAR" },
+  { id: "reversal_risk_skip", short: "开场跳过" },
   { id: "stopped", short: "stopped" },
   { id: "pending_judge", short: "待判定" },
   { id: "capture_failed", short: "读数失败" },
@@ -158,7 +162,7 @@ export function emptyFilterMessage(filter, { detail = false } = {}) {
   if (!filter || filter === "all") {
     return detail
       ? "选择左侧一场进球查看逐帧判定。"
-      : "暂无进球记录。<br/>等 DQD 进球门控（DOM∧AF）或回撤观察（AF∨DOM）。";
+      : "暂无进球记录。<br/>等 DQD 进球门控（DOM∧AF∧射门）或回撤观察（AF∨DOM）。";
   }
   const row = GOAL_FILTERS.find((f) => f.id === filter);
   const label = row?.short || stateLabel(filter);

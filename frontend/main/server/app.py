@@ -1023,7 +1023,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Quote trade → {trade_label} "
         f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(pitch-gate: DOM∧AF first @+0s every 5s until 120s; aligned buy then stop; DQD reverse → AF∨DOM flatten)",
+        f"(pitch-gate: DOM first, AF from in_play, buy on in_play∧AF∧shot; DQD reverse → AF∨DOM flatten)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

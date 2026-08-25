@@ -78,12 +78,6 @@ def main() -> int:
     assert abs(rl.rest_expire_s() - 3600.0) < 1e-9
     os.environ.pop("QUOTE_REST_EXPIRE_S", None)
 
-    assert rl.book_has_ask({"best_ask": 0.999, "asks_top": [{"price": "0.999", "size": "5"}]})
-    assert rl.book_has_ask({"best_ask": None, "asks_top": [{"price": "0.99", "size": "12"}]})
-    assert not rl.book_has_ask({"best_ask": None, "asks_top": []})
-    assert not rl.book_has_ask({"best_bid": 0.99, "best_bid_size": 3000, "asks_top": []})
-    assert not rl.book_has_ask({"best_ask": None, "asks_top": [{"price": "0.99", "size": "0"}]})
-
     import tempfile
 
     os.environ["QUOTE_REST_ENABLED"] = "1"
@@ -115,11 +109,10 @@ def main() -> int:
                 "tick_size": "0.01",
                 "min_order_size": "5",
             }
-            skipped = ex.maybe_trade(
+            posted_empty = ex.maybe_trade(
                 q_no, event_key=ek, match_meta=meta, event_type="score_change"
             )
-            assert skipped and skipped.get("skip_reason") == "rest_no_ask", skipped
-            assert skipped.get("status") == "skipped", skipped
+            assert posted_empty and posted_empty.get("status") == "rest_dry_run", posted_empty
 
             q_stub = dict(q_no)
             q_stub["token_id"] = "tok2"
@@ -133,7 +126,7 @@ def main() -> int:
     finally:
         os.environ.pop("QUOTE_REST_ENABLED", None)
 
-    print("ok: rest ladder $5 / 5-share floor / GTC default / no-ask skip")
+    print("ok: rest ladder $5 / 5-share floor / GTC default")
     return 0
 
 

@@ -5,8 +5,13 @@ Label = DQD ``is_goal`` later undone by an inverse ``is_reversal`` on the same
 match. Features are the 8-cell lookup (opening × clock≥75' × prior_same).
 Logistic regression on the same bits does not beat this table.
 
-Not wired into TradeExecutor — print / JSON only until a buy-policy change
-is explicit.
+Buy path (``pitch_gate.start_gate``) only **skips** the dirty cells:
+
+- opening + same transition already reversed (``prior_same``) — ~50–71% undone
+- opening + clock ≥ 90'
+
+Ordinary opening goals (Delfin / Operário-like 0-0→1-0 at ~35') stay ``full``.
+``haircut`` is recorded on the score object but is **not** applied to size.
 """
 
 from __future__ import annotations
@@ -124,7 +129,10 @@ def lookup_p(
 
 
 def decide_action(feat: ReversalFeatures, p_rev: float) -> tuple[str, float]:
-    """Skip high-p opening re-awards / 90'+ openings; do not shrink the bulk."""
+    """Skip high-p opening re-awards / 90'+ openings; do not shrink the bulk.
+
+    ``haircut`` is advisory only until a size-policy change is explicit.
+    """
     if feat.opening and feat.prior_same:
         return "skip", 0.0
     if feat.opening and feat.clock_ge_90:
@@ -149,6 +157,17 @@ def score(
         size_mult=mult,
         features=feat,
     )
+
+
+def score_event(
+    ev: dict[str, Any],
+    *,
+    prior_same: bool,
+    prior_match: bool = False,
+) -> ReversalScore:
+    """Score a live ``score_change`` goal using event ``prev``/``curr`` + clock."""
+    feat = extract_features(ev, prior_same=bool(prior_same), prior_match=bool(prior_match))
+    return score(feat)
 
 
 def _iter_score_changes(path: Path) -> list[dict[str, Any]]:

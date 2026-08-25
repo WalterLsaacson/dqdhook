@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: pitch-gate board verdicts follow DOM∧AF buy / AF∨DOM flatten."""
+"""Smoke: pitch-gate board verdicts follow DOM∧AF∧射门 buy / AF∨DOM flatten."""
 
 from __future__ import annotations
 
@@ -58,6 +58,8 @@ def main() -> int:
                 "judge": {"play_state": "in_play", "confidence": 0.9},
                 "af": {"ok": True, "score_match": False, "af_score": "0-0"},
                 "dom_state": {"pop_box": "进攻", "center_box": "10:00 1 : 0"},
+                "shot_seen": True,
+                "shot_this_frame": True,
             },
             {
                 "event_key": goal_key,
@@ -72,7 +74,12 @@ def main() -> int:
                 "gate": True,
                 "judge": {"play_state": "in_play", "confidence": 0.9},
                 "af": {"ok": True, "score_match": True, "af_score": "1-0"},
-                "dom_state": {"pop_box": "进攻", "center_box": "10:05 1 : 0"},
+                "dom_state": {
+                    "pop_box": "进攻",
+                    "center_box": "10:05 1 : 0",
+                    "marks": ["ball"],
+                },
+                "shot_seen": True,
             },
             {
                 "event_key": rev_key,
@@ -167,6 +174,7 @@ def main() -> int:
     assert goal["odds_grade"]["level"] == "B", goal.get("odds_grade")
     assert any(f.get("aligned") for f in goal["frames"])
     assert not all(f.get("aligned") for f in goal["frames"])
+    assert goal["shot_seen"] is True
 
     assert rev["verdict"] == "flatten_or", rev["verdict"]
     assert rev["kind"] == "reversal_observe"
@@ -200,6 +208,33 @@ def main() -> int:
     wait = next(g for g in snap2["goals"] if g["event_key"] == wait_key)
     assert wait["verdict"] == "wait_af", wait["verdict"]
 
+    wait_shot_key = "score_change|m2b|0-0->1-0|t2b"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": wait_shot_key,
+                "match_id": "m2b",
+                "home": "C",
+                "away": "D",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 0,
+                "elapsed_s": 5,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {"ok": True, "score_match": True, "af_score": "1-0"},
+                "dom_state": {"pop_box": "进攻", "center_box": "1 : 0"},
+            }
+        ],
+    )
+    snap_shot = board.build_goals_payload(limit=50)
+    wait_shot = next(g for g in snap_shot["goals"] if g["event_key"] == wait_shot_key)
+    assert wait_shot["verdict"] == "wait_shot", wait_shot["verdict"]
+    assert wait_shot["shot_seen"] is False
+    assert not any(f.get("aligned") for f in wait_shot["frames"])
+
     # Gwangju: earlier 0-1→0-0 must not paint a later bought 0-0→0-1.
     early_goal = "score_change|m3|0-0->0-1|2026-08-23T19:49:00+08:00"
     early_rev = "score_change|m3|0-1->0-0|2026-08-23T19:51:55+08:00"
@@ -226,6 +261,7 @@ def main() -> int:
             "dom_state": {
                 "pop_box": "进攻",
                 "center_box": f"1 : 0 {home_score} : {away_score}",
+                "marks": ["ball"],
             },
         }
 
@@ -300,6 +336,7 @@ def main() -> int:
                 "gate": True,
                 "judge": {"play_state": "in_play", "confidence": 0.9},
                 "af": {"ok": True, "score_match": True, "af_score": "1-0"},
+                "dom_state": {"pop_box": "进攻", "center_box": "1 : 0", "marks": ["net"]},
             },
             {
                 "event_key": var_after_key,
@@ -330,7 +367,41 @@ def main() -> int:
     var_after = next(g for g in snap4["goals"] if g["event_key"] == var_after_key)
     assert var_after["verdict"] == "aligned_buy", var_after["verdict"]
 
-    print("ok: pitch-gate board verdicts match DOM∧AF / AF∨DOM")
+    skip_key = "score_change|m5|0-0->1-0|t5"
+    _write_jsonl(
+        quotes,
+        [
+            {
+                "event_key": skip_key,
+                "match_id": "m5",
+                "mode": "pitch_gate_reversal_risk_skip",
+                "trigger": "score_change",
+            }
+        ],
+    )
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": skip_key,
+                "match_id": "m5",
+                "home": "G",
+                "away": "H",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 0,
+                "elapsed_s": 0,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "stopped", "confidence": 0.2},
+            }
+        ],
+    )
+    snap5 = board.build_goals_payload(limit=50)
+    skipped = next(g for g in snap5["goals"] if g["event_key"] == skip_key)
+    assert skipped["verdict"] == "reversal_risk_skip", skipped["verdict"]
+
+    print("ok: pitch-gate board verdicts match DOM∧AF∧射门 / AF∨DOM")
     return 0
 
 

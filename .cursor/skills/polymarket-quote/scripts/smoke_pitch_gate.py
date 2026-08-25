@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: same-tick DOM∧AF buy, stop AF after buy / keep DOM, AF∨DOM reversal flatten."""
+"""Smoke: DOM-first AF, same-tick in_play∧AF∧shot buy, AF∨DOM reversal flatten."""
 
 from __future__ import annotations
 
@@ -138,9 +138,9 @@ def main() -> int:
     }
 
     try:
-        # AND buy: DOM in_play + AF score_match → stop AF, keep DOM to timeout.
+        # AND buy: celebration skips AF; first in_play arms AF; shot latched.
         frames = [
-            _dom("H 进球", "45:01 1 : 0"),
+            _dom("H 进球", "45:01 1 : 0", ["ball"]),
             _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
             _dom("H 控球", "45:11 1 : 0", ["possession-rect"]),
         ]
@@ -167,12 +167,16 @@ def main() -> int:
             assert sum(1 for d in done if d["status"] == "in_play") == 1, done
             assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
             assert af.calls == 2, af.calls
+            assert (obs.rows[0].get("af") or {}).get("skipped") == "before_in_play"
+            assert obs.rows[0].get("shot_seen") is True
+            buy = next(d for d in done if d["status"] == "in_play")
+            assert buy["sample_i"] == 2, buy
             skipped = [
                 r for r in obs.rows if (r.get("af") or {}).get("skipped") == "after_buy"
             ]
             assert skipped, obs.rows
             assert all(
-                (r.get("af") or {}).get("skipped") != "after_buy" for r in obs.rows[:2]
+                (r.get("af") or {}).get("skipped") != "after_buy" for r in obs.rows[:3]
             )
             assert readers[-1].closed
             assert not any(r.get("frame_path") for r in obs.rows)
@@ -182,7 +186,7 @@ def main() -> int:
         # PM 0-1 vs Nami/DQD 1-0 (sides swapped) still buys.
         factory, _ = _open_factory(
             [
-                _dom("H 进球", "45:01 1 : 0"),
+                _dom("H 进球", "45:01 1 : 0", ["ball"]),
                 _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
             ],
             baseline=_dom("H 进球", "44:56 1 : 0"),
@@ -215,7 +219,7 @@ def main() -> int:
 
         # DOM in_play but AF never matches → no buy.
         factory, _ = _open_factory(
-            [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
+            [_dom("H 进攻", "45:06 1 : 0", ["attack-move", "ball"])] * 8,
             baseline=_dom("H 进球", "44:56 1 : 0"),
         )
         pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
@@ -232,10 +236,11 @@ def main() -> int:
             done = _wait_done(coord, n=1)
             assert [d["status"] for d in done] == ["timeout"], done
             assert done[0].get("buy_emitted") is False
+            assert "no_aligned_buy" in str(done[0].get("reason") or ""), done[0]
 
         # AF error fail-closed.
         factory, _ = _open_factory(
-            [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
+            [_dom("H 进攻", "45:06 1 : 0", ["attack-move", "ball"])] * 8,
             baseline=_dom("H 进球", "44:56 1 : 0"),
         )
         pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
@@ -252,6 +257,81 @@ def main() -> int:
             done = _wait_done(coord, n=1)
             assert done[0]["status"] == "timeout", done
             assert done[0].get("buy_emitted") is False
+            assert "no_aligned_buy" in str(done[0].get("reason") or ""), done[0]
+
+        # in_play + AF aligned but never 射门 → no buy.
+        factory, _ = _open_factory(
+            [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_mod.set_active_observer(
+            _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])  # type: ignore[arg-type]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            obs_shot = _FakeObserver(root)
+            set_active_observer(obs_shot)  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m3s"}, event_key="k3s")
+            done = _wait_done(coord, n=1)
+            assert done[0]["status"] == "timeout", done
+            assert done[0].get("buy_emitted") is False
+            assert "no_shot" in str(done[0].get("reason") or ""), done[0]
+            assert all(not r.get("shot_seen") for r in obs_shot.rows)
+
+        # Unclear 射门 (pop) then 进攻 + AF → buy. Celebration/unclear skips AF.
+        factory, _ = _open_factory(
+            [
+                _dom("H 射门", "45:01 1 : 0"),
+                _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
+            ],
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_unclear = _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])
+        af_mod.set_active_observer(af_unclear)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            obs_u = _FakeObserver(root)
+            set_active_observer(obs_u)  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m3u"}, event_key="k3u")
+            done = _wait_done(coord, n=2)
+            assert "in_play" in [d["status"] for d in done], done
+            assert (obs_u.rows[0].get("af") or {}).get("skipped") == "before_in_play"
+            assert obs_u.rows[0].get("shot_this_frame") is True
+            buy = next(d for d in done if d["status"] == "in_play")
+            assert buy["sample_i"] == 1, buy
+            assert af_unclear.calls == 1, af_unclear.calls
+
+        # Shot then VAR still vetoes even after later in_play + AF.
+        factory, _ = _open_factory(
+            [
+                _dom("H 射门", "45:01 1 : 0"),
+                _dom("VAR 回看中", "45:06 1 : 0"),
+                _dom("H 进攻", "45:11 1 : 0", ["attack-move", "ball"]),
+            ],
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_var = _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])
+        af_mod.set_active_observer(af_var)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m3v"}, event_key="k3v")
+            done = _wait_done(coord, n=1)
+            assert done[0]["status"] == "var_veto", done
+            assert done[0].get("buy_emitted") is False
+            assert af_var.calls == 0, af_var.calls
 
         # Reversal observe: DOM score_match vs post-reverse → flatten_or.
         rev_frames = [
@@ -294,9 +374,8 @@ def main() -> int:
         )
         pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
         pg.reset_coordinator_for_tests()
-        af_mod.set_active_observer(
-            _FakeAf([{"ok": False, "score_match": None, "error": "rate_limit"}])  # type: ignore[arg-type]
-        )
+        af_cel = _FakeAf([{"ok": False, "score_match": None, "error": "rate_limit"}])
+        af_mod.set_active_observer(af_cel)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
@@ -315,6 +394,7 @@ def main() -> int:
             assert "flatten_or" in [d["status"] for d in done], done
             flat = next(d for d in done if d["status"] == "flatten_or")
             assert "dom" in str(flat.get("reason")), flat
+            assert af_cel.calls >= 1, af_cel.calls
 
         # Reversal: tracker will not open, AF score_match → flatten_or.
         def _fail_open(_self, _session, _observer):
@@ -352,7 +432,7 @@ def main() -> int:
         pg.PitchGateCoordinator._sample_odds = _slow_odds  # type: ignore[assignment]
         factory, _ = _open_factory(
             [
-                _dom("H 进球", "45:01 1 : 0"),
+                _dom("H 进球", "45:01 1 : 0", ["ball"]),
                 _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
             ],
             baseline=_dom("H 进球", "44:56 1 : 0"),
@@ -360,12 +440,7 @@ def main() -> int:
         pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
         pg.reset_coordinator_for_tests()
         af_mod.set_active_observer(
-            _FakeAf(
-                [
-                    {"ok": True, "score_match": False, "af_score": "0-0"},
-                    {"ok": True, "score_match": True, "af_score": "1-0"},
-                ]
-            )  # type: ignore[arg-type]
+            _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])  # type: ignore[arg-type]
         )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -630,6 +705,76 @@ def main() -> int:
             n_hook = af_slow.calls
             time.sleep(0.12)
             assert af_slow.calls == n_hook, af_slow.calls
+
+        # Opening re-award after the same transition reversed → skip (no DOM).
+        # First opening at ~35' (Delfin) and non-opening re-award (Maranhão) do not skip.
+        pg.reset_coordinator_for_tests()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            coord = pg.get_coordinator(root)
+            open_goal = {
+                "type": "score_change",
+                "match_id": "m_open_rev",
+                "home": "H",
+                "away": "A",
+                "home_score": 1,
+                "away_score": 0,
+                "prev": {"home": 0, "away": 0},
+                "curr": {"home": 1, "away": 0},
+                "official_clock": "36'",
+                "ts": "2026-08-24T12:00:00+08:00",
+                "polymarket": {"event_id": "e1"},
+            }
+            coord.note_reversal(
+                {
+                    **open_goal,
+                    "home_score": 0,
+                    "prev": {"home": 1, "away": 0},
+                    "curr": {"home": 0, "away": 0},
+                    "ts": "2026-08-24T12:01:00+08:00",
+                    "is_reversal": True,
+                }
+            )
+            reaward = {**open_goal, "ts": "2026-08-24T12:02:00+08:00"}
+            assert coord.start_gate(reaward, event_key=lib.event_key(reaward)) is False
+            skipped = coord.drain_done()
+            assert skipped and skipped[0]["status"] == "reversal_risk_skip", skipped
+
+            delfin = {**open_goal, "match_id": "m_delfin"}
+            coord.start_gate(delfin, event_key=lib.event_key(delfin))
+            delfin_done = coord.drain_done()
+            assert all(d["status"] != "reversal_risk_skip" for d in delfin_done), delfin_done
+
+            late = {
+                **open_goal,
+                "match_id": "m_late",
+                "official_clock": "90'+2'",
+                "status": "Playing 90'",
+            }
+            assert coord.start_gate(late, event_key=lib.event_key(late)) is False
+            late_done = coord.drain_done()
+            assert late_done and late_done[0]["status"] == "reversal_risk_skip", late_done
+
+            mar = {
+                **open_goal,
+                "match_id": "m_mar",
+                "home_score": 3,
+                "prev": {"home": 2, "away": 0},
+                "curr": {"home": 3, "away": 0},
+                "official_clock": "25'",
+            }
+            coord.note_reversal(
+                {
+                    **mar,
+                    "home_score": 2,
+                    "prev": {"home": 3, "away": 0},
+                    "curr": {"home": 2, "away": 0},
+                }
+            )
+            coord.start_gate(mar, event_key=lib.event_key(mar))
+            mar_done = coord.drain_done()
+            assert all(d["status"] != "reversal_risk_skip" for d in mar_done), mar_done
 
         print("ok: pitch_gate AND buy / stop AF keep DOM / AF∨DOM flatten / no JPEG")
         return 0

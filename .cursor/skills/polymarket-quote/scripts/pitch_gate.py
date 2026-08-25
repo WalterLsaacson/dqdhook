@@ -1,8 +1,11 @@
-"""Pitch-gate: same-tick DOM∧AF buy; stop AF after buy, keep DOM to timeout.
+"""Pitch-gate: DOM-first, then same-tick in_play ∧ AF ∧ shot buy.
 
-Cadence: first sample @+0s, then every 5s until 120s (or flatten / cancel).
-Aligned buy stops AF (quota) but DOM keeps sampling until the original timeout.
-No screenshots. No nami ball-xy. Odds observe rides the same clock.
+Buy path samples DOM every 5s from +0s; AF starts on the first ``in_play``
+tick and then rides the same clock until buy / timeout / cancel. Aligned buy
+also requires a latched 射门 (pop text or ball/net marks) since t0. Buy stops
+AF (quota); DOM keeps sampling until the original timeout. Flatten trails poll
+AF∨DOM from t0 with no shot gate and no AF delay.
+No screenshots. No nami ball-xy. Odds observe rides every DOM tick.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ GATE_CONFIRM_FRAMES = 1
 # Unused for capture length (flatten / cancel / timeout stop the session).
 GATE_MIN_FRAMES = 1
 GATE_FRAME_COUNT = GATE_MIN_FRAMES
+SHOT_MARKS = frozenset({"ball", "net"})
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -47,6 +51,26 @@ def _judge_shows_var(judge: dict[str, Any] | None) -> bool:
         if "VAR" in text or text.strip().lower() == "var":
             return True
     return False
+
+
+def _dom_shows_shot(
+    dom: dict[str, Any] | None,
+    judged: dict[str, Any] | None = None,
+) -> bool:
+    """True when this frame shows a shot overlay (pop 射门 or ball/net mark)."""
+    pop = ""
+    marks: list[Any] = []
+    if isinstance(judged, dict):
+        pop = str(judged.get("dom_pop_box") or "")
+        marks = list(judged.get("dom_marks") or [])
+    if isinstance(dom, dict):
+        if not pop:
+            pop = str(dom.get("pop_box") or "")
+        if not marks:
+            marks = list(dom.get("marks") or [])
+    if "射门" in pop:
+        return True
+    return any(str(m) in SHOT_MARKS for m in marks)
 
 
 def _animation_rules() -> Any:
@@ -87,6 +111,8 @@ class _GateSession:
     confirm_streak: int = 0
     var_seen: bool = False
     observe_only: bool = False
+    af_armed: bool = False
+    shot_seen: bool = False
 
 
 class PitchGateCoordinator:
@@ -107,6 +133,8 @@ class PitchGateCoordinator:
         # stem → reverse ts. A later 0-1→1-1 with ts ≤ this must not reopen
         # AF/DOM; a re-awarded goal with a newer ts still can.
         self._blocked_until: dict[str, str] = {}
+        # match_id → reverse transitions ("1-0→0-0"). Opening re-awards skip.
+        self._reversed_trans: dict[str, set[str]] = {}
 
     def pending_event_keys(self) -> set[str]:
         with self._lock:
@@ -162,6 +190,37 @@ class PitchGateCoordinator:
             if ts >= prev:
                 self._blocked_until[stem] = ts
 
+    def note_reversal(self, ev: dict[str, Any]) -> None:
+        """Remember this reverse transition so a later opening re-award can skip."""
+        from reversal_score import transition
+
+        mid = str(ev.get("match_id") or "").strip()
+        trans = transition(ev)
+        if not mid or "→" not in trans or "None" in trans:
+            return
+        with self._lock:
+            self._reversed_trans.setdefault(mid, set()).add(trans)
+
+    def prior_same_for_goal(self, ev: dict[str, Any]) -> bool:
+        from reversal_score import inverse_transition, transition
+
+        mid = str(ev.get("match_id") or "").strip()
+        trans = transition(ev)
+        if not mid or "→" not in trans or "None" in trans:
+            return False
+        inv = inverse_transition(trans)
+        with self._lock:
+            return inv in (self._reversed_trans.get(mid) or ())
+
+    def _reversal_risk_skip(self, ev: dict[str, Any]) -> Any | None:
+        """Skip only opening+prior_same and opening+90'. Haircut is not a skip."""
+        from reversal_score import score_event
+
+        scored = score_event(ev, prior_same=self.prior_same_for_goal(ev))
+        if scored.action == "skip":
+            return scored
+        return None
+
     def consumed_event_keys(self, match_id: str) -> set[str]:
         mid = str(match_id or "").strip()
         if not mid:
@@ -193,6 +252,32 @@ class PitchGateCoordinator:
         key = str(event_key or "").strip()
         if not mid or not key:
             return False
+        if not observe_only:
+            skip = self._reversal_risk_skip(ev)
+            if skip is not None:
+                with self._lock:
+                    if self._gate_blocked_locked(key):
+                        return False
+                    self._mark_closed_locked(mid, key)
+                self._push_done(
+                    {
+                        "status": "reversal_risk_skip",
+                        "event_key": key,
+                        "match_id": mid,
+                        "ev": dict(ev),
+                        "reason": skip.features.transition,
+                        "reversal_score": skip.to_dict(),
+                        "observe_only": False,
+                    }
+                )
+                print(
+                    f"pitch-gate → SKIP reversal-risk match_id={mid} key={key} "
+                    f"p_rev={skip.p_rev} cell={skip.cell} "
+                    f"opening={skip.features.opening} clock={skip.features.clock_min} "
+                    f"prior_same={skip.features.prior_same}",
+                    flush=True,
+                )
+                return False
         with self._lock:
             if self._gate_blocked_locked(key):
                 return False
@@ -268,7 +353,7 @@ class PitchGateCoordinator:
             "reversal trail; flatten on AF∨DOM score_match"
             if session.observe_only
             else (
-                f"DOM in_play ∧ AF score_match; VAR→no buy; "
+                f"DOM first; in_play ∧ AF ∧ shot; VAR→no buy; "
                 f"buy → stop AF, DOM until {GATE_TIMEOUT_S:g}s"
             )
         )
@@ -401,7 +486,7 @@ class PitchGateCoordinator:
                     "ev": dict(session.ev),
                     "judge": judge,
                     "af": af_row,
-                    "reason": "dom_in_play_and_af_score_match",
+                    "reason": "dom_in_play_and_af_score_match_and_shot",
                     "elapsed_s": elapsed_s,
                     "sample_i": sample_i,
                 }
@@ -492,10 +577,22 @@ class PitchGateCoordinator:
 
     @staticmethod
     def _af_open(session: _GateSession) -> bool:
-        """AF costs quota. Stop it after an aligned buy; flatten trails keep AF."""
+        """AF costs quota. Buy path waits for first in_play; flatten trails keep AF."""
         if session.observe_only:
             return True
-        return not session.buy_emitted
+        if session.buy_emitted or session.var_seen:
+            return False
+        return bool(session.af_armed)
+
+    @staticmethod
+    def _timeout_reason(session: _GateSession, captured: int) -> str:
+        if not captured:
+            return "pitch_gate_timeout"
+        if not session.af_armed:
+            return f"never_in_play_in_{captured}_frames"
+        if not session.shot_seen:
+            return f"no_shot_in_{captured}_frames"
+        return f"no_aligned_buy_in_{captured}_frames"
 
     def _sample_af(
         self,
@@ -707,10 +804,15 @@ class PitchGateCoordinator:
                             pass
                         reader = None
                 elif reader is None:
+                    hint = (
+                        "continue AF; no DOM board"
+                        if session.observe_only
+                        else "no AF until in_play; no DOM buy"
+                    )
                     print(
                         f"pitch-gate → DOM_UNAVAILABLE match_id={session.match_id} "
                         f"key={session.event_key} reason={open_err} "
-                        f"(continue AF; no DOM buy)",
+                        f"({hint})",
                         flush=True,
                     )
                 else:
@@ -757,6 +859,38 @@ class PitchGateCoordinator:
                         )
                     )
 
+                play_state = str((judged or {}).get("play_state") or "")
+                dom_state = (
+                    row.get("dom_state")
+                    if isinstance(row.get("dom_state"), dict)
+                    else None
+                )
+                shot_this = _dom_shows_shot(dom_state, judged)
+                if shot_this:
+                    session.shot_seen = True
+                row["shot_this_frame"] = shot_this
+                row["shot_seen"] = bool(session.shot_seen)
+                if (
+                    not session.observe_only
+                    and not session.buy_emitted
+                    and has_reading
+                    and _judge_shows_var(judged)
+                ):
+                    if not session.var_seen:
+                        print(
+                            f"pitch-gate → VAR_VETO match_id={session.match_id} "
+                            f"key={session.event_key} sample={sample_i} "
+                            f"(no buy for this goal)",
+                            flush=True,
+                        )
+                    session.var_seen = True
+                if (
+                    not session.observe_only
+                    and play_state == "in_play"
+                    and not session.var_seen
+                ):
+                    session.af_armed = True
+
                 odds_holder: dict[str, Any] = {}
                 self._kick_odds(
                     session,
@@ -779,12 +913,26 @@ class PitchGateCoordinator:
                             "af_score": af_row.get("af_score"),
                             "error": af_row.get("error"),
                         }
-                else:
+                elif session.buy_emitted:
                     row["af"] = {
                         "ok": None,
                         "score_match": None,
                         "skipped": "after_buy",
                         "error": "af_stopped_after_buy",
+                    }
+                elif session.var_seen:
+                    row["af"] = {
+                        "ok": None,
+                        "score_match": None,
+                        "skipped": "after_var",
+                        "error": "af_stopped_after_var",
+                    }
+                else:
+                    row["af"] = {
+                        "ok": None,
+                        "score_match": None,
+                        "skipped": "before_in_play",
+                        "error": "af_skipped_before_in_play",
                     }
                 if odds_holder.get("grade"):
                     grade = odds_holder["grade"]
@@ -800,7 +948,6 @@ class PitchGateCoordinator:
                 captured += 1
 
                 af_ok = bool(af_row and af_row.get("ok") and af_row.get("score_match") is True)
-                play_state = str((judged or {}).get("play_state") or "")
 
                 if session.observe_only:
                     if af_ok or board_match:
@@ -825,17 +972,27 @@ class PitchGateCoordinator:
                         )
                 elif has_reading:
                     if _judge_shows_var(judged):
-                        if not session.var_seen:
-                            session.var_seen = True
-                            print(
-                                f"pitch-gate → VAR_VETO match_id={session.match_id} "
-                                f"key={session.event_key} sample={sample_i} "
-                                f"(no buy for this goal)",
-                                flush=True,
-                            )
                         session.confirm_streak = 0
                     elif play_state == "in_play":
                         if session.var_seen:
+                            session.confirm_streak = 0
+                        elif not session.shot_seen:
+                            if af_ok:
+                                print(
+                                    f"pitch-gate → WAIT_SHOT match_id={session.match_id} "
+                                    f"key={session.event_key} sample={sample_i} "
+                                    f"(in_play ∧ AF, no 射门 yet)",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"pitch-gate → WAIT_AF match_id={session.match_id} "
+                                    f"key={session.event_key} sample={sample_i} "
+                                    f"af_ok={bool(af_row and af_row.get('ok'))} "
+                                    f"score_match={(af_row or {}).get('score_match')} "
+                                    f"err={(af_row or {}).get('error')}",
+                                    flush=True,
+                                )
                             session.confirm_streak = 0
                         elif not af_ok:
                             print(
@@ -957,11 +1114,7 @@ class PitchGateCoordinator:
                 self._finish_session(
                     session,
                     status="timeout",
-                    reason=(
-                        f"no_aligned_buy_in_{captured}_frames"
-                        if captured
-                        else "pitch_gate_timeout"
-                    ),
+                    reason=self._timeout_reason(session, captured),
                     elapsed_s=elapsed_end,
                     frames=captured,
                 )

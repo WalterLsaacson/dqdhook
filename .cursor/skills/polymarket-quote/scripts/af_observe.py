@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Observe-only API-Football score sampling beside pitch-gate DOM reads.
 
-Pitch-gate calls ``sample_once`` on the same +0s / 5s clock as DOM until
-aligned buy (flatten trails keep sampling for the full window).
+Pitch-gate calls ``sample_once`` on the same 5s clock as DOM after the
+first buy-side ``in_play`` (flatten trails keep sampling from t0).
 The independent session thread is unused.
 
 Never buys, never flattens, never runs OCR. Enabled when

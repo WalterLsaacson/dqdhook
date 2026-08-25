@@ -40,7 +40,7 @@
 | 懂球帝看板 | `:8787` | DQD 赛程 |
 | Polymarket 看板 | `:8788` | Gamma 快照 |
 | Match Bridge 看板 | `:8789` | 配对结果（只读；quote 持有桥） |
-| Pitch Gate 看板 | `:8791` | 每球逐帧 DOM 状态 + AF 比分观察（可筛 in_play / 回撤 / 回撤观察） |
+| Pitch Gate 看板 | `:8791` | 每球逐帧 DOM 状态 + AF 比分观察（可筛买入 / 无射门 / 回撤） |
 | API-Football Bridge 看板 | `:8792` | DQD→AF fixture 缓存 / events |
 | `pm_quote watch` | — | **进程内持有 match-bridge**，内存队列直达询价 |
 
@@ -69,8 +69,8 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+0s** 起同拍读 DOM + 打一枪 AF（+ Odds 观察），每 **5s** 一次，直到 **120s** |
-| 买条件 | **同帧** DOM `in_play` **且** AF `ok && score_match`（AF 限流/失败本拍否决） |
+| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；第一次 `in_play` 才打 AF，之后同拍 AF+DOM（+ Odds 观察），直到 **120s** |
+| 买条件 | **同帧** DOM `in_play` **且** AF `ok && score_match` **且** 本球从 t0 起见过射门（pop「射门」或 `ball`/`net`） |
 | 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s**。询价/挂 rest 不再堵住下一场开 DOM。 |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
@@ -112,6 +112,7 @@
 | 事件过旧（默认 >900s） | `goal_stale` 跳过 |
 | 比分对不上 | 继续采样，不买 |
 | 抓帧中出现 VAR | `var_veto`，该球不买 |
+| 开场球刚被同一过渡回撤过，或开场球时钟 ≥90′ | `pitch_gate_reversal_risk_skip`，不开闸（约 35′ 普通开场球仍买） |
 | 懂球帝回撤该球（买入前） | 取消门控 + 撤销未 drain 的买信号 |
 | 懂球帝回撤该球（已有仓） | 5s AF∨DOM 认回撤比分才 flatten；120s 都不认 → 持仓 |
 | 动画已改比分、随后 DQD 才长延迟回撤 | 买入时无法预知；出口靠回撤后再开 5s 轨 |
@@ -156,8 +157,7 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 **限价 rest（可选，默认关）：**
 
 - 需 `QUOTE_REST_ENABLED=1`  
-- 门控 WIN 无法 FAK 成交、且盘口 **还有 ask** 时，挂 **@0.99**、默认 **`GTC`（不设过期）**  
-- **没有 ask**（只剩 0.99 买盘）不挂 rest  
+- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、默认 **`GTC`（不设过期）**；没有卖盘也挂，等砸盘  
 - 金额 **`QUOTE_REST_USDC`（默认 $5）**，满足 CLOB 最低 5 股；**不受** `QUOTE_MAX_OPEN_USDC` 卡住  
 - DQD 回撤 / 终场 / 手取消才会撤这些 rest；`QUOTE_REST_EXPIRE_S>0` 才改回有时限的 GTD  
 
@@ -284,7 +284,7 @@ DQD 侧的 `ssl.SSLEOFError` traceback 不致命，bridge 线程会在 15s 后�
 3. **已成交的买无法靠 cancel 撤回**：同 tick 内未 drain 的 `in_play` 会被 `cancel_match` 转为 `buy_revoked`；若上一 tick 已 FAK，只能靠保护窗口平仓。  
 4. **VAR 依赖动画文案**：纳米不渲染 `VAR` 就不会 `var_veto`；买入之后出现的 VAR 本身不触发平仓，要等懂球帝真正回撤。  
 5. **DOM 结构依赖**：`.pop-box` / `.center-box` 是纳米前端的私有实现，改名会让门控读不到文本 → `unclear` → 停止下单（安全方向，但会静默停交易）。  
-6. **单帧 AND 更严**：DOM `in_play` 单独不够，还要同拍 AF 认分；AF 限流会推迟买入。  
+6. **单帧 AND 更严**：DOM `in_play` 单独不够，还要同拍 AF 认分，且 t0 起见过射门；AF 限流或无射门会推迟/取消买入。  
 7. **动画源是第三方且非公开接口**：纳米改动 URL 形态或页面结构会让门控退化为「读不到合格状态 → 超时不下单」（安全方向，但会静默停止交易）。同理 `animation_live` 缺失的场次（友谊赛、业余级别）没有门控能力。  
 8. **卡死页面只能靠时钟识别**：判定要求 `.center-box` 时钟相对上次读数有推进，开页时会先取一次基线，所以第 0 帧也受保护。但若纳米某天不渲染时钟，这层保护会静默失效（比分相符仍是主要防线）。  
 

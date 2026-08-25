@@ -355,10 +355,17 @@ export function renderDetail(goal) {
             !aligned &&
             alignedAt != null &&
             Number(f.elapsed_s) >= Number(alignedAt);
-          const waitAf = ps === "in_play" && !aligned && !trailAfterBuy;
+          const waitShot =
+            ps === "in_play" &&
+            f.af?.score_match === true &&
+            !aligned &&
+            !trailAfterBuy;
+          const waitAf = ps === "in_play" && !aligned && !trailAfterBuy && !waitShot;
           const orFlat = Boolean(f.or_flatten);
+          const shotThis = Boolean(f.shot_this_frame);
           const frameCls = [
             aligned ? "is-aligned" : "",
+            waitShot ? "is-wait-shot" : "",
             waitAf ? "is-wait-af" : "",
             trailAfterBuy ? "is-after-buy" : "",
             orFlat && revObs ? "is-or-flatten" : "",
@@ -369,6 +376,8 @@ export function renderDetail(goal) {
             ? "aligned_buy"
             : trailAfterBuy
               ? "after_buy"
+              : waitShot
+              ? "wait_shot"
               : waitAf
               ? "wait_af"
               : orFlat && revObs
@@ -377,6 +386,10 @@ export function renderDetail(goal) {
           const afBit =
             f.af?.skipped === "after_buy"
               ? "AF 停"
+              : f.af?.skipped === "after_var"
+              ? "AF VAR"
+              : f.af?.skipped === "before_in_play"
+              ? "AF 未开"
               : f.af?.score_match === true
               ? "AF ✓"
               : f.af?.score_match === false
@@ -393,6 +406,11 @@ export function renderDetail(goal) {
                 <div class="frame__row">
                   <span class="frame__elapsed">t+${escapeHtml(String(f.elapsed_s ?? "?"))}s</span>
                   <span class="${stateBadgeClass(gateBadge)}">${escapeHtml(stateLabel(gateBadge))}</span>
+                  ${
+                    shotThis
+                      ? `<span class="${stateBadgeClass("shot")}">射门</span>`
+                      : ""
+                  }
                 </div>
                 <div class="frame__row">
                   <span>#${escapeHtml(String(f.dom_seq ?? f.sample_i ?? "?"))}${
@@ -439,6 +457,8 @@ export function renderDetail(goal) {
           ${
             goal.aligned_elapsed_s != null
               ? ` · aligned @ t+${escapeHtml(String(goal.aligned_elapsed_s))}s`
+              : goal.verdict === "wait_shot"
+                ? ` · DOM in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s (等射门)`
               : goal.in_play_elapsed_s != null
                 ? ` · DOM in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s (等AF)`
                 : ""

@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from reversal_score import ReversalFeatures, fit_lookup, score  # noqa: E402
+from reversal_score import ReversalFeatures, fit_lookup, score, score_event  # noqa: E402
 
 
 def _feat(**kwargs: object) -> ReversalFeatures:
@@ -31,6 +31,17 @@ def main() -> None:
     delfin = score(_feat(opening=1, clock_min=36, prior_same=0))
     assert delfin.action == "full", delfin
     assert delfin.size_mult == 1.0
+
+    live = score_event(
+        {
+            "prev": {"home": 0, "away": 0},
+            "curr": {"home": 1, "away": 0},
+            "official_clock": "36'",
+        },
+        prior_same=False,
+    )
+    assert live.action == "full", live
+    assert live.features.opening == 1
 
     saprissa = score(_feat(opening=1, clock_min=78, prior_same=1))
     assert saprissa.action == "skip", saprissa

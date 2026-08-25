@@ -164,6 +164,14 @@ def check_judge_dom() -> None:
     j = rules.judge_dom(_dom("阿森纳 控球", "35:12 9 : 9"), expected_home=1, expected_away=0)
     assert j["play_state"] == "in_play", j
 
+    # 射门 is a latch overlay, not an in_play token.
+    j = rules.judge_dom(_dom("阿森纳 射门", "35:12 1 : 0"), **exp)
+    assert j["play_state"] != "in_play", j
+    assert pg._dom_shows_shot(_dom("阿森纳 射门", "35:12 1 : 0"))
+    assert pg._dom_shows_shot(_dom("阿森纳 进攻", "35:12 1 : 0", ["ball"]))
+    assert pg._dom_shows_shot(_dom("阿森纳 进攻", "35:12 1 : 0", ["net"]))
+    assert not pg._dom_shows_shot(_dom("阿森纳 进攻", "35:12 1 : 0", ["attack-move"]))
+
 
 def check_gate_source_env() -> None:
     old = os.environ.get("QUOTE_GATE_SOURCE")
@@ -213,9 +221,10 @@ def check_dom_session() -> None:
 
     orig_open = pg.PitchGateCoordinator._open_dom_reader
     try:
-        # Frame 0 stopped (celebration), frame 1 in_play → exactly one buy.
+        # Frame 0 stopped (celebration, 射门 mark), frame 1 in_play → one buy.
+        # AF is skipped on the celebration frame and starts on first in_play.
         frames = [
-            _dom("H 进球", "45:01 1 : 0"),
+            _dom("H 进球", "45:01 1 : 0", ["ball"]),
             _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
             _dom("H 控球", "45:11 1 : 0", ["possession-rect"]),
         ]
@@ -260,7 +269,9 @@ def check_dom_session() -> None:
             statuses = [d["status"] for d in done]
             assert "in_play" in statuses and "aligned_buy" in statuses, done
             assert sum(1 for d in done if d["status"] == "in_play") == 1, done
-            assert af.calls == 2, af.calls
+            assert af.calls == 1, af.calls
+            assert (obs.rows[0].get("af") or {}).get("skipped") == "before_in_play"
+            assert obs.rows[0].get("shot_seen") is True
             assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
             assert any(
                 (r.get("af") or {}).get("skipped") == "after_buy" for r in obs.rows
@@ -302,13 +313,16 @@ def check_dom_session() -> None:
             done = _wait_done(coord, n=1)
             assert [d["status"] for d in done] == ["timeout"], done
             assert done[0].get("buy_emitted") is False, done[0]
+            assert "never_in_play" in str(done[0].get("reason") or ""), done[0]
 
-        # Reader that cannot open: keep sampling AF, never buy.
+        # Reader that cannot open: never arm AF, never buy.
         def _fail_open(_self, _session, _observer):
             return None, "playwright_browser_missing", {}
 
         pg.PitchGateCoordinator._open_dom_reader = _fail_open  # type: ignore[assignment]
         pg.reset_coordinator_for_tests()
+        af_miss = _AfOk()
+        af_mod.set_active_observer(af_miss)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
@@ -318,6 +332,8 @@ def check_dom_session() -> None:
             done = _wait_done(coord, n=1)
             assert [d["status"] for d in done] == ["timeout"], done
             assert done[0].get("buy_emitted") is False, done[0]
+            assert af_miss.calls == 0, af_miss.calls
+            assert "never_in_play" in str(done[0].get("reason") or ""), done[0]
     finally:
         pg.PitchGateCoordinator._open_dom_reader = orig_open  # type: ignore[assignment]
         set_active_observer(None)
