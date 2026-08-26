@@ -376,6 +376,25 @@ def main() -> int:
     _assert(bl.team_similarity("HJK", "HJK W") >= 0.92, "HJK W")
     _assert(bl.team_similarity("OH Leuven", "OH Leuven W") >= 0.92, "OH Leuven W")
 
+    # 2026-08-26 unmatched PM (93/99): Mash'al, UWCL shorts, Copa Argentina
+    _assert(
+        bl.normalize_team("PFK Mash AL Mubarek")
+        == bl.normalize_team("Mashal Muborak"),
+        "Mashal Mubarek",
+    )
+    _assert(
+        bl.normalize_team("PSG")
+        == bl.normalize_team("Paris Saint-Germain FC"),
+        "PSG",
+    )
+    _assert(
+        bl.normalize_team("Servette Women")
+        == bl.normalize_team("Servette FC Chênois Féminin"),
+        "Servette Chênois",
+    )
+    _assert(bl.normalize_league("阿根廷杯", "") == "argcopa", "阿根廷杯")
+    _assert(bl.normalize_league("ARGCOPA", "argcopa") == "argcopa", "ARGCOPA")
+
     # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
     _assert(
         bl.sides_are_swapped(

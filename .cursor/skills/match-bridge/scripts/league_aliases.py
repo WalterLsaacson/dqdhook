@@ -409,4 +409,9 @@ LEAGUE_ALIASES: dict[str, str] = {
     "dfl-supercup": "gsc",
     "dfl supercup": "gsc",
     "supercup": "gsc",
+    # --- 2026-08-26 unmatched PM (93/99): Copa Argentina ---
+    "阿根廷杯": "argcopa",
+    "argcopa": "argcopa",
+    "copa argentina": "argcopa",
+    "argentina cup": "argcopa",
 }

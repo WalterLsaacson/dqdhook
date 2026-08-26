@@ -47,6 +47,7 @@ _TEAM_STOP = frozenset(
         "afc",
         "sfc",
         "fk",
+        "pfk",
         "bk",
         "if",
         "ik",

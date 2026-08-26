@@ -707,4 +707,14 @@ TEAM_ALIASES: dict[str, str] = {
     "maccabi haifa": "maccabi haifa",
     "hapoel ramat gan givatayim fc": "hapoel ramat gan",
     "hapoel ramat gan": "hapoel ramat gan",
+    # --- 2026-08-26 unmatched PM (93/99): Mash'al / UWCL shorts / ARG Copa ---
+    "pfk mash al mubarek": "mashal muborak",
+    "mash al mubarek": "mashal muborak",
+    "mashal mubarek": "mashal muborak",
+    "mashal muborak": "mashal muborak",
+    "psg": "paris saint germain",
+    "paris saint germain": "paris saint germain",
+    "servette fc chenois feminin": "servette w",
+    "servette chenois feminin": "servette w",
+    "servette women": "servette w",
 }
