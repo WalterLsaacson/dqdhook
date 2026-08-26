@@ -355,12 +355,11 @@ export function renderDetail(goal) {
             !aligned &&
             alignedAt != null &&
             Number(f.elapsed_s) >= Number(alignedAt);
+          const shotLatched = Boolean(
+            f.shot_latched || f.shot_seen || f.shot_this_frame,
+          );
           const waitShot =
-            ps === "in_play" &&
-            !aligned &&
-            !trailAfterBuy &&
-            !f.shot_seen &&
-            !f.shot_this_frame;
+            ps === "in_play" && !aligned && !trailAfterBuy && !shotLatched;
           const waitAf = ps === "in_play" && !aligned && !trailAfterBuy && !waitShot;
           const orFlat = Boolean(f.or_flatten);
           const shotThis = Boolean(f.shot_this_frame);

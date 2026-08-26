@@ -480,6 +480,87 @@ def main() -> int:
     assert late["frames"][1].get("aligned") is False
     assert late["frames"][2].get("aligned") is True
 
+    # 进攻 + ball mark with runtime shot_seen=False is 无射门, not 等AF.
+    no_shot_key = "score_change|m7|0-0->1-0|t7"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": no_shot_key,
+                "match_id": "m7",
+                "home": "Tobol",
+                "away": "Kaysar",
+                "home_score": 2,
+                "away_score": 1,
+                "sample_i": 0,
+                "elapsed_s": 5,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {"ok": None, "score_match": None, "skipped": "before_shot"},
+                "dom_state": {"pop_box": "危险进攻", "marks": ["ball"]},
+                "shot_seen": False,
+                "shot_this_frame": False,
+            }
+        ],
+    )
+    _write_jsonl(quotes, [])
+    snap7 = board.build_goals_payload(limit=50)
+    no_shot = next(g for g in snap7["goals"] if g["event_key"] == no_shot_key)
+    assert no_shot["verdict"] == "wait_shot", no_shot["verdict"]
+    assert no_shot["shot_seen"] is False
+    assert no_shot["frames"][0].get("aligned") is False
+    assert no_shot["frames"][0].get("shot_this_frame") is False
+    assert no_shot["frames"][0].get("shot_latched") is False
+
+    # Last in_play after a real 射门 latch (AF not green) is 等AF.
+    mixed_key = "score_change|m8|0-0->1-0|t8"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": mixed_key,
+                "match_id": "m8",
+                "home": "A",
+                "away": "B",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 0,
+                "elapsed_s": 5,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {"ok": None, "score_match": None, "skipped": "before_shot"},
+                "dom_state": {"pop_box": "进攻"},
+                "shot_seen": False,
+                "shot_this_frame": False,
+            },
+            {
+                "event_key": mixed_key,
+                "match_id": "m8",
+                "home": "A",
+                "away": "B",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 1,
+                "elapsed_s": 50,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {"ok": True, "score_match": False, "af_score": "0-0"},
+                "dom_state": {"pop_box": "射正", "marks": ["ball", "net"]},
+                "shot_seen": True,
+                "shot_this_frame": True,
+            },
+        ],
+    )
+    snap8 = board.build_goals_payload(limit=50)
+    mixed = next(g for g in snap8["goals"] if g["event_key"] == mixed_key)
+    assert mixed["verdict"] == "wait_af", mixed["verdict"]
+    assert mixed["shot_seen"] is True
+    assert mixed["frames"][0].get("aligned") is False
+    assert mixed["frames"][1].get("aligned") is False
+
     print("ok: pitch-gate board verdicts match DOM∧AF∧射门 / AF∨DOM")
     return 0
 

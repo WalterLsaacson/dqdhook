@@ -245,8 +245,13 @@ def _frame_shows_shot(frame: dict[str, Any]) -> bool:
     return any(str(m) in ("ball", "net") for m in marks)
 
 
-def _goal_shot_seen(frames: list[dict[str, Any]]) -> bool:
-    return any(f.get("shot_seen") is True or _frame_shows_shot(f) for f in frames)
+def _frame_shot_latched(frame: dict[str, Any]) -> bool:
+    """Per-tick shot latch. Explicit False is not overridden by ball/net marks."""
+    if "shot_latched" in frame:
+        return bool(frame.get("shot_latched"))
+    if frame.get("shot_seen") is not None:
+        return bool(frame.get("shot_seen"))
+    return bool(frame.get("shot_this_frame") or _frame_shows_shot(frame))
 
 
 def _frame_dom_af_green(frame: dict[str, Any]) -> bool:
@@ -260,14 +265,7 @@ def _frame_aligned_buy(frame: dict[str, Any], *, shot_seen: bool | None = None) 
     goal-wide flag that includes *future* shot frames — that back-dates
     ``aligned @ t+…`` before 射门 actually appeared.
     """
-    if shot_seen is None:
-        latched = bool(
-            frame.get("shot_seen")
-            or frame.get("shot_this_frame")
-            or _frame_shows_shot(frame)
-        )
-    else:
-        latched = bool(shot_seen)
+    latched = _frame_shot_latched(frame) if shot_seen is None else bool(shot_seen)
     if not latched:
         return False
     return _frame_dom_af_green(frame)
@@ -281,7 +279,13 @@ def _frame_or_flatten(frame: dict[str, Any]) -> bool:
 
 
 def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None) -> str:
-    """Aggregate badge for a buy-side goal (not a reversal-observe row)."""
+    """Aggregate badge for a buy-side goal (not a reversal-observe row).
+
+    Walk the timeline and keep the *last* in_play wait state. A later 射门 must
+    not rewrite earlier ticks as aligned, but it *does* move the goal pill from
+    无射门 → 等AF. Goal-wide ``any(shot)`` must not dump every 进攻-with-ball
+    timeout into 等AF.
+    """
     mode = str(quote_mode or "")
     if mode == "pitch_gate_confirmed":
         return "aligned_buy"
@@ -291,21 +295,36 @@ def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None
         return "reversal_risk_skip"
     if mode == "pitch_gate_buy_revoked":
         return "reversed"
+
+    saw_aligned = False
+    saw_var = False
+    last_wait: str | None = None
+    for f in frames:
+        if _frame_var(f):
+            saw_var = True
+        is_aligned = (
+            bool(f.get("aligned")) if "aligned" in f else _frame_aligned_buy(f)
+        )
+        if is_aligned:
+            saw_aligned = True
+            last_wait = None
+            continue
+        if _frame_dom_in_play(f):
+            last_wait = "wait_af" if _frame_shot_latched(f) else "wait_shot"
+
+    if saw_aligned:
+        return "aligned_buy"
+    if saw_var:
+        return "var_veto"
+    if last_wait:
+        return last_wait
+
     judges = [
         f.get("judge")
         for f in frames
         if isinstance(f.get("judge"), dict)
     ]
     states = [str(j.get("play_state") or "") for j in judges]
-    # Per-frame latch only — do not let a late 射门 rewrite earlier WAIT_SHOT ticks.
-    if any(_frame_aligned_buy(f) for f in frames):
-        return "aligned_buy"
-    if any(_frame_var(f) for f in frames):
-        return "var_veto"
-    if any(_frame_dom_in_play(f) for f in frames) and not _goal_shot_seen(frames):
-        return "wait_shot"
-    if any(_frame_dom_in_play(f) for f in frames):
-        return "wait_af"
     if frames and all(f.get("ok") is False for f in frames):
         return "capture_failed"
     if not states:
@@ -884,7 +903,6 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 int(f.get("sample_i") or 0),
             )
         )
-        shot_seen = _goal_shot_seen(frames)
         latched = False
         for f in frames:
             sample_i = f.get("sample_i")
@@ -899,9 +917,16 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                         "level": grade.get("level"),
                         "reason": grade.get("reason"),
                     }
-            f["shot_this_frame"] = bool(
-                f.get("shot_this_frame") or _frame_shows_shot(f)
-            )
+            # Runtime shot flags win. Do not OR overlay ball/net onto an
+            # explicit shot_this_frame=False / shot_seen=False (进攻 often
+            # carries a ball mark without the 射门 latch).
+            if f.get("shot_this_frame") is None:
+                if f.get("shot_seen") is False:
+                    f["shot_this_frame"] = False
+                else:
+                    f["shot_this_frame"] = _frame_shows_shot(f)
+            else:
+                f["shot_this_frame"] = bool(f.get("shot_this_frame"))
             # Runtime ``shot_seen`` is authoritative per tick. Only synthesize a
             # forward latch when older rows omitted the field.
             if f.get("shot_seen") is not None:
@@ -912,10 +937,11 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                 if f["shot_this_frame"]:
                     latched = True
                 frame_latched = latched
+            f["shot_latched"] = frame_latched
             f["aligned"] = _frame_aligned_buy(f, shot_seen=frame_latched)
             f["or_flatten"] = _frame_or_flatten(f)
         g["frames"] = frames
-        g["shot_seen"] = shot_seen
+        g["shot_seen"] = latched
         g["frame_count"] = len(frames)
         g["ok_count"] = sum(1 for f in frames if f.get("ok") is True)
         af_frames = list(af_by_key.get(ek) or [])
@@ -1043,6 +1069,7 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
 
     aligned_n = sum(1 for g in goals if g.get("verdict") == "aligned_buy")
     wait_af_n = sum(1 for g in goals if g.get("verdict") == "wait_af")
+    wait_shot_n = sum(1 for g in goals if g.get("verdict") == "wait_shot")
     rev_n = sum(1 for g in goals if g.get("reversed"))
     rev_obs_n = sum(1 for g in goals if g.get("kind") == "reversal_observe")
     flatten_n = sum(1 for g in goals if g.get("verdict") == "flatten_or")
@@ -1059,6 +1086,7 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
         "aligned_buy_count": aligned_n,
         "in_play_count": aligned_n,
         "wait_af_count": wait_af_n,
+        "wait_shot_count": wait_shot_n,
         "reversed_count": rev_n,
         "reversal_observe_count": rev_obs_n,
         "flatten_count": flatten_n,
@@ -1108,6 +1136,7 @@ def _status_from_snap(snap: dict[str, Any] | None) -> dict[str, Any]:
         or (snap or {}).get("in_play_count")
         or 0,
         "wait_af_count": (snap or {}).get("wait_af_count") or 0,
+        "wait_shot_count": (snap or {}).get("wait_shot_count") or 0,
         "reversed_count": (snap or {}).get("reversed_count") or 0,
         "flatten_count": (snap or {}).get("flatten_count") or 0,
         "hold_count": (snap or {}).get("hold_count") or 0,
