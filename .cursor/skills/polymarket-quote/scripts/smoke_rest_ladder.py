@@ -78,6 +78,7 @@ def main() -> int:
     assert levels[0].get("tick_size") == "0.01", levels[0]
     assert float(levels[0]["shares"]) + 1e-12 >= 5.0, levels[0]
 
+    # Metadata 0.001 is a lie on soccer CLOB — clamp to 0.01 and snap 0.995→0.99.
     fine = rl.allocate_rest_ladder(
         rl.rest_target_usdc(),
         prices=(0.995,),
@@ -88,15 +89,16 @@ def main() -> int:
         min_shares=5.0,
     )
     assert len(fine) == 1, fine
-    assert abs(float(fine[0]["price"]) - 0.995) < 1e-9, fine[0]
-    assert fine[0].get("tick_size") == "0.001", fine[0]
+    assert abs(float(fine[0]["price"]) - 0.99) < 1e-9, fine[0]
+    assert fine[0].get("tick_size") == "0.01", fine[0]
 
     resolved_coarse = rl.resolve_rest_price(0.995, "0.01")
     assert resolved_coarse is not None and abs(resolved_coarse[0] - 0.99) < 1e-9
     assert resolved_coarse[1] == "0.01"
     resolved_fine = rl.resolve_rest_price(0.995, "0.001")
-    assert resolved_fine is not None and abs(resolved_fine[0] - 0.995) < 1e-9
-    assert resolved_fine[1] == "0.001"
+    assert resolved_fine is not None and abs(resolved_fine[0] - 0.99) < 1e-9
+    assert resolved_fine[1] == "0.01"
+    assert rl.rest_limit_tick_size("0.001") == "0.01"
 
     os.environ.pop("QUOTE_REST_EXPIRE_S", None)
     assert abs(rl.rest_expire_s() - 0.0) < 1e-9
@@ -143,6 +145,17 @@ def main() -> int:
             levels_out = plan.get("levels") or []
             assert levels_out and abs(float(levels_out[0]["price"]) - 0.99) < 1e-9, plan
 
+            q_meta_fine = dict(q_no)
+            q_meta_fine["token_id"] = "tok_meta_001"
+            q_meta_fine["tick_size"] = "0.001"
+            posted_fine = ex.maybe_trade(
+                q_meta_fine, event_key=ek, match_meta=meta, event_type="score_change"
+            )
+            assert posted_fine and posted_fine.get("status") == "rest_dry_run", posted_fine
+            fine_plan = posted_fine.get("plan") or {}
+            fine_lvls = fine_plan.get("levels") or []
+            assert fine_lvls and abs(float(fine_lvls[0]["price"]) - 0.99) < 1e-9, fine_plan
+
             q_stub = dict(q_no)
             q_stub["token_id"] = "tok2"
             q_stub["best_ask"] = 0.999
@@ -155,7 +168,7 @@ def main() -> int:
     finally:
         os.environ.pop("QUOTE_REST_ENABLED", None)
 
-    print("ok: rest ladder $5 / 0.01→0.99 / 0.001→0.995 / GTC default")
+    print("ok: rest ladder $5 / 0.01→0.99 / metadata 0.001 clamped to 0.01 / GTC default")
     return 0
 
 

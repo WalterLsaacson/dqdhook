@@ -20,11 +20,10 @@ MIN_REST_USDC = 1.0
 DEFAULT_REST_USDC = 5.0
 MIN_REST_SHARES = 5.0
 _SHARE_Q = Decimal("0.01")
-# CLOB limit orders reject tick_size below 0.01 on many soccer tokens even
-# when exact-score metadata reports 0.001. Never post finer than the book tick,
-# and never invent 0.001 on a 0.01 book just to represent 0.995.
+# CLOB limit orders reject tick_size below 0.01 on soccer tokens even when
+# Gamma/book metadata reports 0.001. Rest never posts finer than 0.01;
+# 0.995 snaps down to 0.99.
 REST_LIMIT_MIN_TICK = 0.01
-REST_FINE_TICK = 0.001
 REST_FALLBACK_TICK = 0.01
 # Master switch for GTD/GTC rest bids (pitch-gate fallback + cushion). Off until stable.
 DEFAULT_REST_ENABLED = False
@@ -87,15 +86,13 @@ def format_rest_tick(tick: float) -> str:
 def rest_limit_tick_size(tick_size: str | float | None) -> str:
     """Tick string for GTD/GTC limit posts.
 
-    Honor a published 0.001 book tick (0.995 is then legal). Otherwise never
-    go below 0.01 — soccer CLOB rejects finer ticks.
+    Do not trust published 0.001 metadata — CLOB's soccer minimum is 0.01.
+    Finer ticks are clamped up; 0.995 then snaps to 0.99.
     """
     try:
         tick = float(tick_size or REST_FALLBACK_TICK)
     except (TypeError, ValueError):
         tick = REST_FALLBACK_TICK
-    if abs(tick - REST_FINE_TICK) < 1e-9:
-        return format_rest_tick(REST_FINE_TICK)
     tick = max(REST_LIMIT_MIN_TICK, tick)
     return format_rest_tick(tick)
 
