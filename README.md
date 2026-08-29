@@ -79,9 +79,9 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**本拍 `in_play` 才同帧打 AF**，直到 **120s** |
+| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**本拍 `in_play` 才同帧打 AF**；未买则采到 **120s** |
 | 买条件 | **同帧** DOM `in_play` ∧ AF。射门不卡买入。Odds Grade A **只观察、不下单** |
-| 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s** |
+| 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **立刻停 AF+DOM** |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
 | 回撤 | 取消进球会话；**已有仓**才开 5s AF+DOM 观察；某一拍 **AF `score_match`**（回撤后比分）→ flatten 并**立刻停轨**；AF 不认 → **持仓** |
@@ -146,7 +146,7 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 
 ### 5. 回撤、买后保护与持仓
 
-懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开 5s AF+DOM 确认轨：某一拍 **AF `ok && score_match`**（回撤后比分）→ flatten，**不受** 300s 保护窗限制，并**立刻停 AF+DOM**（与买入后 DOM 拖到 120s 不同）。DOM 中心比分（庆祝/VAR/僵死时钟）只记观察，**不单独卖出**。AF 报错或比分仍是进球前 → 不平仓。动画页打不开仍继续采 AF。120s AF 不认 → **持仓**。未买入的回撤只取消门控。
+懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开 5s AF+DOM 确认轨：某一拍 **AF `ok && score_match`**（回撤后比分）→ flatten，**不受** 300s 保护窗限制，并**立刻停 AF+DOM**（与买入后停轨相同）。DOM 中心比分（庆祝/VAR/僵死时钟）只记观察，**不单独卖出**。AF 报错或比分仍是进球前 → 不平仓。动画页打不开仍继续采 AF。120s AF 不认 → **持仓**。未买入的回撤只取消门控。
 
 | 动作 | 行为 |
 |---|---|

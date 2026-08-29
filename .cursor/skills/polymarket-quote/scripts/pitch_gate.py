@@ -8,8 +8,8 @@ latch from an earlier ``in_play`` poll of this goal). A later AF
 mismatch clears the latch. 射门 is observe-only on the board, not a
 gate. Odds Grade A is observe-only.
 
-VAR before buy still vetoes. Only an AND buy stops AF; DOM keeps
-sampling until timeout. AF match alone must not stop subsequent polls.
+VAR before buy still vetoes. AND buy stops AF and DOM. AF match alone
+must not stop subsequent polls before the buy.
 
 Flatten (reversal) trails poll AF from t0 with no in_play gate. DOM is still
 sampled for the board, but flatten waits for AF ``ok && score_match`` vs the
@@ -385,8 +385,7 @@ class PitchGateCoordinator:
             if session.observe_only
             else (
                 f"AND in_play∧AF only; AF from first in_play tick; "
-                f"Odds Grade A observe-only; VAR→no buy; AND buy → stop AF, "
-                f"DOM until {GATE_TIMEOUT_S:g}s"
+                f"Odds Grade A observe-only; VAR→no buy; AND buy → stop AF+DOM"
             )
         )
         print(
@@ -516,7 +515,7 @@ class PitchGateCoordinator:
         af_row: dict[str, Any] | None = None,
         reason: str = "dom_in_play_and_af_score_match",
     ) -> bool:
-        """Queue a one-shot buy. Caller keeps the DOM trail until timeout."""
+        """Queue a one-shot buy. Caller stops AF and DOM after this sample."""
         with self._lock:
             if (
                 session.finished
@@ -547,7 +546,7 @@ class PitchGateCoordinator:
             print(
                 f"pitch-gate → IN_PLAY (aligned buy) match_id={session.match_id} "
                 f"key={session.event_key} sample={sample_i} elapsed={elapsed_s:.1f}s "
-                f"reason={reason} · stop AF, DOM until {GATE_TIMEOUT_S:g}s",
+                f"reason={reason} · stop AF+DOM",
                 flush=True,
             )
         return True
@@ -635,7 +634,7 @@ class PitchGateCoordinator:
         """AF costs quota. Buy path polls only on this tick's ``in_play``.
 
         Flatten trails poll from t0. Do not stop after the first
-        ``score_match``. Only AND buy / VAR close the quota.
+        ``score_match``. AND buy / VAR close the quota; buy also ends DOM.
         """
         if session.observe_only:
             return True
@@ -965,7 +964,6 @@ class PitchGateCoordinator:
         surface_info: dict[str, Any] = {}
         prev_clock: str | None = None
         flatten_emitted = False
-        var_after_buy_logged = False
         try:
             if not session.cancel.is_set():
                 reader, open_err, surface_info = self._open_dom_reader(session, observer)
@@ -1073,9 +1071,9 @@ class PitchGateCoordinator:
                 af_ready = af_ok or bool(session.af_matched)
 
                 if session.observe_only:
-                    # Unlike buy (DOM continues to timeout), AF confirm
-                    # stops the 5s trail on this same tick. DOM board score
-                    # is observed only — stale center-box must not sell.
+                    # AF confirm stops the 5s trail on this same tick (buy
+                    # also stops AF+DOM after the fill). DOM board score is
+                    # observed only — stale center-box must not sell.
                     if af_ok:
                         self._fill_row_af(
                             session, row, af_row=af_row, play_state=play_state
@@ -1101,15 +1099,6 @@ class PitchGateCoordinator:
                         )
                         flatten_emitted = True
                         break
-                elif session.buy_emitted:
-                    if _judge_shows_var(judged) and not var_after_buy_logged:
-                        var_after_buy_logged = True
-                        print(
-                            f"pitch-gate → VAR_AFTER_BUY match_id={session.match_id} "
-                            f"key={session.event_key} sample={sample_i} "
-                            f"(DOM trail only; already bought)",
-                            flush=True,
-                        )
                 elif session.var_seen:
                     session.confirm_streak = 0
                 else:
@@ -1162,6 +1151,9 @@ class PitchGateCoordinator:
                 except Exception:  # noqa: BLE001
                     logger.exception("pitch-gate observe write failed")
                 captured += 1
+
+                if session.buy_emitted and not session.observe_only:
+                    break
 
                 sample_i += 1
                 next_t = (
@@ -1226,14 +1218,14 @@ class PitchGateCoordinator:
                 self._finish_session(
                     session,
                     status="aligned_buy",
-                    reason="dom_trail_until_timeout",
+                    reason="stop_after_buy",
                     elapsed_s=elapsed_end,
                     frames=captured,
                 )
                 print(
                     f"pitch-gate → ALIGNED_BUY match_id={session.match_id} "
                     f"key={session.event_key} frames={captured} "
-                    f"elapsed={elapsed_end:.1f}s (AF stopped after buy; DOM trail done)",
+                    f"elapsed={elapsed_end:.1f}s (stop AF+DOM after buy)",
                     flush=True,
                 )
             elif session.var_seen:

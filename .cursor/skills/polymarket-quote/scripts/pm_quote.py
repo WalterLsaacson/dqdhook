@@ -100,7 +100,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         f"{size_channels_label(settings)} "
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
-        f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF → enqueue CLOB worker; stop AF, DOM to timeout)",
+        f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF → enqueue CLOB worker; buy stops AF+DOM)",
         file=sys.stderr,
         flush=True,
     )

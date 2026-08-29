@@ -271,8 +271,11 @@ def check_dom_session() -> None:
             assert af.calls == 1, af.calls
             assert (obs.rows[0].get("af") or {}).get("skipped") == "before_in_play"
             assert obs.rows[0].get("shot_seen") is True
-            assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
-            assert any(
+            assert len(obs.rows) == 2, [r.get("sample_i") for r in obs.rows]
+            n_rows = len(obs.rows)
+            time.sleep(0.15)
+            assert len(obs.rows) == n_rows, "DOM must stop after buy"
+            assert not any(
                 (r.get("af") or {}).get("skipped") == "after_buy" for r in obs.rows
             )
 

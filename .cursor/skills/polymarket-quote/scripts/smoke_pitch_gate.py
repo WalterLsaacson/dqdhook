@@ -168,22 +168,21 @@ def main() -> int:
             statuses = [d["status"] for d in done]
             assert "in_play" in statuses and "aligned_buy" in statuses, done
             assert sum(1 for d in done if d["status"] == "in_play") == 1, done
-            assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
+            assert len(obs.rows) == 3, [r.get("sample_i") for r in obs.rows]
             assert af.calls == 2, af.calls
             assert (obs.rows[0].get("af") or {}).get("skipped") == "before_in_play"
             buy = next(d for d in done if d["status"] == "in_play")
             assert buy["sample_i"] == 2, buy
-            skipped = [
-                r for r in obs.rows if (r.get("af") or {}).get("skipped") == "after_buy"
-            ]
-            assert skipped, obs.rows
-            assert all(
-                (r.get("af") or {}).get("skipped") != "after_buy" for r in obs.rows[:3]
+            n_rows = len(obs.rows)
+            time.sleep(0.15)
+            assert len(obs.rows) == n_rows, "DOM must stop after buy"
+            assert not any(
+                (r.get("af") or {}).get("skipped") == "after_buy" for r in obs.rows
             )
             assert readers[-1].closed
             assert not any(r.get("frame_path") for r in obs.rows)
             trail = next(d for d in done if d["status"] == "aligned_buy")
-            assert trail.get("reason") == "dom_trail_until_timeout", trail
+            assert trail.get("reason") == "stop_after_buy", trail
 
         # PM 0-1 vs Nami/DQD 1-0 (sides swapped) still buys.
         factory, _ = _open_factory(
@@ -914,7 +913,7 @@ def main() -> int:
             mar_done = coord.drain_done()
             assert all(d["status"] != "reversal_risk_skip" for d in mar_done), mar_done
 
-        print("ok: pitch_gate AND only / Odds A observe-only / stop AF keep DOM / AF-only flatten")
+        print("ok: pitch_gate AND only / Odds A observe-only / stop AF+DOM after buy / AF-only flatten")
         return 0
     finally:
         pg.PitchGateCoordinator._open_dom_reader = orig_open  # type: ignore[assignment]

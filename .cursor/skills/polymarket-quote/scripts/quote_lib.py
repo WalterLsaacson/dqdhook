@@ -2398,7 +2398,7 @@ def process_bridge_events(
     latch from an earlier ``in_play`` poll of this goal). AF starts on the
     first ``in_play`` tick and keeps polling later ``in_play`` ticks until
     AND buy. 射门 is not a buy gate. Odds Grade A is observe-only.
-    Aligned buy stops AF (quota) and keeps DOM until timeout. DQD reversals
+    Aligned buy stops AF and DOM. DQD reversals
     cancel rest and open gates; if lots are open they start an AF confirm
     trail from t0 (no shot gate); flatten on first AF score_match then stop
     the trail. Each paired goal also schedules a T+10 book rescan.
@@ -2863,13 +2863,13 @@ def process_bridge_events(
                 )
                 continue
             if status == "complete" or status == "aligned_buy":
-                # Buy already drained on in_play; this is the DOM trail ending.
+                # Buy already drained on in_play; this is session complete.
                 if key not in seen:
                     seen.add(key)
                 print(
                     f"pitch-gate → {status.upper()} match_id={mid} key={key} "
                     f"reason={item.get('reason')} "
-                    f"(DOM trail done; buy_emitted={item.get('buy_emitted')})",
+                    f"(session done; buy_emitted={item.get('buy_emitted')})",
                     flush=True,
                 )
                 continue
