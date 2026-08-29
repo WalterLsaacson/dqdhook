@@ -224,7 +224,7 @@ def main() -> int:
         assert ex.maybe_flatten_for_event(reversal_ev) == []
         assert len(ex.ledger.open_for_match(rev_mid)) == 1
 
-        # AF∨DOM confirm sells pitch-gate lots even outside QUOTE_GATE_PROTECT_S.
+        # AF confirm sells pitch-gate lots even outside QUOTE_GATE_PROTECT_S.
         old_mid = "m_or_confirm"
         ex.ledger.register_buy(
             match_id=old_mid,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: DOM-first AF, same-tick in_play∧AF∧shot buy, AF∨DOM reversal flatten."""
+"""Smoke: AND buy only (Odds Grade A observe-only), AF-only reversal flatten."""
 
 from __future__ import annotations
 
@@ -118,6 +118,9 @@ def main() -> int:
     os.environ["QUOTE_GATE_SOURCE"] = "dom"
     assert pg.GATE_FIRST_DELAY_S == 0.0, pg.GATE_FIRST_DELAY_S
     assert pg.GATE_TIMEOUT_S == 120.0, pg.GATE_TIMEOUT_S
+    assert pg._grade_is_a({"level": "A"})
+    assert pg._grade_is_a({"level": "B", "uncapped_level": "A"})
+    assert not pg._grade_is_a({"level": "B"})
 
     old = (pg.GATE_FIRST_DELAY_S, pg.GATE_INTERVAL_S, pg.GATE_TIMEOUT_S)
     pg.GATE_FIRST_DELAY_S = 0.04
@@ -338,8 +341,8 @@ def main() -> int:
             assert done[0].get("buy_emitted") is False
             assert af_var.calls == 0, af_var.calls
 
-        # Reversal observe: DOM score_match → flatten_or, then stop the 5s trail
-        # (no further DOM/AF samples — unlike buy which keeps DOM to timeout).
+        # Reversal observe: DOM board matches but AF is rate-limited → hold.
+        # Stale/celebration center-box must not flatten without AF.
         rev_frames = [
             _dom("H 控球", "70:01 1 : 0", ["possession-rect"]),
             _dom("H 控球", "70:06 1 : 0", ["possession-rect"]),
@@ -369,27 +372,14 @@ def main() -> int:
                 "observe_only": True,
             }
             assert coord.start_gate(rev, event_key="k4", observe_only=True)
-            done = _wait_done(coord, n=2)
-            statuses = [d["status"] for d in done]
-            assert "flatten_or" in statuses, done
-            assert "observe_complete" in statuses, done
-            flat = next(d for d in done if d["status"] == "flatten_or")
-            assert "dom" in str(flat.get("reason")), flat
-            complete = next(d for d in done if d["status"] == "observe_complete")
-            assert complete.get("reason") == "flatten_or_stop_trail", complete
-            assert complete.get("frames") == 1, complete
-            assert flat.get("sample_i") == 0, flat
-            # Trail stopped: only the confirming tick was sampled.
-            assert len(obs_rev.rows) == 1, [r.get("sample_i") for r in obs_rev.rows]
-            assert af_rev_stop.calls == 1, af_rev_stop.calls
-            rows_n = len(obs_rev.rows)
-            af_n = af_rev_stop.calls
-            time.sleep(0.2)
-            assert len(obs_rev.rows) == rows_n, obs_rev.rows
-            assert af_rev_stop.calls == af_n, af_rev_stop.calls
+            done = _wait_done(coord, n=1)
+            assert all(d["status"] != "flatten_or" for d in done), done
+            assert done[-1]["status"] == "observe_complete", done
+            assert "no_af_confirm" in str(done[-1].get("reason") or ""), done[-1]
+            assert af_rev_stop.calls >= 1, af_rev_stop.calls
             assert readers_rev_stop and readers_rev_stop[-1].closed
 
-        # Reversal: celebration overlay still showing post-reverse board score → flatten.
+        # Reversal: celebration overlay on post-reverse board, AF still down → hold.
         factory, _ = _open_factory(
             [_dom("H 进球", "70:06 1 : 0")],
             baseline=_dom("H 进球", "69:56 1 : 0"),
@@ -412,10 +402,9 @@ def main() -> int:
                 "observe_only": True,
             }
             assert coord.start_gate(rev, event_key="k4c", observe_only=True)
-            done = _wait_done(coord, n=2)
-            assert "flatten_or" in [d["status"] for d in done], done
-            flat = next(d for d in done if d["status"] == "flatten_or")
-            assert "dom" in str(flat.get("reason")), flat
+            done = _wait_done(coord, n=1)
+            assert all(d["status"] != "flatten_or" for d in done), done
+            assert done[-1]["status"] == "observe_complete", done
             assert af_cel.calls >= 1, af_cel.calls
 
         # Reversal: tracker will not open, AF score_match → flatten_or.
@@ -481,6 +470,109 @@ def main() -> int:
             wall = time.monotonic() - t0
             assert "in_play" in [d["status"] for d in done], done
             assert wall < 0.4, wall
+        pg.PitchGateCoordinator._sample_odds = orig_odds  # type: ignore[assignment]
+
+        def _odds_a(_self, _session, *, sample_i, elapsed_s):  # noqa: ANN001, ARG001
+            return {
+                "level": "A",
+                "reason": "oddsapiio_score_matches_and_bet365_open",
+            }
+
+        # Grade A + AF, never in_play, no 射门 → no buy (A does not skip DOM).
+        pg.PitchGateCoordinator._sample_odds = _odds_a  # type: ignore[assignment]
+        factory, _ = _open_factory(
+            [_dom("H 进球", "45:01 1 : 0")] * 8,
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_early = _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])
+        af_mod.set_active_observer(af_early)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m_a_early"}, event_key="k_a_early")
+            done = _wait_done(coord, n=1)
+            assert done[0]["status"] == "timeout", done
+            assert done[0].get("buy_emitted") is False
+            assert "never_in_play" in str(done[0].get("reason") or ""), done[0]
+            assert af_early.calls == 0, af_early.calls
+
+        # Grade A does not skip the 射门 latch.
+        pg.PitchGateCoordinator._sample_odds = _odds_a  # type: ignore[assignment]
+        factory, _ = _open_factory(
+            [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_noshot_a = _FakeAf([{"ok": True, "score_match": True, "af_score": "1-0"}])
+        af_mod.set_active_observer(af_noshot_a)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m_a_shot"}, event_key="k_a_shot")
+            done = _wait_done(coord, n=1)
+            assert done[0]["status"] == "timeout", done
+            assert done[0].get("buy_emitted") is False
+            assert "no_shot" in str(done[0].get("reason") or ""), done[0]
+            assert af_noshot_a.calls == 0, af_noshot_a.calls
+
+        # AF fixture hole + in_play + Grade A → wait AF, A does not stand in.
+        pg.PitchGateCoordinator._sample_odds = _odds_a  # type: ignore[assignment]
+        factory, _ = _open_factory(
+            [_dom("H 进攻", "45:06 1 : 0", ["attack-move", "ball"])] * 8,
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_hole = _FakeAf(
+            [
+                {
+                    "ok": False,
+                    "score_match": None,
+                    "error": "af_fixture_unresolved_ttl",
+                }
+            ]
+        )
+        af_mod.set_active_observer(af_hole)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m_a_af"}, event_key="k_a_af")
+            done = _wait_done(coord, n=1)
+            assert done[0]["status"] == "timeout", done
+            assert done[0].get("buy_emitted") is False
+            assert "no_aligned_buy" in str(done[0].get("reason") or ""), done[0]
+            assert af_hole.calls >= 1, af_hole.calls
+
+        # Grade A does not override a hard AF score mismatch.
+        pg.PitchGateCoordinator._sample_odds = _odds_a  # type: ignore[assignment]
+        factory, _ = _open_factory(
+            [_dom("H 进攻", "45:06 1 : 0", ["attack-move", "ball"])] * 8,
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_mod.set_active_observer(
+            _FakeAf([{"ok": True, "score_match": False, "af_score": "0-0"}])  # type: ignore[arg-type]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m_a_mis"}, event_key="k_a_mis")
+            done = _wait_done(coord, n=1)
+            assert done[0]["status"] == "timeout", done
+            assert done[0].get("buy_emitted") is False
+            assert "no_aligned_buy" in str(done[0].get("reason") or ""), done[0]
         pg.PitchGateCoordinator._sample_odds = orig_odds  # type: ignore[assignment]
 
         # Reversal: AF score_match vs post-reverse, DOM still on old score → flatten_or.
@@ -804,7 +896,7 @@ def main() -> int:
             mar_done = coord.drain_done()
             assert all(d["status"] != "reversal_risk_skip" for d in mar_done), mar_done
 
-        print("ok: pitch_gate AND buy / stop AF keep DOM / AF∨DOM flatten / no JPEG")
+        print("ok: pitch_gate AND only / Odds A observe-only / stop AF keep DOM / AF-only flatten")
         return 0
     finally:
         pg.PitchGateCoordinator._open_dom_reader = orig_open  # type: ignore[assignment]

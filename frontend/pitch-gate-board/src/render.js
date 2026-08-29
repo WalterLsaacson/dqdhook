@@ -269,10 +269,10 @@ export function renderDetail(goal) {
     const to = goal.score_to || scoreLabel(goal);
     const outcome =
       goal.verdict === "flatten_or"
-        ? " · AF∨DOM 已认分 → flatten"
+        ? " · AF 已认分 → flatten"
         : goal.verdict === "hold"
-          ? " · 120s 未认分 → 持仓"
-          : " · 等 AF∨DOM 认回撤后比分";
+          ? " · 120s AF 未认分 → 持仓"
+          : " · 等 AF 认回撤后比分";
     revLine = `<p class="detail__rev detail__rev--observe">回撤观察 · 期望 ${escapeHtml(String(to))}（懂球帝 ${escapeHtml(String(from))}→${escapeHtml(String(to))}）${outcome}</p>`;
   } else if (goal.reversed && rev) {
     const revCls = afterBuy ? "detail__rev detail__rev--after-inplay" : "detail__rev";

@@ -1,6 +1,6 @@
 # Design: AF ∨ DOM or-gate (**rejected, not implemented**)
 
-Status: **否决、不实现.** Live strategy is same-tick **DOM `in_play` ∧ AF `score_match`** buy, then stop; DQD reversal restarts a 5s trail and flattens on **AF∨DOM `score_match`**. Do not code the buy-side or-gate below.  
+Status: **否决、不实现.** Live strategy is same-tick **DOM `in_play` ∧ AF `score_match`** buy, then stop; DQD reversal restarts a 5s trail and flattens on **AF `score_match` only**. Do not code the buy-side or-gate below.  
 Window used for the overnight numbers: 2026-08-22 00:00–09:30 CST.
 
 ## Decision

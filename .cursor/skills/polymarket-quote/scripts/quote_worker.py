@@ -420,7 +420,7 @@ class QuoteWorker:
                         "event_key": key,
                     }
                 ]
-                print(f"ALERT AF∨DOM flatten failed match={mid}: {e}", flush=True)
+                print(f"ALERT AF flatten failed match={mid}: {e}", flush=True)
         bundle = {
             "quoted_at": lib.now_cn_iso(),
             "trigger": "score_change",

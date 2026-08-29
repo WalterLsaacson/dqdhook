@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: pitch-gate board verdicts follow DOM∧AF∧射门 buy / AF∨DOM flatten."""
+"""Smoke: pitch-gate board verdicts follow DOM∧AF∧射门 buy / AF flatten."""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def main() -> int:
                 "is_reversal": True,
                 "board_score_match": True,
                 "judge": {"play_state": "stopped", "stopped_reason": "celebration"},
-                "af": {"ok": True, "score_match": False, "af_score": "1-0"},
+                "af": {"ok": True, "score_match": True, "af_score": "0-0"},
                 "dom_state": {"pop_box": "进球", "center_box": "10:20 0 : 0"},
             },
         ],
@@ -124,7 +124,7 @@ def main() -> int:
                 "match_id": "m1",
                 "quoted_at": "2026-08-23T10:02:06+08:00",
                 "flatten_count": 1,
-                "pitch_gate": {"status": "flatten_or", "reason": "reversal_dom_score_match"},
+                "pitch_gate": {"status": "flatten_or", "reason": "reversal_af_score_match"},
             },
             {
                 "mode": "reversal_observe_complete",
@@ -561,7 +561,7 @@ def main() -> int:
     assert mixed["frames"][0].get("aligned") is False
     assert mixed["frames"][1].get("aligned") is False
 
-    print("ok: pitch-gate board verdicts match DOM∧AF∧射门 / AF∨DOM")
+    print("ok: pitch-gate board verdicts match DOM∧AF∧射门 / AF flatten")
     return 0
 
 

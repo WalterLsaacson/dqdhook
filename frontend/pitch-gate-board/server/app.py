@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pitch Gate Board: DOM∧AF∧射门 buy and AF∨DOM flatten trails (no screenshots)."""
+"""Pitch Gate Board: DOM∧AF∧射门 buy and AF-only flatten trails (no screenshots)."""
 
 from __future__ import annotations
 
@@ -272,10 +272,9 @@ def _frame_aligned_buy(frame: dict[str, Any], *, shot_seen: bool | None = None) 
 
 
 def _frame_or_flatten(frame: dict[str, Any]) -> bool:
-    """Reversal flatten: AF score_match ∨ DOM board score (not in_play)."""
-    if _frame_af(frame).get("score_match") is True:
-        return True
-    return frame.get("board_score_match") is True
+    """Reversal flatten: AF ok ∧ score_match vs post-reverse score."""
+    af = _frame_af(frame)
+    return af.get("ok") is True and af.get("score_match") is True
 
 
 def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None) -> str:
@@ -1019,7 +1018,9 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             elif quote_mode in {
                 "reversal_observe_complete",
                 "pitch_gate_timeout",
-            } or str((quote or {}).get("reason") or "").startswith("no_or_confirm"):
+            } or str((quote or {}).get("reason") or "").startswith(
+                ("no_or_confirm", "no_af_confirm")
+            ):
                 g["verdict"] = "hold"
             else:
                 g["verdict"] = "reversal_observe"

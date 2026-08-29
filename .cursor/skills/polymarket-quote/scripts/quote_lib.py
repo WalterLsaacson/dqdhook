@@ -2154,10 +2154,11 @@ def process_bridge_events(
 
     Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` ∧ a
     latched 射门 (DOM-first: AF starts only after 射门∧``in_play``, then
-    every 5s until 120s) before one quote job. Aligned buy stops AF (quota)
-    and keeps DOM until timeout. DQD reversals cancel rest and open gates;
-    if lots are open they start an AF∨DOM trail from t0 (no shot gate);
-    flatten on first score match then stop the trail.
+    every 5s until 120s) before one quote job. Odds Grade A is observe-only.
+    Aligned buy stops AF (quota) and keeps DOM until timeout. DQD reversals
+    cancel rest and open gates; if lots are open they start an AF confirm
+    trail from t0 (no shot gate); flatten on first AF score_match then stop
+    the trail.
 
     When the CLOB quote worker is running, this tick only starts/cancels
     gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
@@ -2398,7 +2399,7 @@ def process_bridge_events(
                             }
                         ]
                         print(
-                            f"ALERT AF∨DOM flatten failed match={mid}: {e}",
+                            f"ALERT AF flatten failed match={mid}: {e}",
                             flush=True,
                         )
                 bundles.append(

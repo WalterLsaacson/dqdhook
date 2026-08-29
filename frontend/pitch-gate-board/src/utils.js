@@ -66,7 +66,7 @@ export function stateLabel(state) {
     reversed_after_buy: "回撤·已买",
     reversed_after_in_play: "回撤·已买",
     reversal_observe: "回撤观察",
-    flatten_or: "已平仓 ∨",
+    flatten_or: "已平仓 AF",
     hold: "持仓",
     mixed: "mixed",
   };
@@ -162,7 +162,7 @@ export function emptyFilterMessage(filter, { detail = false } = {}) {
   if (!filter || filter === "all") {
     return detail
       ? "选择左侧一场进球查看逐帧判定。"
-      : "暂无进球记录。<br/>等 DQD 进球门控（DOM∧AF∧射门）或回撤观察（AF∨DOM）。";
+      : "暂无进球记录。<br/>等 DQD 进球门控（DOM∧AF∧射门）或回撤观察（AF 认分才平仓）。";
   }
   const row = GOAL_FILTERS.find((f) => f.id === filter);
   const label = row?.short || stateLabel(filter);
