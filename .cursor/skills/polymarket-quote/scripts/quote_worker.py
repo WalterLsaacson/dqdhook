@@ -482,7 +482,9 @@ class QuoteWorker:
 
         flatten_rows: list[dict[str, Any]] = []
         ex = self.trade_executor
-        if ex is not None:
+        if extra.get("skip_flatten"):
+            flatten_rows = []
+        elif ex is not None:
             try:
                 flatten_rows = list(ex.maybe_flatten_for_event(ev) or [])
             except Exception as e:  # noqa: BLE001
@@ -520,6 +522,8 @@ class QuoteWorker:
                 bundle["mode"] = extra["mode"]
             if extra.get("pitch_gate"):
                 bundle["pitch_gate"] = extra["pitch_gate"]
+            if extra.get("t10"):
+                bundle["t10"] = extra["t10"]
             bundles.append(bundle)
             retry_needed = _quote_retry_needed(bundle)
             if str(ev.get("type") or "") == "match_finished" and not retry_needed:

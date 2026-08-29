@@ -1979,7 +1979,7 @@ def quote_tokens(
                 else {}
             )
             if (
-                bool(tc.get("pitch_gate"))
+                (bool(tc.get("pitch_gate")) or bool(tc.get("t10")))
                 and str((match_meta or {}).get("event_type") or "") == "score_change"
                 and str(item.get("settlement") or "") == "WIN"
                 and str(item.get("trade") or "") == "buy_win"
@@ -2401,7 +2401,7 @@ def process_bridge_events(
     Aligned buy stops AF (quota) and keeps DOM until timeout. DQD reversals
     cancel rest and open gates; if lots are open they start an AF confirm
     trail from t0 (no shot gate); flatten on first AF score_match then stop
-    the trail.
+    the trail. Each paired goal also schedules a T+10 book rescan.
 
     When the CLOB quote worker is running, this tick only starts/cancels
     gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
@@ -2414,6 +2414,12 @@ def process_bridge_events(
     )
     from pitch_gate import get_coordinator, invert_score_change_key
     from quote_worker import get_quote_worker
+    from t10_scan import (
+        build_t10_work_event,
+        get_scheduler as get_t10_scheduler,
+        match_is_played,
+        t10_enabled,
+    )
 
     cursor = load_cursor(root)
     cursor_state_before = {
@@ -2515,7 +2521,13 @@ def process_bridge_events(
             clob.submit_quote(work_ev, event_key=key, extra=extra)
             return True
         flatten_rows: list[dict[str, Any]] = []
-        if trade_executor is not None:
+        tc = (
+            work_ev.get("_trade_context")
+            if isinstance(work_ev.get("_trade_context"), dict)
+            else {}
+        )
+        skip_flatten = bool(tc.get("t10"))
+        if trade_executor is not None and not skip_flatten:
             try:
                 flatten_rows = list(
                     trade_executor.maybe_flatten_for_event(work_ev) or []
@@ -2596,6 +2608,67 @@ def process_bridge_events(
                 flush=True,
             )
             return False
+
+    def _drain_t10() -> None:
+        nonlocal bundles, seen
+        if not t10_enabled():
+            return
+        try:
+            sched = get_t10_scheduler(root)
+            due = sched.pop_due()
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT t10 drain failed: {e}", flush=True)
+            return
+        for job in due:
+            if not isinstance(job, dict):
+                continue
+            t10_key = str(job.get("t10_event_key") or "")
+            mid = str(job.get("match_id") or "")
+            if not t10_key:
+                continue
+            if t10_key in seen:
+                continue
+            if mid and (mid in processed_ft_ids or match_is_played(root, mid)):
+                print(
+                    f"t10 → SKIP finished match_id={mid} key={t10_key}",
+                    flush=True,
+                )
+                seen.add(t10_key)
+                continue
+            work_ev = build_t10_work_event(root, job)
+            if work_ev is None:
+                print(
+                    f"t10 → SKIP no score match_id={mid} key={t10_key}",
+                    flush=True,
+                )
+                seen.add(t10_key)
+                continue
+            extra = {
+                "mode": "t10_scan",
+                "skip_flatten": True,
+                "t10": {
+                    "source_event_key": job.get("source_event_key"),
+                    "home_score": work_ev.get("home_score"),
+                    "away_score": work_ev.get("away_score"),
+                },
+            }
+            hs = work_ev.get("home_score")
+            aws = work_ev.get("away_score")
+            print(
+                f"t10 → SCAN match_id={mid} key={t10_key} score={hs}-{aws}",
+                flush=True,
+            )
+            if clob is not None:
+                clob.submit_quote(work_ev, event_key=t10_key, extra=extra)
+                seen.add(t10_key)
+                continue
+            n_before = len(bundles)
+            _quote_one(work_ev, t10_key)
+            if t10_key not in seen:
+                seen.add(t10_key)
+            if len(bundles) > n_before and isinstance(bundles[-1], dict):
+                bundles[-1]["mode"] = "t10_scan"
+                bundles[-1]["t10"] = extra["t10"]
 
     def _drain_pitch_gate() -> None:
         nonlocal bundles, seen
@@ -3047,6 +3120,14 @@ def process_bridge_events(
                 started = gate.start_gate(ev, event_key=key)
                 if started or gate.has_consumed_event(key):
                     seen.add(key)
+                if t10_enabled():
+                    try:
+                        get_t10_scheduler(root).schedule(ev, event_key=key)
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"ALERT t10 schedule failed match={mid_up} key={key}: {e}",
+                            flush=True,
+                        )
                 continue
 
             # Non goal-up / non-reversal score_change (e.g. status-only): skip.
@@ -3066,6 +3147,16 @@ def process_bridge_events(
 
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
+            if mid:
+                try:
+                    n_t10 = get_t10_scheduler(root).cancel_match(mid)
+                    if n_t10:
+                        print(
+                            f"t10 → CANCELED match_id={mid} n={n_t10} reason=match_finished",
+                            flush=True,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT t10 cancel on FT failed match={mid}: {e}", flush=True)
             if mid and clob is not None:
                 clob.submit_rest_cancel(mid, reason="match_finished")
             elif mid and trade_executor is not None:
@@ -3134,6 +3225,7 @@ def process_bridge_events(
 
     # Same-tick unavailable / fast cancel results from start_gate / cancel_match.
     _drain_pitch_gate()
+    _drain_t10()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]

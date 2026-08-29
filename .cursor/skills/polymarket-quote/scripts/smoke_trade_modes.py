@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 _SCRIPTS = Path(__file__).resolve().parent
@@ -237,6 +238,9 @@ def main() -> int:
     f_u, f_sh, f_t = s_sz.caps_for_buy(event_type="match_finished")
     assert g_u == 50.0 and g_t == ((0.98, 50.0),), (g_u, g_t)
     assert f_u == 300.0 and f_t == ((0.98, 300.0),), (f_u, f_t)
+    s_t10 = replace(s_sz, t10_usdc=15.0)
+    t_u, t_sh, t_t = s_t10.caps_for_buy(event_type="score_change", t10=True)
+    assert t_u == 15.0 and t_t == ((0.98, 15.0),), (t_u, t_t, t_sh)
     assert f_sh == 2000.0 and g_sh == 150.0
     assert abs(s_sz.ft_dust_usdc - 100.0) < 1e-9
     assert s_sz.locked_sweep is True

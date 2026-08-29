@@ -15,10 +15,10 @@
                      ▼
               pm_quote watch
                      │
-         ┌───────────┼───────────┐
-         ▼           ▼           ▼
-   进球 pitch-gate   终场立刻询价   回撤立刻认 + 观察 AF/DOM
-   （读动画 DOM）     （无门控直接询价）（不自动平仓）
+         ┌───────────┼───────────┬──────────────┐
+         ▼           ▼           ▼              ▼
+   进球 pitch-gate   终场立刻询价  回撤 AF flatten  进球 +10min 再扫
+   （DOM∧AF 一刀）   （无门控）    （认分才卖）     （当时比分）
 ```
 
 | 模块 | 作用 |
@@ -57,10 +57,20 @@
 2. **Polymarket** 对阵由 polymarket-board 约每 **3 小时**写 `data/polymarket/snapshot.json`；bridge 只读快照做配对，不扫 Gamma 联赛列表。
 3. **配对**：英队名 + 北京开球时间模糊匹配（`min_score` / `min_side` / 联赛别名等，见 `match-bridge`）。未配对场次**不会**进门控下单。
 4. Bridge 产出事件：
-   - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**
-   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten
-   - `match_finished`（`period` 切入 `FT`）→ **立刻询价下单**（不过门控）
+   - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**，并排队 **T+10** 再扫盘
+   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten（T+10 排队不取消，到点用当时比分）
+   - `match_finished`（`period` 切入 `FT`）→ 取消未到期 T+10 + rest；**立刻询价下单**（不过门控）
 5. 加时中（DQD 仍在踢、`minute>90` 且 `injury_time==0`）的比分抖动**不发事件**，避免误触发。
+
+当前会动 CLOB 的路径（只买 `buy_win`）：
+
+| 策略 | 触发 | 是否过门控 | 金额 | 限价 rest |
+|---|---|---|---|---|
+| **Pitch-gate 进球** | 已配对进球，DOM `in_play` ∧ AF 认分 | 是 | `QUOTE_GOAL_MAX_USDC` | 仅当 `QUOTE_REST_ENABLED=1`（`QUOTE_REST_USDC`） |
+| **Locked sweep** | 门控买时，该 token 在**上一分**已是 live WIN | 是（同一刀） | `QUOTE_LOCKED_SWEEP_USDC` | 同门控 rest |
+| **T+10 再扫** | 进球后 10 分钟，按**当时比分** | 否 | `QUOTE_T10_USDC`（FAK 与 0.99 GTC 各用该金额） | **始终挂**（不看 `QUOTE_REST_ENABLED`） |
+| **终场** | `match_finished` | 否 | `QUOTE_FT_MAX_USDC` | 不挂 |
+| **终场灰尘盘** | 终场已锁定 WIN、ask≤0.01 | 否 | `QUOTE_FT_DUST_USDC` | 不挂 |
 
 ### 2. 进球通道（pitch-gate，核心）
 
@@ -75,6 +85,8 @@
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
 | 回撤 | 取消进球会话；**已有仓**才开 5s AF+DOM 观察；某一拍 **AF `score_match`**（回撤后比分）→ flatten 并**立刻停轨**；AF 不认 → **持仓** |
+
+**Locked sweep（进球作废仍 WIN）：** 门控询价时，若 token 在事件 `prev` 已经是 live WIN（这球不算也锁死），FAK 吃光 ask≤0.995 的剩余卖盘，**不走** `QUOTE_GOAL_MAX_USDC`。金额顶 `QUOTE_LOCKED_SWEEP_USDC`（默认 $1000），仍受 `QUOTE_MAX_OPEN_USDC`。`QUOTE_LOCKED_SWEEP=0` 或金额 `0` 关闭。回撤后仓位在新比分仍 WIN 的（如 1-1→1-0 的主队 0.5 大球）**不平仓**。
 
 买入侧 **AF∨DOM 或门否决、不实现**（见 `design-af-dom-or-gate.md`）。
 
@@ -116,13 +128,23 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 | 动画已改比分、随后 DQD 才长延迟回撤 | 买入时无法预知；出口靠回撤后再开 5s 轨 |
 | VAR 出现在**已经下单之后** | 拦不住该刀（除非随后 DQD 回撤且 AF/DOM 认分）
 
-### 3. 终场通道（FT）
+### 3. 进球 +10 分钟再扫盘（T+10）
+
+已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **600s** 后按**当时**懂球帝比分再询价：
+
+- 有 misprice → 同一套 `buy_win` FAK（fee / `min_net` / ask≤0.995；跳过 `min_buy_price`；**不做** locked sweep）
+- **每个已锁定 WIN 的 token** 再挂一笔 **@0.99 GTC**（不依赖 `QUOTE_REST_ENABLED`）
+- FAK 和限价**各**用 `QUOTE_T10_USDC`（叠，不是「一共这么多」）；rest **不受** `QUOTE_MAX_OPEN_USDC` 卡住
+- 终场取消未到期任务并撤 rest；回撤不取消排队
+- `QUOTE_T10_USDC` 未设或 `0`、或 `QUOTE_T10=0` → 关闭。到期超过 `QUOTE_T10_MAX_LATE_S`（默认 900s）的任务丢掉（进程挂太久会漏扫）
+
+### 4. 终场通道（FT）
 
 - `match_finished` 到达后**立即**按终场比分解读盘口、询价；**无** pitch-gate。
 - 默认 **live**；同 `match_id` 终场只处理一次（`cursor.processed_ft_match_ids`）。
 - 过旧事件同样受 `QUOTE_FT_MAX_AGE_S`（默认 900s）约束。
 
-### 4. 回撤、买后保护与持仓
+### 5. 回撤、买后保护与持仓
 
 懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开 5s AF+DOM 确认轨：某一拍 **AF `ok && score_match`**（回撤后比分）→ flatten，**不受** 300s 保护窗限制，并**立刻停 AF+DOM**（与买入后 DOM 拖到 120s 不同）。DOM 中心比分（庆祝/VAR/僵死时钟）只记观察，**不单独卖出**。AF 报错或比分仍是进球前 → 不平仓。动画页打不开仍继续采 AF。120s AF 不认 → **持仓**。未买入的回撤只取消门控。
 
@@ -138,7 +160,7 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 
 Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 后又回撤，列表按钮/徽章为**红色**（「回撤·曾in_play」）。回撤后的 AF/DOM 采样是独立的**青色**「回撤观察」卡片（比分变化如 `1-0→0-0`），与原进球卡可互跳对照。
 
-### 5. 询价与成交规则
+### 6. 询价与成交规则
 
 触发询价后（门控确认的进球，或终场）：
 
@@ -147,20 +169,21 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 3. **只交易 `buy_win`**（买已锁定为 WIN 的一侧）；`sell_lose` 已关闭。  
 4. CLOB：`POST /books` 批量吃盘；默认 **`walk`** 深度（受 `max_levels` / `max_usdc` / `max_shares` / `max_slippage` 约束），FAK 市价。  
 5. 手续费模型：`fee ≈ feeRate × p × (1−p)`（默认 `feeRate=0.05`）；需 `net_edge ≥ min_net`（默认约 0.00475，对应 ask≤0.995）才算 misprice。  
-6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` / fee / `min_net` 约束。  
-   **例外（进球作废仍 WIN）：** 若该盘口在 **上一分** 已经是 live WIN（当下这球不算也锁死），pitch-gate **把 ask≤0.995 的卖盘买光**，不走进球 $50。金额顶 **`QUOTE_LOCKED_SWEEP_USDC`（默认 $1000）**，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度。`QUOTE_LOCKED_SWEEP=0` 关闭。回撤后若仓位在新比分仍是 WIN，不平仓。  
+6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` / fee / `min_net` 约束。Locked sweep / T+10 见上表。  
 7. 极端价（≤0.01 或 >0.995）默认跳过，除非 `--allow-extreme-prices`。**例外：** 终场已锁定 `WIN`、ask≤0.01 仍 FAK（`QUOTE_FT_DUST_FAK`，默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受开仓剩余额度限制；max_price 卡在足球 tick **0.01**，不把 0.001 幽灵墙当成可吃深度；没吃到不记仓。进球门控仍跳过 ≤0.01。  
 
-**涵盖盘口（有则报）：** 胜平负六 token、大小球（含球队/半场）、BTTS、准确比分等（见 `polymarket-quote/reference.md`）。
+**涵盖盘口（有则报）：** 胜平负六 token、大小球（含球队/半场）、BTTS、准确比分等（见 `polymarket-quote/reference.md`）。Live 进球 / T+10 只报**已经锁死**的 WIN（Over 已越过盘口、BTTS 双方已进、exact No 已不可能）。
 
-**限价 rest（可选，默认关）：**
+**限价 rest：**
 
-- 需 `QUOTE_REST_ENABLED=1`  
-- 门控 WIN 无法 FAK 成交时，挂 **@0.99**、默认 **`GTC`（不设过期）**；没有卖盘也挂，等砸盘  
-- 金额 **`QUOTE_REST_USDC`（默认 $5）**，满足 CLOB 最低 5 股；**不受** `QUOTE_MAX_OPEN_USDC` 卡住  
-- DQD 回撤 / 终场 / 手取消才会撤这些 rest；`QUOTE_REST_EXPIRE_S>0` 才改回有时限的 GTD  
+| 来源 | 开关 | 金额 | 说明 |
+|---|---|---|---|
+| Pitch-gate | `QUOTE_REST_ENABLED=1` | `QUOTE_REST_USDC`（默认 $5） | 门控 WIN 无法 FAK 时挂 @0.99 GTC |
+| T+10 | `QUOTE_T10_USDC`>0 | 与 FAK 同变量 | **每个**已锁 WIN token 一笔；与 FAK 叠；不受开仓顶 |
 
-### 6. 模式与仓位
+足球 tick **0.01**（不信 0.001 元数据），0.995 向下收到 **0.99**。没有卖盘也挂。DQD 回撤 / 终场 / 手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改 GTD。
+
+### 7. 模式与仓位
 
 | 通道 | 默认 | 说明 |
 |---|---|---|
@@ -204,9 +227,10 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 1. Hub：Quote 进程 up · Trade `goals:live ft:live` · Boards 4/4。  
 2. Bridge 看板有配对场次。  
 3. Pitch Gate（`:8791`）在进球后出现帧与 `play_state`。  
-4. `data/pm-quote/watch.log` 可见：`pitch-gate → START` → `IN_PLAY` / `ALIGNED_BUY` / `WAIT_AF` / `VAR_VETO` / `NO_ALIGNED_BUY` / `CANCEL`；回撤还有 `OBSERVE START` / `FLATTEN_OR` / `OBSERVE_COMPLETE`。  
+4. `data/pm-quote/watch.log` 可见：`pitch-gate → START` → `IN_PLAY` / `ALIGNED_BUY` / `WAIT_AF` / `VAR_VETO` / `NO_ALIGNED_BUY` / `CANCEL`；回撤还有 `OBSERVE START` / `FLATTEN_OR` / `OBSERVE_COMPLETE`；T+10 有 `t10 → SCAN` / `t10 → CANCELED`。  
 5. 成交写入 `data/pm-quote/trades.jsonl`（live 且成功时 `live: true`）。  
-6. 回撤立刻取消门控/rest；已有仓才开 5s 观察，**AF 认分**后 flatten 并停轨，否则持仓。
+6. 回撤立刻取消门控/rest；已有仓才开 5s 观察，**AF 认分**后 flatten 并停轨，否则持仓。  
+7. 进球后约 10 分钟应再出现一次询价（`mode=t10_scan`），未到期任务在 `data/pm-quote/t10_pending.json`。
 
 ---
 
@@ -226,6 +250,10 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_FT_DUST_USDC` | 终场已锁定 WIN、ask≤0.01 的 FAK 金额，默认 **100**；`0` 关闭该路径 |
 | `QUOTE_LOCKED_SWEEP` | 默认开：进球后若上一分已经 WIN，FAK 吃光 ask≤0.995；`0` 关闭 |
 | `QUOTE_LOCKED_SWEEP_USDC` | 扫盘单笔金额顶，默认 **1000**；`0` 关闭该路径 |
+| `QUOTE_T10_USDC` | 进球 +10 分钟再扫盘：FAK 与每 token 一笔 0.99 GTC **各**用该金额；未设或 `0` 关闭 |
+| `QUOTE_T10_DELAY_S` | T+10 延迟秒数，默认 **600** |
+| `QUOTE_T10_MAX_LATE_S` | 到期后最多晚多久仍扫，默认 **900**；超时丢任务 |
+| `QUOTE_T10` | `0` 关闭 T+10（即使金额已设） |
 | `QUOTE_GOAL_SIZE_TIERS` / `QUOTE_FT_SIZE_TIERS` | `ask:usdc`；终场不继承进球档，避免被 $50 卡住 |
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 两通道都没设时的共享回落（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控和终场都跳过** |
@@ -252,6 +280,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | http://127.0.0.1:8792/ | API-Football Bridge：fixture 缓存 |
 | `data/pm-quote/watch.log` | 询价 / 门控 / 下单 stdout |
 | `data/pm-quote/trades.jsonl` | dry / live 尝试 |
+| `data/pm-quote/t10_pending.json` | 进球 +10 分钟待扫盘任务 |
 | `data/pm-quote/quotes.jsonl` | 完整询价包 |
 | `data/bridge/events.jsonl` | 持久化 bridge 事件 |
 | `data/bridge/matches.json` | 最近配对结果 |
@@ -292,6 +321,7 @@ DQD 侧的 `ssl.SSLEOFError` traceback 不致命，bridge 线程会在 15s 后�
 6. **单帧 AND 更严**：DOM `in_play` 单独不够，还要同拍 AF 认分；AF 限流会推迟/取消买入。  
 7. **动画源是第三方且非公开接口**：纳米改动 URL 形态或页面结构会让门控退化为「读不到合格状态 → 超时不下单」（安全方向，但会静默停止交易）。同理 `animation_live` 缺失的场次（友谊赛、业余级别）没有门控能力。  
 8. **卡死页面只能靠时钟识别**：判定要求 `.center-box` 时钟相对上次读数有推进，开页时会先取一次基线，所以第 0 帧也受保护。但若纳米某天不渲染时钟，这层保护会静默失效（比分相符仍是主要防线）。  
+9. **T+10 rest 按 token 叠**：`QUOTE_T10_USDC` 是**每个**已锁 WIN 盘口的 FAK 上限，再另挂一笔同等金额 GTC；一场多盘、一晚多粒进球会叠。rest 不受 `QUOTE_MAX_OPEN_USDC` 卡住。  
 
 更细的盘口结算与 API 见 `.cursor/skills/polymarket-quote/reference.md`。
 
@@ -313,6 +343,8 @@ python3 .cursor/skills/polymarket-quote/scripts/smoke_dom_page_pool.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_prematch_odds.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_rest_ladder.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_locked_sweep.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_t10_scan.py
 ```
 
 调试单跑（日常勿与 System Main 并行）：

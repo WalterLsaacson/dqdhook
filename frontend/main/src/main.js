@@ -19,7 +19,8 @@ function render(st) {
   const dustUsdc = trade.ft_dust_usdc ?? 100;
   const sweepOn = trade.locked_sweep !== false;
   const sweepUsdc = trade.locked_sweep_usdc ?? 1000;
-  const usdcLabel = `goals $${gUsdc} · ft $${ftUsdc} · dust $${dustUsdc}${sweepOn ? ` · sweep $${sweepUsdc}` : ""}`;
+  const t10Usdc = trade.t10_usdc ?? 0;
+  const usdcLabel = `goals $${gUsdc} · ft $${ftUsdc} · dust $${dustUsdc}${sweepOn ? ` · sweep $${sweepUsdc}` : ""}${t10Usdc > 0 ? ` · t10 $${t10Usdc}` : ""}`;
   if (mode === "off") {
     $("pillTrade").textContent = "Trade off";
     $("pillTrade").className = "pill muted";

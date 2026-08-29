@@ -500,6 +500,11 @@ def _trade_context_pitch_gate(match_meta: dict[str, Any] | None) -> bool:
     return isinstance(tc, dict) and bool(tc.get("pitch_gate"))
 
 
+def _trade_context_t10(match_meta: dict[str, Any] | None) -> bool:
+    tc = (match_meta or {}).get("trade_context")
+    return isinstance(tc, dict) and bool(tc.get("t10"))
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -828,6 +833,8 @@ class TradeExecutor:
         event_type: str = "",
     ) -> bool:
         """Pitch-gate buy_win that stays WIN even if this goal is voided."""
+        if _trade_context_t10(match_meta):
+            return False
         if not bool(getattr(self.settings, "locked_sweep", True)):
             return False
         if float(getattr(self.settings, "locked_sweep_usdc", 1000.0) or 0) <= 0:
@@ -915,15 +922,17 @@ class TradeExecutor:
         match_meta: dict[str, Any] | None = None,
         event_type: str = "",
     ) -> dict[str, Any] | None:
-        """FAK a misprice; pitch-gate may rest @0.995 GTC when rest is enabled."""
+        """FAK a misprice; pitch-gate / T+10 may rest @0.995 GTC."""
         if not self.settings.enabled:
             return None
         q = dict(quote)
         if str(q.get("trade") or "") != "buy_win" and str(q.get("settlement") or "") == "WIN":
             q["trade"] = "buy_win"
         mis = bool(q.get("misprice"))
-        # Rest ladder: pitch-gate confirmed buys when QUOTE_REST_ENABLED=1.
-        rest_ok = rest_enabled() and _trade_context_pitch_gate(match_meta)
+        # Rest: pitch-gate when QUOTE_REST_ENABLED=1; T+10 always (own size).
+        rest_ok = _trade_context_t10(match_meta) or (
+            rest_enabled() and _trade_context_pitch_gate(match_meta)
+        )
         if not mis and not rest_ok:
             return None
 
@@ -1069,6 +1078,11 @@ class TradeExecutor:
             or (match_meta or {}).get("event_key")
             or ""
         )
+        if _trade_context_t10(match_meta):
+            # Independent GTC at QUOTE_T10_USDC (same env as FAK). Not leftover
+            # after FAK. Not clipped by QUOTE_MAX_OPEN_USDC.
+            target = float(getattr(self.settings, "t10_usdc", 0.0) or 0)
+            return max(0.0, target), base
         if _trade_context_pitch_gate(match_meta):
             # Per-order size is QUOTE_REST_USDC. Do not clip by QUOTE_MAX_OPEN_USDC —
             # rest stays until reversal / FT / manual cancel.
@@ -1113,17 +1127,20 @@ class TradeExecutor:
         token_id = str(quote.get("token_id") or "")
         mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
         already = 0.0
+        t10 = _trade_context_t10(match_meta)
         if target > 1e-9 and base and token_id:
-            already = sum(
-                float(lot.get("usdc") or 0)
-                for lot in self.ledger.all_open()
-                if str(lot.get("token_id") or "") == token_id
-                and (not mid or str(lot.get("match_id") or "") == mid)
-                and str(lot.get("event_key") or "") == base
-            )
-            already += self._pending_already_usdc_locked(
-                token_id=token_id, match_id=mid, base_event_key=base
-            )
+            # T+10 rest is a second T10-sized GTC, not remainder of this scan's FAK.
+            if not t10:
+                already = sum(
+                    float(lot.get("usdc") or 0)
+                    for lot in self.ledger.all_open()
+                    if str(lot.get("token_id") or "") == token_id
+                    and (not mid or str(lot.get("match_id") or "") == mid)
+                    and str(lot.get("event_key") or "") == base
+                )
+                already += self._pending_already_usdc_locked(
+                    token_id=token_id, match_id=mid, base_event_key=base
+                )
             if include_rest:
                 already += self.ledger.rest_reserved_usdc(
                     token_id=token_id, match_id=mid, base_event_key=base
@@ -1140,7 +1157,8 @@ class TradeExecutor:
         ignore_ask_zone: bool = False,
     ) -> dict[str, Any] | None:
         """Post/adjust GTC (or GTD) bids for A/B remainder after FAK."""
-        if not rest_enabled():
+        t10 = _trade_context_t10(match_meta)
+        if not rest_enabled() and not t10:
             return None
         typ = self._resolve_event_type(
             event_type=event_type, event_key=event_key, match_meta=match_meta
@@ -1153,8 +1171,8 @@ class TradeExecutor:
             return None
         cushion = quote_reversal_cushion(quote)
         pitch = _trade_context_pitch_gate(match_meta)
-        # Pitch-gate: single 0.995 bid (equivalent size); cushion also 0.995-only.
-        rest_prices = CUSHION_REST_PRICES if (cushion or pitch) else None
+        # Pitch-gate / T+10: single 0.995 bid; cushion also 0.995-only.
+        rest_prices = CUSHION_REST_PRICES if (cushion or pitch or t10) else None
         with self._lock:
             if self._match_buy_blocked_locked(mid) or mid in self._rest_blocked_matches:
                 return None
@@ -1169,9 +1187,13 @@ class TradeExecutor:
             tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
             share_floor = rest_min_shares(quote)
             cap = (
-                float(rest_target_usdc())
-                if pitch
-                else float(self.settings.max_usdc or 0)
+                float(getattr(self.settings, "t10_usdc", 0.0) or 0)
+                if t10
+                else (
+                    float(rest_target_usdc())
+                    if pitch
+                    else float(self.settings.max_usdc or 0)
+                )
             )
             floor = max(
                 float(self.settings.size_floor_usdc or 1),
@@ -1875,6 +1897,7 @@ class TradeExecutor:
             return row
 
         pitch_relaxed = _trade_context_pitch_gate(match_meta)
+        t10 = _trade_context_t10(match_meta)
         sweep = trade == "buy_win" and self._locked_sweep_eligible(
             quote,
             trade=trade,
@@ -1884,6 +1907,7 @@ class TradeExecutor:
         chan_usdc, chan_shares, chan_tiers = self.settings.caps_for_buy(
             event_type=typ,
             pitch_gate=pitch_relaxed,
+            t10=t10,
         )
         max_usdc = float(chan_usdc)
         max_shares = float(chan_shares)
@@ -1950,9 +1974,12 @@ class TradeExecutor:
                     floor_usdc=floor_usdc,
                 )
                 size_meta = caps.to_dict()
-                size_meta["channel"] = (
-                    "ft" if typ == "match_finished" and not pitch_relaxed else "goals"
-                )
+                if t10:
+                    size_meta["channel"] = "t10"
+                else:
+                    size_meta["channel"] = (
+                        "ft" if typ == "match_finished" and not pitch_relaxed else "goals"
+                    )
                 if caps.skip_reason:
                     row = self._record(
                         quote,
@@ -1973,7 +2000,7 @@ class TradeExecutor:
                 logger.info(
                     "size_policy channel=%s ask=%.3f tier=%.2f eff_usdc=%.2f "
                     "eff_shares=%.2f open=%.2f remaining=%s",
-                    "ft" if typ == "match_finished" and not pitch_relaxed else "goals",
+                    size_meta.get("channel") or "goals",
                     caps.ask,
                     caps.tier_usdc,
                     caps.max_usdc,

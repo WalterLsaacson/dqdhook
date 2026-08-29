@@ -108,6 +108,8 @@ class TradeSettings:
     # Pitch-gate: FAK remaining asks when WIN even if this goal is voided.
     locked_sweep: bool = True
     locked_sweep_usdc: float = 1000.0
+    # Goal +10min rescan: FAK + rest share this notional. 0 = off.
+    t10_usdc: float = 0.0
 
     @property
     def live(self) -> bool:
@@ -119,8 +121,13 @@ class TradeSettings:
         *,
         event_type: str = "",
         pitch_gate: bool = False,
+        t10: bool = False,
     ) -> tuple[float, float, tuple[tuple[float, float], ...]]:
         """Return (max_usdc, max_shares, size_tiers) for this buy channel."""
+        if t10:
+            usdc = float(self.t10_usdc or 0.0)
+            shares = usdc / 0.01 if usdc > 0 else 0.0
+            return usdc, shares, ((0.98, usdc),) if usdc > 0 else ((0.98, 0.0),)
         typ = (event_type or "").strip()
         ft = typ == "match_finished" and not pitch_gate
         if ft:
@@ -238,6 +245,10 @@ def load_trade_settings(
     floor_usdc = float(os.getenv("QUOTE_SIZE_FLOOR_USDC", "1") or 1)
     dust_usdc = _env_optional_float("QUOTE_FT_DUST_USDC")
     sweep_usdc = _env_optional_float("QUOTE_LOCKED_SWEEP_USDC")
+    try:
+        from t10_scan import t10_usdc as _t10_usdc_env
+    except ImportError:  # noqa: BLE001
+        _t10_usdc_env = lambda: 0.0  # noqa: E731
 
     funder = os.getenv("FUNDER", "").strip() or None
     return TradeSettings(
@@ -276,6 +287,7 @@ def load_trade_settings(
         locked_sweep_usdc=(
             float(sweep_usdc) if sweep_usdc is not None else 1000.0
         ),
+        t10_usdc=float(_t10_usdc_env()),
     )
 
 
@@ -290,8 +302,10 @@ def size_channels_label(settings: TradeSettings) -> str:
     sweep_on = bool(getattr(settings, "locked_sweep", True))
     sweep_u = float(getattr(settings, "locked_sweep_usdc", 1000.0) or 0)
     sweep = f"on:{sweep_u:g}" if sweep_on and sweep_u > 0 else "off"
+    t10_u = float(getattr(settings, "t10_usdc", 0.0) or 0)
     return (
         f"goals_usdc={g_u:g} tiers={format_size_tiers(g_t)} "
         f"ft_usdc={f_u:g} tiers={format_size_tiers(f_t)} "
-        f"ft_dust_usdc={dust:g} locked_sweep={sweep}"
+        f"ft_dust_usdc={dust:g} locked_sweep={sweep} "
+        f"t10_usdc={t10_u:g}"
     )
