@@ -323,7 +323,7 @@ class GatePrewarm:
         ids = [str(t["token_id"]) for t in tokens if t.get("token_id")]
         if not ids:
             return
-        books = lib.fetch_books(ids, proxy=self.proxy)
+        books = lib.fetch_books(ids, proxy=self.proxy, top_n=lib.LIVE_BOOK_TOP_N)
         with self._lock:
             slot.token_ids = ids
             slot.books = books

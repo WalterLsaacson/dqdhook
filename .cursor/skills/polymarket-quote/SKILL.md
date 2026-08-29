@@ -19,14 +19,14 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 > 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s 轨，**等 AF 认回撤后比分**。**AF 认分 flatten 后立刻停 AF+DOM**（买入后则仍抓 DOM 到原超时，便于事后看 VAR/庆祝，不再打 AF）。
 
-- 懂球帝 **回撤**：立刻取消未完成进球门控，并按 **event_key** 撤销已入队的询价（不按 `match_id` 永久拉黑）。rest 取消入队优先级高于 idle flatten/rest 对账，对账不挡 `rest_cancel`。**进程内 bridge 入队回撤时就会 `cancel_match`**。询价 tick **先扫回撤再 `start_gate`**。回撤 ts 挡住该进球 stem（更早或相同 ts）。非开场的重判进球（更晚 ts）仍可开；**开场球**（0-0→1-0 / 0-0→0-1）若同一过渡刚被撤过，或时钟 ≥90′，不再开闸（`pitch_gate_reversal_risk_skip`）。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 **AF `ok && score_match`** → flatten（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）并 **立刻停 5s 轨**。DOM 中心比分（含僵死页）**不单独 flatten**。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。AF 不认直到 120s → **持仓**。未买入的回撤只取消门控。
+- 懂球帝 **回撤**：立刻取消未完成进球门控，并按 **event_key** 撤销已入队的询价（不按 `match_id` 永久拉黑）。rest 取消入队优先级高于 idle flatten/rest 对账，对账不挡 `rest_cancel`。**进程内 bridge 入队回撤时就会 `cancel_match`**。询价 tick **先扫回撤再 `start_gate`**。回撤 ts 挡住该进球 stem（更早或相同 ts）。非开场的重判进球（更晚 ts）仍可开；**开场球**（0-0→1-0 / 0-0→0-1）若同一过渡刚被撤过，或时钟 ≥90′，不再开闸（`pitch_gate_reversal_risk_skip`）。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 **AF `ok && score_match`** → flatten **仅不再 WIN 的仓**（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）并 **立刻停 5s 轨**。DOM 中心比分（含僵死页）**不单独 flatten**。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。AF 不认直到 120s → **持仓**。未买入的回撤只取消门控。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
 - 同 `match_id` 已处理过终场 → 跳过
 - 门控路径需 `QUOTE_DQD_STREAM_OBSERVE=1`（缺则 `pitch_gate_unavailable`，该球不下单）
 - **判定源是动画 DOM，不截图 / 不跑 OCR**：共用一台 Chromium，进行中已配对场预开 tracker 页；同场后续进球复用标签。每次采样读 `.pop-box` 与 `.center-box`。无 JPEG、无 `QUOTE_GATE_REF_SCREENSHOT`。标签上限 `QUOTE_DOM_POOL_MAX`（默认 24）；预热 `QUOTE_DOM_WARM`（默认开）/`QUOTE_DOM_WARM_INTERVAL_S`（默认 10s）/`QUOTE_DOM_WARM_OPEN_TIMEOUT_S`（默认 3s）。开页等待动画时会穿插处理其它场的 DOM 读。
 - **防僵死**：判定要求 `.center-box` 时钟相对上一次读数有推进；时钟没走 → `unclear`（`stale_page`），不下单。
 - **页面是纳米 tracker**：`animation_live` URL 打开 `tracker.namitiyu.com` 读 DOM，不是懂球帝比赛页。不做 MQTT 球位观察。
-- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → 目标 @**0.995**，但 **不信** Gamma/book 的 `0.001` 元数据；CLOB 足球最小 tick 是 **0.01**，rest 一律按 0.01 **向下收到 0.99**。**`QUOTE_REST_USDC`（默认 $5）** / **`GTC` 一直挂着**（回撤、终场、手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改回 GTD）。门控 rest **不受** `QUOTE_MAX_OPEN_USDC` 限制。没有卖盘（一边倒买盘）也挂，等砸盘。FAK / misprice 上限 **ask≤0.995**（fee 后 `min_net≈0.00475`）。终场已锁定 WIN 且 ask≤0.01：**仍 FAK**（`QUOTE_FT_DUST_FAK` 默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度限制；max_price=0.01，不按 0.001 墙走单。
+- Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → 目标 @**0.995**，但 **不信** Gamma/book 的 `0.001` 元数据；CLOB 足球最小 tick 是 **0.01**，rest 一律按 0.01 **向下收到 0.99**。**`QUOTE_REST_USDC`（默认 $5）** / **`GTC` 一直挂着**（回撤、终场、手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改回 GTD）。门控 rest **不受** `QUOTE_MAX_OPEN_USDC` 限制。没有卖盘（一边倒买盘）也挂，等砸盘。FAK / misprice 上限 **ask≤0.995**（fee 后 `min_net≈0.00475`）。**进球作废仍 WIN：** 比分变化后若该 token 在 **上一分**（`prev`）已经是 live WIN（当下这球不算也锁死），pitch-gate **FAK 吃光** ask≤0.995 的剩余卖盘，**不走** `QUOTE_GOAL_MAX_USDC` $50。金额顶 **`QUOTE_LOCKED_SWEEP_USDC`（默认 $1000）**，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度。开关 **`QUOTE_LOCKED_SWEEP`**（默认开；`0` 或金额 `0` 关闭）。回撤后若仓位在新比分仍是 WIN（如 1-1→1-0 的主队 0.5 大球），**不平仓**。终场已锁定 WIN 且 ask≤0.01：**仍 FAK**（`QUOTE_FT_DUST_FAK` 默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度限制；max_price=0.01，不按 0.001 墙走单。
 - Odds/Bet365：跟 DOM 同一拍后台写入 `book_context_observe.jsonl`（Grade A/B/C）。**Grade A 不下单**，AND 路径不因 Odds HTTP 阻塞。已配对场在距开球 **30 分钟**时 **采一次** Bet365+1xbet 全盘口，写入 `data/pm-quote/prematch_odds.jsonl`。
 - **主客对调**：懂球帝/纳米主场与 Polymarket 相反时，事件带 `sides_swapped`；门控用动画主场比分条，半场大小球用 PM 方向的 `home_half`/`away_half`，避免把雷恩的半场算到巴黎头上。
 
@@ -64,11 +64,11 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
    - `score_change` goal-up (paired) → **start pitch-gate** (DOM @+0s every 5s; AF after 射门∧`in_play`); quote only on AND; stop AF after buy, keep DOM until 120s
-   - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF trail → flatten on first AF `score_match` vs post-reverse score **then stop the trail**
+   - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF trail → flatten on first AF `score_match` vs post-reverse score **only lots that are no longer WIN** (e.g. 1-1→1-0 keeps home O/U 0.5), then stop the trail
    - `match_finished` → immediate quote (default live; stale / once-per-match skip)
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: CLOB worker thread (not the watch tick) runs one `/books` POST; totals/BTTS before exact.
-5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` or live `posted`). Pitch-gate and FT buys skip `min_buy_price`; pitch-gate also skips size/$1 floors (fee/`min_net` + per-channel `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` remain).
+5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` or live `posted`). Pitch-gate and FT buys skip `min_buy_price`; pitch-gate also skips size/$1 floors (fee/`min_net` + per-channel `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` remain). Tokens that are WIN **even at the previous score** (`win_if_goal_void`) FAK remaining asks ≤0.995 up to `QUOTE_LOCKED_SWEEP_USDC` (default $1000) instead of the $50 goal cap.
 6. **No post-goal CLOB re-quotes.** One `quote_bridge_event` per aligned buy.
 
 ## Trading flags

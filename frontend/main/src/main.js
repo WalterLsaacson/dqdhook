@@ -17,7 +17,9 @@ function render(st) {
   const gUsdc = trade.goal_max_usdc ?? trade.max_usdc ?? "?";
   const ftUsdc = trade.ft_max_usdc ?? trade.max_usdc ?? "?";
   const dustUsdc = trade.ft_dust_usdc ?? 100;
-  const usdcLabel = `goals $${gUsdc} · ft $${ftUsdc} · dust $${dustUsdc}`;
+  const sweepOn = trade.locked_sweep !== false;
+  const sweepUsdc = trade.locked_sweep_usdc ?? 1000;
+  const usdcLabel = `goals $${gUsdc} · ft $${ftUsdc} · dust $${dustUsdc}${sweepOn ? ` · sweep $${sweepUsdc}` : ""}`;
   if (mode === "off") {
     $("pillTrade").textContent = "Trade off";
     $("pillTrade").className = "pill muted";

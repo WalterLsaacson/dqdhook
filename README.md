@@ -148,6 +148,7 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 4. CLOB：`POST /books` 批量吃盘；默认 **`walk`** 深度（受 `max_levels` / `max_usdc` / `max_shares` / `max_slippage` 约束），FAK 市价。  
 5. 手续费模型：`fee ≈ feeRate × p × (1−p)`（默认 `feeRate=0.05`）；需 `net_edge ≥ min_net`（默认约 0.00475，对应 ask≤0.995）才算 misprice。  
 6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` / fee / `min_net` 约束。  
+   **例外（进球作废仍 WIN）：** 若该盘口在 **上一分** 已经是 live WIN（当下这球不算也锁死），pitch-gate **把 ask≤0.995 的卖盘买光**，不走进球 $50。金额顶 **`QUOTE_LOCKED_SWEEP_USDC`（默认 $1000）**，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度。`QUOTE_LOCKED_SWEEP=0` 关闭。回撤后若仓位在新比分仍是 WIN，不平仓。  
 7. 极端价（≤0.01 或 >0.995）默认跳过，除非 `--allow-extreme-prices`。**例外：** 终场已锁定 `WIN`、ask≤0.01 仍 FAK（`QUOTE_FT_DUST_FAK`，默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受开仓剩余额度限制；max_price 卡在足球 tick **0.01**，不把 0.001 幽灵墙当成可吃深度；没吃到不记仓。进球门控仍跳过 ≤0.01。  
 
 **涵盖盘口（有则报）：** 胜平负六 token、大小球（含球队/半场）、BTTS、准确比分等（见 `polymarket-quote/reference.md`）。
@@ -223,6 +224,8 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_GOAL_MAX_USDC` / `QUOTE_GOAL_MAX_SHARES` | 比分变化 / pitch-gate 单笔硬顶；缺省回落 `QUOTE_MAX_*` |
 | `QUOTE_FT_MAX_USDC` / `QUOTE_FT_MAX_SHARES` | 终场单笔硬顶；缺省回落 `QUOTE_MAX_*`（股数默认按金额放大） |
 | `QUOTE_FT_DUST_USDC` | 终场已锁定 WIN、ask≤0.01 的 FAK 金额，默认 **100**；`0` 关闭该路径 |
+| `QUOTE_LOCKED_SWEEP` | 默认开：进球后若上一分已经 WIN，FAK 吃光 ask≤0.995；`0` 关闭 |
+| `QUOTE_LOCKED_SWEEP_USDC` | 扫盘单笔金额顶，默认 **1000**；`0` 关闭该路径 |
 | `QUOTE_GOAL_SIZE_TIERS` / `QUOTE_FT_SIZE_TIERS` | `ask:usdc`；终场不继承进球档，避免被 $50 卡住 |
 | `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 两通道都没设时的共享回落（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控和终场都跳过** |

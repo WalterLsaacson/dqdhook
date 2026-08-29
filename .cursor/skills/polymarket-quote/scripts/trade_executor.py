@@ -15,7 +15,7 @@ from typing import Any
 
 import quote_lib as lib
 from clob_trader import ClobTrader
-from fill_planner import FillPlan, plan_fill, MIN_MARKETABLE_BUY_USDC
+from fill_planner import FillPlan, plan_fill, plan_locked_sweep, MIN_MARKETABLE_BUY_USDC
 from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
@@ -274,6 +274,23 @@ def clip_ft_dust_usdc(*, dust_cap: float, remaining_open: float | None) -> float
         return cap
     try:
         left = float(remaining_open)
+    except (TypeError, ValueError):
+        return cap
+    return max(0.0, min(cap, left))
+
+
+def clip_locked_sweep_usdc(*, sweep_cap: float, remaining_open: float | None) -> float:
+    """Sweep remaining asks; clipped by ``QUOTE_LOCKED_SWEEP_USDC`` and leftover open budget."""
+    try:
+        cap = max(0.0, float(sweep_cap or 0.0))
+    except (TypeError, ValueError):
+        cap = 0.0
+    if cap <= 0:
+        return 0.0
+    if remaining_open is None:
+        return cap
+    try:
+        left = max(0.0, float(remaining_open))
     except (TypeError, ValueError):
         return cap
     return max(0.0, min(cap, left))
@@ -634,6 +651,7 @@ class TradeExecutor:
                 neg_risk=None,
                 pitch_gate=_trade_context_pitch_gate(row),
                 opened_at=str(row.get("quoted_at") or "") or None,
+                settle=lib.settle_row_from_lot(row),
             )
         self._close_stale_finished_lots()
 
@@ -800,6 +818,39 @@ class TradeExecutor:
         if price is None:
             return False
         return price <= FT_DUST_FAK_MAX_ASK + 1e-12
+
+    def _locked_sweep_eligible(
+        self,
+        quote: dict[str, Any],
+        *,
+        trade: str,
+        match_meta: dict[str, Any] | None = None,
+        event_type: str = "",
+    ) -> bool:
+        """Pitch-gate buy_win that stays WIN even if this goal is voided."""
+        if not bool(getattr(self.settings, "locked_sweep", True)):
+            return False
+        if float(getattr(self.settings, "locked_sweep_usdc", 1000.0) or 0) <= 0:
+            return False
+        if trade != "buy_win":
+            return False
+        if not _trade_context_pitch_gate(match_meta):
+            return False
+        typ = self._resolve_event_type(
+            event_type=event_type, event_key="", match_meta=match_meta
+        )
+        if typ != "score_change":
+            return False
+        if str(quote.get("settlement") or "").upper() != "WIN":
+            return False
+        if quote.get("locked") is False:
+            return False
+        raw = quote.get("win_if_goal_void")
+        if raw is True:
+            return True
+        if raw is False or raw is None:
+            return False
+        return str(raw).strip().lower() in {"1", "true", "yes"}
 
     def _extreme_price_blocked(
         self,
@@ -1824,6 +1875,12 @@ class TradeExecutor:
             return row
 
         pitch_relaxed = _trade_context_pitch_gate(match_meta)
+        sweep = trade == "buy_win" and self._locked_sweep_eligible(
+            quote,
+            trade=trade,
+            match_meta=match_meta,
+            event_type=typ,
+        )
         chan_usdc, chan_shares, chan_tiers = self.settings.caps_for_buy(
             event_type=typ,
             pitch_gate=pitch_relaxed,
@@ -1836,50 +1893,94 @@ class TradeExecutor:
                 float(r.get("usdc") or 0)
                 for r in self.ledger.all_open()
             ) + self._pending_usdc_total_locked() + self.ledger.rest_reserved_usdc()
-            floor_usdc = (
-                0.0 if pitch_relaxed else float(self.settings.size_floor_usdc)
-            )
-            caps = compute_buy_size_caps(
-                ref_f,
-                max_usdc=chan_usdc,
-                max_shares=chan_shares,
-                tiers=chan_tiers,
-                open_usdc=open_usdc,
-                max_open_usdc=self.settings.max_open_usdc,
-                floor_usdc=floor_usdc,
-            )
-            size_meta = caps.to_dict()
-            size_meta["channel"] = (
-                "ft" if typ == "match_finished" and not pitch_relaxed else "goals"
-            )
-            if caps.skip_reason:
-                row = self._record(
-                    quote,
-                    event_key=event_key,
-                    match_meta=match_meta,
-                    plan=None,
-                    status="skipped",
-                    skip_reason=caps.skip_reason,
-                    response=None,
-                    success=False,
-                    idempotency_key=key,
-                    live=channel_live,
-                    extra={"size_policy": size_meta},
+            remaining_open = None
+            if float(self.settings.max_open_usdc or 0) > 0:
+                remaining_open = max(
+                    0.0, float(self.settings.max_open_usdc) - float(open_usdc)
                 )
-                return row
-            max_usdc = float(caps.max_usdc)
-            max_shares = float(caps.max_shares)
-            logger.info(
-                "size_policy channel=%s ask=%.3f tier=%.2f eff_usdc=%.2f "
-                "eff_shares=%.2f open=%.2f remaining=%s",
-                "ft" if typ == "match_finished" and not pitch_relaxed else "goals",
-                caps.ask,
-                caps.tier_usdc,
-                caps.max_usdc,
-                caps.max_shares,
-                caps.open_usdc,
-                caps.remaining_open,
-            )
+            if sweep:
+                budget = clip_locked_sweep_usdc(
+                    sweep_cap=float(
+                        getattr(self.settings, "locked_sweep_usdc", 0.0) or 0
+                    ),
+                    remaining_open=remaining_open,
+                )
+                size_meta = {
+                    "channel": "goals_sweep",
+                    "locked_sweep": True,
+                    "open_usdc": float(open_usdc),
+                    "remaining_open": remaining_open,
+                    "max_usdc": float(budget),
+                    "ask": ref_f,
+                }
+                if budget <= 1e-12:
+                    row = self._record(
+                        quote,
+                        event_key=event_key,
+                        match_meta=match_meta,
+                        plan=None,
+                        status="skipped",
+                        skip_reason="size_policy_open_budget",
+                        response=None,
+                        success=False,
+                        idempotency_key=key,
+                        live=channel_live,
+                        extra={"size_policy": size_meta},
+                    )
+                    return row
+                max_usdc = float(budget)
+                max_shares = budget / 0.01 if budget > 0 else 0.0
+                logger.info(
+                    "locked_sweep ask=%s budget=%.2f remaining=%s",
+                    ref_f,
+                    budget,
+                    remaining_open,
+                )
+            else:
+                floor_usdc = (
+                    0.0 if pitch_relaxed else float(self.settings.size_floor_usdc)
+                )
+                caps = compute_buy_size_caps(
+                    ref_f,
+                    max_usdc=chan_usdc,
+                    max_shares=chan_shares,
+                    tiers=chan_tiers,
+                    open_usdc=open_usdc,
+                    max_open_usdc=self.settings.max_open_usdc,
+                    floor_usdc=floor_usdc,
+                )
+                size_meta = caps.to_dict()
+                size_meta["channel"] = (
+                    "ft" if typ == "match_finished" and not pitch_relaxed else "goals"
+                )
+                if caps.skip_reason:
+                    row = self._record(
+                        quote,
+                        event_key=event_key,
+                        match_meta=match_meta,
+                        plan=None,
+                        status="skipped",
+                        skip_reason=caps.skip_reason,
+                        response=None,
+                        success=False,
+                        idempotency_key=key,
+                        live=channel_live,
+                        extra={"size_policy": size_meta},
+                    )
+                    return row
+                max_usdc = float(caps.max_usdc)
+                max_shares = float(caps.max_shares)
+                logger.info(
+                    "size_policy channel=%s ask=%.3f tier=%.2f eff_usdc=%.2f "
+                    "eff_shares=%.2f open=%.2f remaining=%s",
+                    "ft" if typ == "match_finished" and not pitch_relaxed else "goals",
+                    caps.ask,
+                    caps.tier_usdc,
+                    caps.max_usdc,
+                    caps.max_shares,
+                    caps.open_usdc,
+                    caps.remaining_open,
+                )
 
         dust_fak = trade == "buy_win" and self._ft_dust_fak_eligible(
             quote,
@@ -1889,16 +1990,35 @@ class TradeExecutor:
             event_key=event_key,
             event_type=typ,
         )
-        plan = plan_fill(
-            quote,
-            take_depth=self.settings.take_depth,
-            max_levels=self.settings.max_levels,
-            max_usdc=max_usdc,
-            max_shares=max_shares,
-            max_slippage=self.settings.max_slippage,
-            min_order_shares=self.settings.min_order_shares,
-            available_shares=available,
-        )
+        if sweep:
+            plan = plan_locked_sweep(
+                quote,
+                max_usdc=max_usdc,
+                min_order_usdc=0.0 if pitch_relaxed else MIN_MARKETABLE_BUY_USDC,
+            )
+            if size_meta is not None:
+                size_meta["max_usdc"] = float(plan.usdc)
+                size_meta["max_shares"] = float(plan.shares)
+                size_meta["levels_used"] = int(plan.levels_used)
+            logger.info(
+                "locked_sweep fill usdc=%.2f shares=%.4f worst=%.4f levels=%s skip=%s",
+                plan.usdc,
+                plan.shares,
+                plan.worst_price,
+                plan.levels_used,
+                plan.skip_reason,
+            )
+        else:
+            plan = plan_fill(
+                quote,
+                take_depth=self.settings.take_depth,
+                max_levels=self.settings.max_levels,
+                max_usdc=max_usdc,
+                max_shares=max_shares,
+                max_slippage=self.settings.max_slippage,
+                min_order_shares=self.settings.min_order_shares,
+                available_shares=available,
+            )
         if dust_fak:
             remaining = None
             if size_meta is not None and size_meta.get("remaining_open") is not None:
@@ -2186,6 +2306,9 @@ class TradeExecutor:
             neg_risk=bool(neg) if neg is not None else None,
             fill_status=fill_status,
             pitch_gate=_trade_context_pitch_gate(meta),
+            settle=lib.settle_row_from_lot(quote),
+            home_half=meta.get("home_half"),
+            away_half=meta.get("away_half"),
         )
 
     def maybe_flatten_for_event(
@@ -2258,11 +2381,35 @@ class TradeExecutor:
         else:
             return []
 
-        affected = [
-            lot
-            for lot in open_lots
-            if lot_depends_on_disallowed_goal(lot, after_score=after)
-        ]
+        hh = ev.get("home_half")
+        ah = ev.get("away_half")
+        dqd = ev.get("dongqiudi") if isinstance(ev.get("dongqiudi"), dict) else {}
+        if hh is None and isinstance(dqd, dict):
+            hh = dqd.get("home_half")
+        if ah is None and isinstance(dqd, dict):
+            ah = dqd.get("away_half")
+
+        affected: list[dict[str, Any]] = []
+        for lot in open_lots:
+            if not lot_depends_on_disallowed_goal(lot, after_score=after):
+                continue
+            if after is not None and lib.lot_still_win_at_score(
+                lot,
+                home_score=after[0],
+                away_score=after[1],
+                home_half=hh,
+                away_half=ah,
+            ):
+                logger.info(
+                    "skip flatten still-win match=%s token=%s… after=%s-%s key=%s",
+                    mid,
+                    str(lot.get("token_id") or "")[:12],
+                    after[0],
+                    after[1],
+                    lot.get("market_key") or "",
+                )
+                continue
+            affected.append(lot)
         if protect_only:
             window_s = gate_protect_window_s()
             in_window = [
@@ -2303,11 +2450,13 @@ class TradeExecutor:
         return out
 
     def _maybe_clear_buy_block(self, mid: str) -> None:
-        """Lift buy_win block once this match has no open lots or in-flight buys."""
+        """Lift buy_win block once this match has no pending flatten exits."""
         mid = str(mid or "")
         if not mid:
             return
-        if self.ledger.open_for_match(mid):
+        if any(
+            r.get("pending_flatten") for r in self.ledger.open_for_match(mid)
+        ):
             return
         if any(
             str(r.get("match_id")) == mid for r in self.ledger.pending_flatten_lots()

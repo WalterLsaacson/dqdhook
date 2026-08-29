@@ -190,6 +190,12 @@ def load_quote_trade_config(
             or (max_usdc if max_usdc is not None else 1)
         ),
         "ft_dust_usdc": float(os.getenv("QUOTE_FT_DUST_USDC") or 100),
+        "locked_sweep": _env_bool("QUOTE_LOCKED_SWEEP", True),
+        "locked_sweep_usdc": float(
+            os.getenv("QUOTE_LOCKED_SWEEP_USDC")
+            if os.getenv("QUOTE_LOCKED_SWEEP_USDC") not in (None, "")
+            else 1000
+        ),
         "max_shares": float(
             max_shares if max_shares is not None else os.getenv("QUOTE_MAX_SHARES", "25")
         ),
@@ -482,7 +488,9 @@ def _ensure_quote() -> bool:
         f"max_usdc={trade.get('max_usdc')} "
         f"goals_usdc={trade.get('goal_max_usdc')} "
         f"ft_usdc={trade.get('ft_max_usdc')} "
-        f"ft_dust_usdc={trade.get('ft_dust_usdc')}) "
+        f"ft_dust_usdc={trade.get('ft_dust_usdc')} "
+        f"locked_sweep={trade.get('locked_sweep', True)}"
+        f":{trade.get('locked_sweep_usdc', 1000)}) "
         "(→ in-process match-bridge → DQD + PM · pitch-gate goals)",
         flush=True,
     )
@@ -1047,6 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
         f"goals_usdc={t.get('goal_max_usdc', t['max_usdc'])} "
         f"ft_usdc={t.get('ft_max_usdc', t['max_usdc'])} "
         f"ft_dust_usdc={t.get('ft_dust_usdc', 100)} "
+        f"locked_sweep={t.get('locked_sweep', True)}:{t.get('locked_sweep_usdc', 1000)} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
         f"(pitch-gate: DOM first, AF from in_play, buy on in_play∧AF∧shot; DQD reverse → AF flatten)",
         flush=True,

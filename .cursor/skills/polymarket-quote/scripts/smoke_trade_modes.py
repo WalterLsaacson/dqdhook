@@ -239,6 +239,8 @@ def main() -> int:
     assert f_u == 300.0 and f_t == ((0.98, 300.0),), (f_u, f_t)
     assert f_sh == 2000.0 and g_sh == 150.0
     assert abs(s_sz.ft_dust_usdc - 100.0) < 1e-9
+    assert s_sz.locked_sweep is True
+    assert abs(s_sz.locked_sweep_usdc - 1000.0) < 1e-9
 
     print("ok: split goals/ft trade modes")
     return 0

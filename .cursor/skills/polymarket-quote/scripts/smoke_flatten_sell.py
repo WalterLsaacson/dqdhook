@@ -181,7 +181,8 @@ def main() -> int:
         ex.ledger.mark_closed("tok_block", mid, reason="score_reversal|dust_bal=0.0004")
         ex._maybe_clear_buy_block(mid)
         assert mid not in ex._buy_blocked_matches
-        # Still-open lot must keep the block.
+        # Still-open lot without pending flatten must not freeze the match
+        # (still-WIN lots after a reverse are kept on purpose).
         ex.ledger.register_buy(
             match_id=mid,
             token_id="tok_block2",
@@ -193,6 +194,10 @@ def main() -> int:
             live=True,
             event_key="score_change|m_block|0-0->1-0|b",
         )
+        ex._buy_blocked_matches.add(mid)
+        ex._maybe_clear_buy_block(mid)
+        assert mid not in ex._buy_blocked_matches
+        ex.ledger.mark_pending_flatten("tok_block2", mid, reason="retry")
         ex._buy_blocked_matches.add(mid)
         ex._maybe_clear_buy_block(mid)
         assert mid in ex._buy_blocked_matches

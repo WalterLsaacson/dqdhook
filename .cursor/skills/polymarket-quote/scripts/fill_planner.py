@@ -5,8 +5,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from rest_ladder import FAK_ZONE_MAX_ASK
+
 # Polymarket marketable BUY rejects notional under $1.
 MIN_MARKETABLE_BUY_USDC = 1.0
+LOCKED_SWEEP_DEPTH = "locked_sweep"
 
 
 @dataclass
@@ -144,6 +147,81 @@ def plan_buy_win(
         trade="buy_win",
         side="BUY",
         take_depth=take_depth,
+        order_type="FAK",
+        shares=round(shares, 6),
+        usdc=round(order_usdc, 6),
+        worst_price=worst,
+        levels_used=len(taken),
+        levels=taken,
+        skip_reason=None,
+    )
+
+
+def plan_locked_sweep(
+    quote: dict[str, Any],
+    *,
+    max_usdc: float,
+    max_ask: float = FAK_ZONE_MAX_ASK,
+    min_order_usdc: float = 0.0,
+) -> FillPlan:
+    """Take remaining asks at or below the FAK zone (ignore goal $50 / share caps)."""
+    asks = _levels_from_top(
+        quote.get("asks_top"),
+        best_price=_f(quote.get("best_ask")),
+        best_size=_f(quote.get("best_ask_size")),
+    )
+    asks.sort(key=lambda x: x[0])
+    empty = FillPlan(
+        trade="buy_win",
+        side="BUY",
+        take_depth=LOCKED_SWEEP_DEPTH,
+        order_type="FAK",
+        shares=0.0,
+        usdc=0.0,
+        worst_price=0.0,
+        levels_used=0,
+        levels=[],
+        skip_reason="no_ask",
+    )
+    if not asks:
+        return empty
+
+    budget = max(0.0, float(max_usdc))
+    cap_price = float(max_ask)
+    min_usdc = max(0.0, float(min_order_usdc))
+    taken: list[dict[str, Any]] = []
+    shares = 0.0
+    usdc = 0.0
+    worst = asks[0][0]
+
+    for price, size in asks:
+        if price > cap_price + 1e-12:
+            break
+        if usdc >= budget - 1e-12:
+            break
+        room_usdc = budget - usdc
+        affordable = room_usdc / price if price > 0 else 0.0
+        take = min(size, affordable)
+        if take <= 1e-12:
+            break
+        cost = take * price
+        taken.append({"price": price, "size": round(take, 6), "level_size": size})
+        shares += take
+        usdc += cost
+        worst = price
+
+    if shares <= 1e-12 or usdc <= 1e-12:
+        empty.skip_reason = "zero_fill"
+        return empty
+
+    order_usdc = usdc
+    if min_usdc > 0 and order_usdc + 1e-12 < min_usdc:
+        order_usdc = min_usdc
+
+    return FillPlan(
+        trade="buy_win",
+        side="BUY",
+        take_depth=LOCKED_SWEEP_DEPTH,
         order_type="FAK",
         shares=round(shares, 6),
         usdc=round(order_usdc, 6),

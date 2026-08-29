@@ -105,6 +105,9 @@ class TradeSettings:
     # FT locked WIN with ask ≤0.01: try FAK anyway (ghost 0.001 books).
     ft_dust_fak: bool = True
     ft_dust_usdc: float = 100.0
+    # Pitch-gate: FAK remaining asks when WIN even if this goal is voided.
+    locked_sweep: bool = True
+    locked_sweep_usdc: float = 1000.0
 
     @property
     def live(self) -> bool:
@@ -234,6 +237,7 @@ def load_trade_settings(
     max_open = float(os.getenv("QUOTE_MAX_OPEN_USDC", "1000") or 1000)
     floor_usdc = float(os.getenv("QUOTE_SIZE_FLOOR_USDC", "1") or 1)
     dust_usdc = _env_optional_float("QUOTE_FT_DUST_USDC")
+    sweep_usdc = _env_optional_float("QUOTE_LOCKED_SWEEP_USDC")
 
     funder = os.getenv("FUNDER", "").strip() or None
     return TradeSettings(
@@ -268,6 +272,10 @@ def load_trade_settings(
         ft_dust_usdc=(
             float(dust_usdc) if dust_usdc is not None else 100.0
         ),
+        locked_sweep=_env_bool("QUOTE_LOCKED_SWEEP", True),
+        locked_sweep_usdc=(
+            float(sweep_usdc) if sweep_usdc is not None else 1000.0
+        ),
     )
 
 
@@ -279,8 +287,11 @@ def size_channels_label(settings: TradeSettings) -> str:
     g_u, _, g_t = settings.caps_for_buy(event_type="score_change")
     f_u, _, f_t = settings.caps_for_buy(event_type="match_finished")
     dust = float(getattr(settings, "ft_dust_usdc", 100.0) or 0)
+    sweep_on = bool(getattr(settings, "locked_sweep", True))
+    sweep_u = float(getattr(settings, "locked_sweep_usdc", 1000.0) or 0)
+    sweep = f"on:{sweep_u:g}" if sweep_on and sweep_u > 0 else "off"
     return (
         f"goals_usdc={g_u:g} tiers={format_size_tiers(g_t)} "
         f"ft_usdc={f_u:g} tiers={format_size_tiers(f_t)} "
-        f"ft_dust_usdc={dust:g}"
+        f"ft_dust_usdc={dust:g} locked_sweep={sweep}"
     )

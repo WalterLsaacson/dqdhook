@@ -42,6 +42,12 @@ HALF_2_RE = re.compile(r"(?:2nd|second)\s*half", re.I)
 EXACT_WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+(\d+)\s*[-–]\s*(\d+)\s*\?", re.I)
 EXACT_DRAW_RE = re.compile(r"draw\s+(\d+)\s*[-–]\s*(\d+)", re.I)
 SCORE_PAIR_RE = re.compile(r"\b(\d+)\s*[-–]\s*(\d+)\b")
+LOT_TOTAL_KEY_RE = re.compile(
+    r"^(match|home|away)(?:_(1h|2h))?_total_([0-9]+(?:\.[0-9]+)?)_(over|under)$",
+    re.I,
+)
+LOT_BTTS_KEY_RE = re.compile(r"^btts(?:_(1h|2h))?_(yes|no)$", re.I)
+LOT_EXACT_KEY_RE = re.compile(r"^exact_(\d+)-(\d+)_(yes|no)$", re.I)
 
 DEFAULT_EPS = 0.005
 # Polymarket sports taker feeRate (2026): fee/share = feeRate * p * (1-p)
@@ -52,6 +58,8 @@ DEFAULT_MAX_BUY_ASK = 0.995
 # 0.00475 ≈ allow ask≤0.995 (fee-aware); ask 0.996 net≈0.0038 is blocked.
 DEFAULT_MIN_NET = 0.00475
 TOP_N = 5
+# Live score_change: keep enough ask levels to sweep a locked WIN book.
+LIVE_BOOK_TOP_N = 20
 
 
 class QuoteError(RuntimeError):
@@ -657,6 +665,216 @@ def _period_ha_goals(
 
 def _exact_scoreline_dead(sh: int, sa: int, home: int, away: int) -> bool:
     return sh < home or sa < away
+
+
+def token_is_win_at_score(
+    row: dict[str, Any],
+    *,
+    home_score: Any,
+    away_score: Any,
+    home_half: Any = None,
+    away_half: Any = None,
+) -> bool:
+    """True if this token would already be a live WIN at the given score.
+
+    Used on score_change to ask: if the current goal is voided (prev score),
+    is this still locked WIN? Distinct from ``reversal_cushion_locked``, which
+    hypothetically subtracts one goal from either side.
+    """
+    family = str(row.get("family") or "").lower()
+
+    if family == "totals":
+        outcome = str(row.get("outcome") or row.get("market_key") or "").lower()
+        if "under" in outcome:
+            return False
+        goals = _goals_for_total(
+            side=str(row.get("total_side") or "match"),
+            period=str(row.get("total_period") or "ft"),
+            home_score=home_score,
+            away_score=away_score,
+            home_half=home_half,
+            away_half=away_half,
+        )
+        if goals is None:
+            return False
+        try:
+            line = float(row.get("line"))
+        except (TypeError, ValueError):
+            return False
+        return goals > line
+
+    if family == "btts":
+        outcome = str(row.get("outcome") or row.get("market_key") or "").lower()
+        if "yes" not in outcome:
+            return False
+        both = _btts_both_scored(
+            period=str(row.get("btts_period") or "ft"),
+            home_score=home_score,
+            away_score=away_score,
+            home_half=home_half,
+            away_half=away_half,
+        )
+        return both is True
+
+    if family == "exact_score":
+        outcome = str(row.get("outcome") or "").lower()
+        if outcome != "no" and "_no" not in str(row.get("market_key") or "").lower():
+            return False
+        printed = str(row.get("scoreline") or "")
+        try:
+            sh, sa = (int(x) for x in printed.split("-", 1))
+        except ValueError:
+            eh, ea = row.get("exact_home"), row.get("exact_away")
+            try:
+                sh, sa = int(eh), int(ea)
+            except (TypeError, ValueError):
+                return False
+        h = _parse_int_score(home_score)
+        a = _parse_int_score(away_score)
+        if h is None or a is None:
+            return False
+        return _exact_scoreline_dead(sh, sa, h, a)
+
+    return False
+
+
+def prev_scores_if_goal_void(
+    ev: dict[str, Any] | None,
+    ctx: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Score bundle as if the current goal never counted (event ``prev``)."""
+    ev = ev or {}
+    ctx = ctx or {}
+    prev = ev.get("prev") if isinstance(ev.get("prev"), dict) else None
+    if not prev:
+        return None
+    ph = _parse_int_score(prev.get("home"))
+    pa = _parse_int_score(prev.get("away"))
+    if ph is None or pa is None:
+        return None
+    period = str(
+        (ctx.get("dongqiudi") or {}).get("period")
+        or ev.get("period")
+        or ""
+    ).strip().upper()
+    hh = ctx.get("home_half")
+    ah = ctx.get("away_half")
+    if period in {"1H", "HT", "1"}:
+        return {
+            "home": ph,
+            "away": pa,
+            "home_half": ph,
+            "away_half": pa,
+        }
+    return {
+        "home": ph,
+        "away": pa,
+        "home_half": hh,
+        "away_half": ah,
+    }
+
+
+def settle_row_from_lot(lot: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Build a token_is_win_at_score row from a ledger lot or quote."""
+    lot = lot or {}
+    stored = lot.get("settle") if isinstance(lot.get("settle"), dict) else None
+    src = dict(stored or {})
+    family = str(src.get("family") or lot.get("family") or "").lower()
+    key = str(src.get("market_key") or lot.get("market_key") or "")
+
+    if family == "totals" or (not family and "_total_" in key):
+        side = src.get("total_side") or lot.get("total_side")
+        period = src.get("total_period") or lot.get("total_period")
+        line = src.get("line") if src.get("line") is not None else lot.get("line")
+        outcome = str(src.get("outcome") or lot.get("outcome") or "")
+        if line is None or not side:
+            m = LOT_TOTAL_KEY_RE.match(key)
+            if not m:
+                return None
+            side = m.group(1).lower()
+            period = (m.group(2) or "ft").lower()
+            line = float(m.group(3))
+            outcome = "Over" if m.group(4).lower() == "over" else "Under"
+        try:
+            line_f = float(line)
+        except (TypeError, ValueError):
+            return None
+        return {
+            "family": "totals",
+            "market_key": key or f"{side}_total_{line_f}_{'over' if 'under' not in outcome.lower() else 'under'}",
+            "outcome": outcome or "Over",
+            "line": line_f,
+            "total_side": str(side).lower(),
+            "total_period": str(period or "ft").lower(),
+        }
+
+    if family == "btts" or key.startswith("btts"):
+        period = src.get("btts_period") or lot.get("btts_period")
+        outcome = str(src.get("outcome") or lot.get("outcome") or "")
+        if not period or not outcome:
+            m = LOT_BTTS_KEY_RE.match(key)
+            if not m:
+                return None
+            period = (m.group(1) or "ft").lower()
+            outcome = "Yes" if m.group(2).lower() == "yes" else "No"
+        return {
+            "family": "btts",
+            "market_key": key or f"btts_{outcome.lower()}",
+            "outcome": outcome,
+            "btts_period": str(period or "ft").lower(),
+        }
+
+    if family == "exact_score" or key.startswith("exact_"):
+        outcome = str(src.get("outcome") or lot.get("outcome") or "")
+        printed = str(src.get("scoreline") or lot.get("scoreline") or "")
+        eh = src.get("exact_home") if src.get("exact_home") is not None else lot.get("exact_home")
+        ea = src.get("exact_away") if src.get("exact_away") is not None else lot.get("exact_away")
+        if not printed:
+            m = LOT_EXACT_KEY_RE.match(key)
+            if m:
+                printed = f"{m.group(1)}-{m.group(2)}"
+                if not outcome:
+                    outcome = "Yes" if m.group(3).lower() == "yes" else "No"
+                eh, ea = int(m.group(1)), int(m.group(2))
+        if not printed:
+            return None
+        return {
+            "family": "exact_score",
+            "market_key": key or f"exact_{printed}_{outcome.lower()}",
+            "outcome": outcome or "No",
+            "scoreline": printed,
+            "exact_home": eh,
+            "exact_away": ea,
+        }
+
+    return None
+
+
+def lot_still_win_at_score(
+    lot: dict[str, Any] | None,
+    *,
+    home_score: Any,
+    away_score: Any,
+    home_half: Any = None,
+    away_half: Any = None,
+) -> bool:
+    """True if this open lot is still a live WIN at the given score (do not flatten)."""
+    row = settle_row_from_lot(lot)
+    if row is None:
+        return False
+    hh = home_half
+    ah = away_half
+    if hh is None:
+        hh = (lot or {}).get("home_half")
+    if ah is None:
+        ah = (lot or {}).get("away_half")
+    return token_is_win_at_score(
+        row,
+        home_score=home_score,
+        away_score=away_score,
+        home_half=hh,
+        away_half=ah,
+    )
 
 
 def reversal_cushion_locked(
@@ -1722,6 +1940,22 @@ def quote_tokens(
             "net_edge": econ.get("net_edge"),
             "trade": econ.get("trade"),
         }
+        item["win_if_goal_void"] = False
+        prev_h = (match_meta or {}).get("prev_home")
+        prev_a = (match_meta or {}).get("prev_away")
+        if (
+            str(row.get("settlement") or "") == "WIN"
+            and prev_h is not None
+            and prev_a is not None
+            and str((match_meta or {}).get("event_type") or "") == "score_change"
+        ):
+            item["win_if_goal_void"] = token_is_win_at_score(
+                row,
+                home_score=prev_h,
+                away_score=prev_a,
+                home_half=(match_meta or {}).get("prev_home_half"),
+                away_half=(match_meta or {}).get("prev_away_half"),
+            )
         skip_fine = (
             skip_fine_tick_exact
             and str(row.get("family") or "") == "exact_score"
@@ -1950,9 +2184,17 @@ def quote_bridge_event(
         "away": ctx.get("away") or "",
         "home_score": ctx.get("home_score"),
         "away_score": ctx.get("away_score"),
+        "home_half": ctx.get("home_half"),
+        "away_half": ctx.get("away_half"),
         "event_type": str(ev.get("type") or ""),
         "event_key": ek,
     }
+    prev_bundle = prev_scores_if_goal_void(ev, ctx)
+    if prev_bundle:
+        match_meta["prev_home"] = prev_bundle["home"]
+        match_meta["prev_away"] = prev_bundle["away"]
+        match_meta["prev_home_half"] = prev_bundle["home_half"]
+        match_meta["prev_away_half"] = prev_bundle["away_half"]
     if trade_context is not None:
         match_meta["trade_context"] = dict(trade_context)
         if not match_meta["trade_context"].get("base_event_key"):
@@ -1992,7 +2234,7 @@ def quote_bridge_event(
                 prewarm_meta = {"hit": False, "reason": f"error:{e}"}
                 book_map = {}
             if not book_map:
-                book_map = fetch_books(all_ids, proxy=proxy)
+                book_map = fetch_books(all_ids, proxy=proxy, top_n=LIVE_BOOK_TOP_N)
                 prewarm_meta = dict(prewarm_meta or {})
                 prewarm_meta.setdefault("hit", False)
                 prewarm_meta["fetched"] = True

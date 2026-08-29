@@ -244,6 +244,9 @@ class OpenPositionLedger:
         fill_status: str = FILL_STATUS_OPEN,
         pitch_gate: bool = False,
         opened_at: str | None = None,
+        settle: dict[str, Any] | None = None,
+        home_half: Any = None,
+        away_half: Any = None,
     ) -> None:
         if not match_id or not token_id or shares <= 0:
             return
@@ -281,6 +284,12 @@ class OpenPositionLedger:
             pitch_gate = bool(pitch_gate or existing.get("pitch_gate"))
             # Top-ups must not extend the protection window past the first buy.
             opened_at = str(existing.get("opened_at") or "") or opened_at
+            if not settle and isinstance(existing.get("settle"), dict):
+                settle = dict(existing.get("settle") or {})
+            if home_half is None:
+                home_half = existing.get("home_half")
+            if away_half is None:
+                away_half = existing.get("away_half")
         row = {
             "status": "open",
             "match_id": str(match_id),
@@ -300,6 +309,12 @@ class OpenPositionLedger:
             "pitch_gate": bool(pitch_gate),
             "opened_at": str(opened_at or iso_now()),
         }
+        if settle:
+            row["settle"] = dict(settle)
+        if home_half is not None:
+            row["home_half"] = home_half
+        if away_half is not None:
+            row["away_half"] = away_half
         if existing is not None and existing.get("pending_flatten"):
             row["pending_flatten"] = True
             row["pending_reason"] = existing.get("pending_reason")
