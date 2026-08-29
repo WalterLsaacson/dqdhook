@@ -53,7 +53,7 @@
 
 ### 1. 数据与触发
 
-1. **懂球帝**以约 5s（有进行中）/ 60s（空闲）节奏刷新 `full` 页签；加时阶段也会保持较快轮询。
+1. **懂球帝**只在**已配对**场进行中（或已完赛但还没出 `FT`）时约 5s 刷一次 `full` 页签；没有这类场时 **10 分钟**一次。全世界其它 live 不加速。
 2. **Polymarket** 对阵由 polymarket-board 约每 **3 小时**写 `data/polymarket/snapshot.json`；bridge 只读快照做配对，不扫 Gamma 联赛列表。
 3. **配对**：英队名 + 北京开球时间模糊匹配（`min_score` / `min_side` / 联赛别名等，见 `match-bridge`）。未配对场次**不会**进门控下单。
 4. Bridge 产出事件：

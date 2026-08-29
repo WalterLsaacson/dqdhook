@@ -553,6 +553,8 @@ def main() -> int:
     _assert(s_den >= bl.DEFAULT_MIN_SCORE, f"OB/Odense should match, got {s_den}")
 
     _assert(bl.DEFAULT_PM_INTERVAL == 10800, "PM snapshot cadence is 3h")
+    _assert(bl.DEFAULT_DQD_INTERVAL == 5, "paired live poll 5s")
+    _assert(bl.DEFAULT_DQD_IDLE_INTERVAL == 600, "idle poll 10min")
     tmp = Path(tempfile.mkdtemp())
     snap_dir = tmp / "data" / "polymarket"
     snap_dir.mkdir(parents=True)
@@ -564,6 +566,8 @@ def main() -> int:
     (snap_dir / "snapshot.json").write_text(json.dumps(snap), encoding="utf-8")
     rt = bl.BridgeRuntime(tmp)
     _assert(rt.pm_interval == 10800, f"runtime default pm_interval, got {rt.pm_interval}")
+    _assert(rt.dqd_interval == 5, f"runtime dqd_interval, got {rt.dqd_interval}")
+    _assert(rt.dqd_idle_interval == 600, f"runtime dqd_idle_interval, got {rt.dqd_idle_interval}")
     fake_load = MagicMock(side_effect=AssertionError("bridge must not call load_matches"))
     with patch.dict("sys.modules", {"pm_lib": MagicMock(load_matches=fake_load)}):
         got = rt.refresh_pm_once()

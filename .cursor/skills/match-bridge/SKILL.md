@@ -24,7 +24,7 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py once --json
 # Rematch from existing snapshots only
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py once --offline --json
 
-# Resident loops (DQD 5s/60s, Polymarket snapshot 3h)
+# Resident loops (DQD 5s paired-live / 10min idle, Polymarket snapshot 3h)
 python3 .cursor/skills/match-bridge/scripts/bridge_match.py start --foreground
 
 # Last result / status
@@ -36,7 +36,7 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py status --json
 
 | Source | Skill | Default refresh |
 |---|---|---|
-| Dongqiudi | `dongqiudi-match` watch (`full` tab) | **5s** live / **60s** idle; **5s** while any match is `Played` but `period` ≠ `FT` |
+| Dongqiudi | `dongqiudi-match` watch (`full` tab) | **5s** while a **paired** match is Playing or `Played` but `period` ≠ `FT`; **600s** otherwise |
 | Polymarket | `data/polymarket/snapshot.json` (written by polymarket-board / `pm_soccer.py list`) | **10800s** (3h) snapshot reload; **does not** scan Gamma leagues |
 
 Matching defaults: `min_score=0.70`, `min_side=0.75`, `max_skew_min=90`, `pm_stale_hours=6` (see [reference.md](reference.md)).  

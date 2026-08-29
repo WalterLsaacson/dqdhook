@@ -30,6 +30,9 @@ DEFAULT_LEAGUE_FLOOR = 0.40
 # Snapshot reload cadence. Gamma league scans are owned by polymarket-board
 # (default 3h); bridge only reads data/polymarket/snapshot.json.
 DEFAULT_PM_INTERVAL = 10800
+# Fast DQD poll only while a *paired* match is Playing or Played-but-not-FT.
+DEFAULT_DQD_INTERVAL = 5
+DEFAULT_DQD_IDLE_INTERVAL = 600
 # After status=Played but period not yet FT, poll at this cadence (same as live default).
 PENDING_FT_POLL_SEC = 5
 
@@ -523,6 +526,27 @@ def has_pending_ft_poll(matches: list[dict[str, Any]] | None) -> bool:
     return any(is_pending_ft_poll(m) for m in (matches or []))
 
 
+def _row_dqd(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not row:
+        return {}
+    inner = row.get("dongqiudi")
+    return inner if isinstance(inner, dict) else row
+
+
+def paired_needs_fast_poll(paired: list[dict[str, Any]] | None) -> bool:
+    """True when a bridged row is Playing or Played-but-not-FT.
+
+    Worldwide live on the DQD full tab does not accelerate polling.
+    """
+    for row in paired or []:
+        dqd = _row_dqd(row)
+        if status_bucket(dqd) == "playing":
+            return True
+        if is_pending_ft_poll(dqd):
+            return True
+    return False
+
+
 def _pm_event_handle(pm: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_id": pm.get("event_id") or "",
@@ -810,8 +834,8 @@ class BridgeRuntime:
         root: Path,
         *,
         dqd_tab: str = "full",
-        dqd_interval: int = 5,
-        dqd_idle_interval: int = 60,
+        dqd_interval: int = DEFAULT_DQD_INTERVAL,
+        dqd_idle_interval: int = DEFAULT_DQD_IDLE_INTERVAL,
         pm_interval: int = DEFAULT_PM_INTERVAL,
         pm_within_hours: int = 48,
         min_score: float = DEFAULT_MIN_SCORE,
@@ -1165,14 +1189,10 @@ class BridgeRuntime:
         while not self._stop.is_set():
             sleep_s = self.dqd_idle_interval
             try:
-                result = self.refresh_dqd_once()
-                self.rematch()
-                dqd_snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
-                dqd_matches = list(dqd_snap.get("matches") or [])
-                if has_pending_ft_poll(dqd_matches):
-                    # Played but period not FT yet — catch period→FT sooner.
-                    sleep_s = PENDING_FT_POLL_SEC
-                elif result.get("has_live"):
+                self.refresh_dqd_once()
+                payload = self.rematch()
+                paired = list((payload or {}).get("matches") or [])
+                if paired_needs_fast_poll(paired):
                     sleep_s = self.dqd_interval
                 else:
                     sleep_s = self.dqd_idle_interval

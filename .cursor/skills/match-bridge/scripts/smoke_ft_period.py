@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke checks for period=FT full-time gating and pending 5s poll."""
+"""Smoke checks for period=FT full-time gating and paired fast poll."""
 
 from __future__ import annotations
 
@@ -112,6 +112,11 @@ def main() -> int:
     _assert(ev4 == [], f"Played+2H must not emit, got {ev4}")
     _assert(bl.is_pending_ft_poll(r4["dongqiudi"]), "pending for 5s poll")
     _assert(bl.has_pending_ft_poll([r4["dongqiudi"]]), "has_pending_ft_poll")
+    _assert(bl.paired_needs_fast_poll([r4]), "paired pending FT is fast")
+    _assert(bl.paired_needs_fast_poll([r1]), "paired Playing is fast")
+    fixture_only = _row(mid="fx", status_raw="Fixture", period="")
+    _assert(not bl.paired_needs_fast_poll([fixture_only]), "paired fixture is idle")
+    _assert(not bl.paired_needs_fast_poll([]), "no pairs is idle")
 
     # Upgrade: status tracked, period file missing, curr already FT → still emit
     prev_status4: dict[str, str] = {"m4": "playing"}

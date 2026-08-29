@@ -37,8 +37,11 @@ def get_runtime(args: argparse.Namespace) -> lib.BridgeRuntime:
         _RUNTIME = lib.BridgeRuntime(
             root(),
             dqd_tab=getattr(args, "tab", "full") or "full",
-            dqd_interval=int(getattr(args, "dqd_interval", 5) or 5),
-            dqd_idle_interval=int(getattr(args, "dqd_idle_interval", 60) or 60),
+            dqd_interval=int(getattr(args, "dqd_interval", lib.DEFAULT_DQD_INTERVAL) or lib.DEFAULT_DQD_INTERVAL),
+            dqd_idle_interval=int(
+                getattr(args, "dqd_idle_interval", lib.DEFAULT_DQD_IDLE_INTERVAL)
+                or lib.DEFAULT_DQD_IDLE_INTERVAL
+            ),
             pm_interval=int(
                 getattr(args, "pm_interval", lib.DEFAULT_PM_INTERVAL) or lib.DEFAULT_PM_INTERVAL
             ),
@@ -130,8 +133,18 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Bridge Dongqiudi + Polymarket match lists")
     p.add_argument("--tab", default="full", help="Dongqiudi tab (default: full)")
-    p.add_argument("--dqd-interval", type=int, default=5, help="DQD live poll seconds")
-    p.add_argument("--dqd-idle-interval", type=int, default=60, help="DQD idle poll seconds")
+    p.add_argument(
+        "--dqd-interval",
+        type=int,
+        default=lib.DEFAULT_DQD_INTERVAL,
+        help="DQD poll seconds while a paired match is live",
+    )
+    p.add_argument(
+        "--dqd-idle-interval",
+        type=int,
+        default=lib.DEFAULT_DQD_IDLE_INTERVAL,
+        help="DQD poll seconds when no paired match is live (default 10min)",
+    )
     p.add_argument(
         "--pm-interval",
         type=int,
