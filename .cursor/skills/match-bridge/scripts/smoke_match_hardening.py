@@ -394,6 +394,19 @@ def main() -> int:
     )
     _assert(bl.normalize_league("阿根廷杯", "") == "argcopa", "阿根廷杯")
     _assert(bl.normalize_league("ARGCOPA", "argcopa") == "argcopa", "ARGCOPA")
+    # 2026-08-28 unmatched PM (304/345): 德甲 / 葡萄牙杯 / Lille
+    _assert(bl.normalize_league("德甲", "") == "bun", "德甲")
+    _assert(bl.normalize_league("Bundesliga", "bun") == "bun", "bun")
+    _assert(bl.normalize_league("葡萄牙杯", "") == "ptc", "葡萄牙杯")
+    _assert(bl.normalize_league("Portuguese Cup", "ptc") == "ptc", "ptc")
+    _assert(
+        bl.normalize_team("LOSC Lille") == bl.normalize_team("Lille OSC"),
+        "Lille OSC↔LOSC",
+    )
+    _assert(
+        bl.normalize_team("Olímpico do Montijo") == bl.normalize_team("CO Montijo"),
+        "Montijo",
+    )
 
     # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
     _assert(

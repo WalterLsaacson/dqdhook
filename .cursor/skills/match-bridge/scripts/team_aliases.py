@@ -717,4 +717,12 @@ TEAM_ALIASES: dict[str, str] = {
     "servette fc chenois feminin": "servette w",
     "servette chenois feminin": "servette w",
     "servette women": "servette w",
+    # --- 2026-08-28 unmatched PM (304/345): Lille / Portuguese cup ---
+    "lille osc": "lille",
+    "losc lille": "lille",
+    "lille": "lille",
+    "co montijo": "montijo",
+    "olimpico do montijo": "montijo",
+    "olimpico montijo": "montijo",
+    "montijo": "montijo",
 }
