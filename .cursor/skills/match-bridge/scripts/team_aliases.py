@@ -725,4 +725,8 @@ TEAM_ALIASES: dict[str, str] = {
     "olimpico do montijo": "montijo",
     "olimpico montijo": "montijo",
     "montijo": "montijo",
+    # --- 2026-08-30 unmatched PM (207/350): Grasshoppers short ---
+    "grasshoppers": "grasshopper zurich",
+    "grasshopper zurich": "grasshopper zurich",
+    "gc zurich": "grasshopper zurich",
 }

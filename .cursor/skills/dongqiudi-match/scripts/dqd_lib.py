@@ -29,6 +29,9 @@ FLAG_HOT_OR_BEIDAN = 320
 
 TZ_CN = timezone(timedelta(hours=8))
 
+# schedule_list often returns [] until DQD publishes that calendar day.
+_EMPTY_SCHEDULE_WARNED: set[str] = set()
+
 TAB_FILTERS: dict[str, Callable[[dict[str, Any]], bool]] = {}
 
 
@@ -562,7 +565,22 @@ def load_matches(
             OSError,
             http.client.IncompleteRead,
             http.client.HTTPException,
-        ):
+        ) as e:
+            if d not in _EMPTY_SCHEDULE_WARNED:
+                _EMPTY_SCHEDULE_WARNED.add(d)
+                print(
+                    f"dqd → schedule_list fail day={d}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+            continue
+        if not raw_rows:
+            if d not in _EMPTY_SCHEDULE_WARNED:
+                _EMPTY_SCHEDULE_WARNED.add(d)
+                print(
+                    f"dqd → schedule_list empty day={d} "
+                    f"(no future soccer yet; PM 48h games stay unmatched)",
+                    flush=True,
+                )
             continue
         for raw in raw_rows:
             if (raw.get("cmp_type") or "soccer") != "soccer":

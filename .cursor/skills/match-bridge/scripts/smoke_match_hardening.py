@@ -407,6 +407,13 @@ def main() -> int:
         bl.normalize_team("Olímpico do Montijo") == bl.normalize_team("CO Montijo"),
         "Montijo",
     )
+    # 2026-08-30 unmatched PM (207/350): Grasshoppers
+    _assert(
+        bl.normalize_team("Grasshoppers")
+        == bl.normalize_team("Grasshopper Club Zurich"),
+        "Grasshoppers",
+    )
+    _assert(bl.team_similarity("Vaduz", "FC Vaduz") >= 0.92, "Vaduz")
 
     # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
     _assert(
