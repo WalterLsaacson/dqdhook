@@ -355,17 +355,11 @@ export function renderDetail(goal) {
             !aligned &&
             alignedAt != null &&
             Number(f.elapsed_s) >= Number(alignedAt);
-          const shotLatched = Boolean(
-            f.shot_latched || f.shot_seen || f.shot_this_frame,
-          );
-          const waitShot =
-            ps === "in_play" && !aligned && !trailAfterBuy && !shotLatched;
-          const waitAf = ps === "in_play" && !aligned && !trailAfterBuy && !waitShot;
+          const waitAf = ps === "in_play" && !aligned && !trailAfterBuy;
           const orFlat = Boolean(f.or_flatten);
           const shotThis = Boolean(f.shot_this_frame);
           const frameCls = [
             aligned ? "is-aligned" : "",
-            waitShot ? "is-wait-shot" : "",
             waitAf ? "is-wait-af" : "",
             trailAfterBuy ? "is-after-buy" : "",
             orFlat && revObs ? "is-or-flatten" : "",
@@ -376,8 +370,6 @@ export function renderDetail(goal) {
             ? "aligned_buy"
             : trailAfterBuy
               ? "after_buy"
-              : waitShot
-              ? "wait_shot"
               : waitAf
               ? "wait_af"
               : orFlat && revObs
@@ -391,7 +383,7 @@ export function renderDetail(goal) {
               : f.af?.skipped === "before_in_play"
               ? "AF 未开"
               : f.af?.skipped === "before_shot"
-              ? "AF 等射门"
+              ? "AF 未开"
               : f.af?.score_match === true
               ? "AF ✓"
               : f.af?.score_match === false
@@ -459,10 +451,8 @@ export function renderDetail(goal) {
           ${
             goal.aligned_elapsed_s != null
               ? ` · aligned @ t+${escapeHtml(String(goal.aligned_elapsed_s))}s`
-              : goal.verdict === "wait_shot"
-                ? ` · DOM in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s (等射门)`
               : goal.in_play_elapsed_s != null
-                ? ` · DOM in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s (等AF)`
+                ? ` · DOM in_play @ t+${escapeHtml(String(goal.in_play_elapsed_s))}s (等 AF)`
                 : ""
           }
           ${

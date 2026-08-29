@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: AND buy only (Odds Grade A observe-only), AF-only reversal flatten."""
+"""Smoke: AND buy (DOM in_play ∧ AF, no 射门 gate), AF-only reversal flatten."""
 
 from __future__ import annotations
 
@@ -141,7 +141,7 @@ def main() -> int:
     }
 
     try:
-        # AND buy: celebration skips AF; in_play∧射门 arms AF.
+        # AND buy: celebration skips AF; first in_play tick polls and buys.
         frames = [
             _dom("H 进球", "45:01 1 : 0", ["ball"]),
             _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
@@ -171,7 +171,6 @@ def main() -> int:
             assert len(obs.rows) > 2, [r.get("sample_i") for r in obs.rows]
             assert af.calls == 2, af.calls
             assert (obs.rows[0].get("af") or {}).get("skipped") == "before_in_play"
-            assert obs.rows[0].get("shot_seen") is True
             buy = next(d for d in done if d["status"] == "in_play")
             assert buy["sample_i"] == 2, buy
             skipped = [
@@ -262,7 +261,7 @@ def main() -> int:
             assert done[0].get("buy_emitted") is False
             assert "no_aligned_buy" in str(done[0].get("reason") or ""), done[0]
 
-        # in_play + AF aligned but never 射门 → no buy (and no AF calls).
+        # in_play + AF, no 射门 overlay → still buy (射门 is not a gate).
         factory, _ = _open_factory(
             [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
             baseline=_dom("H 进球", "44:56 1 : 0"),
@@ -278,19 +277,12 @@ def main() -> int:
             set_active_observer(obs_shot)  # type: ignore[arg-type]
             coord = pg.get_coordinator(root)
             assert coord.start_gate({**ev, "match_id": "m3s"}, event_key="k3s")
-            done = _wait_done(coord, n=1)
-            assert done[0]["status"] == "timeout", done
-            assert done[0].get("buy_emitted") is False
-            assert "no_shot" in str(done[0].get("reason") or ""), done[0]
-            assert all(not r.get("shot_seen") for r in obs_shot.rows)
-            assert all(
-                (r.get("af") or {}).get("skipped") == "before_shot"
-                for r in obs_shot.rows
-                if (r.get("judge") or {}).get("play_state") == "in_play"
-            )
-            assert af_noshot.calls == 0, af_noshot.calls
+            done = _wait_done(coord, n=2)
+            assert "in_play" in [d["status"] for d in done], done
+            assert af_noshot.calls >= 1, af_noshot.calls
+            assert (obs_shot.rows[0].get("af") or {}).get("score_match") is True
 
-        # Unclear 射门 (pop) then 进攻 + AF → buy. Celebration/unclear skips AF.
+        # Unclear 射门 (pop) skips AF; in_play 进攻 same tick polls AF → buy.
         factory, _ = _open_factory(
             [
                 _dom("H 射门", "45:01 1 : 0"),
@@ -312,12 +304,40 @@ def main() -> int:
             done = _wait_done(coord, n=2)
             assert "in_play" in [d["status"] for d in done], done
             assert (obs_u.rows[0].get("af") or {}).get("skipped") == "before_in_play"
-            assert obs_u.rows[0].get("shot_this_frame") is True
             buy = next(d for d in done if d["status"] == "in_play")
             assert buy["sample_i"] == 1, buy
             assert af_unclear.calls == 1, af_unclear.calls
 
-        # Shot then VAR still vetoes even after later in_play + AF.
+        # First in_play AF miss, next in_play match → buy; keep polling until AND.
+        factory, _ = _open_factory(
+            [
+                _dom("H 进攻", "45:06 1 : 0", ["attack-move"]),
+                _dom("H 进攻", "45:11 1 : 0", ["attack-move"]),
+            ],
+            baseline=_dom("H 进球", "44:56 1 : 0"),
+        )
+        pg.PitchGateCoordinator._open_dom_reader = factory  # type: ignore[assignment]
+        pg.reset_coordinator_for_tests()
+        af_late = _FakeAf(
+            [
+                {"ok": True, "score_match": False, "af_score": "0-0"},
+                {"ok": True, "score_match": True, "af_score": "1-0"},
+            ]
+        )
+        af_mod.set_active_observer(af_late)  # type: ignore[arg-type]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "data" / "pm-quote").mkdir(parents=True)
+            set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
+            coord = pg.get_coordinator(root)
+            assert coord.start_gate({**ev, "match_id": "m3late"}, event_key="k3late")
+            done = _wait_done(coord, n=2)
+            assert "in_play" in [d["status"] for d in done], done
+            buy = next(d for d in done if d["status"] == "in_play")
+            assert buy["sample_i"] == 1, buy
+            assert af_late.calls == 2, af_late.calls
+
+        # VAR still vetoes even after later in_play + AF.
         factory, _ = _open_factory(
             [
                 _dom("H 射门", "45:01 1 : 0"),
@@ -500,7 +520,7 @@ def main() -> int:
             assert "never_in_play" in str(done[0].get("reason") or ""), done[0]
             assert af_early.calls == 0, af_early.calls
 
-        # Grade A does not skip the 射门 latch.
+        # Grade A + in_play 进攻 + AF → buy (射门 is not a gate; A still does not skip DOM).
         pg.PitchGateCoordinator._sample_odds = _odds_a  # type: ignore[assignment]
         factory, _ = _open_factory(
             [_dom("H 进攻", "45:06 1 : 0", ["attack-move"])] * 8,
@@ -516,11 +536,9 @@ def main() -> int:
             set_active_observer(_FakeObserver(root))  # type: ignore[arg-type]
             coord = pg.get_coordinator(root)
             assert coord.start_gate({**ev, "match_id": "m_a_shot"}, event_key="k_a_shot")
-            done = _wait_done(coord, n=1)
-            assert done[0]["status"] == "timeout", done
-            assert done[0].get("buy_emitted") is False
-            assert "no_shot" in str(done[0].get("reason") or ""), done[0]
-            assert af_noshot_a.calls == 0, af_noshot_a.calls
+            done = _wait_done(coord, n=2)
+            assert "in_play" in [d["status"] for d in done], done
+            assert af_noshot_a.calls >= 1, af_noshot_a.calls
 
         # AF fixture hole + in_play + Grade A → wait AF, A does not stand in.
         pg.PitchGateCoordinator._sample_odds = _odds_a  # type: ignore[assignment]

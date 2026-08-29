@@ -2394,9 +2394,10 @@ def process_bridge_events(
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into quotes/trades.
 
-    Goal-ups wait for same-tick DOM ``in_play`` ∧ AF ``score_match`` ∧ a
-    latched 射门 (DOM-first: AF starts only after 射门∧``in_play``, then
-    every 5s until 120s) before one quote job. Odds Grade A is observe-only.
+    Goal-ups wait for DOM ``in_play`` ∧ AF ``score_match`` (this tick or a
+    latch from an earlier ``in_play`` poll of this goal). AF starts on the
+    first ``in_play`` tick and keeps polling later ``in_play`` ticks until
+    AND buy. 射门 is not a buy gate. Odds Grade A is observe-only.
     Aligned buy stops AF (quota) and keeps DOM until timeout. DQD reversals
     cancel rest and open gates; if lots are open they start an AF confirm
     trail from t0 (no shot gate); flatten on first AF score_match then stop

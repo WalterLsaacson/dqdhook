@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: pitch-gate board verdicts follow DOM∧AF∧射门 buy / AF flatten."""
+"""Smoke: pitch-gate board verdicts follow DOM∧AF buy / AF flatten."""
 
 from __future__ import annotations
 
@@ -235,8 +235,7 @@ def main() -> int:
     )
     snap_shot = board.build_goals_payload(limit=50)
     wait_shot = next(g for g in snap_shot["goals"] if g["event_key"] == wait_shot_key)
-    assert wait_shot["verdict"] == "wait_shot", wait_shot["verdict"]
-    assert wait_shot["shot_seen"] is False
+    assert wait_shot["verdict"] == "wait_af", wait_shot["verdict"]
     assert not any(f.get("aligned") for f in wait_shot["frames"])
 
     # Gwangju: earlier 0-1→0-0 must not paint a later bought 0-0→0-1.
@@ -405,7 +404,7 @@ def main() -> int:
     skipped = next(g for g in snap5["goals"] if g["event_key"] == skip_key)
     assert skipped["verdict"] == "reversal_risk_skip", skipped["verdict"]
 
-    # Late 射门 must not back-date aligned @ to an earlier AF-green frame.
+    # in_play ∧ AF is aligned even without 射门.
     late_shot_key = "score_change|m6|2-1->2-2|2026-08-25T23:10:05+08:00"
     _write_jsonl(
         observe,
@@ -473,14 +472,14 @@ def main() -> int:
     snap6 = board.build_goals_payload(limit=50)
     late = next(g for g in snap6["goals"] if g["event_key"] == late_shot_key)
     assert late["verdict"] == "aligned_buy", late["verdict"]
-    assert abs(float(late["aligned_elapsed_s"]) - 55.004) < 1e-6, late.get(
+    assert abs(float(late["aligned_elapsed_s"]) - 30.005) < 1e-6, late.get(
         "aligned_elapsed_s"
     )
-    assert late["frames"][0].get("aligned") is False
+    assert late["frames"][0].get("aligned") is True
     assert late["frames"][1].get("aligned") is False
     assert late["frames"][2].get("aligned") is True
 
-    # 进攻 + ball mark with runtime shot_seen=False is 无射门, not 等AF.
+    # 进攻 in_play without AF match is 等AF (射门 is not a gate).
     no_shot_key = "score_change|m7|0-0->1-0|t7"
     _write_jsonl(
         observe,
@@ -507,11 +506,8 @@ def main() -> int:
     _write_jsonl(quotes, [])
     snap7 = board.build_goals_payload(limit=50)
     no_shot = next(g for g in snap7["goals"] if g["event_key"] == no_shot_key)
-    assert no_shot["verdict"] == "wait_shot", no_shot["verdict"]
-    assert no_shot["shot_seen"] is False
+    assert no_shot["verdict"] == "wait_af", no_shot["verdict"]
     assert no_shot["frames"][0].get("aligned") is False
-    assert no_shot["frames"][0].get("shot_this_frame") is False
-    assert no_shot["frames"][0].get("shot_latched") is False
 
     # Last in_play after a real 射门 latch (AF not green) is 等AF.
     mixed_key = "score_change|m8|0-0->1-0|t8"
@@ -561,7 +557,58 @@ def main() -> int:
     assert mixed["frames"][0].get("aligned") is False
     assert mixed["frames"][1].get("aligned") is False
 
-    print("ok: pitch-gate board verdicts match DOM∧AF∧射门 / AF flatten")
+    # AF already matched, then after_buy stopped polls; later in_play must
+    # not stay 等AF (Verdy 0-2 / Urawa 1-2 Grade A trail).
+    latch_key = "score_change|m9|0-1->0-2|t9"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": latch_key,
+                "match_id": "m9",
+                "home": "Tōkyō Verdy",
+                "away": "Kashima Antlers",
+                "home_score": 0,
+                "away_score": 2,
+                "sample_i": 0,
+                "elapsed_s": 35,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "unclear"},
+                "af": {"ok": True, "score_match": True, "af_score": "0-2"},
+                "dom_state": {"pop_box": "射门", "marks": ["ball", "net"]},
+                "shot_seen": True,
+                "shot_this_frame": True,
+            },
+            {
+                "event_key": latch_key,
+                "match_id": "m9",
+                "home": "Tōkyō Verdy",
+                "away": "Kashima Antlers",
+                "home_score": 0,
+                "away_score": 2,
+                "sample_i": 1,
+                "elapsed_s": 80,
+                "ok": True,
+                "gate": True,
+                "judge": {"play_state": "in_play"},
+                "af": {
+                    "ok": None,
+                    "score_match": None,
+                    "skipped": "after_buy",
+                    "error": "af_stopped_after_buy",
+                },
+                "dom_state": {"pop_box": "进攻", "marks": ["possession-rect"]},
+                "shot_seen": True,
+                "shot_this_frame": False,
+            },
+        ],
+    )
+    snap9 = board.build_goals_payload(limit=50)
+    latched = next(g for g in snap9["goals"] if g["event_key"] == latch_key)
+    assert latched["verdict"] == "aligned_buy", latched["verdict"]
+
+    print("ok: pitch-gate board verdicts match DOM∧AF / AF flatten")
     return 0
 
 

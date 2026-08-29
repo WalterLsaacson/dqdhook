@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pitch Gate Board: DOM∧AF∧射门 buy and AF-only flatten trails (no screenshots)."""
+"""Pitch Gate Board: DOM∧AF buy and AF-only flatten trails (no screenshots)."""
 
 from __future__ import annotations
 
@@ -255,19 +255,14 @@ def _frame_shot_latched(frame: dict[str, Any]) -> bool:
 
 
 def _frame_dom_af_green(frame: dict[str, Any]) -> bool:
-    return _frame_dom_in_play(frame) and _frame_af(frame).get("score_match") is True
+    af = _frame_af(frame)
+    af_green = af.get("score_match") is True or af.get("latched") is True
+    return _frame_dom_in_play(frame) and af_green
 
 
 def _frame_aligned_buy(frame: dict[str, Any], *, shot_seen: bool | None = None) -> bool:
-    """Same-tick DOM in_play ∧ AF score_match ∧ latched 射门.
-
-    ``shot_seen`` must reflect this frame's latch state (or earlier). Never pass a
-    goal-wide flag that includes *future* shot frames — that back-dates
-    ``aligned @ t+…`` before 射门 actually appeared.
-    """
-    latched = _frame_shot_latched(frame) if shot_seen is None else bool(shot_seen)
-    if not latched:
-        return False
+    """Same-tick DOM in_play ∧ AF score_match. 射门 is not a buy gate."""
+    del shot_seen
     return _frame_dom_af_green(frame)
 
 
@@ -280,10 +275,8 @@ def _frame_or_flatten(frame: dict[str, Any]) -> bool:
 def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None) -> str:
     """Aggregate badge for a buy-side goal (not a reversal-observe row).
 
-    Walk the timeline and keep the *last* in_play wait state. A later 射门 must
-    not rewrite earlier ticks as aligned, but it *does* move the goal pill from
-    无射门 → 等AF. Goal-wide ``any(shot)`` must not dump every 进攻-with-ball
-    timeout into 等AF.
+    Walk the timeline and keep the *last* in_play wait. AND is DOM in_play ∧
+    AF; 射门 is display-only and must not hold the pill on 无射门.
     """
     mode = str(quote_mode or "")
     if mode == "pitch_gate_confirmed":
@@ -309,9 +302,16 @@ def _goal_verdict(frames: list[dict[str, Any]], *, quote_mode: str | None = None
             last_wait = None
             continue
         if _frame_dom_in_play(f):
-            last_wait = "wait_af" if _frame_shot_latched(f) else "wait_shot"
+            last_wait = "wait_af"
 
     if saw_aligned:
+        return "aligned_buy"
+    if any(
+        isinstance(f.get("af"), dict) and f["af"].get("skipped") == "after_buy"
+        for f in frames
+    ):
+        # Runtime stopped AF after a buy (including historical Grade A).
+        # Later in_play ticks have no AF sidecar, which must not become 等AF.
         return "aligned_buy"
     if saw_var:
         return "var_veto"

@@ -1,13 +1,17 @@
-"""Pitch-gate: DOM ``in_play`` ∧ AF ``score_match`` ∧ 射门 only.
+"""Pitch-gate: DOM ``in_play`` ∧ AF ``score_match`` only.
 
-Buy path samples DOM every 5s from +0s. AF starts after 射门∧``in_play``.
-Buy only on same-tick DOM ``in_play`` ∧ AF ``ok && score_match`` ∧ latched
-射门. Odds Grade A is observe-only: it does not arm AF, skip ``in_play``,
-or stand in for an unresolved AF fixture.
+Buy path samples DOM every 5s from +0s after a DQD goal. AF starts on
+the first ``in_play`` tick (same frame) and keeps polling each later
+``in_play`` tick until AND buy. Celebration / ``unclear`` does not ask
+AF. Buy is same-tick DOM ``in_play`` ∧ AF ``ok && score_match`` (or a
+latch from an earlier ``in_play`` poll of this goal). A later AF
+mismatch clears the latch. 射门 is observe-only on the board, not a
+gate. Odds Grade A is observe-only.
 
-VAR before buy still vetoes. Buy stops AF; DOM keeps sampling until timeout.
+VAR before buy still vetoes. Only an AND buy stops AF; DOM keeps
+sampling until timeout. AF match alone must not stop subsequent polls.
 
-Flatten (reversal) trails poll AF from t0 with no shot gate. DOM is still
+Flatten (reversal) trails poll AF from t0 with no in_play gate. DOM is still
 sampled for the board, but flatten waits for AF ``ok && score_match`` vs the
 post-reverse score, then **stops the 5s trail immediately**. Stale/celebration
 center-box matches do not sell.
@@ -128,7 +132,7 @@ class _GateSession:
     confirm_streak: int = 0
     var_seen: bool = False
     observe_only: bool = False
-    af_armed: bool = False
+    af_matched: bool = False
     in_play_seen: bool = False
     shot_seen: bool = False
     grade_a_seen: bool = False
@@ -380,8 +384,9 @@ class PitchGateCoordinator:
             "reversal trail; flatten on AF score_match then stop (no 120s DOM drag)"
             if session.observe_only
             else (
-                f"AND in_play∧AF∧射门 only; Odds Grade A observe-only; "
-                f"VAR→no buy; buy → stop AF, DOM until {GATE_TIMEOUT_S:g}s"
+                f"AND in_play∧AF only; AF from first in_play tick; "
+                f"Odds Grade A observe-only; VAR→no buy; AND buy → stop AF, "
+                f"DOM until {GATE_TIMEOUT_S:g}s"
             )
         )
         print(
@@ -509,7 +514,7 @@ class PitchGateCoordinator:
         elapsed_s: float,
         sample_i: int,
         af_row: dict[str, Any] | None = None,
-        reason: str = "dom_in_play_and_af_score_match_and_shot",
+        reason: str = "dom_in_play_and_af_score_match",
     ) -> bool:
         """Queue a one-shot buy. Caller keeps the DOM trail until timeout."""
         with self._lock:
@@ -626,13 +631,33 @@ class PitchGateCoordinator:
             )
 
     @staticmethod
-    def _af_open(session: _GateSession) -> bool:
-        """AF costs quota. Armed by 射门∧in_play; flatten keeps AF."""
+    def _af_open(session: _GateSession, play_state: str) -> bool:
+        """AF costs quota. Buy path polls only on this tick's ``in_play``.
+
+        Flatten trails poll from t0. Do not stop after the first
+        ``score_match``. Only AND buy / VAR close the quota.
+        """
         if session.observe_only:
             return True
         if session.buy_emitted or session.var_seen:
             return False
-        return bool(session.af_armed)
+        return play_state == "in_play"
+
+    @staticmethod
+    def _note_af_poll(
+        session: _GateSession,
+        af_row: dict[str, Any] | None,
+        *,
+        af_ok: bool,
+    ) -> None:
+        """Latch AF confirm for this goal; a hard mismatch clears it."""
+        if not af_row:
+            return
+        if af_ok:
+            session.af_matched = True
+            return
+        if af_row.get("ok") is True and af_row.get("score_match") is False:
+            session.af_matched = False
 
     @staticmethod
     def _timeout_reason(session: _GateSession, captured: int) -> str:
@@ -640,8 +665,6 @@ class PitchGateCoordinator:
             return "pitch_gate_timeout"
         if not session.in_play_seen:
             return f"never_in_play_in_{captured}_frames"
-        if not session.shot_seen:
-            return f"no_shot_in_{captured}_frames"
         return f"no_aligned_buy_in_{captured}_frames"
 
     def _sample_af(
@@ -751,6 +774,7 @@ class PitchGateCoordinator:
                 "score_match": af_row.get("score_match"),
                 "af_score": af_row.get("af_score"),
                 "error": af_row.get("error"),
+                "latched": bool(session.af_matched),
             }
             return
         if session.buy_emitted:
@@ -778,8 +802,8 @@ class PitchGateCoordinator:
             row["af"] = {
                 "ok": None,
                 "score_match": None,
-                "skipped": "before_shot",
-                "error": "af_skipped_before_shot",
+                "skipped": "no_observer",
+                "error": "af_observer_missing",
             }
 
     def _emit_aligned_and(
@@ -794,7 +818,7 @@ class PitchGateCoordinator:
         if session.cancel.is_set():
             return False
         need = max(1, int(GATE_CONFIRM_FRAMES))
-        if reason == "dom_in_play_and_af_score_match_and_shot":
+        if reason == "dom_in_play_and_af_score_match":
             session.confirm_streak += 1
             if session.confirm_streak < need:
                 print(
@@ -1025,13 +1049,6 @@ class PitchGateCoordinator:
                             flush=True,
                         )
                     session.var_seen = True
-                if (
-                    not session.observe_only
-                    and play_state == "in_play"
-                    and session.shot_seen
-                    and not session.var_seen
-                ):
-                    session.af_armed = True
 
                 odds_holder: dict[str, Any] = {}
                 odds_thread = self._kick_odds(
@@ -1042,7 +1059,7 @@ class PitchGateCoordinator:
                 )
 
                 af_row = None
-                if self._af_open(session):
+                if self._af_open(session, play_state):
                     af_row = self._sample_af(
                         session, sample_i=sample_i, elapsed_s=round(elapsed, 3)
                     )
@@ -1052,6 +1069,8 @@ class PitchGateCoordinator:
                 af_ok = bool(
                     af_row and af_row.get("ok") and af_row.get("score_match") is True
                 )
+                self._note_af_poll(session, af_row, af_ok=af_ok)
+                af_ready = af_ok or bool(session.af_matched)
 
                 if session.observe_only:
                     # Unlike buy (DOM continues to timeout), AF confirm
@@ -1098,15 +1117,14 @@ class PitchGateCoordinator:
                     if (
                         has_reading
                         and play_state == "in_play"
-                        and session.shot_seen
-                        and af_ok
+                        and af_ready
                     ):
                         bought = self._emit_aligned_and(
                             session,
                             judge=judged,
                             sample_i=sample_i,
                             af_row=af_row,
-                            reason="dom_in_play_and_af_score_match_and_shot",
+                            reason="dom_in_play_and_af_score_match",
                         )
                     if not bought and not session.buy_emitted:
                         odds_thread.join(
@@ -1115,20 +1133,13 @@ class PitchGateCoordinator:
                     if not bought and has_reading and play_state == "in_play":
                         if session.var_seen:
                             session.confirm_streak = 0
-                        elif not session.shot_seen:
-                            print(
-                                f"pitch-gate → WAIT_SHOT match_id={session.match_id} "
-                                f"key={session.event_key} sample={sample_i} "
-                                f"(in_play, no 射门 yet; AF not armed)",
-                                flush=True,
-                            )
-                            session.confirm_streak = 0
-                        elif session.shot_seen and not af_ok:
+                        elif not af_ready:
                             print(
                                 f"pitch-gate → WAIT_AF match_id={session.match_id} "
                                 f"key={session.event_key} sample={sample_i} "
                                 f"af_ok={bool(af_row and af_row.get('ok'))} "
                                 f"score_match={(af_row or {}).get('score_match')} "
+                                f"latched={session.af_matched} "
                                 f"err={(af_row or {}).get('error')}",
                                 flush=True,
                             )

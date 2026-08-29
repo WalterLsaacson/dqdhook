@@ -69,8 +69,8 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**射门 latch 且本拍 `in_play` 才打 AF**，直到 **120s** |
-| 买条件 | **同帧** DOM `in_play` ∧ AF ∧ 射门。Odds Grade A **只观察、不下单** |
+| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**本拍 `in_play` 才同帧打 AF**，直到 **120s** |
+| 买条件 | **同帧** DOM `in_play` ∧ AF。射门不卡买入。Odds Grade A **只观察、不下单** |
 | 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s** |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
@@ -95,7 +95,7 @@
 
 **门控买入条件（仅 AND）：**
 
-- **AND**：DOM 进行中关键词 + 比分=期望 + 时钟在走 + 从未 VAR + 同拍 AF `ok && score_match` + 本球见过射门  
+- **AND**：DOM 进行中关键词 + 比分=期望 + 时钟在走 + 从未 VAR + 同拍 AF `ok && score_match`  
 
 Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比分。  
 
@@ -289,7 +289,7 @@ DQD 侧的 `ssl.SSLEOFError` traceback 不致命，bridge 线程会在 15s 后�
 3. **已成交的买无法靠 cancel 撤回**：同 tick 内未 drain 的 `in_play` 会被 `cancel_match` 转为 `buy_revoked`；若上一 tick 已 FAK，只能靠保护窗口平仓。  
 4. **VAR 依赖动画文案**：纳米不渲染 `VAR` 就不会 `var_veto`；买入之后出现的 VAR 本身不触发平仓，要等懂球帝真正回撤。  
 5. **DOM 结构依赖**：`.pop-box` / `.center-box` 是纳米前端的私有实现，改名会让门控读不到文本 → `unclear` → 停止下单（安全方向，但会静默停交易）。  
-6. **单帧 AND 更严**：DOM `in_play` 单独不够，还要同拍 AF 认分，且 t0 起见过射门；AF 限流或无射门会推迟/取消买入。  
+6. **单帧 AND 更严**：DOM `in_play` 单独不够，还要同拍 AF 认分；AF 限流会推迟/取消买入。  
 7. **动画源是第三方且非公开接口**：纳米改动 URL 形态或页面结构会让门控退化为「读不到合格状态 → 超时不下单」（安全方向，但会静默停止交易）。同理 `animation_live` 缺失的场次（友谊赛、业余级别）没有门控能力。  
 8. **卡死页面只能靠时钟识别**：判定要求 `.center-box` 时钟相对上次读数有推进，开页时会先取一次基线，所以第 0 帧也受保护。但若纳米某天不渲染时钟，这层保护会静默失效（比分相符仍是主要防线）。  
 
