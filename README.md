@@ -58,7 +58,7 @@
 3. **配对**：英队名 + 北京开球时间模糊匹配（`min_score` / `min_side` / 联赛别名等，见 `match-bridge`）。未配对场次**不会**进门控下单。
 4. Bridge 产出事件：
    - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**
-   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s AF∨DOM 观察，首拍认回撤比分再 flatten
+   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten
    - `match_finished`（`period` 切入 `FT`）→ **立刻询价下单**（不过门控）
 5. 加时中（DQD 仍在踢、`minute>90` 且 `injury_time==0`）的比分抖动**不发事件**，避免误触发。
 
@@ -69,12 +69,12 @@
 | 步骤 | 行为 |
 |---|---|
 | 启动 | `PitchGateCoordinator.start_gate`；**此时不下单** |
-| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**射门 latch 且本拍 `in_play` 才打 AF**，之后同拍 AF+DOM（+ Odds 观察），直到 **120s** |
-| 买条件 | **同帧** DOM `in_play` **且** AF `ok && score_match` **且** 本球从 t0 起见过射门（pop「射门」或 `ball`/`net`） |
-| 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s**。询价/挂 rest 不再堵住下一场开 DOM。 |
+| 采样 | 进球后 **+0s** 起每 **5s** 先采 DOM；**射门 latch 且本拍 `in_play` 才打 AF**，直到 **120s** |
+| 买条件 | **同帧** DOM `in_play` ∧ AF ∧ 射门。Odds Grade A **只观察、不下单** |
+| 下单 | watch tick **入队** CLOB worker（`trade_context.pitch_gate=true`），**每球最多一刀**；买完 **停 AF**（省额度），**DOM 继续抓到 120s** |
 | VAR | 任一拍判为 **VAR** → 该球 **永久不下单**（`pitch_gate_var_veto`） |
 | 超时 | 120s 内未对齐 → `pitch_gate_timeout`，不买 |
-| 回撤 | 取消进球会话；**已有仓**才开 5s AF∨DOM；某一拍 AF 或 DOM `score_match`（回撤后比分）→ flatten 并**立刻停轨**；两边都不认 → **持仓** |
+| 回撤 | 取消进球会话；**已有仓**才开 5s AF+DOM 观察；某一拍 **AF `score_match`**（回撤后比分）→ flatten 并**立刻停轨**；AF 不认 → **持仓** |
 
 买入侧 **AF∨DOM 或门否决、不实现**（见 `design-af-dom-or-gate.md`）。
 
@@ -93,13 +93,11 @@
 - 15s（`QUOTE_DOM_OPEN_TIMEOUT_S`）内找不到动画 → `unavailable`，不下单。
 - 不截图、不写 JPEG、不跑 OCR。
 
-**门控买入条件（须同时满足）：**
+**门控买入条件（仅 AND）：**
 
-- DOM 状态文本命中「进行中」类关键词（进攻 / 控球 / 任意球等），且非 VAR/换人/庆祝等停止态  
-- 底部比分 = 该球期望比分（Polymarket 主客；若懂球帝/纳米主客对调，按 `sides_swapped` 再和动画比分条比）  
-- 页面时钟相对上一次读数**有推进**  
-- 本会话**从未**出现过 VAR  
-- **同一拍** AF `ok && score_match`  
+- **AND**：DOM 进行中关键词 + 比分=期望 + 时钟在走 + 从未 VAR + 同拍 AF `ok && score_match` + 本球见过射门  
+
+Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比分。  
 
 **明确不下单的情况：**
 
@@ -114,7 +112,7 @@
 | 抓帧中出现 VAR | `var_veto`，该球不买 |
 | 开场球刚被同一过渡回撤过，或开场球时钟 ≥90′ | `pitch_gate_reversal_risk_skip`，不开闸（约 35′ 普通开场球仍买） |
 | 懂球帝回撤该球（买入前） | 取消门控 + 撤销未 drain 的买信号 |
-| 懂球帝回撤该球（已有仓） | 5s AF∨DOM 认回撤比分才 flatten，**认分后立刻停轨**；120s 都不认 → 持仓 |
+| 懂球帝回撤该球（已有仓） | 5s 轨等 **AF 认回撤比分**才 flatten，**认分后立刻停轨**；120s 不认 → 持仓 |
 | 动画已改比分、随后 DQD 才长延迟回撤 | 买入时无法预知；出口靠回撤后再开 5s 轨 |
 | VAR 出现在**已经下单之后** | 拦不住该刀（除非随后 DQD 回撤且 AF/DOM 认分）
 
@@ -126,12 +124,12 @@
 
 ### 4. 回撤、买后保护与持仓
 
-懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开 5s AF∨DOM 确认轨：某一拍 AF **或** DOM **比分条**对齐（回撤后比分，不要求 `in_play`，庆祝/VAR/卡死时钟仍认）→ flatten，**不受** 300s 保护窗限制，并**立刻停 AF+DOM**（与买入后 DOM 拖到 120s 不同）。AF 单独报错不平仓。动画页打不开仍继续采 AF。120s 两边都不认 → **持仓**。未买入的回撤只取消门控。
+懂球帝回撤是**触发器**，不是立刻 flatten。已有仓才开 5s AF+DOM 确认轨：某一拍 **AF `ok && score_match`**（回撤后比分）→ flatten，**不受** 300s 保护窗限制，并**立刻停 AF+DOM**（与买入后 DOM 拖到 120s 不同）。DOM 中心比分（庆祝/VAR/僵死时钟）只记观察，**不单独卖出**。AF 报错或比分仍是进球前 → 不平仓。动画页打不开仍继续采 AF。120s AF 不认 → **持仓**。未买入的回撤只取消门控。
 
 | 动作 | 行为 |
 |---|---|
 | DQD 回撤 | 取消 **rest** + **进行中的进球 pitch-gate** + 撤销未 drain 的买信号 |
-| 已有仓 | 新开 5s AF+DOM+Odds；AF∨DOM 认回撤比分 → flatten → **停轨**；超时持仓 |
+| 已有仓 | 新开 5s AF+DOM+Odds；**AF 认回撤比分** → flatten → **停轨**；超时持仓 |
 | 无仓 | 只取消门控，不开确认轨 |
 | 未确认的回撤 / FT 持仓 | 仍受 `QUOTE_GATE_PROTECT_S`（默认 300s）；超窗或 `=0` 等终场 `ft_reversal_vs_entry` |
 | 同场新进球 | 取消该场先前未完成的门控会话（`superseded_by_new_goal`） |
@@ -149,8 +147,8 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 3. **只交易 `buy_win`**（买已锁定为 WIN 的一侧）；`sell_lose` 已关闭。  
 4. CLOB：`POST /books` 批量吃盘；默认 **`walk`** 深度（受 `max_levels` / `max_usdc` / `max_shares` / `max_slippage` 约束），FAK 市价。  
 5. 手续费模型：`fee ≈ feeRate × p × (1−p)`（默认 `feeRate=0.05`）；需 `net_edge ≥ min_net`（默认约 0.00475，对应 ask≤0.995）才算 misprice。  
-6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_MAX_USDC` / fee / `min_net` 约束。  
-7. 极端价（≤0.01 或 >0.995）默认跳过，除非 `--allow-extreme-prices`。  
+6. **门控确认单和终场**都跳过 `min_buy_price`（默认 0.6）；门控还跳过部分 $1 尺寸地板。仍受 `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` / fee / `min_net` 约束。  
+7. 极端价（≤0.01 或 >0.995）默认跳过，除非 `--allow-extreme-prices`。**例外：** 终场已锁定 `WIN`、ask≤0.01 仍 FAK（`QUOTE_FT_DUST_FAK`，默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受开仓剩余额度限制；max_price 卡在足球 tick **0.01**，不把 0.001 幽灵墙当成可吃深度；没吃到不记仓。进球门控仍跳过 ≤0.01。  
 
 **涵盖盘口（有则报）：** 胜平负六 token、大小球（含球队/半场）、BTTS、准确比分等（见 `polymarket-quote/reference.md`）。
 
@@ -170,7 +168,7 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 | `--no-trade` | 关闭执行器 | 只询价落盘 |
 | `--goals-mode` / `--ft-mode` | `dry` \| `live` | 分通道覆盖 |
 
-硬顶（`.env` 优先）：`QUOTE_MAX_USDC`（默认 1）、`QUOTE_MAX_SHARES`（默认 25）、`QUOTE_MAX_OPEN_USDC`（默认 1000）。
+硬顶（`.env` 优先）：`QUOTE_GOAL_MAX_USDC`（比分变化，默认回落到 `QUOTE_MAX_USDC`）、`QUOTE_FT_MAX_USDC`（终场）、`QUOTE_GOAL_MAX_SHARES` / `QUOTE_FT_MAX_SHARES`、`QUOTE_MAX_OPEN_USDC`（默认 1000）。
 
 幂等：`event_key|token_id|trade`；成功 live 单重启不重复发。
 
@@ -207,7 +205,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 3. Pitch Gate（`:8791`）在进球后出现帧与 `play_state`。  
 4. `data/pm-quote/watch.log` 可见：`pitch-gate → START` → `IN_PLAY` / `ALIGNED_BUY` / `WAIT_AF` / `VAR_VETO` / `NO_ALIGNED_BUY` / `CANCEL`；回撤还有 `OBSERVE START` / `FLATTEN_OR` / `OBSERVE_COMPLETE`。  
 5. 成交写入 `data/pm-quote/trades.jsonl`（live 且成功时 `live: true`）。  
-6. 回撤立刻取消门控/rest；已有仓才开 5s AF∨DOM，认分后 flatten 并停轨，否则持仓。
+6. 回撤立刻取消门控/rest；已有仓才开 5s 观察，**AF 认分**后 flatten 并停轨，否则持仓。
 
 ---
 
@@ -222,7 +220,11 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_DOM_WARM_OPEN_TIMEOUT_S` | 预热开页上限，默认 3s（门控开页仍用 `QUOTE_DOM_OPEN_TIMEOUT_S`） |
 | `QUOTE_DOM_OPEN_TIMEOUT_S` | 打开动画页的上限，默认 15 |
 | `QUOTE_GOALS_MODE` / `QUOTE_FT_MODE` | 未设则均为 `live` |
-| `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 单笔硬顶（默认 1 / 25） |
+| `QUOTE_GOAL_MAX_USDC` / `QUOTE_GOAL_MAX_SHARES` | 比分变化 / pitch-gate 单笔硬顶；缺省回落 `QUOTE_MAX_*` |
+| `QUOTE_FT_MAX_USDC` / `QUOTE_FT_MAX_SHARES` | 终场单笔硬顶；缺省回落 `QUOTE_MAX_*`（股数默认按金额放大） |
+| `QUOTE_FT_DUST_USDC` | 终场已锁定 WIN、ask≤0.01 的 FAK 金额，默认 **100**；`0` 关闭该路径 |
+| `QUOTE_GOAL_SIZE_TIERS` / `QUOTE_FT_SIZE_TIERS` | `ask:usdc`；终场不继承进球档，避免被 $50 卡住 |
+| `QUOTE_MAX_USDC` / `QUOTE_MAX_SHARES` | 两通道都没设时的共享回落（默认 1 / 25） |
 | `QUOTE_MIN_BUY_PRICE` | 默认 0.6；**门控和终场都跳过** |
 | `QUOTE_GATE_PROTECT_S` | 门控买后保护窗口秒数，默认 300；`0` 关闭 |
 | `QUOTE_REST_ENABLED` | `1` 才挂 0.99 rest（金额 `QUOTE_REST_USDC` 默认 $5） |
@@ -330,6 +332,6 @@ data/               # 运行时快照 / jsonl（勿提交密钥与隐私）
 
 ## 安全
 
-- 默认 goals+ft 均为 **live**；进球仍须过 pitch-gate。请用小额 `QUOTE_MAX_USDC` 起步。  
+- 默认 goals+ft 均为 **live**；进球仍须过 pitch-gate。请用小额 `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` 起步。  
 - 切勿提交 `.env`、私钥、`.idea` 等。  
 - 门控依赖 `QUOTE_DQD_STREAM_OBSERVE=1`（`QUOTE_GATE_SOURCE=ocr` 时另需 `QUOTE_PITCH_STATE=1`）。  

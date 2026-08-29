@@ -130,6 +130,14 @@ def load_quote_trade_config(
     trade_env_file: str | None = None,
 ) -> dict[str, Any]:
     """Merge CLI overrides with QUOTE_* env (defaults = dry-run trade on)."""
+    env_path = Path(trade_env_file) if trade_env_file else ROOT / ".env"
+    if env_path.is_file():
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(env_path, override=False)
+        except Exception:
+            pass
     depth = (take_depth or os.getenv("QUOTE_TAKE_DEPTH") or "walk").strip().lower()
     if depth not in ("top", "walk"):
         depth = "walk"
@@ -171,6 +179,17 @@ def load_quote_trade_config(
         "max_usdc": float(
             max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "1")
         ),
+        "goal_max_usdc": float(
+            os.getenv("QUOTE_GOAL_MAX_USDC")
+            or os.getenv("QUOTE_MAX_USDC")
+            or (max_usdc if max_usdc is not None else 1)
+        ),
+        "ft_max_usdc": float(
+            os.getenv("QUOTE_FT_MAX_USDC")
+            or os.getenv("QUOTE_MAX_USDC")
+            or (max_usdc if max_usdc is not None else 1)
+        ),
+        "ft_dust_usdc": float(os.getenv("QUOTE_FT_DUST_USDC") or 100),
         "max_shares": float(
             max_shares if max_shares is not None else os.getenv("QUOTE_MAX_SHARES", "25")
         ),
@@ -460,7 +479,10 @@ def _ensure_quote() -> bool:
     print(
         "main → starting polymarket-quote watch "
         f"(trade={mode} depth={trade.get('take_depth')} "
-        f"max_usdc={trade.get('max_usdc')}) "
+        f"max_usdc={trade.get('max_usdc')} "
+        f"goals_usdc={trade.get('goal_max_usdc')} "
+        f"ft_usdc={trade.get('ft_max_usdc')} "
+        f"ft_dust_usdc={trade.get('ft_dust_usdc')}) "
         "(→ in-process match-bridge → DQD + PM · pitch-gate goals)",
         flush=True,
     )
@@ -1021,9 +1043,12 @@ def main(argv: list[str] | None = None) -> int:
         trade_label = f"goals:{t.get('goals_mode', 'dry')} ft:{t.get('ft_mode', 'dry')}"
     print(
         f"Quote trade → {trade_label} "
-        f"depth={t['take_depth']} max_usdc={t['max_usdc']} "
+        f"depth={t['take_depth']} "
+        f"goals_usdc={t.get('goal_max_usdc', t['max_usdc'])} "
+        f"ft_usdc={t.get('ft_max_usdc', t['max_usdc'])} "
+        f"ft_dust_usdc={t.get('ft_dust_usdc', 100)} "
         f"min_buy_price={t.get('min_buy_price', 0.0)} "
-        f"(pitch-gate: DOM first, AF from in_play, buy on in_play∧AF∧shot; DQD reverse → AF∨DOM flatten)",
+        f"(pitch-gate: DOM first, AF from in_play, buy on in_play∧AF∧shot; DQD reverse → AF flatten)",
         flush=True,
     )
     print("Booting skills + boards…", flush=True)

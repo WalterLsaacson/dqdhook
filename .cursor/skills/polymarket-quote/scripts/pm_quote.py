@@ -34,7 +34,7 @@ from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import (  # noqa: E402
     load_trade_settings,
     resolve_live_modes,
-    size_tiers_label,
+    size_channels_label,
 )
 
 
@@ -97,10 +97,9 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     f = "live" if settings.live_ft else "dry"
     print(
         f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
-        f"max_usdc={settings.max_usdc} max_shares={settings.max_shares} "
+        f"{size_channels_label(settings)} "
         f"min_buy_price={settings.min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
-        f"size_tiers={size_tiers_label(settings)} "
         f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF → enqueue CLOB worker; stop AF, DOM to timeout)",
         file=sys.stderr,
         flush=True,
@@ -339,7 +338,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         book_obs.start()
         print(
             f"odds observe → {lib.data_dir(rt) / 'book_context_observe.jsonl'} "
-            f"(same DOM clock · grade A/B/C · no size)",
+            f"(same DOM clock · Grade A/B/C observe-only · no buy)",
             file=sys.stderr,
             flush=True,
         )

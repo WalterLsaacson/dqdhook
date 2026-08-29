@@ -10,7 +10,13 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from trade_executor import TradeExecutor, signal_from_event_key  # noqa: E402
+from fill_planner import FillPlan  # noqa: E402
+from trade_executor import (  # noqa: E402
+    TradeExecutor,
+    apply_ft_dust_fak_plan,
+    clip_ft_dust_usdc,
+    signal_from_event_key,
+)
 from trade_settings import resolve_live_modes, TradeSettings  # noqa: E402
 
 
@@ -135,6 +141,104 @@ def main() -> int:
         assert ex._min_buy_price_blocked(0.59) is not None
         assert ex._min_buy_price_blocked(0.6) is None
         assert "buy_price_below_min" in (ex._min_buy_price_blocked(0.5) or "")
+
+        win = {"settlement": "WIN", "locked": True, "trade": "buy_win"}
+        assert (
+            ex._extreme_price_blocked(
+                0.001,
+                quote=win,
+                trade="buy_win",
+                event_type="match_finished",
+            )
+            is None
+        )
+        assert (
+            ex._extreme_price_blocked(
+                0.01,
+                quote=win,
+                trade="buy_win",
+                event_type="match_finished",
+            )
+            is None
+        )
+        # Goals / pitch-gate still skip dust asks.
+        assert ex._extreme_price_blocked(
+            0.001, quote=win, trade="buy_win", event_type="score_change"
+        )
+        assert ex._extreme_price_blocked(
+            0.001,
+            quote=win,
+            trade="buy_win",
+            event_type="match_finished",
+            match_meta={"trade_context": {"pitch_gate": True}},
+        )
+        assert ex._extreme_price_blocked(0.001, quote=win, trade="buy_win")
+        assert ex._extreme_price_blocked(
+            0.996, quote=win, trade="buy_win", event_type="match_finished"
+        )
+        dust = apply_ft_dust_fak_plan(
+            FillPlan(
+                trade="buy_win",
+                side="BUY",
+                take_depth="walk",
+                order_type="FAK",
+                shares=2000.0,
+                usdc=2.0,
+                worst_price=0.001,
+                levels_used=1,
+                levels=[{"price": 0.001, "size": 136000}],
+            ),
+            max_usdc=300.0,
+        )
+        assert dust.take_depth == "dust_fak"
+        assert abs(dust.usdc - 300.0) < 1e-9
+        assert abs(dust.worst_price - 0.01) < 1e-12
+        assert dust.shares > 2000.0
+        assert abs(clip_ft_dust_usdc(dust_cap=100.0, remaining_open=100000) - 100.0) < 1e-9
+        assert abs(clip_ft_dust_usdc(dust_cap=100.0, remaining_open=40.0) - 40.0) < 1e-9
+        assert abs(clip_ft_dust_usdc(dust_cap=100.0, remaining_open=None) - 100.0) < 1e-9
+        ex.settings = replace(ex.settings, ft_dust_usdc=0.0)
+        assert ex._extreme_price_blocked(
+            0.001, quote=win, trade="buy_win", event_type="match_finished"
+        )
+        ex.settings = replace(ex.settings, ft_dust_usdc=100.0)
+        hundred = apply_ft_dust_fak_plan(dust, max_usdc=100.0)
+        assert abs(hundred.usdc - 100.0) < 1e-9
+
+    s_sz = TradeSettings(
+        private_key="",
+        funder=None,
+        signature_type=2,
+        chain_id=137,
+        clob_host="https://clob.polymarket.com",
+        data_api_url="https://data-api.polymarket.com",
+        live_goals=True,
+        live_ft=True,
+        take_depth="top",
+        max_levels=5,
+        max_usdc=50.0,
+        max_shares=150.0,
+        max_slippage=0.03,
+        allow_extreme_prices=False,
+        min_buy_price=0.0,
+        min_order_shares=0.0,
+        enabled=True,
+        size_tiers=((0.98, 50.0),),
+        max_open_usdc=1000.0,
+        size_floor_usdc=1.0,
+        goal_max_usdc=50.0,
+        ft_max_usdc=300.0,
+        goal_max_shares=150.0,
+        ft_max_shares=2000.0,
+        goal_size_tiers=((0.98, 50.0),),
+        ft_size_tiers=((0.98, 300.0),),
+    )
+    g_u, g_sh, g_t = s_sz.caps_for_buy(event_type="score_change", pitch_gate=True)
+    f_u, f_sh, f_t = s_sz.caps_for_buy(event_type="match_finished")
+    assert g_u == 50.0 and g_t == ((0.98, 50.0),), (g_u, g_t)
+    assert f_u == 300.0 and f_t == ((0.98, 300.0),), (f_u, f_t)
+    assert f_sh == 2000.0 and g_sh == 150.0
+    assert abs(s_sz.ft_dust_usdc - 100.0) < 1e-9
 
     print("ok: split goals/ft trade modes")
     return 0

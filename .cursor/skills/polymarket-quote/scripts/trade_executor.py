@@ -78,6 +78,11 @@ FLATTEN_ORDER_MAX_WAIT_S = 60.0
 # storm while waiting for the exchange's balance/order views to converge.
 FLATTEN_ORDER_RECHECK_INTERVAL_S = 2.0
 REST_ORDER_RECHECK_INTERVAL_S = 2.0
+# Soccer CLOB min tick. FT locked-WIN dust books often show 0.001 ghosts;
+# FAK max_price is this tick so unmatched USDC is not spent.
+FT_DUST_FAK_MAX_ASK = 0.01
+FT_DUST_FAK_DEPTH = "dust_fak"
+DEFAULT_FT_DUST_USDC = 100.0
 CUSHION_REST_USDC = 1.0
 CUSHION_REST_PRICES = (0.995,)
 # Keep pending_reason bounded (append loops used to grow to 80KB+).
@@ -217,7 +222,18 @@ def actual_matched_buy_plan(plan: FillPlan, response: Any) -> FillPlan:
     except (TypeError, ValueError):
         return plan
     if shares <= 0.0 or usdc <= 0.0:
-        return plan
+        return FillPlan(
+            trade=plan.trade,
+            side=plan.side,
+            take_depth=plan.take_depth,
+            order_type=plan.order_type,
+            shares=0.0,
+            usdc=0.0,
+            worst_price=plan.worst_price,
+            levels_used=plan.levels_used,
+            levels=list(plan.levels),
+            skip_reason="fak_unmatched",
+        )
     return FillPlan(
         trade=plan.trade,
         side=plan.side,
@@ -230,6 +246,37 @@ def actual_matched_buy_plan(plan: FillPlan, response: Any) -> FillPlan:
         levels=list(plan.levels),
         skip_reason=plan.skip_reason,
     )
+
+
+def apply_ft_dust_fak_plan(plan: FillPlan, *, max_usdc: float) -> FillPlan:
+    """FAK USDC at soccer tick 0.01. Do not size off a 0.001 ghost wall."""
+    px = float(FT_DUST_FAK_MAX_ASK)
+    usdc = max(0.0, float(max_usdc))
+    shares = round(usdc / px, 6) if px > 0 else 0.0
+    return FillPlan(
+        trade=plan.trade or "buy_win",
+        side="BUY",
+        take_depth=FT_DUST_FAK_DEPTH,
+        order_type="FAK",
+        shares=shares,
+        usdc=round(usdc, 6),
+        worst_price=px,
+        levels_used=1,
+        levels=[{"price": px, "size": shares, "note": FT_DUST_FAK_DEPTH}],
+        skip_reason=None,
+    )
+
+
+def clip_ft_dust_usdc(*, dust_cap: float, remaining_open: float | None) -> float:
+    """Independent dust notional; still clipped by leftover QUOTE_MAX_OPEN_USDC."""
+    cap = max(0.0, float(dust_cap))
+    if remaining_open is None:
+        return cap
+    try:
+        left = float(remaining_open)
+    except (TypeError, ValueError):
+        return cap
+    return max(0.0, min(cap, left))
 
 
 def floor_shares(shares: Decimal | float | str, *, decimals: int = FLATTEN_SHARE_DECIMALS) -> Decimal:
@@ -722,10 +769,60 @@ class TradeExecutor:
             self.trader.initialize()
         return self.trader
 
-    def _extreme_price_blocked(self, price: float | None) -> str | None:
+    def _ft_dust_fak_eligible(
+        self,
+        quote: dict[str, Any],
+        *,
+        price: float | None,
+        trade: str,
+        match_meta: dict[str, Any] | None = None,
+        event_key: str = "",
+        event_type: str = "",
+    ) -> bool:
+        """FT locked WIN with a ≤0.01 ask: try FAK; unmatched remainder is not spent."""
+        if not bool(getattr(self.settings, "ft_dust_fak", True)):
+            return False
+        if float(getattr(self.settings, "ft_dust_usdc", DEFAULT_FT_DUST_USDC) or 0) <= 0:
+            return False
+        if trade != "buy_win":
+            return False
+        if _trade_context_pitch_gate(match_meta):
+            return False
+        typ = self._resolve_event_type(
+            event_type=event_type, event_key=event_key, match_meta=match_meta
+        )
+        if typ != "match_finished":
+            return False
+        if str(quote.get("settlement") or "").upper() != "WIN":
+            return False
+        if quote.get("locked") is False:
+            return False
+        if price is None:
+            return False
+        return price <= FT_DUST_FAK_MAX_ASK + 1e-12
+
+    def _extreme_price_blocked(
+        self,
+        price: float | None,
+        *,
+        quote: dict[str, Any] | None = None,
+        trade: str = "",
+        match_meta: dict[str, Any] | None = None,
+        event_key: str = "",
+        event_type: str = "",
+    ) -> str | None:
         if self.settings.allow_extreme_prices or price is None:
             return None
         if price <= 0.01 + 1e-12:
+            if self._ft_dust_fak_eligible(
+                quote or {},
+                price=price,
+                trade=trade,
+                match_meta=match_meta,
+                event_key=event_key,
+                event_type=event_type,
+            ):
+                return None
             return f"extreme_price={price} (<=0.01)"
         # Cap aligned with quote_lib.DEFAULT_MAX_BUY_ASK (ask≤0.995).
         max_ask = float(getattr(lib, "DEFAULT_MAX_BUY_ASK", 0.995))
@@ -1638,7 +1735,14 @@ class TradeExecutor:
             ref_f = float(ref_price) if ref_price is not None else None
         except (TypeError, ValueError):
             ref_f = None
-        extreme = self._extreme_price_blocked(ref_f)
+        extreme = self._extreme_price_blocked(
+            ref_f,
+            quote=quote,
+            trade=trade,
+            match_meta=match_meta,
+            event_key=event_key,
+            event_type=typ,
+        )
         if extreme:
             row = self._record(
                 quote,
@@ -1719,28 +1823,35 @@ class TradeExecutor:
             self._done.add(key)
             return row
 
-        max_usdc = float(self.settings.max_usdc)
-        max_shares = float(self.settings.max_shares)
+        pitch_relaxed = _trade_context_pitch_gate(match_meta)
+        chan_usdc, chan_shares, chan_tiers = self.settings.caps_for_buy(
+            event_type=typ,
+            pitch_gate=pitch_relaxed,
+        )
+        max_usdc = float(chan_usdc)
+        max_shares = float(chan_shares)
         size_meta: dict[str, Any] | None = None
         if trade == "buy_win":
             open_usdc = sum(
                 float(r.get("usdc") or 0)
                 for r in self.ledger.all_open()
             ) + self._pending_usdc_total_locked() + self.ledger.rest_reserved_usdc()
-            pitch_relaxed = _trade_context_pitch_gate(match_meta)
             floor_usdc = (
                 0.0 if pitch_relaxed else float(self.settings.size_floor_usdc)
             )
             caps = compute_buy_size_caps(
                 ref_f,
-                max_usdc=self.settings.max_usdc,
-                max_shares=self.settings.max_shares,
-                tiers=self.settings.size_tiers,
+                max_usdc=chan_usdc,
+                max_shares=chan_shares,
+                tiers=chan_tiers,
                 open_usdc=open_usdc,
                 max_open_usdc=self.settings.max_open_usdc,
                 floor_usdc=floor_usdc,
             )
             size_meta = caps.to_dict()
+            size_meta["channel"] = (
+                "ft" if typ == "match_finished" and not pitch_relaxed else "goals"
+            )
             if caps.skip_reason:
                 row = self._record(
                     quote,
@@ -1759,8 +1870,9 @@ class TradeExecutor:
             max_usdc = float(caps.max_usdc)
             max_shares = float(caps.max_shares)
             logger.info(
-                "size_policy ask=%.3f tier=%.2f eff_usdc=%.2f eff_shares=%.2f "
-                "open=%.2f remaining=%s",
+                "size_policy channel=%s ask=%.3f tier=%.2f eff_usdc=%.2f "
+                "eff_shares=%.2f open=%.2f remaining=%s",
+                "ft" if typ == "match_finished" and not pitch_relaxed else "goals",
                 caps.ask,
                 caps.tier_usdc,
                 caps.max_usdc,
@@ -1769,6 +1881,14 @@ class TradeExecutor:
                 caps.remaining_open,
             )
 
+        dust_fak = trade == "buy_win" and self._ft_dust_fak_eligible(
+            quote,
+            price=ref_f,
+            trade=trade,
+            match_meta=match_meta,
+            event_key=event_key,
+            event_type=typ,
+        )
         plan = plan_fill(
             quote,
             take_depth=self.settings.take_depth,
@@ -1779,10 +1899,37 @@ class TradeExecutor:
             min_order_shares=self.settings.min_order_shares,
             available_shares=available,
         )
+        if dust_fak:
+            remaining = None
+            if size_meta is not None and size_meta.get("remaining_open") is not None:
+                remaining = size_meta.get("remaining_open")
+            dust_usdc = clip_ft_dust_usdc(
+                dust_cap=float(
+                    getattr(self.settings, "ft_dust_usdc", DEFAULT_FT_DUST_USDC)
+                    or 0
+                ),
+                remaining_open=remaining,
+            )
+            if dust_usdc <= 1e-12:
+                plan.skip_reason = plan.skip_reason or "ft_dust_usdc_zero"
+            else:
+                # Independent of QUOTE_FT_MAX_USDC; still clipped by open budget.
+                plan = apply_ft_dust_fak_plan(plan, max_usdc=dust_usdc)
+                if size_meta is not None:
+                    size_meta["ft_dust_fak"] = True
+                    size_meta["ft_dust_usdc"] = float(dust_usdc)
+                    size_meta["max_usdc"] = float(plan.usdc)
+                    size_meta["max_shares"] = float(plan.shares)
+                logger.info(
+                    "ft_dust_fak ask=%s usdc=%.2f max_price=%.2f tick=0.01",
+                    ref_f,
+                    plan.usdc,
+                    plan.worst_price,
+                )
 
         # Marketable BUY floor is $1: bump thin-book plans up so FAK can eat
         # resting size (e.g. 0.99@$0.99) instead of CLOB rejecting $0.98.
-        # Pitch-gate path skips this floor (still capped by QUOTE_MAX_USDC).
+        # Pitch-gate path skips this floor (still capped by channel QUOTE_*_MAX_USDC).
         if (
             trade == "buy_win"
             and not _trade_context_pitch_gate(match_meta)
@@ -1833,7 +1980,7 @@ class TradeExecutor:
                 plan.take_depth,
                 typ or "?",
             )
-            if trade == "buy_win":
+            if trade == "buy_win" and str(plan.take_depth or "") != FT_DUST_FAK_DEPTH:
                 self._register_open_buy(
                     quote, plan=plan, event_key=event_key, match_meta=match_meta, live=False
                 )
@@ -1841,6 +1988,8 @@ class TradeExecutor:
 
         # Live post: reserve under the lock, HTTP happens in maybe_trade.
         tick = str(quote.get("tick_size") or "0.01") or "0.01"
+        if str(plan.take_depth or "") == FT_DUST_FAK_DEPTH:
+            tick = rest_limit_tick_size(tick)
         neg = quote.get("neg_risk")
         neg_risk = bool(neg) if neg is not None else None
         mid_live = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
@@ -1918,6 +2067,23 @@ class TradeExecutor:
                     delayed_shares,
                     plan.shares,
                 )
+            elif str(plan.take_depth or "") == FT_DUST_FAK_DEPTH:
+                ledger_plan = FillPlan(
+                    trade=plan.trade,
+                    side=plan.side,
+                    take_depth=plan.take_depth,
+                    order_type=plan.order_type,
+                    shares=0.0,
+                    usdc=0.0,
+                    worst_price=plan.worst_price,
+                    levels_used=plan.levels_used,
+                    levels=list(plan.levels),
+                    skip_reason="fak_unmatched",
+                )
+                logger.info(
+                    "ft_dust_fak unmatched token=%s… (delayed, balance 0)",
+                    str(ctx.get("token_id") or "")[:12],
+                )
             else:
                 logger.warning(
                     "delayed buy accepted but balance still 0 token=%s… "
@@ -1928,12 +2094,18 @@ class TradeExecutor:
         skip_reason = (
             f"delayed|{resp_status.lower()}" if resp_status == "DELAYED" else None
         )
+        if (
+            trade == "buy_win"
+            and float(getattr(ledger_plan, "shares", 0) or 0) <= 1e-9
+            and str(getattr(ledger_plan, "skip_reason", "") or "") == "fak_unmatched"
+        ):
+            skip_reason = "fak_unmatched"
         extra: dict[str, Any] | None = (
             {"size_policy": size_meta} if size_meta else None
         )
         if ok:
             self._done.add(key)
-            if trade == "buy_win":
+            if trade == "buy_win" and float(ledger_plan.shares or 0) > 1e-9:
                 fill_st = FILL_STATUS_OPEN
                 if resp_status == "DELAYED" and ledger_plan is plan:
                     fill_st = FILL_STATUS_PENDING
@@ -2022,7 +2194,7 @@ class TradeExecutor:
         """Flatten FT corrections, plus DQD reversals.
 
         Raw DQD reverse (default) only sells pitch-gate lots inside
-        ``QUOTE_GATE_PROTECT_S``. AF∨DOM ``flatten_or`` passes
+        ``QUOTE_GATE_PROTECT_S``. AF ``flatten_or`` passes
         ``require_protect_window=False`` so a confirmed reverse sells those
         lots regardless of age (``QUOTE_GATE_PROTECT_S=0`` still blocks the
         unconfirmed DQD path only).

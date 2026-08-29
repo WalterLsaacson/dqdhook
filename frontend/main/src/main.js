@@ -14,17 +14,21 @@ function render(st) {
   const trade = st.quote?.trade || {};
   const mode = trade.mode || "off";
   const depth = trade.take_depth || "walk";
+  const gUsdc = trade.goal_max_usdc ?? trade.max_usdc ?? "?";
+  const ftUsdc = trade.ft_max_usdc ?? trade.max_usdc ?? "?";
+  const dustUsdc = trade.ft_dust_usdc ?? 100;
+  const usdcLabel = `goals $${gUsdc} · ft $${ftUsdc} · dust $${dustUsdc}`;
   if (mode === "off") {
     $("pillTrade").textContent = "Trade off";
     $("pillTrade").className = "pill muted";
   } else if (trade.live_paused) {
-    $("pillTrade").textContent = `Trade dry (live paused) · ${depth} · $${trade.max_usdc ?? "?"}`;
+    $("pillTrade").textContent = `Trade dry (live paused) · ${depth} · ${usdcLabel}`;
     $("pillTrade").className = "pill ok";
   } else if (String(mode).includes("live") || mode === "live") {
-    $("pillTrade").textContent = `Trade ${mode} · ${depth} · $${trade.max_usdc ?? "?"}`;
+    $("pillTrade").textContent = `Trade ${mode} · ${depth} · ${usdcLabel}`;
     $("pillTrade").className = "pill ok";
   } else {
-    $("pillTrade").textContent = `Trade ${mode || "dry"} · ${depth} · $${trade.max_usdc ?? "?"}`;
+    $("pillTrade").textContent = `Trade ${mode || "dry"} · ${depth} · ${usdcLabel}`;
     $("pillTrade").className = "pill ok";
   }
 
