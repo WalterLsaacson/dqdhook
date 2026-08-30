@@ -110,6 +110,9 @@ class TradeSettings:
     locked_sweep_usdc: float = 1000.0
     # Goal +10min rescan: FAK + rest share this notional. 0 = off.
     t10_usdc: float = 0.0
+    # Periodic post-FT leftover WIN ask sweep (pm-locked-scan).
+    postft_sweep: bool = True
+    postft_sweep_usdc: float = 1000.0
 
     @property
     def live(self) -> bool:
@@ -288,6 +291,12 @@ def load_trade_settings(
             float(sweep_usdc) if sweep_usdc is not None else 1000.0
         ),
         t10_usdc=float(_t10_usdc_env()),
+        postft_sweep=_env_bool("QUOTE_POSTFT_SWEEP", True),
+        postft_sweep_usdc=(
+            float(os.getenv("QUOTE_POSTFT_SWEEP_USDC"))
+            if os.getenv("QUOTE_POSTFT_SWEEP_USDC") not in (None, "")
+            else 1000.0
+        ),
     )
 
 
@@ -303,9 +312,12 @@ def size_channels_label(settings: TradeSettings) -> str:
     sweep_u = float(getattr(settings, "locked_sweep_usdc", 1000.0) or 0)
     sweep = f"on:{sweep_u:g}" if sweep_on and sweep_u > 0 else "off"
     t10_u = float(getattr(settings, "t10_usdc", 0.0) or 0)
+    postft_on = bool(getattr(settings, "postft_sweep", True))
+    postft_u = float(getattr(settings, "postft_sweep_usdc", 1000.0) or 0)
+    postft = f"on:{postft_u:g}" if postft_on and postft_u > 0 else "off"
     return (
         f"goals_usdc={g_u:g} tiers={format_size_tiers(g_t)} "
         f"ft_usdc={f_u:g} tiers={format_size_tiers(f_t)} "
         f"ft_dust_usdc={dust:g} locked_sweep={sweep} "
-        f"t10_usdc={t10_u:g}"
+        f"t10_usdc={t10_u:g} postft_sweep={postft}"
     )

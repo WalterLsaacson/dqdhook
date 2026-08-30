@@ -300,6 +300,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
         trade_executor=executor,
         market_cache=cache,
     )
+    try:
+        from postft_sweep import start_scheduler as start_postft_sweep, stop_scheduler as stop_postft_sweep
+
+        start_postft_sweep(
+            rt,
+            executor=executor,
+            worker=clob_worker,
+            proxy=proxy,
+            stop_event=stop_warm,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"postft-sweep setup warning: {e}", file=sys.stderr, flush=True)
     retain_h = float(getattr(args, "retain_hours", data_prune.DEFAULT_RETAIN_HOURS))
     data_prune.start_pruner(
         rt,
@@ -455,6 +467,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nbye", file=sys.stderr)
         stop_warm.set()
+        try:
+            from postft_sweep import stop_scheduler as stop_postft_sweep
+
+            stop_postft_sweep()
+        except Exception:
+            pass
         stop_quote_worker()
         if lsa_obs is not None:
             lsa_obs.stop()
@@ -611,6 +629,14 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--json", action="store_true", help="Print prune report as JSON")
     prune.set_defaults(func=cmd_prune)
 
+    sweep = sub.add_parser(
+        "postft-sweep",
+        help="One-shot 24h locked-WIN leftover ask walk (FAK ≤0.995, cheapest first)",
+    )
+    _add_common_flags(sweep)
+    sweep.add_argument("--json", action="store_true")
+    sweep.set_defaults(func=cmd_postft_sweep)
+
     return p
 
 
@@ -641,6 +667,30 @@ def cmd_prune(args: argparse.Namespace) -> int:
                     f"{stats.get('bytes_before')}→{stats.get('bytes_after')} bytes",
                     flush=True,
                 )
+    return 0
+
+
+def cmd_postft_sweep(args: argparse.Namespace) -> int:
+    """Scan last 24h leftover WIN asks and walk-buy up to 0.995 (ft live/dry)."""
+    rt = root()
+    proxy = None if args.no_proxy else (args.proxy if args.proxy else ...)
+    try:
+        executor = build_executor(args, rt)
+    except Exception as e:  # noqa: BLE001
+        print(f"trade setup failed: {e}", file=sys.stderr)
+        return 1
+    from postft_sweep import run_once
+
+    summary = run_once(
+        rt,
+        executor=executor,
+        worker=None,
+        proxy=proxy,
+        progress=sys.stderr,
+    )
+    if getattr(args, "json", False):
+        json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
+        print()
     return 0
 
 

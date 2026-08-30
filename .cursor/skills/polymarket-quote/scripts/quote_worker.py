@@ -22,6 +22,7 @@ _PRIO_REST_CANCEL = 0
 _PRIO_FLATTEN = 1
 _PRIO_QUOTE = 2
 _PRIO_HOUSEKEEP = 3
+_PRIO_POSTFT = 4
 
 _active: "QuoteWorker | None" = None
 _active_lock = threading.Lock()
@@ -131,6 +132,7 @@ class QuoteWorker:
         self._thread: threading.Thread | None = None
         self._busy_kind: str | None = None
         self._housekeep_queued = False
+        self._urgent = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -202,6 +204,7 @@ class QuoteWorker:
                 self._in_flight.add(key)
             if mid and key:
                 self._quote_keys_by_match.setdefault(mid, set()).add(key)
+            self._urgent += 1
         self._put(
             _PRIO_QUOTE,
             {
@@ -220,6 +223,8 @@ class QuoteWorker:
         event_key: str,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        with self._lock:
+            self._urgent += 1
         self._put(
             _PRIO_FLATTEN,
             {
@@ -231,11 +236,35 @@ class QuoteWorker:
             },
         )
 
+    def submit_postft(
+        self,
+        quote: dict[str, Any],
+        *,
+        event_key: str,
+        match_meta: dict[str, Any] | None = None,
+    ) -> None:
+        """Low-priority leftover WIN FAK; does not jump pitch-gate quotes."""
+        key = str(event_key or "").strip()
+        mid = str((match_meta or {}).get("match_id") or "")
+        self._put(
+            _PRIO_POSTFT,
+            {
+                "kind": "postft",
+                "quote": dict(quote),
+                "event_key": key,
+                "match_id": mid,
+                "match_meta": dict(match_meta or {}),
+                "ev": {},
+            },
+        )
+
     def submit_rest_cancel(self, match_id: str, *, reason: str) -> None:
         mid = str(match_id or "").strip()
         if not mid:
             return
         self.revoke_submitted_quotes(mid)
+        with self._lock:
+            self._urgent += 1
         self._put(
             _PRIO_REST_CANCEL,
             {
@@ -246,6 +275,14 @@ class QuoteWorker:
                 "reason": str(reason or "cancel"),
             },
         )
+
+    def urgent_pending(self) -> bool:
+        with self._lock:
+            return self._urgent > 0
+
+    def _finish_urgent(self) -> None:
+        with self._lock:
+            self._urgent = max(0, self._urgent - 1)
 
     def _next_seq(self) -> int:
         with self._lock:
@@ -310,6 +347,8 @@ class QuoteWorker:
                 )
                 self._finish_flight(str(job.get("event_key") or ""))
             finally:
+                if kind in ("quote", "flatten", "rest_cancel"):
+                    self._finish_urgent()
                 self._busy_kind = None
                 self._q.task_done()
 
@@ -383,6 +422,62 @@ class QuoteWorker:
             return
         if kind == "housekeep":
             self._run_housekeep()
+            return
+        if kind == "postft":
+            self._run_postft(job)
+
+    def _run_postft(self, job: dict[str, Any]) -> None:
+        """FAK only. Book refresh happens on the sweep thread so this stays short."""
+        if self.urgent_pending():
+            quote = job.get("quote") if isinstance(job.get("quote"), dict) else {}
+            meta = job.get("match_meta") if isinstance(job.get("match_meta"), dict) else {}
+            self.submit_postft(
+                quote,
+                event_key=str(job.get("event_key") or ""),
+                match_meta=meta,
+            )
+            return
+        ex = self.trade_executor
+        quote = job.get("quote") if isinstance(job.get("quote"), dict) else {}
+        key = str(job.get("event_key") or "")
+        meta = job.get("match_meta") if isinstance(job.get("match_meta"), dict) else {}
+        tid = str(quote.get("token_id") or "")
+        if ex is None or not tid:
+            return
+        try:
+            quote = dict(quote)
+            quote["neg_risk"] = False
+            quote["trade"] = "buy_win"
+            quote["misprice"] = True
+            quote["settlement"] = "WIN"
+            row = ex.maybe_trade(
+                quote,
+                event_key=key,
+                match_meta=meta,
+                event_type="postft",
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT postft FAK failed token={tid[:12]}… {e}", flush=True)
+            return
+        if isinstance(row, dict):
+            self._push_result(
+                QuoteJobResult(
+                    bundles=[
+                        {
+                            "quoted_at": _now(),
+                            "trigger": "postft_sweep",
+                            "event_key": key,
+                            "match_id": str(job.get("match_id") or ""),
+                            "trade": row,
+                        }
+                    ],
+                    seen_keys=[],
+                    ft_match_ids=[],
+                    event_key=key,
+                    match_id=str(job.get("match_id") or ""),
+                    kind="postft",
+                )
+            )
 
     def _run_rest_cancel(self, job: dict[str, Any]) -> None:
         mid = str(job.get("match_id") or "")

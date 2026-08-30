@@ -505,6 +505,11 @@ def _trade_context_t10(match_meta: dict[str, Any] | None) -> bool:
     return isinstance(tc, dict) and bool(tc.get("t10"))
 
 
+def _trade_context_postft(match_meta: dict[str, Any] | None) -> bool:
+    tc = (match_meta or {}).get("trade_context")
+    return isinstance(tc, dict) and bool(tc.get("postft_sweep"))
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -555,7 +560,7 @@ class TradeExecutor:
         typ = (event_type or "").strip()
         if typ == "score_change":
             return bool(self.settings.live_goals)
-        if typ == "match_finished":
+        if typ in ("match_finished", "postft"):
             return bool(self.settings.live_ft)
         return bool(self.settings.live)
 
@@ -835,6 +840,16 @@ class TradeExecutor:
         """Pitch-gate buy_win that stays WIN even if this goal is voided."""
         if _trade_context_t10(match_meta):
             return False
+        if _trade_context_postft(match_meta):
+            if trade != "buy_win":
+                return False
+            if not bool(getattr(self.settings, "postft_sweep", True)):
+                return False
+            if float(getattr(self.settings, "postft_sweep_usdc", 0.0) or 0) <= 0:
+                return False
+            if str(quote.get("settlement") or "").upper() != "WIN":
+                return False
+            return True
         if not bool(getattr(self.settings, "locked_sweep", True)):
             return False
         if float(getattr(self.settings, "locked_sweep_usdc", 1000.0) or 0) <= 0:
@@ -902,6 +917,8 @@ class TradeExecutor:
         """
         if _trade_context_pitch_gate(match_meta):
             return None
+        if _trade_context_postft(match_meta):
+            return None
         typ = self._resolve_event_type(
             event_type=event_type, event_key=event_key, match_meta=match_meta
         )
@@ -929,9 +946,16 @@ class TradeExecutor:
         if str(q.get("trade") or "") != "buy_win" and str(q.get("settlement") or "") == "WIN":
             q["trade"] = "buy_win"
         mis = bool(q.get("misprice"))
+        postft = _trade_context_postft(match_meta)
+        if postft:
+            mis = True
+            q["neg_risk"] = False
+            if not str(q.get("tick_size") or "").strip():
+                q["tick_size"] = "0.001"
         # Rest: pitch-gate when QUOTE_REST_ENABLED=1; T+10 always (own size).
-        rest_ok = _trade_context_t10(match_meta) or (
-            rest_enabled() and _trade_context_pitch_gate(match_meta)
+        rest_ok = (not postft) and (
+            _trade_context_t10(match_meta)
+            or (rest_enabled() and _trade_context_pitch_gate(match_meta))
         )
         if not mis and not rest_ok:
             return None
@@ -1904,6 +1928,20 @@ class TradeExecutor:
             match_meta=match_meta,
             event_type=typ,
         )
+        if _trade_context_postft(match_meta) and not sweep:
+            row = self._record(
+                quote,
+                event_key=event_key,
+                match_meta=match_meta,
+                plan=None,
+                status="skipped",
+                skip_reason="postft_sweep_disabled",
+                response=None,
+                success=False,
+                idempotency_key=key,
+                live=channel_live,
+            )
+            return row
         chan_usdc, chan_shares, chan_tiers = self.settings.caps_for_buy(
             event_type=typ,
             pitch_gate=pitch_relaxed,
@@ -1923,15 +1961,20 @@ class TradeExecutor:
                     0.0, float(self.settings.max_open_usdc) - float(open_usdc)
                 )
             if sweep:
+                postft = _trade_context_postft(match_meta)
+                sweep_cap = float(
+                    getattr(self.settings, "postft_sweep_usdc", 0.0) or 0
+                    if postft
+                    else getattr(self.settings, "locked_sweep_usdc", 0.0) or 0
+                )
                 budget = clip_locked_sweep_usdc(
-                    sweep_cap=float(
-                        getattr(self.settings, "locked_sweep_usdc", 0.0) or 0
-                    ),
+                    sweep_cap=sweep_cap,
                     remaining_open=remaining_open,
                 )
                 size_meta = {
-                    "channel": "goals_sweep",
+                    "channel": "postft_sweep" if postft else "goals_sweep",
                     "locked_sweep": True,
+                    "postft_sweep": bool(postft),
                     "open_usdc": float(open_usdc),
                     "remaining_open": remaining_open,
                     "max_usdc": float(budget),
