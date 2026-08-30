@@ -414,6 +414,24 @@ def main() -> int:
         "Grasshoppers",
     )
     _assert(bl.team_similarity("Vaduz", "FC Vaduz") >= 0.92, "Vaduz")
+    # 2026-08-30 unmatched PM (230/299): PTC pinyin + Neftçi
+    _assert(
+        bl.normalize_team("Neftchi Baku PFC") == bl.normalize_team("Neftçi"),
+        "Neftçi",
+    )
+    _assert(
+        bl.normalize_team("CF Os Gavionenses") == bl.normalize_team("Saert yong"),
+        "Gavionenses",
+    )
+    _assert(
+        bl.normalize_team("AD Marco 09") == bl.normalize_team("maerkou"),
+        "Marco",
+    )
+    _assert(
+        bl.normalize_team("Associação Naval 1893")
+        == bl.normalize_team("Naval 1º de Maio"),
+        "Naval",
+    )
 
     # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
     _assert(

@@ -729,4 +729,18 @@ TEAM_ALIASES: dict[str, str] = {
     "grasshoppers": "grasshopper zurich",
     "grasshopper zurich": "grasshopper zurich",
     "gc zurich": "grasshopper zurich",
+    # --- 2026-08-30 unmatched PM (230/299): PTC pinyin + Azerbaijan ---
+    "neftchi baku pfc": "neftci",
+    "neftchi baku": "neftci",
+    "neftci": "neftci",
+    "saert yong": "gavionenses",
+    "os gavionenses": "gavionenses",
+    "gavionenses": "gavionenses",
+    "maerkou": "marco",
+    "ad marco 09": "marco",
+    "marco 09": "marco",
+    "associacao naval 1893": "naval",
+    "naval 1893": "naval",
+    "naval 1o maio": "naval",
+    "naval 1 de maio": "naval",
 }
