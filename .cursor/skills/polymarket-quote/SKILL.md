@@ -22,7 +22,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 | T+10 | 进球后默认 600s，按当时比分 | 否 | `QUOTE_T10_USDC`（FAK 与 0.99 GTC **各**一份） | **始终挂**，每已锁 WIN token 一笔 |
 | 终场 | `match_finished` | 否 | `QUOTE_FT_MAX_USDC` | 不挂 |
 | 终场灰尘盘 | 终场锁定 WIN、ask≤0.01 | 否 | `QUOTE_FT_DUST_USDC` | 不挂 |
-| 完赛扫盘 | 主脚本运行中每 **3h** 扫过去 **24h** 未结算完赛盘 | 否 | `QUOTE_POSTFT_SWEEP_USDC`（默认 $1000） | 不挂；FAK 从最低卖价吃到 **0.995** |
+| 完赛扫盘 | 主脚本运行中每 **1h** 扫过去 **24h** 未结算完赛盘 | 否 | `QUOTE_POSTFT_SWEEP_USDC`（默认 $1000） | 不挂；FAK 从最低卖价吃到 **0.995** |
 
 **Pitch-gate 细节**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。**本拍 DOM `in_play` 才同帧打 AF**（庆祝/`unclear` 不打）。买入只有一条：**同帧 DOM `in_play` ∧ AF `ok && score_match`**（或本球更早一次 `in_play` 已认分的锁存；本拍硬不一致会清掉）。**射门不再卡买入**。Odds Grade A **只观察、不下单**。VAR 买入前仍永久否决。买入后立刻停 AF+DOM。回撤确认轨仍是 5s AF+DOM 观察，**仅 AF `score_match` 才 flatten**（DOM 比分条不单独卖出）。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。终场立刻询价。
 
@@ -30,7 +30,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 > 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s 轨，**等 AF 认回撤后比分**。**AF 认分 flatten 后立刻停 AF+DOM**（买入后同样立刻停 AF+DOM，不再拖到 120s）。
 
-**完赛扫盘（post-FT leftover）**：`pm_quote watch` 启动约 60s 后跑第一轮，之后每 **3 小时**。扫盘是**独立子进程**（`pm_locked_scan.py`），不占 watch tick、也不占 CLOB worker。扫完后只把短 FAK 丢进 worker；若队列里已有进球询价 / flatten / 撤 rest，扫盘单会让路。只吃 ask≤**0.995**；token 按最低卖价排序。`tick` 用盘口，`neg_risk=False`。不 `--refresh-af`。跟 `--ft-mode`。`QUOTE_POSTFT_SWEEP=0` 关闭。手跑：`python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py postft-sweep`。
+**完赛扫盘（post-FT leftover）**：`pm_quote watch` 启动约 60s 后跑第一轮，之后每 **1 小时**。扫盘是**独立子进程**（`pm_locked_scan.py`），不占 watch tick、也不占 CLOB worker。扫完后只把短 FAK 丢进 worker；若队列里已有进球询价 / flatten / 撤 rest，扫盘单会让路。只吃 ask≤**0.995**；token 按最低卖价排序。`tick` 用盘口，`neg_risk=False`。不 `--refresh-af`。跟 `--ft-mode`。`QUOTE_POSTFT_SWEEP=0` 关闭。手跑：`python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py postft-sweep`。
 
 - 懂球帝 **回撤**：立刻取消未完成进球门控，并按 **event_key** 撤销已入队的询价（不按 `match_id` 永久拉黑）。rest 取消入队优先级高于 idle flatten/rest 对账，对账不挡 `rest_cancel`。**进程内 bridge 入队回撤时就会 `cancel_match`**。询价 tick **先扫回撤再 `start_gate`**。回撤 ts 挡住该进球 stem（更早或相同 ts）。非开场的重判进球（更晚 ts）仍可开；**开场球**（0-0→1-0 / 0-0→0-1）若同一过渡刚被撤过，或时钟 ≥90′，不再开闸（`pitch_gate_reversal_risk_skip`）。询价 tick **先处理事件再 drain**。若该场 **已有仓**，再开 5s AF+DOM（期望=回撤后比分）；某一拍 **AF `ok && score_match`** → flatten **仅不再 WIN 的仓**（**不受** `QUOTE_GATE_PROTECT_S` 窗限制）并 **立刻停 5s 轨**。DOM 中心比分（含僵死页）**不单独 flatten**。懂球帝回撤本身不立刻平仓；窗只约束未确认的 DQD 路径。AF 不认直到 120s → **持仓**。未买入的回撤只取消门控。
 - 事件超过 **`QUOTE_FT_MAX_AGE_S`（默认 900s）** → 跳过（防重启重放）
@@ -42,6 +42,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 - Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → 目标 @**0.995**，但 **不信** Gamma/book 的 `0.001` 元数据；CLOB 足球最小 tick 是 **0.01**，rest 一律按 0.01 **向下收到 0.99**。**`QUOTE_REST_USDC`（默认 $5）** / **`GTC` 一直挂着**（回撤、终场、手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改回 GTD）。门控 rest **不受** `QUOTE_MAX_OPEN_USDC` 限制。没有卖盘（一边倒买盘）也挂，等砸盘。FAK / misprice 上限 **ask≤0.995**（fee 后 `min_net≈0.00475`）。**进球作废仍 WIN：** 比分变化后若该 token 在 **上一分**（`prev`）已经是 live WIN（当下这球不算也锁死），pitch-gate **FAK 吃光** ask≤0.995 的剩余卖盘，**不走** `QUOTE_GOAL_MAX_USDC` $50。金额顶 **`QUOTE_LOCKED_SWEEP_USDC`（默认 $1000）**，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度。开关 **`QUOTE_LOCKED_SWEEP`**（默认开；`0` 或金额 `0` 关闭）。回撤后若仓位在新比分仍是 WIN（如 1-1→1-0 的主队 0.5 大球），**不平仓**。终场已锁定 WIN 且 ask≤0.01：**仍 FAK**（`QUOTE_FT_DUST_FAK` 默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度限制；max_price=0.01，不按 0.001 墙走单。
 - Odds/Bet365：跟 DOM 同一拍后台写入 `book_context_observe.jsonl`（Grade A/B/C）。**Grade A 不下单**，AND 路径不因 Odds HTTP 阻塞。已配对场在距开球 **30 分钟**时 **采一次** Bet365+1xbet 全盘口，写入 `data/pm-quote/prematch_odds.jsonl`。
 - **主客对调**：懂球帝/纳米主场与 Polymarket 相反时，事件带 `sides_swapped`；门控用动画主场比分条，半场大小球用 PM 方向的 `home_half`/`away_half`，避免把雷恩的半场算到巴黎头上。
+- **半场盘**：1H/2H O/U 与 BTTS 只用半场比分。下半场懂球帝 `hts` 有时会写成当前比分；询价取事件与快照里 **≤ 当前比分且总进球最少** 的半场，**绝不拿全场比分当 1H**。上半场还没有 `hts` 时才用当前比分。
 
 ## Quick start
 

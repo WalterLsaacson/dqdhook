@@ -13,7 +13,7 @@ description: >-
 
 Standalone scan. **Does not** start quote watch by itself. When System Main
 (`python3 frontend/run_main.py`) is running, `pm_quote watch` runs this scan
-every 3 hours (24h lookback) and FAK-walks leftover WIN asks ≤ **0.995**.
+every 1 hour (24h lookback) and FAK-walks leftover WIN asks ≤ **0.995**.
 The scan itself is a **child process**; quote watch only submits short FAKs.
 
 Regulation only: **90 minutes + stoppage**. Extra time and penalties are

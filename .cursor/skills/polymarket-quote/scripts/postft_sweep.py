@@ -27,7 +27,7 @@ from rest_ladder import FAK_ZONE_MAX_ASK  # noqa: E402
 
 DEFAULT_ENABLED = True
 DEFAULT_HOURS = 24
-DEFAULT_INTERVAL_S = 10800.0
+DEFAULT_INTERVAL_S = 3600.0
 DEFAULT_START_DELAY_S = 60.0
 DEFAULT_USDC = 1000.0
 DEFAULT_MAX_ASK = FAK_ZONE_MAX_ASK
@@ -416,7 +416,7 @@ def start_scheduler(
     proxy: str | None | object = ...,
     stop_event: threading.Event | None = None,
 ) -> threading.Thread | None:
-    """Daemon thread: first scan after start delay, then every 3h."""
+    """Daemon thread: first scan after start delay, then every 1h."""
     global _active_stop, _active_thread
     if not sweep_enabled():
         print("postft-sweep skipped (QUOTE_POSTFT_SWEEP=0 or USDC=0)", flush=True)
