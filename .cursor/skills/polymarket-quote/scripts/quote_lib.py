@@ -42,6 +42,7 @@ HALF_2_RE = re.compile(r"(?:2nd|second)\s*half", re.I)
 EXACT_WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+(\d+)\s*[-–]\s*(\d+)\s*\?", re.I)
 EXACT_DRAW_RE = re.compile(r"draw\s+(\d+)\s*[-–]\s*(\d+)", re.I)
 SCORE_PAIR_RE = re.compile(r"\b(\d+)\s*[-–]\s*(\d+)\b")
+_CLOCK_MINUTE_RE = re.compile(r"(\d+)\s*'")
 LOT_TOTAL_KEY_RE = re.compile(
     r"^(match|home|away)(?:_(1h|2h))?_total_([0-9]+(?:\.[0-9]+)?)_(over|under)$",
     re.I,
@@ -577,6 +578,94 @@ def halves_in_pm_frame(ctx: dict[str, Any]) -> tuple[Any, Any]:
     if swapped is True:
         return raw_ah, raw_hh
     return raw_hh, raw_ah
+
+
+def _half_pair(hh: Any, ah: Any) -> tuple[int, int] | None:
+    h = _parse_int_score(hh)
+    a = _parse_int_score(ah)
+    if h is None or a is None or h < 0 or a < 0:
+        return None
+    return h, a
+
+
+def _minute_hint(*values: Any) -> int | None:
+    for value in values:
+        if value is None or value == "":
+            continue
+        parsed = _parse_int_score(value)
+        if parsed is not None:
+            return parsed
+        m = _CLOCK_MINUTE_RE.search(str(value))
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def infer_clock_period(
+    ev: dict[str, Any] | None,
+    dqd: dict[str, Any] | None = None,
+) -> str:
+    """Return 1H | 2H | FT | '' from event/DQD period or minute/clock."""
+    for src in (ev, dqd):
+        if not isinstance(src, dict):
+            continue
+        p = str(src.get("period") or "").strip().upper()
+        if p == "FT":
+            return "FT"
+        if p in {"2H", "AET", "PEN", "ET"}:
+            return "2H"
+        if p in {"1H", "HT"}:
+            # HT: current score *is* the 1H score.
+            return "1H"
+    minute = _minute_hint(
+        (ev or {}).get("official_clock") if ev else None,
+        (ev or {}).get("minute") if ev else None,
+        (ev or {}).get("status") if ev else None,
+        (dqd or {}).get("official_clock") if dqd else None,
+        (dqd or {}).get("minute") if dqd else None,
+        (dqd or {}).get("status") if dqd else None,
+        (dqd or {}).get("minute_str") if dqd else None,
+    )
+    if minute is None:
+        return ""
+    return "1H" if minute <= 45 else "2H"
+
+
+def resolve_regulation_halves(
+    *,
+    home_score: Any,
+    away_score: Any,
+    candidates: list[tuple[Any, Any]],
+    period: str = "",
+) -> tuple[Any, Any]:
+    """Choose HT that cannot include second-half goals.
+
+    Dongqiudi ``hts`` sometimes copies the live 2H score. Among pairs that are
+    componentwise ≤ current, pick the smallest total. During 1H only, missing
+    HT falls back to the current score. During 2H/FT, never fall back — that
+    is what settled 1H O/U from the full-time score (Portuguesa 1-2).
+    """
+    h = _parse_int_score(home_score)
+    a = _parse_int_score(away_score)
+    valid: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    if h is not None and a is not None:
+        for hh_raw, ah_raw in candidates:
+            pair = _half_pair(hh_raw, ah_raw)
+            if pair is None:
+                continue
+            hh, ah = pair
+            if hh > h or ah > a:
+                continue
+            if pair not in seen:
+                seen.add(pair)
+                valid.append(pair)
+    if valid:
+        valid.sort(key=lambda p: (p[0] + p[1], p[0], p[1]))
+        return valid[0]
+    if str(period or "").upper() == "1H" and h is not None and a is not None:
+        return h, a
+    return None, None
 
 
 def _goals_for_total(
@@ -1613,9 +1702,20 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         "home": ev.get("home") or pm.get("home") or dqd.get("home") or "",
         "away": ev.get("away") or pm.get("away") or dqd.get("away") or "",
     }
-    hh, ah = halves_in_pm_frame(ctx)
+    hh_dqd, ah_dqd = halves_in_pm_frame(ctx)
+    period = infer_clock_period(ev, dqd)
+    hh, ah = resolve_regulation_halves(
+        home_score=ctx["home_score"],
+        away_score=ctx["away_score"],
+        candidates=[
+            (ev.get("home_half"), ev.get("away_half")),
+            (hh_dqd, ah_dqd),
+        ],
+        period=period,
+    )
     ctx["home_half"] = hh
     ctx["away_half"] = ah
+    ctx["clock_period"] = period
     return ctx
 
 
@@ -1813,7 +1913,22 @@ def collect_target_tokens(
             hh = ctx.get("home_half")
             ah = ctx.get("away_half")
             if hh is None and ah is None:
-                hh, ah = halves_in_pm_frame(ctx)
+                ev_row = ctx.get("event") if isinstance(ctx.get("event"), dict) else {}
+                dqd_row = (
+                    ctx.get("dongqiudi") if isinstance(ctx.get("dongqiudi"), dict) else {}
+                )
+                hh_dqd, ah_dqd = halves_in_pm_frame(ctx)
+                hh, ah = resolve_regulation_halves(
+                    home_score=hs,
+                    away_score=aws,
+                    candidates=[
+                        (ev_row.get("home_half"), ev_row.get("away_half")),
+                        (hh_dqd, ah_dqd),
+                    ],
+                    period=str(
+                        ctx.get("clock_period") or infer_clock_period(ev_row, dqd_row)
+                    ),
+                )
             tokens.extend(
                 totals_tokens(
                     prop_markets,

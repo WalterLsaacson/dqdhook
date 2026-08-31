@@ -139,7 +139,7 @@ Pitch-gate drives DOM reads every **5s** for up to **120s** after a paired goal 
 
 **Animation source (纳米 tracker URL only):** one shared Chromium; in-play paired fixtures are pre-opened from `animation_live` (`https://tracker.namitiyu.com/zh/football?profile=…&id=<nami_id>`). A goal **evaluates** `.pop-box` / `.center-box` on that tab (same match reuses it). Cap `QUOTE_DOM_POOL_MAX` (default 24). Warming is on by default (`QUOTE_DOM_WARM`, interval `QUOTE_DOM_WARM_INTERVAL_S` default 10s, open timeout `QUOTE_DOM_WARM_OPEN_TIMEOUT_S` default 3s). While an open waits for the animation root, pending DOM reads are drained so a goal sample is not stuck behind warm. No MQTT ball-xy, no `page.screenshot`. Fixtures with no `animation_live` fall back to the DQD page iframe. Missing animation → timeout, no buy.
 
-Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_locked_sweep.py`, `.../smoke_t10_scan.py`, `.../smoke_pitch_gate_dom.py`, `.../smoke_dom_page_pool.py`, `.../smoke_af_observe.py`, `.../smoke_book_context_observe.py`, `.../smoke_prematch_odds.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
+Smoke: `python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py`, `.../smoke_locked_sweep.py`, `.../smoke_t10_scan.py`, `.../smoke_half_settle.py`, `.../smoke_pitch_gate_dom.py`, `.../smoke_dom_page_pool.py`, `.../smoke_af_observe.py`, `.../smoke_book_context_observe.py`, `.../smoke_prematch_odds.py`, `python3 .cursor/skills/dongqiudi-match/scripts/smoke_dqd_live.py`.
 
 **Gate source: DOM only**
 

@@ -151,10 +151,9 @@ def _rest_remote_filled_shares(remote: dict[str, Any], order: dict[str, Any]) ->
                     return val
         except (TypeError, ValueError):
             continue
-    orig = float(order.get("shares") or 0)
-    status = str(remote.get("status") or "").upper()
-    if status in ("MATCHED", "FILLED") and orig > 0:
-        return orig
+    # MATCHED/FILLED without size_matched is not a full fill. CLOB often
+    # marks a GTC MATCHED when the market resolves after a dust hit
+    # (Portuguesa 1H O/U rest @0.99 vs 0.006 asks → ~$4, not $100).
     return float(order.get("filled_shares") or 0)
 
 

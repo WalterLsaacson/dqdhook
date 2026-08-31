@@ -12,7 +12,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import rest_ladder as rl  # noqa: E402
-from trade_executor import TradeExecutor  # noqa: E402
+from trade_executor import TradeExecutor, _rest_remote_filled_shares  # noqa: E402
 from trade_settings import TradeSettings  # noqa: E402
 
 
@@ -167,6 +167,22 @@ def main() -> int:
             assert posted and posted.get("status") == "rest_dry_run", posted
     finally:
         os.environ.pop("QUOTE_REST_ENABLED", None)
+
+    # MATCHED with no size_matched must not invent the full rest size.
+    assert (
+        _rest_remote_filled_shares({"status": "MATCHED"}, {"shares": 101.01, "filled_shares": 0})
+        == 0
+    )
+    assert (
+        abs(
+            _rest_remote_filled_shares(
+                {"status": "MATCHED", "size_matched": "4.04"},
+                {"shares": 101.01, "filled_shares": 0},
+            )
+            - 4.04
+        )
+        < 1e-9
+    )
 
     print("ok: rest ladder $5 / 0.01→0.99 / metadata 0.001 clamped to 0.01 / GTC default")
     return 0
