@@ -39,19 +39,37 @@ class FetchError(RuntimeError):
     """Raised when the upstream API cannot be reached or response is truncated."""
 
 
-def fetch_json(path: str, params: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
+def fetch_json(
+    path: str,
+    params: dict[str, Any],
+    timeout: float = 20.0,
+    *,
+    retries: int = 3,
+    retry_sleep_s: float = 0.6,
+) -> dict[str, Any]:
+    """GET JSON from Dongqiudi. Retries truncated/transient reads (large schedule_list)."""
     qs = urllib.parse.urlencode(params)
     url = f"{BASE}{path}?{qs}"
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except http.client.IncompleteRead as e:
-        raise FetchError(f"IncompleteRead: {e}") from e
-    except http.client.HTTPException as e:
-        raise FetchError(f"HTTPException: {e}") from e
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
-        raise FetchError(str(e)) from e
+    attempts = max(1, int(retries))
+    last_err: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except http.client.IncompleteRead as e:
+            last_err = e
+            err = FetchError(f"IncompleteRead: {e}")
+        except http.client.HTTPException as e:
+            last_err = e
+            err = FetchError(f"HTTPException: {e}")
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            last_err = e
+            err = FetchError(str(e))
+        if attempt >= attempts:
+            raise err from last_err
+        time.sleep(max(0.0, float(retry_sleep_s)) * attempt)
+    raise FetchError("fetch_json failed")  # pragma: no cover
 
 
 def fetch_soccer_match_list(language: str = "en") -> list[dict[str, Any]]:
@@ -91,8 +109,13 @@ def fetch_soccer_schedule_list(
     *,
     language: str = "zh-CN",
     future: bool = True,
+    timeout: float = 45.0,
 ) -> list[dict[str, Any]]:
-    """Fetch one Beijing calendar day via schedule_list (future or past tabs)."""
+    """Fetch one Beijing calendar day via schedule_list (future or past tabs).
+
+    Busy days are ~1.5MB+; use a longer timeout and fetch_json retries so a
+    single IncompleteRead does not drop the whole calendar day from the snapshot.
+    """
     payload = fetch_json(
         "/magicball/v1/list/schedule_list",
         {
@@ -101,6 +124,9 @@ def fetch_soccer_schedule_list(
             "cmp_type": "soccer",
             "start": schedule_start_param(beijing_day),
         },
+        timeout=timeout,
+        retries=4,
+        retry_sleep_s=0.8,
     )
     data = payload.get("data") or {}
     return list(data.get("matches") or [])
@@ -528,6 +554,7 @@ def load_matches(
     language: str = "en",
     day: str | None = None,
     days: int = 3,
+    fallback_matches: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Load soccer list for a Beijing date window (default: today + next 2 days).
@@ -539,6 +566,10 @@ def load_matches(
 
     For English (default): team names come from `team_en_name` via team detail
     (cached in `data/dqd_team_en.json`). Explicit `zh-cn` skips the rename.
+
+    When a future day's schedule_list fails or returns empty after we already
+    had fixtures for that day, keep ``fallback_matches`` for that local_date
+    so a truncated HTTP read does not wipe bridge coverage.
     """
     day = day or today_cn()
     days = max(1, int(days))
@@ -552,9 +583,11 @@ def load_matches(
             by_id[mid] = m
 
     # Future calendar days are missing from match_list — pull schedule_list.
+    recovered_days: set[str] = set()
     for d in day_window(day, days):
         if d <= day:
             continue
+        raw_rows: list[dict[str, Any]] | None = None
         try:
             raw_rows = fetch_soccer_schedule_list(d, language="zh-CN", future=True)
         except (
@@ -572,9 +605,26 @@ def load_matches(
                     f"dqd → schedule_list fail day={d}: {type(e).__name__}: {e}",
                     flush=True,
                 )
+            recovered_days.add(d)
             continue
         if not raw_rows:
-            if d not in _EMPTY_SCHEDULE_WARNED:
+            # Empty can be "not published yet" OR a truncated/bad body that
+            # decoded to {}. Prefer keeping last-known fixtures for the day.
+            prev_n = sum(
+                1
+                for m in (fallback_matches or [])
+                if str(m.get("local_date") or "") == d
+            )
+            if prev_n > 0:
+                if d not in _EMPTY_SCHEDULE_WARNED:
+                    _EMPTY_SCHEDULE_WARNED.add(d)
+                    print(
+                        f"dqd → schedule_list empty day={d} "
+                        f"(keeping {prev_n} prior fixtures)",
+                        flush=True,
+                    )
+                recovered_days.add(d)
+            elif d not in _EMPTY_SCHEDULE_WARNED:
                 _EMPTY_SCHEDULE_WARNED.add(d)
                 print(
                     f"dqd → schedule_list empty day={d} "
@@ -582,6 +632,8 @@ def load_matches(
                     flush=True,
                 )
             continue
+        # Successful fetch for this day — allow future warnings again.
+        _EMPTY_SCHEDULE_WARNED.discard(d)
         for raw in raw_rows:
             if (raw.get("cmp_type") or "soccer") != "soccer":
                 continue
@@ -589,6 +641,22 @@ def load_matches(
             mid = str(m.get("id") or "")
             if mid:
                 by_id[mid] = m
+
+    if recovered_days and fallback_matches:
+        kept = 0
+        for m in fallback_matches:
+            if str(m.get("local_date") or "") not in recovered_days:
+                continue
+            mid = str(m.get("id") or "")
+            if not mid or mid in by_id:
+                continue
+            by_id[mid] = m
+            kept += 1
+        if kept:
+            print(
+                f"dqd → schedule fallback kept={kept} days={sorted(recovered_days)}",
+                flush=True,
+            )
 
     schedule = [m for m in by_id.values() if m.get("local_date") in allowed]
     if not schedule:
@@ -845,9 +913,15 @@ def safe_load_matches(
     language: str = "en",
     day: str | None = None,
     days: int = 3,
+    fallback_matches: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        return load_matches(language=language, day=day, days=days)
+        return load_matches(
+            language=language,
+            day=day,
+            days=days,
+            fallback_matches=fallback_matches,
+        )
     except FetchError:
         raise
     except (urllib.error.URLError, TimeoutError, OSError, http.client.IncompleteRead, http.client.HTTPException) as e:

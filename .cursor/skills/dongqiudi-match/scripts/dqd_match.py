@@ -109,7 +109,15 @@ def run_watch_once(
     quiet: bool = False,
     days: int = 3,
 ) -> dict[str, Any]:
-    matches = lib.safe_load_matches(language=language, days=days)
+    prev_snap = read_json(ddir / "snapshot.json", {})
+    fallback = (
+        list(prev_snap.get("matches") or [])
+        if isinstance(prev_snap, dict)
+        else []
+    )
+    matches = lib.safe_load_matches(
+        language=language, days=days, fallback_matches=fallback
+    )
     snapshot = lib.build_snapshot(tab, language=language, days=days, matches=matches)
     selected = snapshot["matches"]
 
