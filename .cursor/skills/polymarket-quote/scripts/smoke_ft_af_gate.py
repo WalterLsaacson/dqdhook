@@ -78,12 +78,13 @@ def test_ft_mismatch_and_confirm() -> None:
         (root / "data" / "bridge" / "matches.json").write_text('{"matches":[]}', encoding="utf-8")
         (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
 
-        # AF regulation 2-2 while DQD FT says 2-3 → mismatch, no quote.
-        def events_fn_mismatch(mid: str, **kwargs: Any) -> dict[str, Any]:
+        # AF regulation 2-2 while DQD FT says 2-3 → quote AF 2-2 (AF is truth).
+        def events_fn_rewrite(mid: str, **kwargs: Any) -> dict[str, Any]:
             return {
                 "ok": True,
                 "goals": {"home": 2, "away": 2},
                 "finished": True,
+                "regulation_ready": True,
                 "status_short": "FT",
                 "af_fixture_id": 1,
                 "score_source": "score.fulltime",
@@ -93,34 +94,54 @@ def test_ft_mismatch_and_confirm() -> None:
             root,
             poll_s=0.01,
             timeout_s=1.0,
-            events_fn=events_fn_mismatch,
+            events_fn=events_fn_rewrite,
             poll_schedule=False,
         )
-        with patch.object(lib, "quote_bridge_event") as q:
-            q.side_effect = AssertionError("should not quote on FT mismatch")
-            bundles = lib.process_bridge_events(
+        quoted: list[dict[str, Any]] = []
+
+        def fake_quote(root_arg: Path, ev: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            quoted.append(dict(ev))
+            return {
+                "quoted_at": lib.now_cn_iso(),
+                "trigger": "match_finished",
+                "match_id": ev.get("match_id"),
+                "home_score": ev.get("home_score"),
+                "away_score": ev.get("away_score"),
+                "score_source": ev.get("score_source"),
+                "count": 0,
+                "opportunity_count": 0,
+            }
+
+        with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
+            lib.process_bridge_events(
                 root,
                 events_override=[_ft_ev(home_score=2, away_score=3)],
                 af_referee=referee,
                 af_mode="gate",
                 trade_executor=None,
             )
-            # wait for async confirm
             for _ in range(50):
-                more = lib.process_bridge_events(
+                lib.process_bridge_events(
                     root,
                     events_override=[],
                     af_referee=referee,
                     af_mode="gate",
                     trade_executor=None,
                 )
-                bundles.extend(more)
-                if any(b.get("mode") == "af_ft_unconfirmed" for b in bundles if isinstance(b, dict)):
+                if quoted:
                     break
                 time.sleep(0.02)
-        modes = [b.get("mode") for b in bundles if isinstance(b, dict)]
-        check("mismatch → af_ft_unconfirmed", "af_ft_unconfirmed" in modes, str(modes))
-        check("no quote on mismatch", q.call_count == 0)
+        check("DQD≠AF still quotes after AF ready", len(quoted) == 1, str(quoted))
+        if quoted:
+            check(
+                "quotes AF regulation score not DQD",
+                quoted[0].get("home_score") == 2 and quoted[0].get("away_score") == 2,
+                str(quoted[0]),
+            )
+            check(
+                "score_source api_football",
+                quoted[0].get("score_source") == "api_football",
+            )
 
         # Second FT for same match_id should be skipped via processed_ft_match_ids.
         bundles2 = lib.process_bridge_events(
@@ -153,6 +174,7 @@ def test_ft_confirm_quotes_regulation() -> None:
                 "ok": True,
                 "goals": {"home": 1, "away": 0},
                 "finished": True,
+                "regulation_ready": True,
                 "status_short": "FT",
                 "af_fixture_id": 9,
                 "score_source": "score.fulltime",
@@ -202,6 +224,111 @@ def test_ft_confirm_quotes_regulation() -> None:
         if quoted:
             check("uses AF regulation score", quoted[0].get("home_score") == 1 and quoted[0].get("away_score") == 0)
             check("score_source api_football", quoted[0].get("score_source") == "api_football")
+
+
+def test_ft_not_ready_no_quote() -> None:
+    """DQD FT during stoppage: AF not regulation_ready → do not trade."""
+    print("test_ft_not_ready_no_quote")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        (root / "data" / "bridge" / "matches.json").write_text('{"matches":[]}', encoding="utf-8")
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+
+        state = {"ready": False}
+
+        def events_fn(mid: str, **kwargs: Any) -> dict[str, Any]:
+            if not state["ready"]:
+                return {
+                    "ok": True,
+                    "goals": {"home": 1, "away": 2},
+                    "finished": False,
+                    "regulation_ready": False,
+                    "status_short": "2H",
+                    "af_fixture_id": 3,
+                    "score_source": "score.fulltime",
+                }
+            return {
+                "ok": True,
+                "goals": {"home": 0, "away": 2},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 3,
+                "score_source": "score.fulltime",
+            }
+
+        referee = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=2.0,
+            events_fn=events_fn,
+            poll_schedule=False,
+        )
+        quoted: list[dict[str, Any]] = []
+
+        def fake_quote(root_arg: Path, ev: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            quoted.append(dict(ev))
+            return {
+                "quoted_at": lib.now_cn_iso(),
+                "trigger": "match_finished",
+                "match_id": ev.get("match_id"),
+                "home_score": ev.get("home_score"),
+                "away_score": ev.get("away_score"),
+                "score_source": ev.get("score_source"),
+                "count": 0,
+                "opportunity_count": 0,
+            }
+
+        with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
+            first = lib.process_bridge_events(
+                root,
+                events_override=[_ft_ev(match_id="m_var", home_score=1, away_score=2)],
+                af_referee=referee,
+                af_mode="gate",
+                trade_executor=None,
+            )
+            for _ in range(8):
+                lib.process_bridge_events(
+                    root,
+                    events_override=[],
+                    af_referee=referee,
+                    af_mode="gate",
+                    trade_executor=None,
+                )
+                time.sleep(0.02)
+            check("no quote while AF still in play", quoted == [], str(quoted))
+            check(
+                "pending mode on DQD FT",
+                any(b.get("mode") == "af_ft_pending" for b in first if isinstance(b, dict)),
+                str([b.get("mode") for b in first]),
+            )
+            cur = lib.load_cursor(root)
+            check(
+                "false FT does not mark processed_ft",
+                "m_var" not in (cur.get("processed_ft_match_ids") or []),
+                str(cur.get("processed_ft_match_ids")),
+            )
+            state["ready"] = True
+            for _ in range(80):
+                lib.process_bridge_events(
+                    root,
+                    events_override=[],
+                    af_referee=referee,
+                    af_mode="gate",
+                    trade_executor=None,
+                )
+                if quoted:
+                    break
+                time.sleep(0.02)
+        check("quotes after AF regulation_ready", len(quoted) == 1, str(quoted))
+        if quoted:
+            check(
+                "uses AF score after VAR wipe",
+                quoted[0].get("home_score") == 0 and quoted[0].get("away_score") == 2,
+                str(quoted[0]),
+            )
 
 
 def test_stale_skip_in_pipeline() -> None:
@@ -292,8 +419,8 @@ def test_goal_stale_skips_af() -> None:
         )
         check("no AF submit for stale goal", submitted == [], str(submitted))
         check(
-            "pipeline marks af_goal_stale",
-            any(b.get("mode") == "af_goal_stale" for b in bundles if isinstance(b, dict)),
+            "pipeline marks goal_stale",
+            any(b.get("mode") == "goal_stale" for b in bundles if isinstance(b, dict)),
             str([b.get("mode") for b in bundles]),
         )
 
@@ -422,6 +549,7 @@ def main() -> int:
     test_ft_stale_and_helpers()
     test_ft_mismatch_and_confirm()
     test_ft_confirm_quotes_regulation()
+    test_ft_not_ready_no_quote()
     test_stale_skip_in_pipeline()
     test_goal_stale_skips_af()
     test_events_offset_clamps_on_shrink()

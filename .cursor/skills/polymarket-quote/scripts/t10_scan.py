@@ -1,8 +1,8 @@
 """Post-goal +10min book rescan.
 
 After a paired DQD goal-up, wait ``QUOTE_T10_DELAY_S`` (default 600s) and quote
-again from the **score at fire time** (bridge ``prev_scores``), independent of
-whether pitch-gate bought. FAK + rest both use ``QUOTE_T10_USDC``.
+from the **API-Football live score** at fire time. Dongqiudi ``prev_scores`` is
+only a skeleton (sides / halves); no T+10 order without an AF score.
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from typing import Any
 DEFAULT_T10_DELAY_S = 600.0
 DEFAULT_T10_MAX_LATE_S = 900.0
 DEFAULT_T10_ENABLED = True
+# AF live poll budget at fire (already waited delay_s). Cache miss skips immediately.
+DEFAULT_T10_AF_TIMEOUT_S = 90.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,6 +63,10 @@ def t10_max_late_s() -> float:
     return max(0.0, _env_float("QUOTE_T10_MAX_LATE_S", DEFAULT_T10_MAX_LATE_S))
 
 
+def t10_af_timeout_s() -> float:
+    return max(0.05, _env_float("QUOTE_T10_AF_TIMEOUT_S", DEFAULT_T10_AF_TIMEOUT_S))
+
+
 def t10_event_key(source_event_key: str) -> str:
     src = str(source_event_key or "").strip()
     if src.startswith("t10|"):
@@ -87,6 +93,8 @@ def _slim_ev(ev: dict[str, Any]) -> dict[str, Any]:
         "kickoff_beijing",
         "official_clock",
         "sides_swapped",
+        "dqd_home",
+        "dqd_away",
         "polymarket",
         "prev",
         "curr",
@@ -99,26 +107,72 @@ def _slim_ev(ev: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _score_pair(row: Any) -> tuple[int, int] | None:
+    if not isinstance(row, dict):
+        return None
+    try:
+        h = row.get("home", row.get("home_score"))
+        a = row.get("away", row.get("away_score"))
+        if h is None or a is None:
+            return None
+        return int(h), int(a)
+    except (TypeError, ValueError):
+        return None
+
+
+def orient_dqd_score_to_pm(
+    hs: int,
+    aws: int,
+    ev: dict[str, Any] | None,
+    row: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Map DQD-frame ``prev_scores`` / snapshot onto event (Polymarket) sides.
+
+    Bridge keeps ``prev_scores`` in Dongqiudi home/away so change detection
+    matches the snapshot. Score-change events already re-orient. T+10 overlay
+    must do the same or team totals / exact score buy the wrong side.
+    """
+    ev = ev if isinstance(ev, dict) else {}
+    dqd = row.get("dongqiudi") if isinstance((row or {}).get("dongqiudi"), dict) else {}
+    pm = row.get("polymarket") if isinstance((row or {}).get("polymarket"), dict) else {}
+    src_h = str(ev.get("dqd_home") or (dqd or {}).get("home") or "")
+    src_a = str(ev.get("dqd_away") or (dqd or {}).get("away") or "")
+    dst_h = str(ev.get("home") or (pm or {}).get("home") or "")
+    dst_a = str(ev.get("away") or (pm or {}).get("away") or "")
+    if src_h and dst_h:
+        try:
+            import quote_lib as lib
+
+            oh, oa = lib._bridge_lib().orient_scores(src_h, src_a, hs, aws, dst_h, dst_a)
+            return int(oh), int(oa)
+        except (TypeError, ValueError, Exception):  # noqa: BLE001
+            pass
+    if ev.get("sides_swapped") is True:
+        return aws, hs
+    return hs, aws
+
+
 def current_score_for_match(
     root: Path,
     match_id: str,
     fallback_ev: dict[str, Any] | None = None,
 ) -> tuple[int, int] | None:
-    """Live DQD score: in-process bridge, then ``prev_scores.json``, then event."""
+    """Live score in Polymarket home/away (same frame as the scheduled event).
+
+    ``prev_scores`` and the DQD snapshot are venue/DQD order; re-orient before
+    overlaying onto the PM-labeled T+10 work event.
+    """
     mid = str(match_id or "").strip()
-
-    def _pair(row: Any) -> tuple[int, int] | None:
-        if not isinstance(row, dict):
-            return None
+    row: dict[str, Any] | None = None
+    if mid:
         try:
-            h = row.get("home", row.get("home_score"))
-            a = row.get("away", row.get("away_score"))
-            if h is None or a is None:
-                return None
-            return int(h), int(a)
-        except (TypeError, ValueError):
-            return None
+            import quote_lib as lib
 
+            row = lib.find_match_row(root, match_id=mid)
+        except Exception:  # noqa: BLE001
+            row = None
+
+    dqd_pair: tuple[int, int] | None = None
     if mid:
         try:
             import quote_lib as lib
@@ -126,31 +180,22 @@ def current_score_for_match(
             owned = lib.get_owned_bridge()
             ps = getattr(owned, "_prev_scores", None) if owned is not None else None
             if isinstance(ps, dict):
-                got = _pair(ps.get(mid))
-                if got is not None:
-                    return got
+                dqd_pair = _score_pair(ps.get(mid))
         except Exception:  # noqa: BLE001
             pass
-        try:
-            import quote_lib as lib
+        if dqd_pair is None:
+            try:
+                import quote_lib as lib
 
-            file_ps = lib.load_json(lib.bridge_dir(root) / "prev_scores.json", {}) or {}
-            if isinstance(file_ps, dict):
-                got = _pair(file_ps.get(mid))
-                if got is not None:
-                    return got
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            import quote_lib as lib
-
-            row = lib.find_match_row(root, match_id=mid)
-            dqd = (row or {}).get("dongqiudi") or {}
-            got = _pair(dqd)
-            if got is not None:
-                return got
-        except Exception:  # noqa: BLE001
-            pass
+                file_ps = lib.load_json(lib.bridge_dir(root) / "prev_scores.json", {}) or {}
+                if isinstance(file_ps, dict):
+                    dqd_pair = _score_pair(file_ps.get(mid))
+            except Exception:  # noqa: BLE001
+                pass
+        if dqd_pair is None and isinstance(row, dict):
+            dqd_pair = _score_pair((row or {}).get("dongqiudi") or {})
+    if dqd_pair is not None:
+        return orient_dqd_score_to_pm(dqd_pair[0], dqd_pair[1], fallback_ev, row)
     if fallback_ev:
         try:
             from score_events import target_score_from_event
@@ -160,7 +205,7 @@ def current_score_for_match(
                 return got
         except Exception:  # noqa: BLE001
             pass
-        got = _pair(fallback_ev)
+        got = _score_pair(fallback_ev)
         if got is not None:
             return got
     return None
@@ -195,7 +240,10 @@ def build_t10_work_event(
         return None
     score = current_score_for_match(root, mid, ev)
     if score is None:
-        return None
+        score = _score_pair(ev)
+    if score is None:
+        # Placeholder until AF live confirm overwrites home/away_score.
+        score = (0, 0)
     hs, aws = score
     work = dict(ev)
     work["type"] = "score_change"
@@ -205,6 +253,30 @@ def build_t10_work_event(
     work["curr"] = {"home": hs, "away": aws}
     work.pop("prev", None)
     work.pop("is_reversal", None)
+    try:
+        import quote_lib as lib
+
+        row = lib.find_match_row(root, match_id=mid)
+    except Exception:  # noqa: BLE001
+        row = None
+    if isinstance(row, dict):
+        dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+        pm = row.get("polymarket") if isinstance(row.get("polymarket"), dict) else {}
+        try:
+            fields = lib._bridge_lib().pm_side_fields(dqd or {}, pm or {})
+        except Exception:  # noqa: BLE001
+            fields = {}
+        if isinstance(fields, dict):
+            if "sides_swapped" in fields:
+                work["sides_swapped"] = fields.get("sides_swapped")
+            if fields.get("dqd_home"):
+                work["dqd_home"] = fields.get("dqd_home")
+            if fields.get("dqd_away"):
+                work["dqd_away"] = fields.get("dqd_away")
+            hh, ah = fields.get("home_half"), fields.get("away_half")
+            if hh not in (None, "") and ah not in (None, ""):
+                work["home_half"] = hh
+                work["away_half"] = ah
     t10_key = str(job.get("t10_event_key") or t10_event_key(src))
     work["_trade_event_key"] = t10_key
     work["_trade_context"] = {

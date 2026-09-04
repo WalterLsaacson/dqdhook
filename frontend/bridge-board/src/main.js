@@ -11,6 +11,9 @@ import { consumeEvents, eventKey, render, renderMeta, tickWallClocks } from "./r
 
 function applySnap(snap) {
   state.matches = snap.matches || [];
+  if (Array.isArray(snap.coverage_by_date)) {
+    state.coverageByDate = snap.coverage_by_date;
+  }
   render(snap);
 }
 

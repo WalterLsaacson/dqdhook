@@ -55,7 +55,7 @@ def main() -> int:
         "results": [
             {
                 "match": {"id": "m-hi", "home": "A", "away": "B"},
-                "score": {"home": 2, "away": 0},
+                "score": {"home": 2, "away": 0, "source": "apifootball"},
                 "hits": [
                     {
                         "token_id": "tok_hi",
@@ -68,7 +68,7 @@ def main() -> int:
             },
             {
                 "match": {"id": "m-lo", "home": "C", "away": "D"},
-                "score": {"home": 2, "away": 0},
+                "score": {"home": 2, "away": 0, "source": "apifootball"},
                 "hits": [
                     {
                         "token_id": "tok_lo",
@@ -81,7 +81,7 @@ def main() -> int:
             },
             {
                 "match": {"id": "m-wall", "home": "E", "away": "F"},
-                "score": {"home": 1, "away": 0},
+                "score": {"home": 1, "away": 0, "source": "apifootball"},
                 "hits": [
                     {
                         "token_id": "tok_wall",
@@ -92,11 +92,25 @@ def main() -> int:
                     }
                 ],
             },
+            {
+                "match": {"id": "m-dqd", "home": "G", "away": "H"},
+                "score": {"home": 3, "away": 0, "source": "dongqiudi"},
+                "hits": [
+                    {
+                        "token_id": "tok_dqd",
+                        "best_ask": 0.95,
+                        "tradeable_shares": 20,
+                        "asks": [{"price": 0.95, "size": 20}],
+                        "question": "O/U 0.5 Over",
+                    }
+                ],
+            },
         ]
     }
     hits = ps.collect_tradeable_hits(payload, max_ask=0.995)
     assert [h["token_id"] for h in hits] == ["tok_lo", "tok_hi"], hits
     assert not any(h["token_id"] == "tok_wall" for h in hits)
+    assert not any(h["token_id"] == "tok_dqd" for h in hits)
 
     q = ps.hit_to_quote(hits[0])
     assert q["neg_risk"] is False
@@ -141,6 +155,7 @@ def main() -> int:
     assert "--hours" in cmd and "24" in cmd
     assert "--max-ask" in cmd and "0.995" in cmd
     assert "--json" in cmd
+    assert "--require-af" in cmd
     print("smoke_postft_sweep: ok")
     return 0
 

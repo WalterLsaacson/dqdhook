@@ -1,3 +1,5 @@
+import { state } from "./state.js";
+
 export function $(id) {
   return document.getElementById(id);
 }
@@ -121,4 +123,28 @@ export function formatBeijingDateTime(value) {
     second: "2-digit",
     hour12: false,
   }).format(d);
+}
+
+/** Beijing calendar date YYYY-MM-DD from a paired row. */
+export function kickoffDate(row) {
+  const s = String(
+    row?.kickoff_beijing ||
+      row?.polymarket?.kickoff_beijing ||
+      row?.dongqiudi?.local_date ||
+      "",
+  );
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : "";
+}
+
+export function shortDate(iso) {
+  const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return iso || "";
+  return `${Number(m[2])}/${Number(m[3])}`;
+}
+
+export function visibleMatches() {
+  const date = state.filterDate;
+  if (!date) return state.matches;
+  return state.matches.filter((r) => kickoffDate(r) === date);
 }

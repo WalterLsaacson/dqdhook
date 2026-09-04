@@ -155,6 +155,9 @@ def main() -> int:
     _assert(bl.normalize_league("荷乙") == "ned2", "荷乙→ned2")
     _assert(bl.normalize_league("意大利杯") == "itc", "意大利杯→itc")
     _assert(bl.normalize_league("希腊杯") == "grc", "希腊杯→grc")
+    _assert(bl.normalize_league("荷兰杯") == "nlc", "荷兰杯→nlc")
+    _assert(bl.normalize_league("NLC", "nlc") == "nlc", "NLC→nlc")
+    _assert(bl.normalize_league("Dutch Cup") == "nlc", "Dutch Cup→nlc")
     # 2026-08-15: Community Shield / French Supercup / Saudi King Cup
     _assert(bl.normalize_league("社区盾杯") == "ecs", "社区盾杯→ecs")
     _assert(bl.normalize_league("ECS", "ecs") == "ecs", "ECS→ecs")
@@ -432,6 +435,67 @@ def main() -> int:
         == bl.normalize_team("Naval 1º de Maio"),
         "Naval",
     )
+    # 2026-09-02 unmatched PM (95/123 fresh): 荷兰杯 / UWCL Madrid
+    _assert(bl.normalize_league("荷兰杯", "") == "nlc", "荷兰杯 nlc")
+    _assert(bl.league_similarity({"league": "荷兰杯"}, {"league_id": "nlc", "league": "NLC"}) == 1.0, "荷兰杯↔nlc")
+    _assert(bl.normalize_team("TOGB") == bl.normalize_team("Tot Ons Genoegen Berkel"), "TOGB")
+    _assert(bl.normalize_team("VV Sint Bavo") == bl.normalize_team("VVSB"), "VVSB")
+    _assert(bl.normalize_team("SV Zwaluwen Wierden") == bl.normalize_team("SVZW"), "SVZW")
+    _assert(
+        bl.normalize_team("Real Madrid CF Femenino")
+        == bl.normalize_team("Real Madrid(W)"),
+        "Madrid Femenino",
+    )
+    nlc_pair = bl.score_pair(
+        {
+            "home": "Staphorst",
+            "away": "UNA",
+            "league": "荷兰杯",
+            "kickoff_beijing": "2026-09-03 02:00",
+            "local_date": "2026-09-03",
+            "time": "02:00",
+        },
+        {
+            "home": "VV Staphorst",
+            "away": "VV UNA",
+            "league": "NLC",
+            "league_id": "nlc",
+            "kickoff_beijing": "2026-09-03 02:00",
+        },
+    )
+    _assert(nlc_pair >= bl.DEFAULT_MIN_SCORE, f"Staphorst NLC should match, got {nlc_pair}")
+    uwcl_pair = bl.score_pair(
+        {
+            "home": "Real Madrid(W)",
+            "away": "Ajax Amsterdam Women",
+            "league": "女足欧冠",
+            "kickoff_beijing": "2026-09-03 02:00",
+            "local_date": "2026-09-03",
+            "time": "02:00",
+        },
+        {
+            "home": "Real Madrid CF Femenino",
+            "away": "AFC Ajax",
+            "league": "UWCL",
+            "league_id": "uwcl",
+            "kickoff_beijing": "2026-09-03 02:00",
+        },
+    )
+    _assert(uwcl_pair >= bl.DEFAULT_MIN_SCORE, f"Madrid UWCL should match, got {uwcl_pair}")
+    # 2026-09-04 league-gate near-misses
+    _assert(bl.normalize_league("泰超") == "tha1", "泰超→tha1")
+    _assert(bl.normalize_league("THA1", "tha1") == "tha1", "THA1→tha1")
+    _assert(bl.normalize_league("印尼超") == "idn1", "印尼超→idn1")
+    _assert(bl.normalize_league("英女超") == "wsl", "英女超→wsl")
+    _assert(bl.normalize_league("非冠杯") == "cafcl", "非冠杯→cafcl")
+    _assert(
+        bl.league_similarity({"league": "泰超"}, {"league_id": "tha1", "league": "THA1"}) == 1.0,
+        "泰超↔tha1",
+    )
+    _assert(
+        bl.normalize_team("SC Schwarz-Weiß Bregenz") == bl.normalize_team("SW Bregenz"),
+        "Bregenz",
+    )
 
     # PM lists Villa first; DQD/AF list Pathum as home with 1-3 → emit Villa 3-1
     _assert(
@@ -591,6 +655,28 @@ def main() -> int:
         got = rt.refresh_pm_once()
     _assert(got.get("count") == 1, f"reuse snapshot count, got {got.get('count')}")
     _assert(fake_load.call_count == 0, "Gamma load_matches must not run")
+
+    cov = bl.coverage_by_date(
+        [
+            {"kickoff_beijing": "2026-08-31 22:00", "polymarket": {"event_id": "1"}},
+            {"kickoff_beijing": "2026-09-01 01:00", "polymarket": {"event_id": "2"}},
+        ],
+        [
+            {"kickoff_beijing": "2026-08-31 22:00"},
+            {"kickoff_beijing": "2026-08-31 23:00"},
+            {"kickoff_beijing": "2026-09-01 01:00"},
+            {"kickoff_beijing": "2026-09-02 02:45"},
+        ],
+    )
+    by_day = {r["date"]: r for r in cov}
+    _assert(by_day["2026-08-31"] == {"date": "2026-08-31", "matched": 1, "total": 2}, str(by_day["2026-08-31"]))
+    _assert(by_day["2026-09-01"] == {"date": "2026-09-01", "matched": 1, "total": 1}, str(by_day["2026-09-01"]))
+    _assert(by_day["2026-09-02"] == {"date": "2026-09-02", "matched": 0, "total": 1}, str(by_day["2026-09-02"]))
+    _assert(bl.beijing_kickoff_date({"dongqiudi": {"local_date": "2026-08-31"}}) == "2026-08-31", "dqd local_date")
+    _assert(
+        bl.league_similarity({"league": "足协杯"}, {"league_id": "chfa", "league": "CHFA"}) == 1.0,
+        "足协杯 must alias to chfa",
+    )
 
     print("smoke_match_hardening: ok")
     return 0

@@ -130,7 +130,7 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 
 ### 3. 进球 +10 分钟再扫盘（T+10）
 
-已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **600s** 后按**当时**懂球帝比分再询价：
+已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **600s** 后按**当时**懂球帝比分再询价（叠到 Polymarket 主客上，主客对调要换边，不能把懂球帝 1-0 直接写成 PM 主队 1-0）：
 
 - 有 misprice → 同一套 `buy_win` FAK（fee / `min_net` / ask≤0.995；跳过 `min_buy_price`；**不做** locked sweep）
 - **每个已锁定 WIN 的 token** 再挂一笔 **@0.99 GTC**（不依赖 `QUOTE_REST_ENABLED`）

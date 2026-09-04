@@ -10,16 +10,19 @@ import {
   wallClockNow,
   leagueColor,
   formatBeijingDateTime,
+  shortDate,
+  visibleMatches,
 } from "./utils.js";
 
 export function renderRail(onFilter) {
   const rail = $("leagueRail");
-  const groups = groupMatches(state.matches, null);
+  const shown = visibleMatches();
+  const groups = groupMatches(shown, null);
   const chips = [
     `<button class="league-chip ${state.filterLeagueId ? "" : "is-active"}" data-league="" type="button">
       <span class="league-chip__dot" style="--dot:#2dd4bf;background:#2dd4bf"></span>
       <span class="league-chip__name">All</span>
-      <span class="league-chip__count">${state.matches.length}</span>
+      <span class="league-chip__count">${shown.length}</span>
     </button>`,
   ];
   for (const g of groups) {
@@ -128,8 +131,15 @@ function rowHtml(row) {
 
 export function renderBoard() {
   const board = $("board");
-  const groups = groupMatches(state.matches, state.filterLeagueId);
+  const shown = visibleMatches();
+  const groups = groupMatches(shown, state.filterLeagueId);
   if (!groups.length) {
+    if (state.filterDate) {
+      const row = (state.coverageByDate || []).find((r) => r.date === state.filterDate);
+      const total = row?.total ?? 0;
+      board.innerHTML = `<div class="empty">${escapeHtml(shortDate(state.filterDate))} 暂无配对（Polymarket ${total} 场）。</div>`;
+      return;
+    }
     board.innerHTML = `<div class="empty">暂无匹配赛程。等待 DQD / Polymarket 轮询，或点 Refresh。</div>`;
     return;
   }
@@ -221,12 +231,69 @@ export function consumeEvents(events) {
   for (const ev of events || []) pushToast(ev);
 }
 
+function coverageTone(matched, total) {
+  if (!total) return "empty";
+  if (matched >= total) return "full";
+  if (matched <= 0) return "empty";
+  return "partial";
+}
+
+export function renderDateCoverage(snap) {
+  const el = $("dateCoverage");
+  if (!el) return;
+  const rows = Array.isArray(snap?.coverage_by_date)
+    ? snap.coverage_by_date
+    : state.coverageByDate || [];
+  state.coverageByDate = rows;
+  if (!rows.length) {
+    el.innerHTML = "";
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const sumM = rows.reduce((n, r) => n + (Number(r.matched) || 0), 0);
+  const sumT = rows.reduce((n, r) => n + (Number(r.total) || 0), 0);
+  const chips = [
+    `<button type="button" class="date-chip ${state.filterDate ? "" : "is-active"}" data-date="">
+      <span class="date-chip__day">全部</span>
+      <span class="date-chip__frac">${sumM} / ${sumT}</span>
+      <span class="date-chip__hint">PM 场次</span>
+    </button>`,
+  ];
+  for (const r of rows) {
+    const date = String(r.date || "");
+    const matched = Number(r.matched) || 0;
+    const total = Number(r.total) || 0;
+    const tone = coverageTone(matched, total);
+    const pct = total ? Math.round((100 * matched) / total) : 0;
+    chips.push(`
+      <button type="button" class="date-chip date-chip--${tone} ${state.filterDate === date ? "is-active" : ""}" data-date="${escapeHtml(date)}">
+        <span class="date-chip__day">${escapeHtml(shortDate(date))}</span>
+        <span class="date-chip__frac">${matched} / ${total}</span>
+        <span class="date-chip__hint">${pct}%</span>
+      </button>
+    `);
+  }
+  el.innerHTML = chips.join("");
+  el.querySelectorAll(".date-chip").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-date") || "";
+      state.filterDate = id || null;
+      render(state.lastMeta);
+    });
+  });
+}
+
 export function renderMeta(snap) {
-  const liveN = state.matches.filter((r) => isLive(r.dongqiudi)).length;
-  const ftN =
-    snap?.finished_count ??
-    state.matches.filter((r) => isFinished(r.dongqiudi, r)).length;
-  $("pillCount").textContent = `${state.matches.length} matched`;
+  const shown = visibleMatches();
+  const liveN = shown.filter((r) => isLive(r.dongqiudi)).length;
+  const ftN = state.filterDate
+    ? shown.filter((r) => isFinished(r.dongqiudi, r)).length
+    : snap?.finished_count ??
+      state.matches.filter((r) => isFinished(r.dongqiudi, r)).length;
+  $("pillCount").textContent = state.filterDate
+    ? `${visibleMatches().length} / ${(state.coverageByDate || []).find((r) => r.date === state.filterDate)?.total ?? "—"} · ${shortDate(state.filterDate)}`
+    : `${state.matches.length} matched`;
   $("pillLive").textContent = `Live ${liveN}`;
   $("pillLive").classList.toggle("is-live", liveN > 0);
   const pillFt = $("pillFt");
@@ -253,7 +320,11 @@ export function renderMeta(snap) {
 
 export function render(snap) {
   state.lastMeta = snap || state.lastMeta;
+  if (Array.isArray((snap || state.lastMeta)?.coverage_by_date)) {
+    state.coverageByDate = (snap || state.lastMeta).coverage_by_date;
+  }
   if (snap?.events?.length) consumeEvents(snap.events);
+  renderDateCoverage(snap || state.lastMeta);
   renderRail((id) => {
     state.filterLeagueId = id;
     render(state.lastMeta);

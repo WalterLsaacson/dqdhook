@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import unicodedata
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -310,6 +311,55 @@ def filter_fresh_pm_matches(
         dt = _kickoff_dt(p)
         if dt is None or dt >= cutoff:
             out.append(p)
+    return out
+
+
+def beijing_kickoff_date(row: dict[str, Any] | None) -> str:
+    """Beijing calendar date (YYYY-MM-DD) from a PM row or a paired bridge row."""
+    if not row:
+        return ""
+    dt = _kickoff_dt(row)
+    if dt is None:
+        nested = row.get("polymarket") if isinstance(row.get("polymarket"), dict) else None
+        if nested:
+            dt = _kickoff_dt(nested)
+        if dt is None:
+            dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else None
+            if dqd:
+                dt = _kickoff_dt(dqd)
+    if dt is not None:
+        return dt.strftime("%Y-%m-%d")
+    kb = str(row.get("kickoff_beijing") or "").strip()
+    if len(kb) >= 10 and kb[4] == "-" and kb[7] == "-":
+        return kb[:10]
+    dqd = row.get("dongqiudi") if isinstance(row.get("dongqiudi"), dict) else {}
+    ld = str((dqd or {}).get("local_date") or row.get("local_date") or "").strip()
+    return ld[:10] if len(ld) >= 10 else ""
+
+
+def coverage_by_date(
+    paired: list[dict[str, Any]] | None,
+    pm_matches: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Per Beijing date: matched pairs vs PM snapshot totals."""
+    totals: dict[str, int] = defaultdict(int)
+    matched: dict[str, int] = defaultdict(int)
+    for p in pm_matches or []:
+        day = beijing_kickoff_date(p)
+        if day:
+            totals[day] += 1
+    for row in paired or []:
+        day = beijing_kickoff_date(row)
+        if day:
+            matched[day] += 1
+    dates = sorted(set(totals) | set(matched))
+    out: list[dict[str, Any]] = []
+    for day in dates:
+        m = int(matched.get(day, 0))
+        total = int(totals.get(day, 0))
+        if total < m:
+            total = m
+        out.append({"date": day, "matched": m, "total": total})
     return out
 
 
@@ -1092,6 +1142,7 @@ class BridgeRuntime:
                 "pm_count": len(pm_matches),
                 "count": len(paired),
                 "finished_count": finished_n,
+                "coverage_by_date": coverage_by_date(paired, pm_matches),
                 "min_score": self.min_score,
                 "max_skew_min": self.max_skew_min,
                 "min_side": self.min_side,

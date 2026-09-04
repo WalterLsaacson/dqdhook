@@ -26,12 +26,17 @@ python3 .cursor/skills/pm-locked-scan/scripts/pm_locked_scan.py --json
 python3 .cursor/skills/pm-locked-scan/scripts/pm_locked_scan.py --hours 48 --league ptc --json
 python3 .cursor/skills/pm-locked-scan/scripts/pm_locked_scan.py --tradeable --json
 python3 .cursor/skills/pm-locked-scan/scripts/pm_locked_scan.py --from-snapshot --json
+python3 .cursor/skills/pm-locked-scan/scripts/pm_locked_scan.py --hours 24 --tradeable --require-af --json
 ```
 
 `--tradeable` keeps asks ≤ **0.995** (quote taker cap). Default `--max-ask 1.0`
 keeps any remaining sell, including 0.999 walls.
 
 `--json` still prints per-match progress on stderr unless `-q`.
+
+`--require-af`: settle only from API-Football regulation (`score.fulltime` + HT).
+Skip matches that would have used a Dongqiudi league fallback. The hourly
+quote sweep always passes this flag.
 
 Writes `data/pm-locked-scan/latest.json`.
 
@@ -53,7 +58,9 @@ silently scan zero rows.
      On AET, if `fulltime` equals live `goals` and `extratime` is an increment
      (e.g. 2-3 + 0-1), subtract extra time so settlement is 90' (2-2).
    - else Dongqiudi `data/snapshot.json` for **league** games when `period=FT`
-     and the clock is not past 90'. Cups / knockout (UCL, domestic cups, …)
+     and the clock is not past 90' — **research CLI only**. The hourly quote
+     sweep always passes `--require-af` and skips that fallback (error
+     `no_af_regulation_score`). Cups / knockout (UCL, domestic cups, …)
      are not taken from DQD: after AET, DQD often stays `period=FT` with the
      120' score. If AF has the same matchup live or in ET/pen without a usable
      90' score, DQD is not used either.

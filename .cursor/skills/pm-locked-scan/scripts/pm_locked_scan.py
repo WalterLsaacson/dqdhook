@@ -68,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--snapshot", default=None, help="Override PM snapshot path")
     p.add_argument("--dqd-snapshot", default=None, help="Override Dongqiudi snapshot path")
+    p.add_argument(
+        "--require-af",
+        action="store_true",
+        help=(
+            "Settle only from API-Football regulation (score.fulltime + HT). "
+            "Skip matches that would have used a Dongqiudi fallback. "
+            "Used by the hourly quote sweep."
+        ),
+    )
     p.add_argument("--proxy", default=None)
     p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--json", action="store_true")
@@ -148,6 +157,7 @@ def main() -> int:
             dqd_path=Path(args.dqd_snapshot) if args.dqd_snapshot else None,
             proxy=_resolve_proxy(args),
             progress=progress,
+            require_af=bool(args.require_af),
         )
     except Exception as e:  # noqa: BLE001
         print(f"scan failed: {e}", file=sys.stderr)

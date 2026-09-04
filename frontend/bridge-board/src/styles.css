@@ -124,10 +124,74 @@ body {
 .meta {
   max-width: 1240px;
   margin: 0 auto;
-  padding: 8px 24px 18px;
+  padding: 8px 24px 10px;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.date-coverage {
+  max-width: 1240px;
+  margin: 0 auto 16px;
+  padding: 0 24px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.date-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 108px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(14, 24, 30, 0.9);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.date-chip:hover,
+.date-chip.is-active {
+  border-color: rgba(45, 212, 191, 0.45);
+  background: rgba(45, 212, 191, 0.1);
+}
+
+.date-chip__day {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.date-chip__frac {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+
+.date-chip__hint {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.date-chip--full .date-chip__frac {
+  color: var(--live);
+}
+
+.date-chip--partial .date-chip__frac {
+  color: var(--injury);
+}
+
+.date-chip--empty .date-chip__frac {
+  color: var(--danger);
 }
 
 .pill {

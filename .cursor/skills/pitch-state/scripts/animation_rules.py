@@ -586,7 +586,7 @@ def judge_animation(
                 "confidence": 0.55,
                 "evidence": evidence,
                 **score_payload,
-            }
+        }
 
     play_hits = [token for token in IN_PLAY_TOKENS if token in full]
     if play_hits:

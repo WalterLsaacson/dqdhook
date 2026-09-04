@@ -80,6 +80,14 @@ def sweep_max_ask() -> float:
     return min(1.0, max(0.01, _env_float("QUOTE_POSTFT_SWEEP_MAX_ASK", DEFAULT_MAX_ASK)))
 
 
+AF_SCORE_SOURCES = frozenset({"apifootball", "api_football", "score.fulltime"})
+
+
+def af_regulation_source(score: dict[str, Any] | None) -> bool:
+    src = str((score or {}).get("source") or "").strip().lower()
+    return src in AF_SCORE_SOURCES
+
+
 def tradeable_hit(hit: dict[str, Any], *, max_ask: float = DEFAULT_MAX_ASK) -> bool:
     """True when leftover WIN asks exist at or below the FAK cap."""
     try:
@@ -108,6 +116,8 @@ def collect_tradeable_hits(
             continue
         match = scanned.get("match") or {}
         score = scanned.get("score") or {}
+        if not af_regulation_source(score):
+            continue
         for hit in scanned.get("hits") or []:
             if not isinstance(hit, dict):
                 continue
@@ -246,6 +256,7 @@ def scan_cli_cmd(
     max_ask: float,
     out_path: Path,
 ) -> list[str]:
+    """Hourly trade sweep: AF regulation only (no Dongqiudi fallback)."""
     return [
         sys.executable,
         str(SCAN_CLI),
@@ -256,6 +267,7 @@ def scan_cli_cmd(
         "--out",
         str(out_path),
         "--json",
+        "--require-af",
     ]
 
 

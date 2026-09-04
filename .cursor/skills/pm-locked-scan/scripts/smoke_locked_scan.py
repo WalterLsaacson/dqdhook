@@ -385,6 +385,20 @@ def test_dqd_skips_cup_and_et() -> None:
     )
     check("AF AET without 90' blocks DQD", blocked.get("error") == "af_live_or_et_no_regulation")
 
+    require_af = lib.resolve_regulation_score(
+        {
+            "home": "AC Malveira",
+            "away": "CD Mafra",
+            "start_play": "2026-08-29T16:00:00+00:00",
+            "league": "EPL",
+            "league_id": "epl",
+        },
+        af_fixtures=[],
+        dqd_matches=[_dqd_ft(minute="90", home_score=2, away_score=2)],
+        allow_dqd=False,
+    )
+    check("require AF skips DQD fallback", require_af.get("error") == "no_af_regulation_score")
+
 
 def test_unknown_league() -> None:
     print("test_unknown_league")

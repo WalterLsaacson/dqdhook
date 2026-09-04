@@ -96,6 +96,17 @@ def refresh_clocks(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def decorate_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Clocks + per-date PM coverage (matched / snapshot total)."""
+    out = refresh_clocks(payload or {})
+    pm_snap = bridge.load_json(ROOT / "data" / "polymarket" / "snapshot.json", {}) or {}
+    pm_matches = list(pm_snap.get("matches") or []) if isinstance(pm_snap, dict) else []
+    out["coverage_by_date"] = bridge.coverage_by_date(out.get("matches") or [], pm_matches)
+    if out.get("pm_count") is None and pm_matches:
+        out["pm_count"] = len(pm_matches)
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "BridgeBoard/1.0"
 
@@ -174,16 +185,18 @@ class Handler(BaseHTTPRequestHandler):
                     json_response(
                         self,
                         200,
-                        {
-                            "matched_at": None,
-                            "count": 0,
-                            "matches": [],
-                            "events": [],
-                            "note": "read-only until match-bridge writes data/bridge",
-                        },
+                        decorate_payload(
+                            {
+                                "matched_at": None,
+                                "count": 0,
+                                "matches": [],
+                                "events": [],
+                                "note": "read-only until match-bridge writes data/bridge",
+                            }
+                        ),
                     )
                     return
-            out = refresh_clocks(snap)
+            out = decorate_payload(snap)
             # Surface in-memory events from the latest rematch tick (file may be stale mid-tick).
             if RUNTIME.last_result and RUNTIME.last_result.get("events"):
                 out = dict(out)
@@ -219,12 +232,14 @@ class Handler(BaseHTTPRequestHandler):
             if owner.is_file():
                 # Read-only: quote owns the skill; just re-serve file snapshot.
                 snap = bridge.load_json(ROOT / "data" / "bridge" / "matches.json", {}) or {}
-                out = refresh_clocks(snap) if snap else {
-                    "matched_at": None,
-                    "count": 0,
-                    "matches": [],
-                    "note": "quote owns match-bridge; showing file snapshot",
-                }
+                out = decorate_payload(snap) if snap else decorate_payload(
+                    {
+                        "matched_at": None,
+                        "count": 0,
+                        "matches": [],
+                        "note": "quote owns match-bridge; showing file snapshot",
+                    }
+                )
                 out["ok"] = True
                 out["viewer_mode"] = "quote_owned"
                 json_response(self, 200, out)
@@ -232,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
             offline = bool(body.get("offline"))
             try:
                 payload = RUNTIME.run_once(refresh=not offline)
-                json_response(self, 200, refresh_clocks(payload))
+                json_response(self, 200, decorate_payload(payload))
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 json_response(self, 502, {"error": str(e)})
@@ -253,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
                             "match-bridge is owned by polymarket-quote (in-process). "
                             "Board is read-only; Start is a no-op."
                         ),
-                        "last_result": refresh_clocks(snap) if snap else None,
+                        "last_result": decorate_payload(snap) if snap else None,
                     },
                 )
                 return
@@ -265,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
                 snap = RUNTIME.last_result or bridge.load_json(
                     ROOT / "data" / "bridge" / "matches.json", {}
                 )
-                result["last_result"] = refresh_clocks(snap) if snap else result.get("last_result")
+                result["last_result"] = decorate_payload(snap) if snap else result.get("last_result")
                 result["viewer_mode"] = "board_skill"
                 json_response(self, 200, result)
             except Exception as e:  # noqa: BLE001

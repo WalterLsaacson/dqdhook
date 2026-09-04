@@ -364,6 +364,21 @@ def call_af_bridge_regulation_score(
     )
 
 
+def t10_live_blocked_by_af_status(payload: dict[str, Any] | None) -> bool:
+    """True when T+10 must not trade AF live goals (FT path owns the match).
+
+    AF ``regulation_ready`` / finished / FT·ET·PEN means live event tallies
+    can include a stoppage VAR goal or extra time. Skip; do not quote.
+    """
+    row = payload if isinstance(payload, dict) else {}
+    if row.get("regulation_ready") is True:
+        return True
+    if row.get("finished") is True:
+        return True
+    short = str(row.get("status_short") or "").strip().upper()
+    return bool(short) and short in aflib.REGULATION_DECIDED_SHORT
+
+
 def af_score_satisfies(
     af: tuple[int, int],
     target: tuple[int, int],
@@ -456,6 +471,24 @@ def _is_transient_af_error(payload: dict[str, Any] | str | None) -> bool:
         "temporary failure",
     )
     return any(n in blob for n in needles)
+
+
+def call_af_bridge_live_status(
+    match_id: str,
+    *,
+    af: aflib.AFClient,
+    cache: dict[str, Any],
+    cache_only: bool = True,
+    http_timeout: float | None = None,
+) -> dict[str, Any]:
+    """In-process AF ``/fixtures?id=`` live goals + status (T+10)."""
+    return aflib.fetch_live_fixture_status_for_match_id(
+        af,
+        str(match_id),
+        cache=cache,
+        cache_only=cache_only,
+        http_timeout=http_timeout,
+    )
 
 
 def call_af_bridge_events(
@@ -733,6 +766,40 @@ class AfReferee:
                 _POLL_CACHE[mid] = (time.monotonic(), dict(out))
         return out
 
+    def poll_t10_once(
+        self,
+        match_id: str,
+        *,
+        persist_burst: bool = False,
+        http_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """T+10 poll: fixture live goals + status (not events-only)."""
+        mid = str(match_id)
+        if self._events_fn is not None:
+            try:
+                return self._events_fn(mid, persist_burst=persist_burst, kind="live")
+            except TypeError:
+                return self._events_fn(mid)
+        return call_af_bridge_live_status(
+            mid,
+            af=self._client(),
+            cache=self._fixture_cache(),
+            cache_only=True,
+            http_timeout=http_timeout,
+        )
+
+    def has_pending_kind(self, match_id: str, kind: str) -> bool:
+        mid = str(match_id or "")
+        want = str(kind or "").strip().lower()
+        if not mid or not want:
+            return False
+        with self._lock:
+            return any(
+                str(m.get("match_id") or "") == mid
+                and str(m.get("kind") or "") == want
+                for m in self._meta.values()
+            )
+
     def poll_regulation_once(
         self,
         match_id: str,
@@ -768,6 +835,7 @@ class AfReferee:
         event_away: str = "",
         abort_event: threading.Event | None = None,
         abort_reason_holder: dict[str, str] | None = None,
+        for_t10_live: bool = False,
     ) -> dict[str, Any]:
         """Block until AF confirms target (or AF already covers it) / timeout.
 
@@ -786,6 +854,10 @@ class AfReferee:
         ``event_home`` / ``event_away``: consumer-facing sides (PM labels on the
         bridge event). AF goals are remapped from fixture home/away into this
         frame before compare/apply.
+
+        ``for_t10_live=True``: skip (do not confirm) when AF has already
+        decided regulation / finished — T+10 must not trade live tallies
+        that can still hold a stoppage VAR goal.
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
         timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
@@ -929,11 +1001,18 @@ class AfReferee:
             # Pick up late sync mappings between polls.
             self._reload_fixture_cache()
             try:
-                last = self.poll_once(
-                    mid,
-                    persist_burst=False,
-                    http_timeout=min(8.0, max(0.5, remain_budget)),
-                )
+                if for_t10_live:
+                    last = self.poll_t10_once(
+                        mid,
+                        persist_burst=False,
+                        http_timeout=min(8.0, max(0.5, remain_budget)),
+                    )
+                else:
+                    last = self.poll_once(
+                        mid,
+                        persist_burst=False,
+                        http_timeout=min(8.0, max(0.5, remain_budget)),
+                    )
             except Exception as e:  # noqa: BLE001
                 last_error = str(e)
                 last = {"ok": False, "error": str(e), "goals": last_goals}
@@ -1010,6 +1089,30 @@ class AfReferee:
                     event_away=event_away,
                 )
                 last_goals = {"home": gh_o, "away": ga_o}
+                if for_t10_live and t10_live_blocked_by_af_status(last):
+                    return {
+                        "ok": False,
+                        "confirmed": False,
+                        "match_id": mid,
+                        "target": {"home": th, "away": ta},
+                        "goals": last_goals,
+                        "baseline": (
+                            {"home": base[0], "away": base[1]} if base else None
+                        ),
+                        "af_fixture_id": last.get("af_fixture_id"),
+                        "burst_dir": last.get("burst_dir"),
+                        "polls": polls,
+                        "elapsed_ms": elapsed_ms,
+                        "poll_s": poll,
+                        "timeout_s": timeout,
+                        "schedule": self._schedule_desc(),
+                        "error": "t10_af_ft_skip",
+                        "status_short": last.get("status_short"),
+                        "finished": bool(last.get("finished")),
+                        "regulation_ready": bool(last.get("regulation_ready")),
+                        "via": "apifootball-bridge",
+                        "cache_only": True,
+                    }
                 try:
                     gh, ga = gh_o, ga_o
                     if gh is not None and ga is not None:
@@ -1093,12 +1196,13 @@ class AfReferee:
         abort_event: threading.Event | None = None,
         abort_reason_holder: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Block until AF regulation fulltime equals DQD FT target (exact).
+        """Block until AF marks regulation decided (``score.fulltime``).
 
-        Uses ``score.fulltime`` only (ET/penalties ignored — Polymarket rule).
-        When AF fixture is finished with a different regulation score → immediate
-        mismatch (no trade). When not finished yet → keep polling until timeout.
-        Remaps AF fixture-frame goals into ``event_home``/``event_away`` before compare.
+        Polymarket ignores ET/penalties. DQD ``match_finished`` is only a hint —
+        confirm when AF ``regulation_ready`` and use that fulltime score even if
+        it differs from the DQD target (stoppage VAR / false FT). Keep polling
+        while AF is still in play. Remaps AF fixture-frame goals into
+        ``event_home``/``event_away`` before apply.
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
         timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
@@ -1300,59 +1404,36 @@ class AfReferee:
                 try:
                     gh, ga = gh_o, ga_o
                     if gh is not None and ga is not None and last_ready:
-                        if af_ft_score_matches((int(gh), int(ga)), (th, ta)):
-                            fid = last.get("af_fixture_id")
-                            truth = (int(gh), int(ga))
-                            set_confirmed_score_async(
-                                self.root,
-                                mid,
-                                truth[0],
-                                truth[1],
-                                af_fixture_id=int(fid) if fid is not None else None,
-                                source="af_fixture_fulltime",
-                            )
-                            return {
-                                "ok": True,
-                                "confirmed": True,
-                                "kind": "ft",
-                                "match_id": mid,
-                                "target": {"home": th, "away": ta},
-                                "goals": {"home": truth[0], "away": truth[1]},
-                                "finished": last_finished,
-                                "regulation_ready": True,
-                                "status_short": last_status,
-                                "af_fixture_id": fid,
-                                "polls": polls,
-                                "elapsed_ms": elapsed_ms,
-                                "timeout_s": timeout,
-                                "schedule": self._schedule_desc(),
-                                "via": "apifootball-bridge",
-                                "score_source": "score.fulltime",
-                                "cache_only": True,
-                            }
-                        # Regulation decided but ≠ DQD → do not trade.
+                        fid = last.get("af_fixture_id")
+                        truth = (int(gh), int(ga))
+                        rewritten = not af_ft_score_matches(truth, (th, ta))
+                        set_confirmed_score_async(
+                            self.root,
+                            mid,
+                            truth[0],
+                            truth[1],
+                            af_fixture_id=int(fid) if fid is not None else None,
+                            source="af_fixture_fulltime",
+                        )
                         return {
-                            "ok": False,
-                            "confirmed": False,
+                            "ok": True,
+                            "confirmed": True,
                             "kind": "ft",
                             "match_id": mid,
                             "target": {"home": th, "away": ta},
-                            "goals": {"home": int(gh), "away": int(ga)},
+                            "goals": {"home": truth[0], "away": truth[1]},
                             "finished": last_finished,
                             "regulation_ready": True,
                             "status_short": last_status,
-                            "af_fixture_id": last.get("af_fixture_id"),
+                            "af_fixture_id": fid,
                             "polls": polls,
                             "elapsed_ms": elapsed_ms,
                             "timeout_s": timeout,
                             "schedule": self._schedule_desc(),
-                            "error": (
-                                f"af_ft_score_mismatch="
-                                f"{int(gh)}-{int(ga)}!={th}-{ta}"
-                            ),
                             "via": "apifootball-bridge",
                             "score_source": "score.fulltime",
                             "cache_only": True,
+                            "score_rewritten": rewritten,
                         }
                 except (TypeError, ValueError):
                     pass
@@ -1397,19 +1478,31 @@ class AfReferee:
         *,
         wait_cache: bool = False,
         kind: str = "goal",
+        timeout_s: float | None = None,
     ) -> bool:
         """Enqueue non-blocking confirmation. Returns False if already pending.
 
-        ``kind="ft"``: poll AF regulation fulltime (score.fulltime) for exact
-        agreement with DQD FT — Polymarket ignores ET/penalties.
+        ``kind="ft"``: poll AF regulation fulltime (score.fulltime) until
+        ``regulation_ready``, then use that score (DQD FT is a hint).
+        ``kind="live"``: poll AF live goals (any score, including 0-0) and use
+        that as truth — T+10 does not trade the DQD overlay.
         ``wait_cache=True``: keep polling on fixture-cache miss until timeout.
         """
         mid = str(ev.get("match_id") or "")
         if not mid:
             return False
-        job_kind = "ft" if str(kind or "").strip().lower() == "ft" else "goal"
+        raw_kind = str(kind or "").strip().lower()
+        if raw_kind == "ft":
+            job_kind = "ft"
+        elif raw_kind == "live":
+            job_kind = "live"
+        else:
+            job_kind = "goal"
         abort = threading.Event()
         reason_holder: dict[str, str] = {"reason": ""}
+        job_timeout = (
+            self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
+        )
         with self._lock:
             if event_key in self._pending:
                 return False
@@ -1423,10 +1516,27 @@ class AfReferee:
                     mid,
                     target,
                     wait_cache=bool(wait_cache),
+                    timeout_s=job_timeout,
                     event_home=ev_home,
                     event_away=ev_away,
                     abort_event=abort,
                     abort_reason_holder=reason_holder,
+                )
+            elif job_kind == "live":
+                # Target 0-0 + ahead rule → accept whatever AF live score is
+                # while still in play. FT/ET/PEN skips (for_t10_live).
+                fut = self._exec.submit(
+                    self.await_score,
+                    mid,
+                    (0, 0),
+                    baseline=(0, 0),
+                    wait_cache=bool(wait_cache),
+                    timeout_s=job_timeout,
+                    event_home=ev_home,
+                    event_away=ev_away,
+                    abort_event=abort,
+                    abort_reason_holder=reason_holder,
+                    for_t10_live=True,
                 )
             else:
                 fut = self._exec.submit(
@@ -1435,15 +1545,17 @@ class AfReferee:
                     target,
                     baseline=baseline,
                     wait_cache=bool(wait_cache),
+                    timeout_s=job_timeout,
                     event_home=ev_home,
                     event_away=ev_away,
                     abort_event=abort,
                     abort_reason_holder=reason_holder,
                 )
             self._pending[event_key] = fut
+            live_target = (0, 0) if job_kind == "live" else (int(target[0]), int(target[1]))
             self._meta[event_key] = {
                 "ev": dict(ev),
-                "target": (int(target[0]), int(target[1])),
+                "target": live_target,
                 "match_id": mid,
                 "submitted_at": iso_now(),
                 "wait_cache": bool(wait_cache),
@@ -1451,12 +1563,14 @@ class AfReferee:
                 "abort": abort,
                 "abort_reason_holder": reason_holder,
             }
+        tgt = live_target
         print(
-            f"af-referee → queued {mid} target={target[0]}-{target[1]} "
+            f"af-referee → queued {mid} target={tgt[0]}-{tgt[1]} "
             f"key={event_key} kind={job_kind} (async · cache-only · "
-            f"{self._schedule_desc()} · timeout {self.timeout_s}s"
+            f"{self._schedule_desc()} · timeout {job_timeout}s"
             f"{' · wait_cache' if wait_cache else ''}"
-            f"{' · regulation=fulltime' if job_kind == 'ft' else ''})",
+            f"{' · regulation=fulltime' if job_kind == 'ft' else ''}"
+            f"{' · live-score' if job_kind == 'live' else ''})",
             flush=True,
         )
         return True
@@ -1510,3 +1624,79 @@ class AfReferee:
                 }
             )
         return out
+
+    def cancel_ft_for_match(self, match_id: str, reason: str = "superseded") -> int:
+        """Abort pending FT confirms for one Dongqiudi id (leave goal jobs)."""
+        mid = str(match_id or "")
+        if not mid:
+            return 0
+        with self._lock:
+            keys = [
+                k
+                for k, m in self._meta.items()
+                if str(m.get("match_id") or "") == mid
+                and str(m.get("kind") or "") == "ft"
+            ]
+        n = 0
+        for k in keys:
+            if self.cancel_key(k, reason=reason):
+                n += 1
+        return n
+
+    def cancel_live_for_match(self, match_id: str, reason: str = "ft_pending") -> int:
+        """Abort pending T+10 live confirms for one Dongqiudi id."""
+        mid = str(match_id or "")
+        if not mid:
+            return 0
+        with self._lock:
+            keys = [
+                k
+                for k, m in self._meta.items()
+                if str(m.get("match_id") or "") == mid
+                and str(m.get("kind") or "") == "live"
+            ]
+        n = 0
+        for k in keys:
+            if self.cancel_key(k, reason=reason):
+                n += 1
+        return n
+
+    def cancel_live_for_match(self, match_id: str, reason: str = "ft_pending") -> int:
+        """Abort pending T+10 live confirms for one Dongqiudi id."""
+        mid = str(match_id or "")
+        if not mid:
+            return 0
+        with self._lock:
+            keys = [
+                k
+                for k, m in self._meta.items()
+                if str(m.get("match_id") or "") == mid
+                and str(m.get("kind") or "") == "live"
+            ]
+        n = 0
+        for k in keys:
+            if self.cancel_key(k, reason=reason):
+                n += 1
+        return n
+
+
+_ft_referee: AfReferee | None = None
+_ft_ref_lock = threading.Lock()
+
+
+def get_ft_referee(root: Path | None = None) -> AfReferee:
+    """Process-local FT referee. Times out at ``QUOTE_FT_MAX_AGE_S`` (900s)."""
+    global _ft_referee
+    with _ft_ref_lock:
+        if _ft_referee is None:
+            if root is None:
+                raise RuntimeError("FT AF referee requires root on first use")
+            age = max(90.0, ft_max_age_s())
+            _ft_referee = AfReferee(root, timeout_s=age, poll_schedule=True)
+        return _ft_referee
+
+
+def reset_ft_referee_for_tests() -> None:
+    global _ft_referee
+    with _ft_ref_lock:
+        _ft_referee = None

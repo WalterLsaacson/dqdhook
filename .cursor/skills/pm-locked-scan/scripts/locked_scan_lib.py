@@ -831,8 +831,13 @@ def resolve_regulation_score(
     *,
     af_fixtures: list[dict[str, Any]],
     dqd_matches: list[dict[str, Any]],
+    allow_dqd: bool = True,
 ) -> dict[str, Any]:
-    """Regulation FT + HT on Polymarket sides. Never uses Gamma's score field."""
+    """Regulation FT + HT on Polymarket sides. Never uses Gamma's score field.
+
+    ``allow_dqd=False``: AF regulation only (hourly trade sweep). No Dongqiudi
+    fallback — cups / VAR / false FT must not settle from DQD.
+    """
     home = str(match.get("home") or "")
     away = str(match.get("away") or "")
     kickoff = parse_kickoff(match.get("start_play"))
@@ -843,6 +848,15 @@ def resolve_regulation_score(
         return {
             "source": None,
             "error": "af_live_or_et_no_regulation",
+            "home": None,
+            "away": None,
+            "home_half": None,
+            "away_half": None,
+        }
+    if not allow_dqd:
+        return {
+            "source": None,
+            "error": "no_af_regulation_score",
             "home": None,
             "away": None,
             "home_half": None,
@@ -1004,6 +1018,7 @@ def run_scan(
     dqd_path: Path | None = None,
     proxy: str | None | object = ...,
     progress: Any = None,
+    require_af: bool = False,
 ) -> dict[str, Any]:
     """List → score → settle → CLOB. Does not trade."""
     proxy_url = pm.configure_proxy(None if proxy is ... else (None if proxy is None else str(proxy)))
@@ -1080,6 +1095,7 @@ def run_scan(
             hydrated.get("match") or row,
             af_fixtures=af_fixtures,
             dqd_matches=dqd_matches,
+            allow_dqd=not require_af,
         )
         if score.get("home") is None:
             skipped.append(

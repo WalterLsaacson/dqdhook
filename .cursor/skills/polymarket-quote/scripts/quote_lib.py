@@ -2170,6 +2170,7 @@ def build_bundle(
         "away_score": ctx["away_score"],
         "prev_score": ev.get("prev"),
         "winner": winner,
+        "score_source": ev.get("score_source"),
         "polymarket": {
             "event_id": (ctx.get("polymarket") or {}).get("event_id") or "",
             "slug": (ctx.get("polymarket") or {}).get("slug") or "",
@@ -2506,6 +2507,8 @@ def process_bridge_events(
     trade_executor: Any | None = None,
     market_cache: Any | None = None,
     events_override: list[dict[str, Any]] | None = None,
+    af_referee: Any | None = None,
+    af_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     """Process bridge score_change / match_finished into quotes/trades.
 
@@ -2516,7 +2519,15 @@ def process_bridge_events(
     Aligned buy stops AF and DOM. DQD reversals
     cancel rest and open gates; if lots are open they start an AF confirm
     trail from t0 (no shot gate); flatten on first AF score_match then stop
-    the trail. Each paired goal also schedules a T+10 book rescan.
+    the trail.     Each paired goal also schedules a T+10 book rescan. At fire, T+10
+    quotes the API-Football **live** score while the match is still in
+    play (not Dongqiudi overlay). If AF is already FT/ET/PEN or an FT
+    confirm is pending, T+10 skips and the FT path owns the match.
+
+    ``match_finished`` is not FT until API-Football ``regulation_ready``.
+    DQD period=FT is a hint. Quote uses the AF regulation score. T+10 /
+    rest / pitch-gate cancel only after that confirm. ``af_mode="off"``
+    skips the gate (tests). Default is gate.
 
     When the CLOB quote worker is running, this tick only starts/cancels
     gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
@@ -2532,7 +2543,7 @@ def process_bridge_events(
     from t10_scan import (
         build_t10_work_event,
         get_scheduler as get_t10_scheduler,
-        match_is_played,
+        t10_af_timeout_s,
         t10_enabled,
     )
 
@@ -2552,6 +2563,13 @@ def process_bridge_events(
     tick_t0 = time.monotonic()
     gate = get_coordinator(root)
     clob = get_quote_worker()
+    ft_af_mode = str(af_mode or "gate").strip().lower()
+    ft_gate_on = ft_af_mode != "off"
+    referee = af_referee
+    if ft_gate_on and referee is None:
+        from af_referee import get_ft_referee as _get_ft_ref
+
+        referee = _get_ft_ref(root)
 
     def _mark_ft_done(match_id: str) -> None:
         mid = str(match_id or "").strip()
@@ -2724,6 +2742,306 @@ def process_bridge_events(
             )
             return False
 
+    def _release_live_on_confirmed_ft(mid: str) -> None:
+        """Cancel T+10 / rest / pitch-gate only after AF regulation confirm."""
+        if not mid:
+            return
+        try:
+            n_t10 = get_t10_scheduler(root).cancel_match(mid)
+            if n_t10:
+                print(
+                    f"t10 → CANCELED match_id={mid} n={n_t10} reason=match_finished",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT t10 cancel on FT failed match={mid}: {e}", flush=True)
+        if clob is not None:
+            clob.submit_rest_cancel(mid, reason="match_finished")
+        elif trade_executor is not None:
+            try:
+                trade_executor.cancel_rest_orders_for_match(
+                    mid, reason="match_finished"
+                )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"ALERT rest cancel on FT failed match={mid}: {e}",
+                    flush=True,
+                )
+        try:
+            gate.cancel_match(mid, reason="match_finished")
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"ALERT pitch-gate cancel on FT failed match={mid}: {e}",
+                flush=True,
+            )
+        try:
+            from dqd_stream_observe import get_active_observer as get_dqd_obs
+
+            obs = get_dqd_obs()
+            if obs is not None and hasattr(obs, "release_match"):
+                obs.release_match(mid, reason="match_finished")
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"ALERT dom-pool close on FT failed match={mid}: {e}",
+                flush=True,
+            )
+
+    def _quote_confirmed_ft(
+        work_ev: dict[str, Any],
+        orig_key: str,
+        mid: str,
+    ) -> None:
+        quote_key = event_key(work_ev)
+        work_ev["_trade_event_key"] = quote_key
+        _release_live_on_confirmed_ft(mid)
+        quoted = _quote_one(work_ev, quote_key)
+        seen.add(orig_key)
+        if quoted or quote_key in seen:
+            seen.add(quote_key)
+            _mark_ft_done(mid)
+
+    def _quote_t10_work(work_ev: dict[str, Any], t10_key: str) -> None:
+        extra = {
+            "mode": "t10_scan",
+            "skip_flatten": True,
+            "t10": {
+                "source_event_key": (
+                    (work_ev.get("_trade_context") or {}).get("source_event_key")
+                    if isinstance(work_ev.get("_trade_context"), dict)
+                    else None
+                ),
+                "home_score": work_ev.get("home_score"),
+                "away_score": work_ev.get("away_score"),
+                "score_source": work_ev.get("score_source"),
+            },
+        }
+        hs = work_ev.get("home_score")
+        aws = work_ev.get("away_score")
+        print(
+            f"t10 → SCAN match_id={work_ev.get('match_id')} key={t10_key} "
+            f"score={hs}-{aws} src={work_ev.get('score_source') or 'af'}",
+            flush=True,
+        )
+        if clob is not None:
+            clob.submit_quote(work_ev, event_key=t10_key, extra=extra)
+            seen.add(t10_key)
+            return
+        n_before = len(bundles)
+        _quote_one(work_ev, t10_key)
+        if t10_key not in seen:
+            seen.add(t10_key)
+        if len(bundles) > n_before and isinstance(bundles[-1], dict):
+            bundles[-1]["mode"] = "t10_scan"
+            bundles[-1]["t10"] = extra["t10"]
+
+    def _handle_t10_af_done(item: dict[str, Any]) -> None:
+        from af_referee import apply_af_score_to_event
+
+        orig_key = str(item.get("event_key") or "")
+        mid = str(item.get("match_id") or "")
+        ev = item.get("ev") if isinstance(item.get("ev"), dict) else {}
+        gate_row = item.get("gate") if isinstance(item.get("gate"), dict) else {}
+        if not orig_key:
+            return
+        if mid and mid in processed_ft_ids:
+            seen.add(orig_key)
+            print(
+                f"t10 → SKIP finished match_id={mid} key={orig_key}",
+                flush=True,
+            )
+            return
+        confirmed = bool(gate_row.get("confirmed") and gate_row.get("ok"))
+        goals = gate_row.get("goals") if isinstance(gate_row.get("goals"), dict) else {}
+        try:
+            gh, ga = int(goals.get("home")), int(goals.get("away"))
+        except (TypeError, ValueError):
+            gh, ga = None, None
+        if confirmed and gh is not None and ga is not None:
+            work = apply_af_score_to_event(ev, home=gh, away=ga)
+            dqd_s = f"{ev.get('home_score')}-{ev.get('away_score')}"
+            print(
+                f"t10 → AF confirmed match_id={mid} af={gh}-{ga} "
+                f"dqd={dqd_s} key={orig_key}",
+                flush=True,
+            )
+            _quote_t10_work(work, orig_key)
+            return
+        err = str(gate_row.get("error") or "af_t10_unconfirmed")
+        reason = str(gate_row.get("reason") or "")
+        if err == "t10_af_ft_skip":
+            mode = "t10_skip_af_finished"
+        elif err == "aborted" and reason in {"ft_pending", "match_finished"}:
+            mode = "t10_skip_ft_pending"
+        else:
+            mode = "t10_af_unconfirmed"
+        seen.add(orig_key)
+        bundles.append(
+            {
+                "quoted_at": now_cn_iso(),
+                "trigger": "score_change",
+                "mode": mode,
+                "event_key": orig_key,
+                "match_id": mid,
+                "count": 0,
+                "opportunity_count": 0,
+                "af_error": err,
+            }
+        )
+        print(
+            f"t10 → SKIP {mode} match_id={mid} err={err} key={orig_key}",
+            flush=True,
+        )
+
+    def _drain_ft_af() -> None:
+        nonlocal bundles, seen
+        if not ft_gate_on or referee is None:
+            return
+        from af_referee import apply_af_score_to_event
+
+        try:
+            done = list(referee.drain_done() or [])
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT FT AF drain failed: {e}", flush=True)
+            return
+        for item in done:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "")
+            if kind == "live":
+                _handle_t10_af_done(item)
+                continue
+            if kind != "ft":
+                continue
+            orig_key = str(item.get("event_key") or "")
+            mid = str(item.get("match_id") or "")
+            ev = item.get("ev") if isinstance(item.get("ev"), dict) else {}
+            gate_row = item.get("gate") if isinstance(item.get("gate"), dict) else {}
+            if not orig_key or not mid:
+                continue
+            if mid in processed_ft_ids and not force:
+                seen.add(orig_key)
+                continue
+            confirmed = bool(gate_row.get("confirmed") and gate_row.get("ok"))
+            goals = gate_row.get("goals") if isinstance(gate_row.get("goals"), dict) else {}
+            try:
+                gh, ga = int(goals.get("home")), int(goals.get("away"))
+            except (TypeError, ValueError):
+                gh, ga = None, None
+            if confirmed and gh is not None and ga is not None:
+                work = apply_af_score_to_event(ev, home=gh, away=ga)
+                dqd_s = f"{ev.get('home_score')}-{ev.get('away_score')}"
+                extra = " rewritten" if gate_row.get("score_rewritten") else ""
+                print(
+                    f"ft → AF confirmed match_id={mid} af={gh}-{ga} "
+                    f"dqd={dqd_s}{extra} key={orig_key}",
+                    flush=True,
+                )
+                _quote_confirmed_ft(work, orig_key, mid)
+                continue
+            stale, age = ft_event_is_stale(ev)
+            err = str(gate_row.get("error") or "af_ft_unconfirmed")
+            if stale:
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "match_finished",
+                        "mode": "af_ft_unconfirmed",
+                        "event_key": orig_key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "stale_age_s": age,
+                        "af_error": err,
+                    }
+                )
+                seen.add(orig_key)
+                print(
+                    f"ft → SKIP AF unconfirmed match_id={mid} err={err} "
+                    f"age_s={age} key={orig_key}",
+                    flush=True,
+                )
+                continue
+            target = item.get("target")
+            if not (isinstance(target, (tuple, list)) and len(target) == 2):
+                target = target_score_from_event(ev)
+            if target is None:
+                seen.add(orig_key)
+                continue
+            try:
+                referee.submit_ft(orig_key, ev, (int(target[0]), int(target[1])))
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"ALERT FT AF resubmit failed match={mid}: {e}",
+                    flush=True,
+                )
+            print(
+                f"ft → WAIT AF retry match_id={mid} err={err} key={orig_key}",
+                flush=True,
+            )
+
+    def _submit_ft_af(ev: dict[str, Any], key: str, mid: str) -> None:
+        target = target_score_from_event(ev)
+        if target is None:
+            bundles.append(
+                {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "match_finished",
+                    "mode": "ft_skip_bad_event",
+                    "event_key": key,
+                    "match_id": mid,
+                    "count": 0,
+                    "opportunity_count": 0,
+                }
+            )
+            seen.add(key)
+            return
+        pending = set()
+        try:
+            pending = set(referee.pending_event_keys() or [])
+        except Exception:  # noqa: BLE001
+            pending = set()
+        if key in pending:
+            return
+        try:
+            referee.cancel_ft_for_match(mid, reason="superseded_ft")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            referee.cancel_live_for_match(mid, reason="ft_pending")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ok = bool(referee.submit_ft(key, ev, target))
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT FT AF submit failed match={mid}: {e}", flush=True)
+            ok = False
+        if not ok:
+            # Already pending under another key, or empty match id.
+            return
+        bundles.append(
+            {
+                "quoted_at": now_cn_iso(),
+                "trigger": "match_finished",
+                "mode": "af_ft_pending",
+                "event_key": key,
+                "match_id": mid,
+                "home": ev.get("home"),
+                "away": ev.get("away"),
+                "home_score": ev.get("home_score"),
+                "away_score": ev.get("away_score"),
+                "count": 0,
+                "opportunity_count": 0,
+            }
+        )
+        print(
+            f"ft → WAIT AF match_id={mid} dqd={target[0]}-{target[1]} key={key}",
+            flush=True,
+        )
+
     def _drain_t10() -> None:
         nonlocal bundles, seen
         if not t10_enabled():
@@ -2743,7 +3061,7 @@ def process_bridge_events(
                 continue
             if t10_key in seen:
                 continue
-            if mid and (mid in processed_ft_ids or match_is_played(root, mid)):
+            if mid and mid in processed_ft_ids:
                 print(
                     f"t10 → SKIP finished match_id={mid} key={t10_key}",
                     flush=True,
@@ -2753,37 +3071,59 @@ def process_bridge_events(
             work_ev = build_t10_work_event(root, job)
             if work_ev is None:
                 print(
-                    f"t10 → SKIP no score match_id={mid} key={t10_key}",
+                    f"t10 → SKIP no event match_id={mid} key={t10_key}",
                     flush=True,
                 )
                 seen.add(t10_key)
                 continue
-            extra = {
-                "mode": "t10_scan",
-                "skip_flatten": True,
-                "t10": {
-                    "source_event_key": job.get("source_event_key"),
-                    "home_score": work_ev.get("home_score"),
-                    "away_score": work_ev.get("away_score"),
-                },
-            }
-            hs = work_ev.get("home_score")
-            aws = work_ev.get("away_score")
-            print(
-                f"t10 → SCAN match_id={mid} key={t10_key} score={hs}-{aws}",
-                flush=True,
-            )
-            if clob is not None:
-                clob.submit_quote(work_ev, event_key=t10_key, extra=extra)
+            if ft_gate_on and referee is not None:
+                if mid and referee.has_pending_kind(mid, "ft"):
+                    seen.add(t10_key)
+                    bundles.append(
+                        {
+                            "quoted_at": now_cn_iso(),
+                            "trigger": "score_change",
+                            "mode": "t10_skip_ft_pending",
+                            "event_key": t10_key,
+                            "match_id": mid,
+                            "count": 0,
+                            "opportunity_count": 0,
+                            "af_error": "ft_pending",
+                        }
+                    )
+                    print(
+                        f"t10 → SKIP ft pending match_id={mid} key={t10_key}",
+                        flush=True,
+                    )
+                    continue
+                try:
+                    ok = bool(
+                        referee.submit(
+                            t10_key,
+                            work_ev,
+                            (0, 0),
+                            wait_cache=False,
+                            kind="live",
+                            timeout_s=t10_af_timeout_s(),
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"ALERT t10 AF submit failed match={mid}: {e}", flush=True)
+                    ok = False
+                if ok:
+                    print(
+                        f"t10 → WAIT AF match_id={mid} key={t10_key} "
+                        f"dqd={work_ev.get('home_score')}-{work_ev.get('away_score')}",
+                        flush=True,
+                    )
+                    continue
                 seen.add(t10_key)
+                print(
+                    f"t10 → SKIP AF submit match_id={mid} key={t10_key}",
+                    flush=True,
+                )
                 continue
-            n_before = len(bundles)
-            _quote_one(work_ev, t10_key)
-            if t10_key not in seen:
-                seen.add(t10_key)
-            if len(bundles) > n_before and isinstance(bundles[-1], dict):
-                bundles[-1]["mode"] = "t10_scan"
-                bundles[-1]["t10"] = extra["t10"]
+            _quote_t10_work(work_ev, t10_key)
 
     def _drain_pitch_gate() -> None:
         nonlocal bundles, seen
@@ -3039,12 +3379,19 @@ def process_bridge_events(
     # Events already gathered + reversed gates canceled at tick start.
     # Drain after the event loop so same-tick reversals revoke queued buys
     # before _quote_one.
+    _drain_ft_af()
 
     for ev in events_iter:
         key = event_key(ev)
         if not force and key in seen:
             continue
         if not force and clob is not None and clob.is_in_flight(key):
+            continue
+        if (
+            not force
+            and referee is not None
+            and key in referee.pending_event_keys()
+        ):
             continue
         # Gate session still running for this goal — wait for drain.
         if not force and key in gate.pending_event_keys():
@@ -3262,47 +3609,6 @@ def process_bridge_events(
 
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
-            if mid:
-                try:
-                    n_t10 = get_t10_scheduler(root).cancel_match(mid)
-                    if n_t10:
-                        print(
-                            f"t10 → CANCELED match_id={mid} n={n_t10} reason=match_finished",
-                            flush=True,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"ALERT t10 cancel on FT failed match={mid}: {e}", flush=True)
-            if mid and clob is not None:
-                clob.submit_rest_cancel(mid, reason="match_finished")
-            elif mid and trade_executor is not None:
-                try:
-                    trade_executor.cancel_rest_orders_for_match(
-                        mid, reason="match_finished"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    print(
-                        f"ALERT rest cancel on FT failed match={mid}: {e}",
-                        flush=True,
-                    )
-            if mid:
-                try:
-                    gate.cancel_match(mid, reason="match_finished")
-                except Exception as e:  # noqa: BLE001
-                    print(
-                        f"ALERT pitch-gate cancel on FT failed match={mid}: {e}",
-                        flush=True,
-                    )
-                try:
-                    from dqd_stream_observe import get_active_observer as get_dqd_obs
-
-                    obs = get_dqd_obs()
-                    if obs is not None and hasattr(obs, "release_match"):
-                        obs.release_match(mid, reason="match_finished")
-                except Exception as e:  # noqa: BLE001
-                    print(
-                        f"ALERT dom-pool close on FT failed match={mid}: {e}",
-                        flush=True,
-                    )
             if mid and mid in processed_ft_ids and not force:
                 seen.add(key)
                 continue
@@ -3330,6 +3636,11 @@ def process_bridge_events(
                     flush=True,
                 )
                 continue
+            if ft_gate_on and referee is not None:
+                _submit_ft_af(ev, key, mid)
+                continue
+            # Tests / explicit af_mode=off: treat DQD FT as final.
+            _release_live_on_confirmed_ft(mid)
             _quote_one(ev, key)
             if key in seen:
                 _mark_ft_done(mid)
@@ -3338,9 +3649,11 @@ def process_bridge_events(
         # Unknown event types: mark seen so cursor advances.
         seen.add(key)
 
+    _drain_ft_af()
     # Same-tick unavailable / fast cancel results from start_gate / cancel_match.
     _drain_pitch_gate()
     _drain_t10()
+    _drain_ft_af()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]
