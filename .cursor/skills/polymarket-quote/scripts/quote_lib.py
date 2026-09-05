@@ -433,6 +433,16 @@ def _parse_spread(market: dict[str, Any]) -> tuple[str, float] | None:
     return None
 
 
+def _spread_period(question: str) -> str:
+    """Return ft | 1h | 2h for spread markets (incl. ``1st Half Spread: …``)."""
+    q = question or ""
+    if HALF_2_RE.search(q) or re.search(r"in\s+second\s+half", q, re.I):
+        return "2h"
+    if HALF_1_RE.search(q) or re.search(r"in\s+(?:the\s+)?(?:1st|first)\s+half", q, re.I):
+        return "1h"
+    return "ft"
+
+
 def spread_tokens(
     markets: list[dict[str, Any]],
     *,
@@ -440,22 +450,38 @@ def spread_tokens(
     away: str,
     home_score: Any,
     away_score: Any,
+    home_half: Any = None,
+    away_half: Any = None,
 ) -> list[dict[str, Any]]:
-    try:
-        h, a = int(home_score), int(away_score)
-    except (TypeError, ValueError):
-        return []
-    margin = h - a
+    """Settle spreads with the matching score bucket (FT / 1H / 2H).
+
+    Half spreads must not use the full-time score — that marks losing 1H/2H
+    tokens as WIN (ask≈0.001) while true FT winners sit near 0.99.
+    """
     rows: list[dict[str, Any]] = []
     for m in markets:
         smt = (m.get("sports_market_type") or "").lower()
         parsed = _parse_spread(m)
+        question = str(m.get("question") or "")
         if smt not in ("spreads", "spread") and not parsed:
-            if "spread:" not in (m.get("question") or "").lower():
+            if "spread:" not in question.lower():
                 continue
         if not parsed:
             continue
         fav_team, line = parsed
+        period = _spread_period(question)
+        period_scores = _period_ha_goals(
+            period=period,
+            home_score=home_score,
+            away_score=away_score,
+            home_half=home_half,
+            away_half=away_half,
+        )
+        if period_scores is None:
+            # Half market without HT (or invalid 2H) — skip, never fall back to FT.
+            continue
+        h, a = period_scores
+        margin = h - a
         # Handicap applies to favorite team named in "Spread: Team (line)"
         # If line is -1.5 on home, home covers when margin > 1.5
         fav_role = _role_for_team_blob(fav_team, home, away)
@@ -469,6 +495,7 @@ def spread_tokens(
         if len(tokens) < 2 or len(outcomes) < 2:
             # assume [favorite, underdog] or Yes/No
             outcomes = outcomes or [fav_team, away if fav_is_home else home]
+        period_suffix = "" if period == "ft" else f"_{period}"
         for i, token in enumerate(tokens[:2]):
             label = str(outcomes[i]) if i < len(outcomes) else f"outcome_{i}"
             nl = _norm_name(label)
@@ -483,17 +510,20 @@ def spread_tokens(
             rows.append(
                 {
                     "family": "spreads",
-                    "market_key": f"spread_{_norm_name(fav_team)}_{line}_{i}",
+                    "market_key": f"spread{period_suffix}_{_norm_name(fav_team)}_{line}_{i}",
                     "role": "spread",
                     "outcome": label,
                     "settlement": settlement,
                     "token_id": token,
                     "market_id": m.get("market_id") or "",
                     "condition_id": m.get("condition_id") or "",
-                    "question": m.get("question") or "",
+                    "question": question,
                     "sports_market_type": "spreads",
                     "line": line,
                     "favorite": fav_team,
+                    "spread_period": period,
+                    "home": home,
+                    "away": away,
                 }
             )
     return rows
@@ -791,6 +821,42 @@ def token_is_win_at_score(
         except (TypeError, ValueError):
             return False
         return goals > line
+
+    if family == "spreads":
+        period = str(row.get("spread_period") or "ft")
+        period_scores = _period_ha_goals(
+            period=period,
+            home_score=home_score,
+            away_score=away_score,
+            home_half=home_half,
+            away_half=away_half,
+        )
+        if period_scores is None:
+            return False
+        h, a = period_scores
+        margin = h - a
+        fav_team = str(row.get("favorite") or "")
+        home_name = str(row.get("home") or "")
+        away_name = str(row.get("away") or "")
+        fav_role = _role_for_team_blob(fav_team, home_name, away_name)
+        if fav_role is None:
+            return False
+        fav_margin = margin if fav_role == "home" else -margin
+        try:
+            line = float(row.get("line"))
+        except (TypeError, ValueError):
+            return False
+        fav_covers = fav_margin + line > 0
+        nl_out = _norm_name(str(row.get("outcome") or ""))
+        nl_fav = _norm_name(fav_team)
+        is_fav = (
+            nl_out == nl_fav
+            or (nl_fav and nl_fav in nl_out and len(nl_fav) >= 4)
+            or str(row.get("outcome") or "").lower() == "yes"
+        )
+        if str(row.get("outcome") or "").lower() == "no":
+            is_fav = False
+        return (is_fav and fav_covers) or ((not is_fav) and (not fav_covers))
 
     if family == "btts":
         outcome = str(row.get("outcome") or row.get("market_key") or "").lower()
@@ -1906,10 +1972,6 @@ def collect_target_tokens(
             prop_markets = [
                 enrich_market(m) for m in (more.get("markets") or []) if isinstance(m, dict)
             ]
-            if mode == "ft":
-                tokens.extend(
-                    spread_tokens(prop_markets, home=home, away=away, home_score=hs, away_score=aws)
-                )
             hh = ctx.get("home_half")
             ah = ctx.get("away_half")
             if hh is None and ah is None:
@@ -1928,6 +1990,18 @@ def collect_target_tokens(
                     period=str(
                         ctx.get("clock_period") or infer_clock_period(ev_row, dqd_row)
                     ),
+                )
+            if mode == "ft":
+                tokens.extend(
+                    spread_tokens(
+                        prop_markets,
+                        home=home,
+                        away=away,
+                        home_score=hs,
+                        away_score=aws,
+                        home_half=hh,
+                        away_half=ah,
+                    )
                 )
             tokens.extend(
                 totals_tokens(

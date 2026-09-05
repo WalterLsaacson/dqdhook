@@ -216,30 +216,66 @@ def prune_market_cache(cache: MarketCatalogCache) -> dict[str, int | str]:
     }
 
 
+def prune_files_by_mtime(
+    directory: Path,
+    *,
+    cutoff: datetime,
+    glob: str = "*",
+) -> dict[str, int]:
+    """Delete files under ``directory`` whose mtime is older than ``cutoff``."""
+    if not directory.is_dir():
+        return {"kept": 0, "removed": 0, "bytes_before": 0, "bytes_after": 0}
+    kept = removed = 0
+    bytes_before = bytes_after = 0
+    cutoff_ts = cutoff.timestamp()
+    for path in directory.glob(glob):
+        if not path.is_file():
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        bytes_before += st.st_size
+        if st.st_mtime < cutoff_ts:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                bytes_after += st.st_size
+                kept += 1
+        else:
+            bytes_after += st.st_size
+            kept += 1
+    return {
+        "kept": kept,
+        "removed": removed,
+        "bytes_before": bytes_before,
+        "bytes_after": bytes_after,
+    }
+
+
 def prune_runtime_data(
     root: Path,
     *,
     retain_hours: float = DEFAULT_RETAIN_HOURS,
     market_cache: MarketCatalogCache | None = None,
 ) -> dict[str, Any]:
-    """Prune market_cache + rolling 24h jsonl under pm-quote / bridge."""
+    """Prune market_cache + rolling retain window under pm-quote / bridge / DQD."""
     hours = max(1.0, float(retain_hours))
     cutoff = _now_cn() - timedelta(hours=hours)
     cache = market_cache or MarketCatalogCache(root)
-    processed = set((lib.load_cursor(root).get("processed_keys") or []))
     report: dict[str, Any] = {
         "pruned_at": _now_cn().isoformat(timespec="seconds"),
         "retain_hours": hours,
         "cutoff": cutoff.isoformat(timespec="seconds"),
         "market_cache": prune_market_cache(cache),
         "jsonl": {},
+        "dirs": {},
     }
 
-    def _keep_unprocessed_bridge(row: dict[str, Any]) -> bool:
-        if row.get("type") not in ("score_change", "match_finished"):
-            return False
-        return lib.event_key(row) not in processed
-
+    # Bridge score/FT events: pure rolling time. Do NOT keep "unprocessed" forever —
+    # cursor.processed_keys is capped at 1000, so older keys look unprocessed and
+    # would pin the whole history on disk.
     targets: list[tuple[Path, tuple[str, ...], Callable[[dict[str, Any]], bool] | None, str]] = [
         (lib.data_dir(root) / "quotes.jsonl", ("quoted_at", "ts"), None, "quotes.jsonl"),
         (
@@ -249,12 +285,38 @@ def prune_runtime_data(
             "opportunities.jsonl",
         ),
         (lib.data_dir(root) / "trades.jsonl", ("quoted_at", "ts"), None, "trades.jsonl"),
-        # Observe jsonl retained indefinitely (book/goal/livescore/prematch) — not pruned.
         (
             lib.bridge_dir(root) / "events.jsonl",
             ("ts", "quoted_at"),
-            _keep_unprocessed_bridge,
+            None,
             "bridge/events.jsonl",
+        ),
+        # Upstream DQD watch log (repo data/events.jsonl).
+        (root / "data" / "events.jsonl", ("ts", "quoted_at"), None, "dqd/events.jsonl"),
+        # Goal/book observe trails (were retained indefinitely; roll with the same window).
+        (
+            lib.data_dir(root) / "book_context_observe.jsonl",
+            ("ts", "quoted_at", "sampled_at", "dqd_ts"),
+            None,
+            "book_context_observe.jsonl",
+        ),
+        (
+            lib.data_dir(root) / "dqd_stream_observe.jsonl",
+            ("ts", "quoted_at", "sampled_at", "dqd_ts"),
+            None,
+            "dqd_stream_observe.jsonl",
+        ),
+        (
+            lib.data_dir(root) / "af_observe.jsonl",
+            ("ts", "quoted_at", "sampled_at", "dqd_ts"),
+            None,
+            "af_observe.jsonl",
+        ),
+        (
+            lib.data_dir(root) / "prematch_odds.jsonl",
+            ("ts", "quoted_at", "sampled_at", "dqd_ts"),
+            None,
+            "prematch_odds.jsonl",
         ),
     ]
     for path, keys, keep_row, label in targets:
@@ -265,6 +327,16 @@ def prune_runtime_data(
         except Exception as e:  # noqa: BLE001
             report["jsonl"][label] = {"error": str(e)}
             logger.exception("prune failed for %s", path)
+
+    try:
+        report["dirs"]["book_context_raw"] = prune_files_by_mtime(
+            lib.data_dir(root) / "book_context_raw",
+            cutoff=cutoff,
+            glob="*.json",
+        )
+    except Exception as e:  # noqa: BLE001
+        report["dirs"]["book_context_raw"] = {"error": str(e)}
+        logger.exception("prune failed for book_context_raw")
     return report
 
 
@@ -295,9 +367,10 @@ def start_pruner(
                 )
                 mc = report.get("market_cache") or {}
                 jl = report.get("jsonl") or {}
+                dirs = report.get("dirs") or {}
                 removed = sum(
                     int((v or {}).get("removed") or 0)
-                    for v in jl.values()
+                    for v in list(jl.values()) + list(dirs.values())
                     if isinstance(v, dict)
                 )
                 if mc.get("dropped") or mc.get("skipped") or removed:

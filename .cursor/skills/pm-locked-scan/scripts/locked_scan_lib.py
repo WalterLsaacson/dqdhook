@@ -411,7 +411,13 @@ def settle_event_tokens(
         main_m, home=home, away=away, home_score=home_score, away_score=away_score
     )
     rows += ql.spread_tokens(
-        more_m, home=home, away=away, home_score=home_score, away_score=away_score
+        more_m,
+        home=home,
+        away=away,
+        home_score=home_score,
+        away_score=away_score,
+        home_half=home_half,
+        away_half=away_half,
     )
     rows += ql.totals_tokens(
         more_m,

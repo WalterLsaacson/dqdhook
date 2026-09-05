@@ -42,7 +42,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 - Pitch-gate 限价 rest：需 **`QUOTE_REST_ENABLED=1`** → 目标 @**0.995**，但 **不信** Gamma/book 的 `0.001` 元数据；CLOB 足球最小 tick 是 **0.01**，rest 一律按 0.01 **向下收到 0.99**。**`QUOTE_REST_USDC`（默认 $5）** / **`GTC` 一直挂着**（回撤、终场、手取消才撤；`QUOTE_REST_EXPIRE_S>0` 才改回 GTD）。门控 rest **不受** `QUOTE_MAX_OPEN_USDC` 限制。没有卖盘（一边倒买盘）也挂，等砸盘。FAK / misprice 上限 **ask≤0.995**（fee 后 `min_net≈0.00475`）。**进球作废仍 WIN：** 比分变化后若该 token 在 **上一分**（`prev`）已经是 live WIN（当下这球不算也锁死），pitch-gate **FAK 吃光** ask≤0.995 的剩余卖盘，**不走** `QUOTE_GOAL_MAX_USDC` $50。金额顶 **`QUOTE_LOCKED_SWEEP_USDC`（默认 $1000）**，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度。开关 **`QUOTE_LOCKED_SWEEP`**（默认开；`0` 或金额 `0` 关闭）。回撤后若仓位在新比分仍是 WIN（如 1-1→1-0 的主队 0.5 大球），**不平仓**。终场已锁定 WIN 且 ask≤0.01：**仍 FAK**（`QUOTE_FT_DUST_FAK` 默认开），金额 **`QUOTE_FT_DUST_USDC`（默认 $100）**，独立于 `QUOTE_FT_MAX_USDC`，仍受 `QUOTE_MAX_OPEN_USDC` 剩余额度限制；max_price=0.01，不按 0.001 墙走单。
 - Odds/Bet365：跟 DOM 同一拍后台写入 `book_context_observe.jsonl`（Grade A/B/C）。**Grade A 不下单**，AND 路径不因 Odds HTTP 阻塞。已配对场在距开球 **30 分钟**时 **采一次** Bet365+1xbet 全盘口，写入 `data/pm-quote/prematch_odds.jsonl`。
 - **主客对调**：懂球帝/纳米主场与 Polymarket 相反时，事件带 `sides_swapped`；门控用动画主场比分条，半场大小球用 PM 方向的 `home_half`/`away_half`，避免把雷恩的半场算到巴黎头上。
-- **半场盘**：1H/2H O/U 与 BTTS 只用半场比分。下半场懂球帝 `hts` 有时会写成当前比分；询价取事件与快照里 **≤ 当前比分且总进球最少** 的半场，**绝不拿全场比分当 1H**。上半场还没有 `hts` 时才用当前比分。
+- **半场盘**：1H/2H O/U、BTTS、**Spread** 只用对应半场比分（2H = 全场−半场）。下半场懂球帝 `hts` 有时会写成当前比分；询价取事件与快照里 **≤ 当前比分且总进球最少** 的半场，**绝不拿全场比分当 1H**。上半场还没有 `hts` 时才用当前比分。缺半场比分的半场盘直接跳过，不结算。
 
 ## Quick start
 

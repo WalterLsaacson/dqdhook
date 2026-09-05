@@ -24,8 +24,10 @@ Background warmer (`market_cache.py`) syncs open paired fixtures every ~5s.
 |---|---|
 | `market_cache/*.json` | Keep open paired matches plus finished matches not yet present in `cursor.processed_ft_match_ids`; also scan `events.jsonl` so an unconsumed FT remains protected after it disappears from `matches.json`. Drop consumed FT / orphan. **Skip** if matches file missing / bad / empty. |
 | `quotes.jsonl` / `opportunities.jsonl` / `trades.jsonl` | Keep rows with `quoted_at`/`sampled_at`/`dqd_ts` ≥ now − retain_hours |
+| `book_context_observe.jsonl` / `dqd_stream_observe.jsonl` / `af_observe.jsonl` / `prematch_odds.jsonl` | Same rolling cutoff |
+| `book_context_raw/*.json` | Drop files with mtime &lt; cutoff |
 | `livescore_observe.jsonl` | **Not pruned** (research) |
-| `data/bridge/events.jsonl` | Keep if `ts` ≥ cutoff **or** event key not yet in `cursor.processed_keys` |
+| `data/bridge/events.jsonl` / `data/events.jsonl` | Keep if `ts` ≥ cutoff (pure time; `processed_keys` is capped and must not pin history) |
 
 Default `retain_hours=24` is a **rolling** cutoff (`datetime.now − 24h`), not “delete at local midnight”. Append + prune share `{file}.lock` (`fcntl`) so rewrite cannot drop concurrent appends. Unparseable timestamps are kept. Interval in watch: ~600s after an immediate first pass.
 
