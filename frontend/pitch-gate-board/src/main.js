@@ -3,11 +3,11 @@
  */
 import { state } from "./state.js";
 import { $, escapeHtml } from "./utils.js";
-import { fetchGoals } from "./api.js";
+import { GOALS_LIMIT, fetchGoals } from "./api.js";
 import { consumeReversals, ensureFilterUi, render, renderMeta, setFilter } from "./render.js";
 
 async function refresh() {
-  const snap = await fetchGoals(5000);
+  const snap = await fetchGoals(GOALS_LIMIT);
   renderMeta(snap);
   render(snap.goals || []);
   consumeReversals(snap.recent_reversals || [], { toast: true });

@@ -1,3 +1,4 @@
+import { GOALS_LIMIT } from "./api.js";
 import { state } from "./state.js";
 import {
   $,
@@ -485,7 +486,7 @@ export function renderDetail(goal) {
 }
 
 export function render(goals) {
-  state.goals = goals || [];
+  state.goals = (goals || []).slice(0, GOALS_LIMIT);
   const visible = filterGoals(state.goals);
   if (state.selectedKey && !visible.some((g) => g.event_key === state.selectedKey)) {
     state.selectedKey = visible[0]?.event_key || null;

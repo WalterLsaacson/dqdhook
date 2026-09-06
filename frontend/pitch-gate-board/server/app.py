@@ -1111,7 +1111,13 @@ def build_goals_payload(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
         stamp = _observe_stamp()
         cached = _GOALS_CACHE
         if cached is not None and cached[0] == stamp and cached[1] >= limit:
-            return cached[2]
+            payload = cached[2]
+            if cached[1] > limit:
+                payload = dict(payload)
+                goals = list(payload.get("goals") or [])[:limit]
+                payload["goals"] = goals
+                payload["goal_count"] = len(goals)
+            return payload
         snap = _build_goals_payload_uncached(limit=limit)
         _GOALS_CACHE = (_observe_stamp(), limit, snap)
         return snap
