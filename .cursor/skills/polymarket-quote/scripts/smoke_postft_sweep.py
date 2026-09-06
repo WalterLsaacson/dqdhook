@@ -113,7 +113,9 @@ def main() -> int:
     assert not any(h["token_id"] == "tok_dqd" for h in hits)
 
     q = ps.hit_to_quote(hits[0])
-    assert q["neg_risk"] is False
+    assert q["neg_risk"] is None
+    nr_hit = dict(hits[0], neg_risk=True)
+    assert ps.hit_to_quote(nr_hit)["neg_risk"] is True
     assert q["trade"] == "buy_win"
     plan = plan_locked_sweep(q, max_usdc=1000.0)
     assert plan.skip_reason is None

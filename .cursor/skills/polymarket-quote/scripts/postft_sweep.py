@@ -182,7 +182,7 @@ def refresh_quote_book(
     *,
     proxy: str | None | object = ...,
 ) -> dict[str, Any]:
-    """Replace asks with a live CLOB book. Forces soccer tick + neg_risk=False."""
+    """Replace asks with a live CLOB book. Keep the book's tick and neg_risk."""
     import quote_lib as ql
 
     tid = str(quote.get("token_id") or "")
@@ -200,7 +200,8 @@ def refresh_quote_book(
     out["best_ask"] = book.get("best_ask")
     out["best_ask_size"] = book.get("best_ask_size")
     out["tick_size"] = str(book.get("tick_size") or out.get("tick_size") or "0.001") or "0.001"
-    out["neg_risk"] = False
+    if "neg_risk" in book:
+        out["neg_risk"] = bool(book.get("neg_risk"))
     out["book_missing"] = False
     return out
 
@@ -224,7 +225,9 @@ def hit_to_quote(hit: dict[str, Any]) -> dict[str, Any]:
         "best_ask_size": best_size,
         "asks_top": [{"price": str(a.get("price")), "size": str(a.get("size"))} for a in asks],
         "tick_size": str(hit.get("tick_size") or "0.001") or "0.001",
-        "neg_risk": False,
+        "neg_risk": (
+            bool(hit.get("neg_risk")) if hit.get("neg_risk") is not None else None
+        ),
         "question": hit.get("question") or "",
         "family": hit.get("family"),
         "outcome": hit.get("outcome"),

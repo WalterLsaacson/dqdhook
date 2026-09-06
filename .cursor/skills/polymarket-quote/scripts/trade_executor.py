@@ -948,7 +948,6 @@ class TradeExecutor:
         postft = _trade_context_postft(match_meta)
         if postft:
             mis = True
-            q["neg_risk"] = False
             if not str(q.get("tick_size") or "").strip():
                 q["tick_size"] = "0.001"
         # Rest: pitch-gate when QUOTE_REST_ENABLED=1; T+10 always (own size).

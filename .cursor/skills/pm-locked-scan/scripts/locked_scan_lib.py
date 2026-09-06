@@ -926,7 +926,7 @@ def win_tokens_with_asks(
                 "best_ask": best_ask,
                 "asks": [{"price": p, "size": s} for p, s in levels],
                 "tick_size": str(book.get("tick_size") or "") or "0.001",
-                "neg_risk": False,
+                "neg_risk": bool(book.get("neg_risk")),
                 "ask_shares": round(size_all, 4),
                 "tradeable_shares": round(size_tradeable, 4),
             }

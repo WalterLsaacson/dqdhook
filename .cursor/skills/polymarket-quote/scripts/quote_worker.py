@@ -446,7 +446,6 @@ class QuoteWorker:
             return
         try:
             quote = dict(quote)
-            quote["neg_risk"] = False
             quote["trade"] = "buy_win"
             quote["misprice"] = True
             quote["settlement"] = "WIN"
