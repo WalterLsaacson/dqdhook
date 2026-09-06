@@ -295,6 +295,22 @@ def kickoff_minutes_apart(a: dict[str, Any], b: dict[str, Any]) -> int | None:
     return int(abs((dta - dtb).total_seconds()) // 60)
 
 
+def dedupe_pm_events(pm_matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one row per Polymarket event (Gamma repeats some J-League ids)."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for p in pm_matches or []:
+        key = str(p.get("id") or p.get("event_id") or "").strip()
+        if not key:
+            key = str(p.get("slug") or "").strip()
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(p)
+    return out
+
+
 def filter_fresh_pm_matches(
     pm_matches: list[dict[str, Any]],
     *,
@@ -302,12 +318,13 @@ def filter_fresh_pm_matches(
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Drop PM events whose kickoff is more than ``stale_hours`` in the past."""
+    rows = dedupe_pm_events(pm_matches)
     if stale_hours is None or stale_hours < 0:
-        return list(pm_matches)
+        return rows
     now_cn = now or datetime.now(TZ_CN)
     cutoff = now_cn - timedelta(hours=float(stale_hours))
     out: list[dict[str, Any]] = []
-    for p in pm_matches:
+    for p in rows:
         dt = _kickoff_dt(p)
         if dt is None or dt >= cutoff:
             out.append(p)
@@ -344,7 +361,7 @@ def coverage_by_date(
     """Per Beijing date: matched pairs vs PM snapshot totals."""
     totals: dict[str, int] = defaultdict(int)
     matched: dict[str, int] = defaultdict(int)
-    for p in pm_matches or []:
+    for p in dedupe_pm_events(pm_matches or []):
         day = beijing_kickoff_date(p)
         if day:
             totals[day] += 1
@@ -1191,7 +1208,7 @@ class BridgeRuntime:
             dqd_snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
             pm_snap = load_json(self.pm_data / "snapshot.json", {}) or {}
             dqd_matches = list(dqd_snap.get("matches") or [])
-            pm_matches = list(pm_snap.get("matches") or [])
+            pm_matches = dedupe_pm_events(list(pm_snap.get("matches") or []))
             prio_ids = priority_team_ids_for_pm(
                 dqd_matches,
                 pm_matches,

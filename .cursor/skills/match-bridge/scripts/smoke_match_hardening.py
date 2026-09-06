@@ -360,6 +360,18 @@ def main() -> int:
     _assert(bl.normalize_league("韩K2联", "") == "kor2", "韩K2联")
     _assert(bl.normalize_league("", "kor2") == "kor2", "kor2")
     _assert(bl.normalize_league("U20女足世界杯", "") == "u20wwc", "U20女足世界杯")
+    _assert(
+        bl.team_similarity("One Knoxville SC", "Knoxville troops") >= 0.99,
+        "Knoxville troops",
+    )
+    _assert(
+        bl.team_similarity("DPR Korea", "North Korea Women U20") >= 0.99,
+        "DPR Korea",
+    )
+    _assert(
+        bl.team_similarity("China PR", "China (w) U20") >= 0.99,
+        "China PR",
+    )
     _assert(bl.normalize_league("以超", "") == "isr", "以超")
     _assert(bl.normalize_league("GRE1", "gre1") == "gre1", "GRE1")
     _assert(bl.normalize_league("德超级杯", "") == "gsc", "德超级杯")
@@ -708,6 +720,14 @@ def main() -> int:
     _assert(by_day["2026-09-01"] == {"date": "2026-09-01", "matched": 1, "total": 1}, str(by_day["2026-09-01"]))
     _assert(by_day["2026-09-02"] == {"date": "2026-09-02", "matched": 0, "total": 1}, str(by_day["2026-09-02"]))
     _assert(bl.beijing_kickoff_date({"dongqiudi": {"local_date": "2026-08-31"}}) == "2026-08-31", "dqd local_date")
+    dup_cov = bl.coverage_by_date(
+        [{"kickoff_beijing": "2026-09-06 17:00", "polymarket": {"event_id": "1"}}],
+        [
+            {"id": "1", "kickoff_beijing": "2026-09-06 17:00", "league_id": "jap"},
+            {"id": "1", "kickoff_beijing": "2026-09-06 17:00", "league_id": "j1100"},
+        ],
+    )
+    _assert(dup_cov == [{"date": "2026-09-06", "matched": 1, "total": 1}], f"dedupe coverage: {dup_cov}")
     _assert(
         bl.league_similarity({"league": "足协杯"}, {"league_id": "chfa", "league": "CHFA"}) == 1.0,
         "足协杯 must alias to chfa",
