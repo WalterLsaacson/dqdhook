@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import http.client
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -437,9 +438,33 @@ def _map_soccer_list(language: str) -> list[dict[str, Any]]:
     return [map_match(r) for r in raw if (r.get("cmp_type") or "soccer") == "soccer"]
 
 
+_TEAM_EN_LOCK = threading.RLock()
+_EN_FETCH_PRIORITY: list[str] = []
+
+
 def team_en_cache_path() -> Path:
     # scripts → dongqiudi-match → skills → .cursor → repo
     return Path(__file__).resolve().parents[4] / "data" / "dqd_team_en.json"
+
+
+def set_en_fetch_priority(team_ids: Iterable[str]) -> None:
+    """Prefer these team_ids when warming English names (PM-window fixtures)."""
+    global _EN_FETCH_PRIORITY
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in team_ids:
+        tid = str(raw or "").strip()
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        ordered.append(tid)
+    with _TEAM_EN_LOCK:
+        _EN_FETCH_PRIORITY = ordered
+
+
+def en_fetch_priority() -> list[str]:
+    with _TEAM_EN_LOCK:
+        return list(_EN_FETCH_PRIORITY)
 
 
 def load_team_en_cache() -> dict[str, str]:
@@ -458,10 +483,10 @@ def load_team_en_cache() -> dict[str, str]:
 def save_team_en_cache(cache: dict[str, str]) -> None:
     path = team_en_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
 
 
 def fetch_team_en_name(team_id: str) -> str | None:
@@ -488,47 +513,72 @@ def resolve_team_en_names(
     workers: int = 8,
     max_fetch: int = 64,
     fetch_timeout_s: float = 8.0,
+    priority_ids: Iterable[str] | None = None,
 ) -> dict[str, str]:
     """Return team_id → English name, fetching + caching misses.
 
-    Cold cache (after wiping ``data/``) can mean thousands of misses. Cap
-    per-call fetches so match_list / bridge rematch stay responsive; remaining
-    ids keep Chinese names until later ticks warm the cache.
+    Cold cache can mean thousands of misses. Cap per-call fetches so match_list
+    / live rematch stay responsive. Priority ids (PM-overlapping fixtures) are
+    fetched first; leftover ids are only a background fill.
     """
-    cache = load_team_en_cache()
-    missing = sorted(
-        {
-            str(t).strip()
-            for t in team_ids
-            if str(t).strip() and not cache.get(str(t).strip())
-        }
-    )
-    if missing:
-        batch = missing[: max(0, int(max_fetch))]
-        if batch:
-            deadline = time.monotonic() + max(0.5, float(fetch_timeout_s))
-            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-                futures = {pool.submit(fetch_team_en_name, tid): tid for tid in batch}
-                try:
-                    for fut in as_completed(
-                        futures, timeout=max(0.1, deadline - time.monotonic())
-                    ):
-                        tid = futures[fut]
-                        try:
-                            name = fut.result(timeout=0)
-                        except Exception:  # noqa: BLE001
-                            name = None
-                        if name:
-                            cache[tid] = name
-                        if time.monotonic() >= deadline:
-                            break
-                except FuturesTimeout:
-                    pass
+    wanted = {str(t).strip() for t in team_ids if str(t).strip()}
+    with _TEAM_EN_LOCK:
+        cache = load_team_en_cache()
+    missing = [tid for tid in wanted if not cache.get(tid)]
+    if not missing:
+        return cache
+
+    prio_src = list(priority_ids) if priority_ids is not None else en_fetch_priority()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for tid in prio_src:
+        tid = str(tid or "").strip()
+        if tid and tid in wanted and tid not in cache and tid not in seen:
+            ordered.append(tid)
+            seen.add(tid)
+    for tid in missing:
+        if tid not in seen:
+            ordered.append(tid)
+            seen.add(tid)
+
+    batch = ordered[: max(0, int(max_fetch))]
+    got: dict[str, str] = {}
+    if batch:
+        deadline = time.monotonic() + max(0.5, float(fetch_timeout_s))
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            futures = {pool.submit(fetch_team_en_name, tid): tid for tid in batch}
+            try:
+                for fut in as_completed(
+                    futures, timeout=max(0.1, deadline - time.monotonic())
+                ):
+                    tid = futures[fut]
+                    try:
+                        name = fut.result(timeout=0)
+                    except Exception:  # noqa: BLE001
+                        name = None
+                    if name:
+                        got[tid] = name
+                    if time.monotonic() >= deadline:
+                        break
+            except FuturesTimeout:
+                pass
+    if got:
+        with _TEAM_EN_LOCK:
+            cache = load_team_en_cache()
+            cache.update(got)
             save_team_en_cache(cache)
+            return cache
     return cache
 
 
-def apply_english_team_names(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_english_team_names(
+    matches: list[dict[str, Any]],
+    *,
+    priority_ids: Iterable[str] | None = None,
+    max_fetch: int = 64,
+    fetch_timeout_s: float = 8.0,
+    workers: int = 8,
+) -> list[dict[str, Any]]:
     """Overwrite home/away with cached/fetched `team_en_name` values."""
     ids = [
         str(m.get("home_team_id") or "")
@@ -539,7 +589,13 @@ def apply_english_team_names(matches: list[dict[str, Any]]) -> list[dict[str, An
         for m in matches
         if m.get("away_team_id")
     ]
-    names = resolve_team_en_names(ids)
+    names = resolve_team_en_names(
+        ids,
+        workers=workers,
+        max_fetch=max_fetch,
+        fetch_timeout_s=fetch_timeout_s,
+        priority_ids=priority_ids,
+    )
     for m in matches:
         hid = str(m.get("home_team_id") or "")
         aid = str(m.get("away_team_id") or "")
@@ -672,7 +728,7 @@ def load_matches(
     if lang in ("zh-cn", "zh", "cn"):
         return schedule
 
-    return apply_english_team_names(schedule)
+    return apply_english_team_names(schedule, max_fetch=16, fetch_timeout_s=4.0)
 
 
 def build_snapshot(

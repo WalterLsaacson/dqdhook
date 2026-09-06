@@ -421,6 +421,51 @@ def polymarket_handle(pm: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def priority_team_ids_for_pm(
+    dqd_matches: list[dict[str, Any]],
+    pm_matches: list[dict[str, Any]],
+    *,
+    max_skew_min: int = DEFAULT_MAX_SKEW_MIN,
+    league_floor: float = DEFAULT_LEAGUE_FLOOR,
+) -> list[str]:
+    """DQD team ids that could pair with a PM fixture (time + league gate)."""
+    pm_fresh = filter_fresh_pm_matches(pm_matches)
+    pm_by_min: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for p in pm_fresh:
+        dt = _kickoff_dt(p)
+        if dt is None:
+            continue
+        pm_by_min[int(dt.timestamp() // 60)].append(p)
+
+    skew = max(0, int(max_skew_min))
+    ranked: list[tuple[float, str]] = []
+    seen: set[str] = set()
+    for d in dqd_matches:
+        dt = _kickoff_dt(d)
+        if dt is None:
+            continue
+        minute = int(dt.timestamp() // 60)
+        hit = False
+        for m in range(minute - skew, minute + skew + 1):
+            for p in pm_by_min.get(m, ()):
+                league_s = league_similarity(d, p)
+                if league_s is None or league_s >= league_floor:
+                    hit = True
+                    break
+            if hit:
+                break
+        if not hit:
+            continue
+        ko = dt.timestamp()
+        for key in ("home_team_id", "away_team_id"):
+            tid = str(d.get(key) or "").strip()
+            if tid and tid not in seen:
+                seen.add(tid)
+                ranked.append((ko, tid))
+    ranked.sort(key=lambda x: x[0])
+    return [tid for _ko, tid in ranked]
+
+
 def match_fixtures(
     dqd_matches: list[dict[str, Any]],
     pm_matches: list[dict[str, Any]],
@@ -431,11 +476,42 @@ def match_fixtures(
     league_floor: float = DEFAULT_LEAGUE_FLOOR,
     pm_stale_hours: float = DEFAULT_PM_STALE_HOURS,
 ) -> list[dict[str, Any]]:
-    """Greedy 1:1 matching by similarity score."""
+    """Greedy 1:1 matching by similarity score.
+
+    Pair scoring is gated on kickoff skew, so candidates are bucketed by minute
+    instead of a full cartesian product (thousands of DQD amateur rows).
+    """
     pm_fresh = filter_fresh_pm_matches(pm_matches, stale_hours=pm_stale_hours)
+    pm_by_min: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    untimed_pm: list[tuple[int, dict[str, Any]]] = []
+    for j, p in enumerate(pm_fresh):
+        dt = _kickoff_dt(p)
+        if dt is None:
+            untimed_pm.append((j, p))
+            continue
+        pm_by_min[int(dt.timestamp() // 60)].append((j, p))
+
+    skew = max(0, int(max_skew_min))
     candidates: list[tuple[float, int, int]] = []
     for i, d in enumerate(dqd_matches):
-        for j, p in enumerate(pm_fresh):
+        dt = _kickoff_dt(d)
+        nearby: list[tuple[int, dict[str, Any]]]
+        if dt is None:
+            nearby = list(untimed_pm)
+            for bucket in pm_by_min.values():
+                nearby.extend(bucket)
+        else:
+            minute = int(dt.timestamp() // 60)
+            seen_j: set[int] = set()
+            nearby = []
+            for m in range(minute - skew, minute + skew + 1):
+                for j, p in pm_by_min.get(m, ()):
+                    if j in seen_j:
+                        continue
+                    seen_j.add(j)
+                    nearby.append((j, p))
+            nearby.extend(untimed_pm)
+        for j, p in nearby:
             s = score_pair(
                 d,
                 p,
@@ -914,7 +990,8 @@ class BridgeRuntime:
         self.bridge_data = root / "data" / "bridge"
 
         self.lock = threading.RLock()
-        self._rematch_lock = threading.Lock()
+        # RLock: event hooks must not deadlock if they re-enter rematch().
+        self._rematch_lock = threading.RLock()
         self.running = False
         self._stop = threading.Event()
         self._shutting_down = False
@@ -1110,20 +1187,42 @@ class BridgeRuntime:
         return payload
 
     def rematch(self) -> dict[str, Any]:
-        dqd_snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
-        pm_snap = load_json(self.pm_data / "snapshot.json", {}) or {}
-        dqd_matches = list(dqd_snap.get("matches") or [])
-        pm_matches = list(pm_snap.get("matches") or [])
-        paired = match_fixtures(
-            dqd_matches,
-            pm_matches,
-            min_score=self.min_score,
-            max_skew_min=self.max_skew_min,
-            min_side=self.min_side,
-            pm_stale_hours=self.pm_stale_hours,
-        )
-
         with self._rematch_lock:
+            dqd_snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
+            pm_snap = load_json(self.pm_data / "snapshot.json", {}) or {}
+            dqd_matches = list(dqd_snap.get("matches") or [])
+            pm_matches = list(pm_snap.get("matches") or [])
+            prio_ids = priority_team_ids_for_pm(
+                dqd_matches,
+                pm_matches,
+                max_skew_min=self.max_skew_min,
+            )
+            en_cached = 0
+            en_missing = 0
+            try:
+                import dqd_lib as dqd  # type: ignore
+
+                dqd.set_en_fetch_priority(prio_ids)
+                dqd.apply_english_team_names(
+                    dqd_matches,
+                    priority_ids=prio_ids,
+                    max_fetch=16,
+                    fetch_timeout_s=4.0,
+                )
+                cache = dqd.load_team_en_cache()
+                en_cached = len(cache)
+                en_missing = sum(1 for tid in prio_ids if not cache.get(tid))
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            paired = match_fixtures(
+                dqd_matches,
+                pm_matches,
+                min_score=self.min_score,
+                max_skew_min=self.max_skew_min,
+                min_side=self.min_side,
+                pm_stale_hours=self.pm_stale_hours,
+            )
+
             self._load_prev_state()
             prev_status = self._prev_status
             prev_period = self._prev_period
@@ -1147,11 +1246,12 @@ class BridgeRuntime:
                 "max_skew_min": self.max_skew_min,
                 "min_side": self.min_side,
                 "pm_stale_hours": self.pm_stale_hours,
+                "en_names_cached": en_cached,
+                "en_priority_missing": en_missing,
                 "events": events,
                 "matches": paired,
             }
 
-            # Hot path: memory queue first (quote wakes here, not on file mtime).
             for ev in events:
                 self._queue_event(ev)
 
@@ -1177,7 +1277,6 @@ class BridgeRuntime:
             self._ensure_persist_worker()
             self._persist_q.put(job)
         else:
-            # Sync when shutting down or async disabled — never spawn a second worker.
             self._persist_rematch_job(job)
         return payload
 
@@ -1210,9 +1309,11 @@ class BridgeRuntime:
         # Loops fetch immediately; do not block start() on a slow PM pull.
         t_dqd = threading.Thread(target=self._dqd_loop, name="bridge-dqd", daemon=True)
         t_pm = threading.Thread(target=self._pm_loop, name="bridge-pm", daemon=True)
-        self._threads = [t_dqd, t_pm]
+        t_en = threading.Thread(target=self._en_warm_loop, name="bridge-en-warm", daemon=True)
+        self._threads = [t_dqd, t_pm, t_en]
         t_dqd.start()
         t_pm.start()
+        t_en.start()
         return {"ok": True, "already": False, **self.status()}
 
     def stop(self) -> dict[str, Any]:
@@ -1255,6 +1356,60 @@ class BridgeRuntime:
             self._stop.wait(sleep_s)
         with self.lock:
             self.running = self.running and any(t.is_alive() for t in self._threads)
+
+    def _en_warm_loop(self) -> None:
+        """Fetch English team names for PM-window DQD sides; rematch when cache grows."""
+        import dqd_lib as dqd  # type: ignore
+
+        while not self._stop.is_set():
+            idle_s = 1.5
+            try:
+                dqd_snap = load_json(self.dqd_data / "snapshot.json", {}) or {}
+                pm_snap = load_json(self.pm_data / "snapshot.json", {}) or {}
+                dqd_matches = list(dqd_snap.get("matches") or [])
+                pm_matches = list(pm_snap.get("matches") or [])
+                if not dqd_matches or not pm_matches:
+                    self._stop.wait(idle_s)
+                    continue
+                prio = priority_team_ids_for_pm(
+                    dqd_matches,
+                    pm_matches,
+                    max_skew_min=self.max_skew_min,
+                )
+                if not prio:
+                    self._stop.wait(idle_s)
+                    continue
+                cache = dqd.load_team_en_cache()
+                missing = [tid for tid in prio if not cache.get(tid)]
+                if not missing:
+                    self._stop.wait(30)
+                    continue
+                before = len(cache)
+                dqd.set_en_fetch_priority(prio)
+                dqd.resolve_team_en_names(
+                    prio,
+                    priority_ids=prio,
+                    max_fetch=48,
+                    fetch_timeout_s=16.0,
+                    workers=8,
+                )
+                after_cache = dqd.load_team_en_cache()
+                after = len(after_cache)
+                if after > before:
+                    still_missing = sum(1 for tid in prio if not after_cache.get(tid))
+                    print(
+                        f"bridge → en-warm +{after - before} "
+                        f"cache={after} priority_missing={still_missing}",
+                        flush=True,
+                    )
+                    self.rematch()
+            except Exception as e:  # noqa: BLE001
+                with self.lock:
+                    self.last_error = f"en-warm: {e}"
+                traceback.print_exc()
+                self._stop.wait(15)
+                continue
+            self._stop.wait(idle_s)
 
     def _pm_loop(self) -> None:
         # Reload snapshot.json (written by polymarket-board). Rematch only after

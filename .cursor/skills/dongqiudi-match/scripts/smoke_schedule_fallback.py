@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.client
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -71,16 +72,42 @@ def test_load_matches_keeps_fallback_on_schedule_fail() -> None:
     with (
         patch.object(lib, "_map_soccer_list", return_value=[]),
         patch.object(lib, "fetch_soccer_schedule_list", side_effect=boom),
-        patch.object(lib, "apply_english_team_names", side_effect=lambda ms: ms),
+        patch.object(lib, "apply_english_team_names", side_effect=lambda ms, **_k: ms),
     ):
         got = lib.load_matches(language="en", day=today, days=3, fallback_matches=fallback)
     ids = {str(m.get("id")) for m in got}
     _assert("keep-me" in ids, f"fallback lost: {ids}")
 
 
+def test_resolve_team_en_priority_order() -> None:
+    print("test_resolve_team_en_priority_order")
+    fetched: list[str] = []
+
+    def fake_fetch(tid: str) -> str:
+        fetched.append(str(tid))
+        return f"Name {tid}"
+
+    with tempfile.TemporaryDirectory() as td:
+        cache_path = Path(td) / "dqd_team_en.json"
+        with (
+            patch.object(lib, "team_en_cache_path", return_value=cache_path),
+            patch.object(lib, "fetch_team_en_name", side_effect=fake_fetch),
+        ):
+            lib.save_team_en_cache({})
+            lib.resolve_team_en_names(
+                ["10", "999", "20"],
+                priority_ids=["999", "20"],
+                max_fetch=2,
+                fetch_timeout_s=5.0,
+                workers=2,
+            )
+    _assert(fetched[:2] == ["999", "20"], f"priority first, got {fetched}")
+
+
 def main() -> int:
     test_fetch_json_retries_incomplete_read()
     test_load_matches_keeps_fallback_on_schedule_fail()
+    test_resolve_team_en_priority_order()
     print("ok")
     return 0
 

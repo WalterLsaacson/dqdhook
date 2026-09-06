@@ -40,6 +40,7 @@ python3 .cursor/skills/match-bridge/scripts/bridge_match.py status --json
 | Polymarket | `data/polymarket/snapshot.json` (written by polymarket-board / `pm_soccer.py list`) | **10800s** (3h) snapshot reload; **does not** scan Gamma leagues |
 
 Matching defaults: `min_score=0.70`, `min_side=0.75`, `max_skew_min=90`, `pm_stale_hours=6` (see [reference.md](reference.md)).  
+DQD list APIs are Chinese; English names come from `/magicball/v1/team/detail` into `data/dqd_team_en.json`. A daemon `bridge-en-warm` fetches PM-window team IDs first (48 / 16s / 8 workers) and rematches when the cache grows.  
 Full-time: `period=FT` edge (not mere `Played`); see [reference.md](reference.md).
 
 ## Agent workflow

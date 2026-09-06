@@ -10,10 +10,11 @@ Inputs:
 Algorithm (greedy 1:1):
 
 1. **Drop stale PM** — kickoff more than **6h** in the past (override `--pm-stale-hours`)
-2. **Kickoff skew** — absolute `|t_dqd − t_pm| ≤ 90` minutes (override `--max-skew-min`). Prefer DQD `match_timestamp` (UTC epoch → Beijing) and PM `kickoff_beijing`; fall back to `local_date` + `time`
-3. **Bilateral team floor** — home **and** away similarity each ≥ **0.75** on the chosen orientation (direct or swapped); override `--min-side`. Digit tokens like `2028` / `04` are **kept**; digits inside a token are never stripped
-4. **League gate** — when both sides have league fields, alias to canonical codes ([`league_aliases.py`](scripts/league_aliases.py)); known codes must match exactly; otherwise fuzzy ratio must be ≥ **0.40**. Missing league on either side skips this gate
-5. Keep pairs with composite `match_score ≥ 0.70` (override `--min-score`)
+2. **English names** — overwrite DQD `home`/`away` from `data/dqd_team_en.json` (priority = team IDs that pass the time+league gate vs some PM game). Pairing buckets PM by kickoff minute ± skew instead of a full cartesian product. `rematch()` holds `_rematch_lock` (RLock) for apply + pair + publish so a thin rematch cannot overwrite a fuller one.
+3. **Kickoff skew** — absolute `|t_dqd − t_pm| ≤ 90` minutes (override `--max-skew-min`). Prefer DQD `match_timestamp` (UTC epoch → Beijing) and PM `kickoff_beijing`; fall back to `local_date` + `time`
+4. **Bilateral team floor** — home **and** away similarity each ≥ **0.75** on the chosen orientation (direct or swapped); override `--min-side`. Digit tokens like `2028` / `04` are **kept**; digits inside a token are never stripped
+5. **League gate** — when both sides have league fields, alias to canonical codes ([`league_aliases.py`](scripts/league_aliases.py)); known codes must match exactly; otherwise fuzzy ratio must be ≥ **0.40**. Missing league on either side skips this gate
+6. Keep pairs with composite `match_score ≥ 0.70` (override `--min-score`)
 
 Smoke: `python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py`  
 FT period: `python3 .cursor/skills/match-bridge/scripts/smoke_ft_period.py`
@@ -132,7 +133,7 @@ Matched rows get `finished: true` / `dongqiudi.is_finished: true` while `period`
 ## Notes
 
 - Coverage is limited to fixtures present in **both** upstream snapshots.
-- PM Gamma scans are owned by polymarket-board (default **3h**). Bridge only reloads `data/polymarket/snapshot.json`. The board fetch loop needs the local proxy (`http://127.0.0.1:1082`) when Gamma is blocked.
+- PM Gamma scans are owned by polymarket-board (default **3h**). Bridge only reloads `data/polymarket/snapshot.json`. Outbound is direct by default; set `PM_PROXY` only when Gamma is blocked.
 - Prop markets (`"A vs. B - Halftime"`) are already filtered by the Polymarket skill.
 - Dongqiudi skill uses `zh-cn` schedule + per-team `team_en_name` (cached). Bridge residual mismatches go in **[`scripts/team_aliases.py`](scripts/team_aliases.py)** (CN / abbreviations → canonical EN tokens).
 - Prefer `match_timestamp` for kickoff (DQD `start_play` string may be wrong on the EN feed).

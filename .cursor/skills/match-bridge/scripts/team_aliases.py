@@ -777,4 +777,13 @@ TEAM_ALIASES: dict[str, str] = {
     "naval 1893": "naval",
     "naval 1o maio": "naval",
     "naval 1 de maio": "naval",
+    "al merrikh": "merreikh",
+    "al-merrikh": "merreikh",
+    "al merrikh sdn": "merreikh",
+    "el merreikh": "merreikh",
+    "el merreikh omdurman": "merreikh",
+    "el merreikh sc omdurman": "merreikh",
+    "korea republic": "south korea",
+    "south korea women u20": "south korea",
+    "charlton women": "charlton",
 }

@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -354,6 +356,10 @@ def main() -> int:
     # 2026-08-21 league gaps (Serie A / ISR / GRE1 / GSC)
     _assert(bl.normalize_league("意甲", "") == "ita", "意甲")
     _assert(bl.normalize_league("Serie A", "") == "ita", "Serie A")
+    _assert(bl.normalize_league("", "sea") == "ita", "PM sea→ita")
+    _assert(bl.normalize_league("韩K2联", "") == "kor2", "韩K2联")
+    _assert(bl.normalize_league("", "kor2") == "kor2", "kor2")
+    _assert(bl.normalize_league("U20女足世界杯", "") == "u20wwc", "U20女足世界杯")
     _assert(bl.normalize_league("以超", "") == "isr", "以超")
     _assert(bl.normalize_league("GRE1", "gre1") == "gre1", "GRE1")
     _assert(bl.normalize_league("德超级杯", "") == "gsc", "德超级杯")
@@ -655,6 +661,35 @@ def main() -> int:
         got = rt.refresh_pm_once()
     _assert(got.get("count") == 1, f"reuse snapshot count, got {got.get('count')}")
     _assert(fake_load.call_count == 0, "Gamma load_matches must not run")
+
+    # Concurrent rematch() must not overlap match_fixtures (stale thin pairing).
+    dqd_snap = tmp / "data" / "snapshot.json"
+    dqd_snap.write_text(json.dumps({"tab": "full", "matches": []}), encoding="utf-8")
+    rt.async_persist = False
+    active = 0
+    max_active = 0
+    gate = threading.Lock()
+
+    def _slow_match(*_a, **_k):
+        nonlocal active, max_active
+        with gate:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.12)
+        with gate:
+            active -= 1
+        return []
+
+    with patch.object(bl, "match_fixtures", side_effect=_slow_match):
+        threads = [
+            threading.Thread(target=rt.rematch, name=f"rematch-{i}") for i in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+            _assert(not t.is_alive(), "rematch thread hung")
+    _assert(max_active == 1, f"rematch overlapped match_fixtures, max_active={max_active}")
 
     cov = bl.coverage_by_date(
         [
