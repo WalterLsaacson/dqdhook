@@ -152,11 +152,11 @@ def load_quote_trade_config(
     if not env_file and (ROOT / ".env").is_file():
         env_file = str(ROOT / ".env")
 
-    # Per-channel modes from CLI/env; default both to live when unset.
+    # Per-channel modes from CLI/env; default goals dry / ft live on this branch.
     g_mode = goals_mode if goals_mode is not None else _env_mode("QUOTE_GOALS_MODE")
     f_mode = ft_mode if ft_mode is not None else _env_mode("QUOTE_FT_MODE")
     if g_mode is None:
-        g_mode = "live"
+        g_mode = "dry"
     if f_mode is None:
         f_mode = "live"
     # --live / QUOTE_LIVE forces both live unless a channel was set explicitly.
@@ -962,7 +962,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "System Main — hub + boards + quote "
-            "(pitch-gate goals+ft live by default; do not start pm_quote / boards separately)"
+            "(this branch: pitch-gate goals dry by default; T+10/FT/locked-sweep hard-stopped; "
+            "do not start pm_quote / boards separately)"
         )
     )
     parser.add_argument("--no-trade", action="store_true", help="Quote only (no executor)")
@@ -975,7 +976,7 @@ def main(argv: list[str] | None = None) -> int:
         "--goals-mode",
         choices=("dry", "live"),
         default=None,
-        help="score_change dry|live (default live; pitch-gate buys)",
+        help="score_change dry|live (default dry on this branch; first knife is dry)",
     )
     parser.add_argument(
         "--ft-mode",

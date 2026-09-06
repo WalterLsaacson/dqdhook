@@ -15,16 +15,18 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 **当前会动 CLOB 的策略（只买 `buy_win`）：**
 
+> 本分支 `feat/goal-reconfirm-20260906`：进球第一刀 **dry-run**；T+10 / 终场扫盘 / locked-sweep / 小时扫盘在代码常量硬停（不读 `.env`）。懂球帝回撤 flatten **仍在**。
+
 | 策略 | 触发 | 门控 | 金额 | Rest |
 |---|---|---|---|---|
-| Pitch-gate | 已配对进球，同帧 DOM `in_play` ∧ AF `score_match` | 是 | `QUOTE_GOAL_MAX_USDC` | 仅 `QUOTE_REST_ENABLED=1` |
-| Locked sweep | 门控买时 token 在上一分已是 live WIN | 同一刀 | `QUOTE_LOCKED_SWEEP_USDC` | 同门控 |
-| T+10 | 进球后默认 600s；进行中按 **AF live**，AF 已结束则 skip | **AF live**（FT/ET 交给终场） | `QUOTE_T10_USDC`（FAK 与 0.99 GTC **各**一份） | **始终挂**，每已锁 WIN token 一笔 |
-| 终场 | `match_finished` 且 AF `regulation_ready` | **AF 常规时间确认** | `QUOTE_FT_MAX_USDC` | 不挂 |
-| 终场灰尘盘 | 终场锁定 WIN、ask≤0.01 | 同上 | `QUOTE_FT_DUST_USDC` | 不挂 |
-| 完赛扫盘 | 主脚本运行中每 **1h** 扫过去 **24h** 未结算完赛盘 | **AF 常规时间** | `QUOTE_POSTFT_SWEEP_USDC`（默认 $1000） | 不挂；FAK 从最低卖价吃到 **0.995** |
+| Pitch-gate | 已配对进球，同帧 DOM `in_play` ∧ AF `score_match` | 是 | `QUOTE_GOAL_MAX_USDC`（本分支 **dry**） | 仅 `QUOTE_REST_ENABLED=1` |
+| Locked sweep | ~~门控买时 token 在上一分已是 live WIN~~ | **硬停** | — | — |
+| T+10 | ~~进球后 600s~~ | **硬停** | — | — |
+| 终场 | ~~`match_finished` 且 AF `regulation_ready`~~ | **硬停** | — | — |
+| 终场灰尘盘 | 随终场 | **硬停** | — | — |
+| 完赛扫盘 | ~~每 1h~~ | **硬停** | — | — |
 
-**Pitch-gate 细节**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。**本拍 DOM `in_play` 才同帧打 AF**（庆祝/`unclear` 不打）。买入只有一条：**同帧 DOM `in_play` ∧ AF `ok && score_match`**（或本球更早一次 `in_play` 已认分的锁存；本拍硬不一致会清掉）。**射门不再卡买入**。Odds Grade A **只观察、不下单**。VAR 买入前仍永久否决。买入后立刻停 AF+DOM。回撤确认轨仍是 5s AF+DOM 观察，**仅 AF `score_match` 才 flatten**（DOM 比分条不单独卖出）。AF∨DOM **或门买入否决、不实现**（见 `design-af-dom-or-gate.md`）。终场必须等 AF `regulation_ready` 才询价。
+**Pitch-gate 细节**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。**本拍 DOM `in_play` 才同帧打 AF**（庆祝/`unclear` 不打）。买入只有一条：**同帧 DOM `in_play` ∧ AF `ok && score_match`**（或本球更早一次 `in_play` 已认分的锁存；本拍硬不一致会清掉）。**射门不再卡买入**。Odds Grade A **只观察、不下单**。VAR 买入前仍永久否决。买入后立刻停 AF+DOM。本分支第一刀 **dry-run**（`goals_mode=dry`）。回撤确认轨仍是 5s AF+DOM 观察，**仅 AF `score_match` 才 flatten**（DOM 比分条不单独卖出）。**Locked-sweep 硬停**：不再对「这球不算也锁死」的 token 加买。终场 / T+10 / 小时扫盘硬停，见 `experiment_flags.py`。
 
 > 询价、挂 rest、flatten、rest 对账在 **CLOB worker 线程**；watch tick 只 `start_gate` / 取消门控 / 把事件载荷入队。别场的 `/books` 和 GTC 不再堵住新球开 DOM。**`start_gate` 后并行预热** Gamma catalog + 周期 `POST /books`（`QUOTE_GATE_PREWARM`，默认开）；BUY 询价优先吃新鲜预热盘口，省掉热路径上约 0.5–1s 的 books RTT（**不缩短** DOM/AF 等待）。
 
@@ -46,7 +48,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 ## Quick start
 
-**主入口（推荐）** — System Main 拉起 boards + `pm_quote watch`（默认 goals+ft live）：
+**主入口（推荐）** — System Main 拉起 boards + `pm_quote watch`（本分支默认 goals=dry，T+10 / FT / locked-sweep / 小时扫盘硬停）：
 
 ```bash
 python3 frontend/run_main.py
@@ -61,7 +63,7 @@ Skill 单跑（调试用）：
 
 ```bash
 python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py once --from-bridge --json
-python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py watch --goals-mode live --ft-mode dry
+python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py watch --goals-mode dry --ft-mode dry
 python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py once --from-bridge --no-trade
 python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py postft-sweep --json
 ```
@@ -78,21 +80,21 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
-  - `score_change` goal-up (paired) → **start pitch-gate** (DOM @+0s every 5s; AF on each `in_play` tick; quote on AND; stop AF+DOM after AND buy) and **schedule T+10** rescan
-  - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF trail → flatten on first AF `score_match` vs post-reverse score **only lots that are no longer WIN** (e.g. 1-1→1-0 keeps home O/U 0.5), then stop the trail. T+10 is **not** canceled (quotes AF live score at fire time).
-  - `match_finished` → **wait for AF regulation_ready**; then cancel T+10 + rest and quote at the AF fulltime score (stale / once-per-match skip). DQD FT alone does not trade.
+  - `score_change` goal-up (paired) → **start pitch-gate** (DOM @+0s every 5s; AF on each `in_play` tick; dry-run quote on AND; stop AF+DOM after AND buy). T+10 **硬停**.
+  - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF trail → flatten on first AF `score_match` vs post-reverse score **only lots that are no longer WIN** (e.g. 1-1→1-0 keeps home O/U 0.5), then stop the trail.
+  - `match_finished` → **硬停**（取消 rest / gate；不询价、不下单）。
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: CLOB worker thread (not the watch tick) runs one `/books` POST; totals/BTTS before exact.
-5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` or live `posted`). Pitch-gate and FT buys skip `min_buy_price`; pitch-gate also skips size/$1 floors (fee/`min_net` + per-channel `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` remain). Tokens that are WIN **even at the previous score** (`win_if_goal_void`) FAK remaining asks ≤0.995 up to `QUOTE_LOCKED_SWEEP_USDC` (default $1000) instead of the $50 goal cap.
-6. **Pitch-gate: one `quote_bridge_event` per aligned buy.** Separately, each paired goal schedules a **T+10** rescan (`QUOTE_T10_USDC`; delay `QUOTE_T10_DELAY_S` default 600s). At fire, poll AF **live** goals (`QUOTE_T10_AF_TIMEOUT_S`, default 90s) only while the match is still in play. If AF is already FT/ET/PEN / `regulation_ready`, or an FT confirm is pending, T+10 **skips** (`t10_skip_af_finished` / `t10_skip_ft_pending`) and the FT path owns the score. Dongqiudi `prev_scores` is only a skeleton (sides / halves), never the traded score. Cache miss / timeout → skip (`t10_af_unconfirmed`), no DQD fallback. FAK uses the same fee/`min_net`/0.995 path; rest @0.99 uses the same USDC var (does not need `QUOTE_REST_ENABLED`). Locked sweep does **not** apply. Skip / cancel if AF has already confirmed FT.
+5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` on this branch). Pitch-gate skips `min_buy_price` and size/$1 floors. **Locked-sweep 硬停**（`win_if_goal_void` 不再 FAK 加买）。
+6. **Pitch-gate: one `quote_bridge_event` per aligned buy.** T+10 / FT / post-FT leftover sweep are hard-stopped (`experiment_flags.py`).
 
 ## Trading flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| (default) | goals **live** / ft **live** | Pitch-gate live buys; FT live after AF regulation confirm |
-| `--live` | off | Both channels live |
-| `--goals-mode` / `--ft-mode` | live / live | Per-channel override |
+| (default) | goals **dry** / ft live-flag（FT 硬停） | 第一刀 dry；T+10 / FT / locked-sweep 硬停 |
+| `--live` | off | Both channels live (FT still hard-stopped on this branch) |
+| `--goals-mode` / `--ft-mode` | dry / live | Per-channel override |
 | `--no-trade` | off | Quote only (no executor) |
 | `--take-depth top\|walk` | `walk` | Walk book vs best level only |
 | `--max-levels` | 5 | Walk depth cap |

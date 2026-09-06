@@ -849,6 +849,13 @@ class TradeExecutor:
             if str(quote.get("settlement") or "").upper() != "WIN":
                 return False
             return True
+        try:
+            from experiment_flags import HARD_STOP_LOCKED_SWEEP
+
+            if HARD_STOP_LOCKED_SWEEP:
+                return False
+        except ImportError:
+            pass
         if not bool(getattr(self.settings, "locked_sweep", True)):
             return False
         if float(getattr(self.settings, "locked_sweep_usdc", 1000.0) or 0) <= 0:

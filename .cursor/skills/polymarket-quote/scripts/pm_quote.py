@@ -50,17 +50,18 @@ def root() -> Path:
 def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
     """Build TradeExecutor when trading is enabled (default on; --no-trade disables).
 
-    Defaults: goals=live and ft=live (real CLOB). Override with --goals-mode /
-    --ft-mode / env. Goals still require pitch-gate ``in_play`` before buy.
+    Defaults: goals=dry (this experiment branch) and ft=live. Override with
+    --goals-mode / --ft-mode / env. Goals still require pitch-gate ``in_play``
+    before buy.
     """
     if getattr(args, "no_trade", False):
         return None
     live = bool(getattr(args, "live", False))
     goals_mode = getattr(args, "goals_mode", None)
     ft_mode = getattr(args, "ft_mode", None)
-    # Default both channels to live when unset (unless --live already implies both).
+    # Default goals dry / ft live when unset (unless --live already implies both).
     if goals_mode is None and not live:
-        goals_mode = "live"
+        goals_mode = "dry"
     if ft_mode is None and not live:
         ft_mode = "live"
     live_goals, live_ft = resolve_live_modes(
@@ -301,15 +302,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
         market_cache=cache,
     )
     try:
+        from experiment_flags import HARD_STOP_POSTFT_SWEEP
         from postft_sweep import start_scheduler as start_postft_sweep, stop_scheduler as stop_postft_sweep
 
-        start_postft_sweep(
-            rt,
-            executor=executor,
-            worker=clob_worker,
-            proxy=proxy,
-            stop_event=stop_warm,
-        )
+        if HARD_STOP_POSTFT_SWEEP:
+            print(
+                "postft-sweep → HARD STOP (experiment_flags.HARD_STOP_POSTFT_SWEEP)",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            start_postft_sweep(
+                rt,
+                executor=executor,
+                worker=clob_worker,
+                proxy=proxy,
+                stop_event=stop_warm,
+            )
     except Exception as e:  # noqa: BLE001
         print(f"postft-sweep setup warning: {e}", file=sys.stderr, flush=True)
     retain_h = float(getattr(args, "retain_hours", data_prune.DEFAULT_RETAIN_HOURS))
@@ -524,7 +533,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
         "--goals-mode",
         choices=("dry", "live"),
         default=None,
-        help="Goals channel: dry|live (default live; pitch-gate buys)",
+        help="Goals channel: dry|live (default dry on this branch; pitch-gate first knife is dry)",
     )
     sp.add_argument(
         "--ft-mode",

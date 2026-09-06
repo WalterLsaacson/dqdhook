@@ -2620,6 +2620,7 @@ def process_bridge_events(
         t10_af_timeout_s,
         t10_enabled,
     )
+    from experiment_flags import HARD_STOP_FT_SCAN
 
     cursor = load_cursor(root)
     cursor_state_before = {
@@ -3683,6 +3684,30 @@ def process_bridge_events(
 
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
+            if HARD_STOP_FT_SCAN:
+                _release_live_on_confirmed_ft(mid)
+                seen.add(key)
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "match_finished",
+                        "mode": "ft_hard_stop",
+                        "event_key": key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                    }
+                )
+                print(
+                    f"ft → HARD STOP match_id={mid} key={key} "
+                    f"(experiment_flags.HARD_STOP_FT_SCAN)",
+                    flush=True,
+                )
+                continue
             if mid and mid in processed_ft_ids and not force:
                 seen.add(key)
                 continue

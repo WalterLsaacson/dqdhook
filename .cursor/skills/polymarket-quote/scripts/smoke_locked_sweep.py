@@ -17,6 +17,7 @@ from quote_lib import (  # noqa: E402
     token_is_win_at_score,
 )
 from trade_executor import clip_locked_sweep_usdc  # noqa: E402
+import experiment_flags as ef  # noqa: E402
 
 
 def _over(*, side: str = "home", period: str = "ft", line: float = 0.5) -> dict:
@@ -254,6 +255,11 @@ def main() -> int:
         ex = TradeExecutor(root, settings)
         q = {**quoted[0], "trade": "buy_win", "settlement": "WIN"}
         meta = {"event_type": "score_change", "trade_context": {"pitch_gate": True}}
+        ef.restore_hard_stops()
+        assert not ex._locked_sweep_eligible(
+            q, trade="buy_win", match_meta=meta, event_type="score_change"
+        )
+        ef.disable_hard_stops_for_tests()
         assert ex._locked_sweep_eligible(
             q, trade="buy_win", match_meta=meta, event_type="score_change"
         )
@@ -343,6 +349,7 @@ def main() -> int:
         assert "tok-home-05" in open_tids
         assert "tok-away-05" not in open_tids
 
+    ef.restore_hard_stops()
     print("ok: locked sweep (win if goal void)")
     return 0
 

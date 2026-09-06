@@ -39,6 +39,13 @@ def _env_float(name: str, default: float) -> float:
 
 def t10_enabled() -> bool:
     """Off when ``QUOTE_T10=0`` or ``QUOTE_T10_USDC`` is unset/0."""
+    try:
+        from experiment_flags import HARD_STOP_T10
+
+        if HARD_STOP_T10:
+            return False
+    except ImportError:
+        pass
     if not _env_bool("QUOTE_T10", DEFAULT_T10_ENABLED):
         return False
     return t10_usdc() > 1e-12

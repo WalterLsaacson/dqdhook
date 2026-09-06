@@ -16,6 +16,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import af_referee as ref  # noqa: E402
+import experiment_flags as ef  # noqa: E402
 import quote_lib as lib  # noqa: E402
 import t10_scan as t10  # noqa: E402
 from trade_executor import TradeExecutor, _trade_context_t10  # noqa: E402
@@ -70,6 +71,7 @@ def _settings(*, t10_usdc: float = 15.0) -> TradeSettings:
 
 def main() -> int:
     t10.reset_scheduler_for_tests()
+    ef.disable_hard_stops_for_tests()
     saved = {k: os.environ.get(k) for k in (
         "QUOTE_T10",
         "QUOTE_T10_USDC",
@@ -84,10 +86,12 @@ def main() -> int:
         if rc != 0:
             return rc
         test_t10_af_live_gate()
+        test_t10_hard_stop_flag()
         return 0
     finally:
         t10.reset_scheduler_for_tests()
         ref.reset_ft_referee_for_tests()
+        ef.restore_hard_stops()
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -539,6 +543,22 @@ def test_t10_af_live_gate() -> None:
         ), last
 
     print("ok: t10 AF live score (rewrite DQD) / skip unconfirmed / skip AF FT")
+
+
+def test_t10_hard_stop_flag() -> None:
+    """experiment_flags.HARD_STOP_T10 blocks schedule even with QUOTE_T10_USDC."""
+    ef.restore_hard_stops()
+    os.environ["QUOTE_T10"] = "1"
+    os.environ["QUOTE_T10_USDC"] = "15"
+    assert not t10.t10_enabled()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        t10.reset_scheduler_for_tests()
+        sched = t10.get_scheduler(root)
+        assert sched.schedule(_goal_ev(), event_key="score_change|m1|x") is False
+    ef.disable_hard_stops_for_tests()
+    assert t10.t10_enabled()
 
 
 if __name__ == "__main__":

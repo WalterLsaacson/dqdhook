@@ -17,6 +17,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import af_referee as ref  # noqa: E402
+import experiment_flags as ef  # noqa: E402
 import quote_lib as lib  # noqa: E402
 import pm_quote  # noqa: E402
 from score_reversal import (  # noqa: E402
@@ -555,17 +556,21 @@ def test_refresh_af_deadline() -> None:
 
 
 def main() -> int:
-    test_ledger_af_status()
-    test_confirm_clears_pending_flatten()
-    test_deadline_skips_inflight_af_keys()
-    test_refresh_af_deadline()
-    test_postcheck_trade_then_confirm_hold()
-    test_postcheck_timeout_flattens()
-    test_gate_mode_no_immediate_trade()
-    test_resolve_af_mode_default()
-    test_gate_timeout_no_flatten()
-    print(f"\n{PASS} passed, {FAIL} failed")
-    return 1 if FAIL else 0
+    ef.disable_hard_stops_for_tests()
+    try:
+        test_ledger_af_status()
+        test_confirm_clears_pending_flatten()
+        test_deadline_skips_inflight_af_keys()
+        test_refresh_af_deadline()
+        test_postcheck_trade_then_confirm_hold()
+        test_postcheck_timeout_flattens()
+        test_gate_mode_no_immediate_trade()
+        test_resolve_af_mode_default()
+        test_gate_timeout_no_flatten()
+        print(f"\n{PASS} passed, {FAIL} failed")
+        return 1 if FAIL else 0
+    finally:
+        ef.restore_hard_stops()
 
 
 if __name__ == "__main__":

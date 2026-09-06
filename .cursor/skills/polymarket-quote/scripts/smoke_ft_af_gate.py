@@ -16,6 +16,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import af_referee as ref  # noqa: E402
+import experiment_flags as ef  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from data_prune import prune_market_cache  # noqa: E402
 from market_cache import MarketCatalogCache  # noqa: E402
@@ -545,18 +546,50 @@ def test_ft_market_cache_survives_until_consumed() -> None:
         check("pruner drops consumed FT", cache.get("ft-cache") is None)
 
 
+def test_ft_hard_stop_flag() -> None:
+    print("test_ft_hard_stop_flag")
+    ef.restore_hard_stops()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        (root / "data" / "bridge" / "matches.json").write_text(
+            '{"matches":[]}', encoding="utf-8"
+        )
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+        bundles = lib.process_bridge_events(
+            root,
+            events_override=[_ft_ev()],
+            af_mode="off",
+        )
+        check(
+            "HARD_STOP_FT_SCAN skips match_finished",
+            any(
+                isinstance(b, dict) and str(b.get("mode") or "") == "ft_hard_stop"
+                for b in bundles
+            ),
+            str(bundles),
+        )
+    ef.disable_hard_stops_for_tests()
+
+
 def main() -> int:
-    test_ft_stale_and_helpers()
-    test_ft_mismatch_and_confirm()
-    test_ft_confirm_quotes_regulation()
-    test_ft_not_ready_no_quote()
-    test_stale_skip_in_pipeline()
-    test_goal_stale_skips_af()
-    test_events_offset_clamps_on_shrink()
-    test_cursor_writes_only_on_change()
-    test_ft_market_cache_survives_until_consumed()
-    print(f"\n{PASS} passed, {FAIL} failed")
-    return 1 if FAIL else 0
+    ef.disable_hard_stops_for_tests()
+    try:
+        test_ft_stale_and_helpers()
+        test_ft_mismatch_and_confirm()
+        test_ft_confirm_quotes_regulation()
+        test_ft_not_ready_no_quote()
+        test_stale_skip_in_pipeline()
+        test_goal_stale_skips_af()
+        test_events_offset_clamps_on_shrink()
+        test_cursor_writes_only_on_change()
+        test_ft_market_cache_survives_until_consumed()
+        test_ft_hard_stop_flag()
+        print(f"\n{PASS} passed, {FAIL} failed")
+        return 1 if FAIL else 0
+    finally:
+        ef.restore_hard_stops()
 
 
 if __name__ == "__main__":
