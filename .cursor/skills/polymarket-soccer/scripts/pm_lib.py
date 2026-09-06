@@ -25,9 +25,9 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Default local proxy (Shadowrocket / MacPacket system HTTP on 1082).
-# SOCKS5 also works on the same port when enabled; override with PM_PROXY.
-DEFAULT_PROXY = "http://127.0.0.1:1082"
+# Direct outbound by default (this host can reach Gamma/CLOB without a local proxy).
+# Override with PM_PROXY / ALL_PROXY, or --proxy. Disable explicitly with PM_PROXY=none.
+DEFAULT_PROXY = None
 
 # Some Shadowrocket rules return CONNECT 503 for the gamma hostname but allow
 # the Cloudflare anycast IPs. Keep a small fallback list + live DoH lookup.
@@ -112,7 +112,7 @@ class FetchError(RuntimeError):
 
 
 def resolve_proxy(explicit: str | None = None) -> str | None:
-    """Return proxy URL. Default socks5h://127.0.0.1:1082. Use 'none'/'off'/'direct' to disable."""
+    """Return proxy URL. Direct by default. Use 'none'/'off'/'direct' to disable an inherited proxy."""
     if explicit is not None:
         raw = explicit.strip()
     else:
@@ -121,6 +121,7 @@ def resolve_proxy(explicit: str | None = None) -> str | None:
             or os.environ.get("ALL_PROXY")
             or os.environ.get("all_proxy")
             or DEFAULT_PROXY
+            or ""
         ).strip()
     if not raw or raw.lower() in ("none", "off", "direct", "0", "-"):
         return None
@@ -257,7 +258,7 @@ def _fetch_via_curl(
         "-H",
         "Referer: https://polymarket.com/",
     ]
-    if force_noproxy:
+    if force_noproxy or not proxy:
         cmd.extend(["--noproxy", "*"])
     elif proxy:
         cmd.extend(["-x", proxy])
@@ -305,7 +306,7 @@ def fetch_json(
     GET JSON from Gamma API.
 
     proxy:
-      ellipsis → use DEFAULT_PROXY / PM_PROXY (default http://127.0.0.1:1082)
+      ellipsis → use PM_PROXY / ALL_PROXY (default: direct)
       None / 'none' → direct
       str → explicit proxy URL
     """
@@ -316,8 +317,10 @@ def fetch_json(
 
     if proxy is ...:
         proxy_url = configure_proxy(None)
+    elif proxy is None:
+        proxy_url = configure_proxy("none")
     else:
-        proxy_url = configure_proxy(None if proxy is None else str(proxy))
+        proxy_url = configure_proxy(str(proxy))
 
     headers = {
         "User-Agent": UA,

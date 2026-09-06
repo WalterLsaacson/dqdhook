@@ -20,11 +20,13 @@ SRC = MODULE_DIR / "src"
 BRIDGE_SCRIPTS = ROOT / ".cursor" / "skills" / "match-bridge" / "scripts"
 DQD_SCRIPTS = ROOT / ".cursor" / "skills" / "dongqiudi-match" / "scripts"
 
+sys.path.insert(0, str(FRONTEND_DIR))
+from netbind import bind_host, listen_banner  # noqa: E402
 sys.path.insert(0, str(BRIDGE_SCRIPTS))
 sys.path.insert(0, str(DQD_SCRIPTS))
 import bridge_lib as bridge  # noqa: E402
 
-HOST = "127.0.0.1"
+BIND_HOST = bind_host()
 PORT = 8789
 MODULE_ID = "bridge-board"
 
@@ -298,8 +300,8 @@ def main() -> int:
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
     (ROOT / "data" / "bridge").mkdir(parents=True, exist_ok=True)
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Bridge Board → http://{HOST}:{PORT}/", flush=True)
+    httpd = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
+    print(listen_banner("Bridge Board", BIND_HOST, PORT), flush=True)
     print(f"Module path  → {MODULE_DIR}", flush=True)
     print(
         "Skill        → match-bridge (read-only UI; Start watch / Sync once, "

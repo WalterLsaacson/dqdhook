@@ -22,11 +22,13 @@ SRC = MODULE_DIR / "src"
 SCRIPTS = ROOT / ".cursor" / "skills" / "polymarket-soccer" / "scripts"
 DATA = ROOT / "data" / "polymarket"
 
+sys.path.insert(0, str(FRONTEND_DIR))
+from netbind import bind_host, listen_banner  # noqa: E402
 sys.path.insert(0, str(SCRIPTS))
 import pm_lib as lib  # noqa: E402
 from pm_soccer import data_dir, write_json  # noqa: E402
 
-HOST = "127.0.0.1"
+BIND_HOST = bind_host()
 PORT = 8788
 MODULE_ID = "polymarket-board"
 # Gamma soccer catalog is ~169 leagues; default 3h. Bridge reads snapshot.json.
@@ -432,14 +434,14 @@ def main() -> int:
     DATA.mkdir(parents=True, exist_ok=True)
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    httpd = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     FETCH.start(
         "all",
         include_closed=False,
         within_hours=int(getattr(lib, "DEFAULT_WITHIN_HOURS", 48)),
         interval=DEFAULT_FETCH_INTERVAL,
     )
-    print(f"Polymarket Board → http://{HOST}:{PORT}/", flush=True)
+    print(listen_banner("Polymarket Board", BIND_HOST, PORT), flush=True)
     print(f"Gamma fetch loop  → every {DEFAULT_FETCH_INTERVAL}s (3h)", flush=True)
     print(f"Module path       → {MODULE_DIR}", flush=True)
     print(f"Skill scripts     → {SCRIPTS}", flush=True)

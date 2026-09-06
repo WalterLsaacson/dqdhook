@@ -22,11 +22,15 @@ SRC = MODULE_DIR / "src"
 SCRIPTS = ROOT / ".cursor" / "skills" / "dongqiudi-match" / "scripts"
 DATA = ROOT / "data"
 
+if str(FRONTEND_DIR) not in sys.path:
+    sys.path.insert(0, str(FRONTEND_DIR))
+from netbind import bind_host, listen_banner  # noqa: E402
+
 sys.path.insert(0, str(SCRIPTS))
 import dqd_lib as lib  # noqa: E402
 from dqd_match import data_dir, emit_sentinels, run_watch_once, write_json  # noqa: E402
 
-HOST = "127.0.0.1"
+BIND_HOST = bind_host()
 PORT = 8787
 MODULE_ID = "match-board"
 
@@ -315,8 +319,8 @@ def main() -> int:
     DATA.mkdir(parents=True, exist_ok=True)
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Match Board module → http://{HOST}:{PORT}/", flush=True)
+    httpd = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
+    print(listen_banner("Match Board", BIND_HOST, PORT), flush=True)
     print(f"Module path        → {MODULE_DIR}", flush=True)
     print(f"Skill scripts      → {SCRIPTS}", flush=True)
     try:

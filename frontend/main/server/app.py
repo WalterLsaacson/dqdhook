@@ -25,12 +25,23 @@ PUBLIC = MODULE_DIR / "public"
 SRC = MODULE_DIR / "src"
 
 _ANALYTICS = ROOT / ".cursor" / "skills" / "trade-analytics" / "scripts"
+if str(FRONTEND) not in sys.path:
+    sys.path.insert(0, str(FRONTEND))
 if str(_ANALYTICS) not in sys.path:
     sys.path.insert(0, str(_ANALYTICS))
+from netbind import bind_host, listen_banner, loopback_url, public_url  # noqa: E402
 import analytics_lib as _ta  # noqa: E402
 
-HOST = "127.0.0.1"
+BIND_HOST = bind_host()
 PORT = 8790
+
+
+def _internal_url(port: int, path: str = "/") -> str:
+    return loopback_url(int(port), path)
+
+
+def _ui_url(port: int, path: str = "/", *, request_host: str | None = None) -> str:
+    return public_url(int(port), path, request_host=request_host)
 
 BOARDS = (
     {
@@ -353,7 +364,7 @@ def _ensure_af_bridge_watch() -> dict[str, Any]:
     port = AF_BRIDGE_BOARD_PORT
     if not _port_open(port):
         return {"ok": False, "error": "af_bridge_board_down", "port": port}
-    st = _http_json(f"http://{HOST}:{port}/api/status", timeout=2.0)
+    st = _http_json(_internal_url(port, "/api/status"), timeout=2.0)
     if st and st.get("running"):
         print(
             f"main → apifootball-bridge watch already running "
@@ -362,7 +373,7 @@ def _ensure_af_bridge_watch() -> dict[str, Any]:
         )
         return {"ok": True, "already": True, "running": True, **st}
     print("main → starting apifootball-bridge watch via af-bridge-board…", flush=True)
-    result = _http_post_json(f"http://{HOST}:{port}/api/af/start", {}, timeout=10.0)
+    result = _http_post_json(_internal_url(port, "/api/af/start"), {}, timeout=10.0)
     if not result:
         return {"ok": False, "error": "af_start_http_failed", "port": port}
     print(
@@ -383,10 +394,12 @@ def _spawn(script: Path, *args: str, log_path: Path | None = None) -> subprocess
         log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
         stdout = log_fh
         stderr = subprocess.STDOUT
+    env = os.environ.copy()
+    env.setdefault("DQD_BIND", BIND_HOST)
     proc = subprocess.Popen(
         [sys.executable, str(script), *args],
         cwd=str(ROOT),
-        env=os.environ.copy(),
+        env=env,
         stdout=stdout,
         stderr=stderr,
         start_new_session=True,
@@ -421,7 +434,7 @@ def _ensure_boards() -> list[dict[str, Any]]:
     launched: list[dict[str, Any]] = []
     for board in BOARDS:
         port = int(board["port"])
-        url = f"http://{HOST}:{port}/"
+        url = _ui_url(port)
         if _port_open(port):
             launched.append(
                 {"id": board["id"], "port": port, "url": url, "already": True}
@@ -555,7 +568,7 @@ def ensure_stack(*, open_browser: bool = False) -> dict[str, Any]:
             "quote_pid": _quote_proc.pid if _quote_proc else None,
             "quote_trade": dict(trade),
             "quote_argv": quote_watch_argv(trade),
-            "hub": f"http://{HOST}:{PORT}/",
+            "hub": _ui_url(PORT),
         }
 
 
@@ -597,7 +610,7 @@ def _supervisor_loop() -> None:
         else:
             try:
                 st = _http_json(
-                    f"http://{HOST}:{AF_BRIDGE_BOARD_PORT}/api/status", timeout=1.0
+                    f"{_internal_url(AF_BRIDGE_BOARD_PORT, '/api/status')}", timeout=1.0
                 )
                 if (
                     st is not None
@@ -631,7 +644,7 @@ def _start_supervisor() -> None:
 
 def _open_uis(launched: list[dict[str, Any]]) -> None:
     time.sleep(0.8)
-    urls = [f"http://{HOST}:{PORT}/"] + [b["url"] for b in launched]
+    urls = [_ui_url(PORT)] + [b["url"] for b in launched]
     for url in urls:
         try:
             if sys.platform == "darwin":
@@ -699,7 +712,7 @@ def status() -> dict[str, Any]:
         up = _port_open(port)
         extra: dict[str, Any] = {}
         if up and board["id"] == "bridge-board":
-            st = _http_json(f"http://{HOST}:{port}/api/status")
+            st = _http_json(_internal_url(port, "/api/status"))
             if st:
                 extra = {
                     "skill_running": st.get("running"),
@@ -707,7 +720,7 @@ def status() -> dict[str, Any]:
                     "pm_ticks": st.get("pm_ticks"),
                 }
         if up and board["id"] == "pitch-gate-board":
-            st = _http_json(f"http://{HOST}:{port}/api/status")
+            st = _http_json(_internal_url(port, "/api/status"))
             if st:
                 extra = {
                     "goal_count": st.get("goal_count"),
@@ -718,7 +731,7 @@ def status() -> dict[str, Any]:
                     "flatten_count": st.get("flatten_count"),
                 }
         if up and board["id"] == "af-bridge-board":
-            st = _http_json(f"http://{HOST}:{port}/api/status")
+            st = _http_json(_internal_url(port, "/api/status"))
             if st:
                 extra = {
                     "skill_running": st.get("running"),
@@ -733,7 +746,7 @@ def status() -> dict[str, Any]:
                 "name": board["name"],
                 "skill": board["skill"],
                 "port": port,
-                "url": f"http://{HOST}:{port}/",
+                "url": _ui_url(port),
                 "up": up,
                 **extra,
             }
@@ -746,7 +759,7 @@ def status() -> dict[str, Any]:
     mode = _trade_mode_label(trade)
     return {
         "module": "main",
-        "hub": f"http://{HOST}:{PORT}/",
+        "hub": _ui_url(PORT),
         "started_at": started,
         "quote": {
             "skill": "polymarket-quote",
@@ -847,7 +860,7 @@ def trades_ledger_payload(qs: dict[str, list[str]]) -> dict[str, Any]:
         "open_usdc": round(open_usdc, 4),
         "total": len(opens),
     }
-    payload["hub_trades_url"] = f"http://{HOST}:{PORT}/trades"
+    payload["hub_trades_url"] = _ui_url(PORT, "/trades")
     return payload
 
 
@@ -1039,7 +1052,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if _port_open(PORT):
         print(
-            f"error: System Main already running on http://{HOST}:{PORT}/ — "
+            f"error: System Main already running on {loopback_url(PORT)} — "
             "do not start a second hub; stop the existing one first "
             f"(POST /api/stop or kill the run_main process).",
             file=sys.stderr,
@@ -1047,9 +1060,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    httpd = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     _httpd = httpd
-    print(f"System Main → http://{HOST}:{PORT}/", flush=True)
+    print(listen_banner("System Main", BIND_HOST, PORT), flush=True)
+    if BIND_HOST not in ("127.0.0.1", "localhost"):
+        print(
+            "warning: boards are bound on all interfaces; Hub POST /api/stop "
+            "is reachable from the network. Restrict with a firewall if needed.",
+            flush=True,
+        )
     t = _quote_trade
     if not t["enabled"]:
         trade_label = "off"

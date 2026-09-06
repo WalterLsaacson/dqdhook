@@ -23,20 +23,18 @@ CLI: `--within-hours 48` (default), `--within-hours 0` disables the window. Prop
 
 ## Proxy (default)
 
-Outbound HTTPS goes through the local Shadowrocket proxy by default (matches system HTTP/HTTPS proxy used by Chrome):
+Outbound HTTPS is **direct by default** on this host. Set a proxy only when Gamma/CLOB is blocked:
 
 | Setting | Value |
 |---|---|
-| Default | `http://127.0.0.1:1082` |
+| Default | direct (`None`) |
 | Env | `PM_PROXY` or `ALL_PROXY` |
 | CLI | `--proxy URL` / `--no-proxy` |
 | Disable | `--no-proxy` or `PM_PROXY=none` |
 
-- Shadowrocket on this machine exposes **HTTP** on `1082` (`HTTPEnable`/`HTTPSEnable`); SOCKS may be off in system settings even if the port also accepts SOCKS.
-- Bare `host:port` is treated as `socks5h://` (remote DNS). Prefer an explicit `http://` URL for Shadowrocket.
+- Bare `host:port` is treated as `socks5h://` (remote DNS).
 - SOCKS needs [PySocks](https://pypi.org/project/PySocks/): `pip3 install PySocks`.
-- Requests go through `curl -x` first. If Shadowrocket returns **CONNECT 503** for the hostname `gamma-api.polymarket.com` (while `polymarket.com` still works), the client retries with Cloudflare IP pinning (`curl --connect-to`).
-- Optional: in Shadowrocket, add `DOMAIN-SUFFIX,gamma-api.polymarket.com,PROXY` (or GLOBAL) so the hostname itself is allowed.
+- Requests go through `curl` (`--noproxy *` when no proxy). If a proxy returns **CONNECT 503** for the hostname `gamma-api.polymarket.com`, the client retries with Cloudflare IP pinning (`curl --connect-to`).
 
 When the season has no open fixtures, `list` may return `count: 0` with default filters. Use `--include-closed` to include settled games.
 

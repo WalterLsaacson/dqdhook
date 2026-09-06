@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--proxy",
         default=None,
         help=(
-            "Outbound proxy URL (default: http://127.0.0.1:1082). "
+            "Outbound proxy URL (default: direct). "
             "Also: PM_PROXY / ALL_PROXY. Bare host:port → socks5h://"
         ),
     )

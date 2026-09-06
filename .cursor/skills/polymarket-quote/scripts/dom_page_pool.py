@@ -85,6 +85,17 @@ def warm_open_timeout_s() -> float:
     return _env_float("QUOTE_DOM_WARM_OPEN_TIMEOUT_S", 3.0, lo=1.0, hi=15.0)
 
 
+def chromium_launch_kwargs() -> dict[str, Any]:
+    """Headless Chromium args that work on a root Linux server."""
+    args = ["--disable-dev-shm-usage", "--disable-gpu"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.extend(["--no-sandbox", "--disable-setuid-sandbox"])
+    extra = (os.getenv("QUOTE_CHROMIUM_ARGS") or "").strip()
+    if extra:
+        args.extend(part for part in extra.split() if part)
+    return {"headless": True, "args": args}
+
+
 class DomBackend(Protocol):
     def start(self) -> None: ...
     def ensure_open(
@@ -532,7 +543,7 @@ class PlaywrightDomBackend:
         used_at: dict[str, float] = {}
         try:
             pw = sync_playwright().start()
-            browser = pw.chromium.launch(headless=True)
+            browser = pw.chromium.launch(**chromium_launch_kwargs())
             context = browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 locale="zh-CN",
@@ -835,7 +846,7 @@ class _LegacyDomBrowser:
             return False, "playwright_not_installed"
         try:
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=True)
+            self._browser = self._pw.chromium.launch(**chromium_launch_kwargs())
             self._context = self._browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 locale="zh-CN",

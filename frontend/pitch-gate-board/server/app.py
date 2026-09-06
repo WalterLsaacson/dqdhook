@@ -19,7 +19,10 @@ ROOT = FRONTEND_DIR.parent
 PUBLIC = MODULE_DIR / "public"
 SRC = MODULE_DIR / "src"
 
-HOST = "127.0.0.1"
+sys.path.insert(0, str(FRONTEND_DIR))
+from netbind import bind_host, listen_banner  # noqa: E402
+
+HOST = bind_host()
 PORT = 8791
 MODULE_ID = "pitch-gate-board"
 
@@ -1221,7 +1224,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     httpd.daemon_threads = True
-    print(f"Pitch Gate Board → http://{HOST}:{PORT}/", flush=True)
+    print(listen_banner("Pitch Gate Board", HOST, PORT), flush=True)
     print(f"  observe → {OBSERVE_PATH}", flush=True)
     print(f"  af observe → {AF_OBSERVE_PATH}", flush=True)
     print(f"  odds observe → {BOOK_OBSERVE_PATH}", flush=True)

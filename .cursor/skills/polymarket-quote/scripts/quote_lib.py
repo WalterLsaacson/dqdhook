@@ -1463,8 +1463,10 @@ def fetch_books(
         return {}
     if proxy is ...:
         proxy_url = pm.configure_proxy(None)
+    elif proxy is None:
+        proxy_url = pm.configure_proxy("none")
     else:
-        proxy_url = pm.configure_proxy(None if proxy is None else str(proxy))
+        proxy_url = pm.configure_proxy(str(proxy))
 
     books: dict[str, dict[str, Any]] = {}
     for i in range(0, len(ids), 50):

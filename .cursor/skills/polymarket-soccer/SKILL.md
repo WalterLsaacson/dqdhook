@@ -31,7 +31,7 @@ python3 .cursor/skills/polymarket-soccer/scripts/pm_soccer.py list --within-hour
 python3 .cursor/skills/polymarket-soccer/scripts/pm_soccer.py leagues --json
 ```
 
-Outbound requests **default to** `http://127.0.0.1:1082` (Shadowrocket / MacPacket system HTTP proxy; same port as Chrome). SOCKS5 (`socks5h://127.0.0.1:1082`) also works when enabled. Override with `--proxy`, `PM_PROXY` / `ALL_PROXY`, or disable with `--no-proxy`. SOCKS needs `PySocks` (`pip3 install PySocks`).
+Outbound requests **default to direct**. Set `--proxy` / `PM_PROXY` / `ALL_PROXY` when Gamma is blocked (for example `http://127.0.0.1:1082`). Disable with `--no-proxy` or `PM_PROXY=none`. SOCKS needs `PySocks` (`pip3 install PySocks`).
 
 ```bash
 # Explicit proxy / direct

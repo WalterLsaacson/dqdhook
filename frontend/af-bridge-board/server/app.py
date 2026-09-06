@@ -19,10 +19,12 @@ PUBLIC = MODULE_DIR / "public"
 SRC = MODULE_DIR / "src"
 AF_SCRIPTS = ROOT / ".cursor" / "skills" / "apifootball-bridge" / "scripts"
 
+sys.path.insert(0, str(FRONTEND_DIR))
+from netbind import bind_host, listen_banner  # noqa: E402
 sys.path.insert(0, str(AF_SCRIPTS))
 import af_bridge_lib as aflib  # noqa: E402
 
-HOST = "127.0.0.1"
+BIND_HOST = bind_host()
 PORT = 8792
 MODULE_ID = "af-bridge-board"
 WATCH_INTERVAL_S = 15.0
@@ -364,8 +366,8 @@ def main() -> int:
     PUBLIC.mkdir(parents=True, exist_ok=True)
     SRC.mkdir(parents=True, exist_ok=True)
     (ROOT / "data" / "apifootball").mkdir(parents=True, exist_ok=True)
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"AF Bridge Board → http://{HOST}:{PORT}/", flush=True)
+    httpd = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
+    print(listen_banner("AF Bridge Board", BIND_HOST, PORT), flush=True)
     print(f"Module path     → {MODULE_DIR}", flush=True)
     print(
         "Skill           → apifootball-bridge (read cache; Start watch / Sync once to hit AF)",

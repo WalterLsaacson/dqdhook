@@ -21,6 +21,7 @@ from dom_page_pool import (  # noqa: E402
     DomPagePool,
     DomReader,
     warm_open_timeout_s,
+    chromium_launch_kwargs,
 )
 
 logger = logging.getLogger("pm_quote.dqd_stream_observe")
@@ -551,7 +552,7 @@ class DqdStreamObserver:
         try:
             with sync_playwright() as pw:
                 try:
-                    browser = pw.chromium.launch(headless=True)
+                    browser = pw.chromium.launch(**chromium_launch_kwargs())
                 except Exception as launch_err:  # noqa: BLE001
                     msg = str(launch_err)
                     if "Executable doesn't exist" in msg or "playwright install" in msg:

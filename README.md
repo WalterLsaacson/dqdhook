@@ -206,10 +206,19 @@ pip install -r .cursor/skills/polymarket-quote/requirements-trade.txt
 # 仓库根目录 .env（切勿提交），至少包含：
 #   PRIVATE_KEY / FUNDER / SIGNATURE_TYPE / CHAIN_ID / CLOB_HOST
 #   QUOTE_DQD_STREAM_OBSERVE=1
-#   PM_PROXY=http://127.0.0.1:1082   # 可选，默认常为此
+#   PM_PROXY=none                     # 默认直连；本机需代理时再设 http://127.0.0.1:1082
 
 python3 frontend/run_main.py --no-browser
-# 浏览器打开 http://127.0.0.1:8790/
+# 浏览器打开 http://127.0.0.1:8790/  （看板绑 0.0.0.0，也可用本机公网 IP）
+```
+
+本机常驻（关 IDE 不停）：
+
+```bash
+./scripts/dqdhook.sh deps
+./scripts/dqdhook.sh install
+./scripts/dqdhook.sh start   # 无 .env 时自动 --no-trade
+./scripts/dqdhook.sh urls
 ```
 
 常用覆盖：
@@ -266,7 +275,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_PREMATCH_ODDS` | 默认开；`0` 关闭开赛前那一枪 |
 | `QUOTE_PREMATCH_LEAD_S` | 触发提前量，默认 1800（开赛前 30 分钟采一次） |
 | `MAIN_BRIDGE_INPROC` | 默认开；`0` 则走 board 文件唤醒 |
-| `PM_PROXY` | CLOB/Gamma 代理 |
+| `PM_PROXY` | 默认直连；需要时代理 CLOB/Gamma，`none` 明确关闭 |
 | `PRIVATE_KEY` 等 | live 下单必填；勿提交 |
 
 ---
