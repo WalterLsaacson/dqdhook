@@ -379,6 +379,25 @@ def t10_live_blocked_by_af_status(payload: dict[str, Any] | None) -> bool:
     return bool(short) and short in aflib.REGULATION_DECIDED_SHORT
 
 
+def t10_live_score_relation(
+    af: tuple[int, int],
+    target: tuple[int, int],
+) -> str:
+    """How AF live goals relate to the T+10 triggering score-change.
+
+    ``match`` — same score; T+10 may quote.
+    ``behind`` — AF still catching up (or the trigger goal reversed); keep polling.
+    ``mismatch`` — a later goal or other disagreement; skip immediately.
+    """
+    ah, aa = int(af[0]), int(af[1])
+    th, ta = int(target[0]), int(target[1])
+    if ah == th and aa == ta:
+        return "match"
+    if ah <= th and aa <= ta:
+        return "behind"
+    return "mismatch"
+
+
 def af_score_satisfies(
     af: tuple[int, int],
     target: tuple[int, int],
@@ -857,7 +876,10 @@ class AfReferee:
 
         ``for_t10_live=True``: skip (do not confirm) when AF has already
         decided regulation / finished — T+10 must not trade live tallies
-        that can still hold a stoppage VAR goal.
+        that can still hold a stoppage VAR goal. Confirm only when AF live
+        **exactly** matches ``target`` (the triggering goal's score). A later
+        goal is ``t10_score_mismatch`` immediately; AF still behind keeps
+        polling until timeout.
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
         timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
@@ -1116,9 +1138,40 @@ class AfReferee:
                 try:
                     gh, ga = gh_o, ga_o
                     if gh is not None and ga is not None:
-                        ok, truth = af_score_satisfies(
-                            (int(gh), int(ga)), (th, ta), baseline=base
-                        )
+                        if for_t10_live:
+                            rel = t10_live_score_relation(
+                                (int(gh), int(ga)), (th, ta)
+                            )
+                            if rel == "mismatch":
+                                return {
+                                    "ok": False,
+                                    "confirmed": False,
+                                    "match_id": mid,
+                                    "target": {"home": th, "away": ta},
+                                    "goals": last_goals,
+                                    "baseline": (
+                                        {"home": base[0], "away": base[1]}
+                                        if base
+                                        else None
+                                    ),
+                                    "af_fixture_id": last.get("af_fixture_id"),
+                                    "burst_dir": last.get("burst_dir"),
+                                    "polls": polls,
+                                    "elapsed_ms": elapsed_ms,
+                                    "poll_s": poll,
+                                    "timeout_s": timeout,
+                                    "schedule": self._schedule_desc(),
+                                    "error": "t10_score_mismatch",
+                                    "status_short": last.get("status_short"),
+                                    "via": "apifootball-bridge",
+                                    "cache_only": True,
+                                }
+                            ok = rel == "match"
+                            truth = (int(gh), int(ga))
+                        else:
+                            ok, truth = af_score_satisfies(
+                                (int(gh), int(ga)), (th, ta), baseline=base
+                            )
                         if ok:
                             fid = last.get("af_fixture_id")
                             # Hot path: memory only — no second AF fetch, no sync disk.
@@ -1484,8 +1537,9 @@ class AfReferee:
 
         ``kind="ft"``: poll AF regulation fulltime (score.fulltime) until
         ``regulation_ready``, then use that score (DQD FT is a hint).
-        ``kind="live"``: poll AF live goals (any score, including 0-0) and use
-        that as truth — T+10 does not trade the DQD overlay.
+        ``kind="live"``: poll AF live goals while in play. T+10 confirms only
+        when that live tally **exactly** matches ``target`` (the triggering
+        goal). A later AF score is a mismatch skip, not a rewrite-and-buy.
         ``wait_cache=True``: keep polling on fixture-cache miss until timeout.
         """
         mid = str(ev.get("match_id") or "")
@@ -1523,13 +1577,14 @@ class AfReferee:
                     abort_reason_holder=reason_holder,
                 )
             elif job_kind == "live":
-                # Target 0-0 + ahead rule → accept whatever AF live score is
-                # while still in play. FT/ET/PEN skips (for_t10_live).
+                # Exact trigger score. Later goals mismatch; AF lag keeps polling.
+                # FT/ET/PEN skips (for_t10_live).
+                live_tgt = (int(target[0]), int(target[1]))
                 fut = self._exec.submit(
                     self.await_score,
                     mid,
-                    (0, 0),
-                    baseline=(0, 0),
+                    live_tgt,
+                    baseline=None,
                     wait_cache=bool(wait_cache),
                     timeout_s=job_timeout,
                     event_home=ev_home,
@@ -1552,7 +1607,7 @@ class AfReferee:
                     abort_reason_holder=reason_holder,
                 )
             self._pending[event_key] = fut
-            live_target = (0, 0) if job_kind == "live" else (int(target[0]), int(target[1]))
+            live_target = (int(target[0]), int(target[1]))
             self._meta[event_key] = {
                 "ev": dict(ev),
                 "target": live_target,

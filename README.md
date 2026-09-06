@@ -18,7 +18,7 @@
          ┌───────────┼───────────┬──────────────┐
          ▼           ▼           ▼              ▼
    进球 pitch-gate   终场立刻询价  回撤 AF flatten  进球 +10min 再扫
-   （DOM∧AF 一刀）   （无门控）    （认分才卖）     （当时比分）
+   （DOM∧AF 一刀）   （无门控）    （认分才卖）     （AF=触发比分）
 ```
 
 | 模块 | 作用 |
@@ -58,7 +58,7 @@
 3. **配对**：英队名 + 北京开球时间模糊匹配（`min_score` / `min_side` / 联赛别名等，见 `match-bridge`）。未配对场次**不会**进门控下单。
 4. Bridge 产出事件：
    - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**，并排队 **T+10** 再扫盘
-   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten（T+10 排队不取消，到点用当时比分）
+   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten（T+10 排队不取消，到点 AF 必须仍等于触发那球的比分才买）
    - `match_finished`（`period` 切入 `FT`）→ 取消未到期 T+10 + rest；**立刻询价下单**（不过门控）
 5. 加时中（DQD 仍在踢、`minute>90` 且 `injury_time==0`）的比分抖动**不发事件**，避免误触发。
 
@@ -68,7 +68,7 @@
 |---|---|---|---|---|
 | **Pitch-gate 进球** | 已配对进球，DOM `in_play` ∧ AF 认分 | 是 | `QUOTE_GOAL_MAX_USDC` | 仅当 `QUOTE_REST_ENABLED=1`（`QUOTE_REST_USDC`） |
 | **Locked sweep** | 门控买时，该 token 在**上一分**已是 live WIN | 是（同一刀） | `QUOTE_LOCKED_SWEEP_USDC` | 同门控 rest |
-| **T+10 再扫** | 进球后 10 分钟，按**当时比分** | 否 | `QUOTE_T10_USDC`（FAK 与 0.99 GTC 各用该金额） | **始终挂**（不看 `QUOTE_REST_ENABLED`） |
+| **T+10 再扫** | 进球后 10 分钟，AF live **等于触发那球的比分**才买 | 否 | `QUOTE_T10_USDC`（FAK 与 0.99 GTC 各用该金额） | **始终挂**（不看 `QUOTE_REST_ENABLED`） |
 | **终场** | `match_finished` | 否 | `QUOTE_FT_MAX_USDC` | 不挂 |
 | **终场灰尘盘** | 终场已锁定 WIN、ask≤0.01 | 否 | `QUOTE_FT_DUST_USDC` | 不挂 |
 
@@ -130,7 +130,7 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 
 ### 3. 进球 +10 分钟再扫盘（T+10）
 
-已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **600s** 后按**当时**懂球帝比分再询价（叠到 Polymarket 主客上，主客对调要换边，不能把懂球帝 1-0 直接写成 PM 主队 1-0）：
+已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **600s** 后拉 AF **live** 比分，**必须和触发这次 T+10 的那次进球后比分一致**才询价（后续又进球 / 回撤则 `t10_skip_score_mismatch`，不拿最新比分改写后买入）。叠到 Polymarket 主客上，主客对调要换边：
 
 - 有 misprice → 同一套 `buy_win` FAK（fee / `min_net` / ask≤0.995；跳过 `min_buy_price`；**不做** locked sweep）
 - **每个已锁定 WIN 的 token** 再挂一笔 **@0.99 GTC**（不依赖 `QUOTE_REST_ENABLED`）
@@ -249,6 +249,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 |---|---|
 | `QUOTE_DQD_STREAM_OBSERVE` | 须为 `1`，否则进球门控不可用 |
 | `QUOTE_DOM_POOL_MAX` | 共用 Chromium 标签上限，默认 24；满则踢最久未用的空闲页 |
+| `QUOTE_DOM_WEBGL` | 默认关：不跑纳米 3D/WebGL（只读 overlay 文本）；`1` 才恢复 |
 | `QUOTE_DOM_WARM` | 默认开：进行中已配对场预开 tracker 页 |
 | `QUOTE_DOM_WARM_INTERVAL_S` | 预热扫描间隔，默认 10s |
 | `QUOTE_DOM_WARM_OPEN_TIMEOUT_S` | 预热开页上限，默认 3s（门控开页仍用 `QUOTE_DOM_OPEN_TIMEOUT_S`） |

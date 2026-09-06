@@ -134,8 +134,10 @@ def _run() -> int:
         assert len(due) == 1, due
         work = t10.build_t10_work_event(root, due[0])
         assert work is not None
-        assert work["home_score"] == 2 and work["away_score"] == 1
-        assert "prev" not in work
+        # Trigger was 1-0; live prev_scores 2-1 must not become the traded score.
+        assert work["home_score"] == 1 and work["away_score"] == 0
+        assert work.get("dqd_live_home") == 2 and work.get("dqd_live_away") == 1
+        assert work.get("prev") == {"home": 0, "away": 0}
         tc = work["_trade_context"]
         assert tc.get("t10") is True
         assert tc.get("pitch_gate") is True
@@ -287,6 +289,7 @@ def _pump_t10(
                 "t10_af_unconfirmed",
                 "t10_skip_af_finished",
                 "t10_skip_ft_pending",
+                "t10_skip_score_mismatch",
             }
             for b in last
         ):
@@ -296,7 +299,7 @@ def _pump_t10(
 
 
 def test_t10_af_live_gate() -> None:
-    """T+10 quotes AF live score; cache miss / timeout does not fall back to DQD."""
+    """T+10 quotes AF live only when it matches the triggering goal score."""
     t10.reset_scheduler_for_tests()
     ref.reset_ft_referee_for_tests()
     os.environ["QUOTE_T10"] = "1"
@@ -318,7 +321,7 @@ def test_t10_af_live_gate() -> None:
         root = _t10_root(td)
         lib.write_json(
             root / "data" / "bridge" / "prev_scores.json",
-            {"m_t10_af": {"home": 1, "away": 2}},
+            {"m_t10_af": {"home": 3, "away": 2}},
         )
         sched = t10.get_scheduler(root)
         assert sched.schedule(ev, event_key=src)
@@ -326,7 +329,7 @@ def test_t10_af_live_gate() -> None:
         def events_fn_live(mid: str, **kwargs: Any) -> dict[str, Any]:
             return {
                 "ok": True,
-                "goals": {"home": 0, "away": 2},
+                "goals": {"home": 1, "away": 2},
                 "finished": False,
                 "status_short": "2H",
                 "af_fixture_id": 42,
@@ -357,7 +360,7 @@ def test_t10_af_live_gate() -> None:
         with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
             _pump_t10(root, referee, quoted)
         assert len(quoted) == 1, quoted
-        assert quoted[0].get("home_score") == 0 and quoted[0].get("away_score") == 2, quoted[0]
+        assert quoted[0].get("home_score") == 1 and quoted[0].get("away_score") == 2, quoted[0]
         assert quoted[0].get("score_source") == "api_football", quoted[0]
 
     t10.reset_scheduler_for_tests()
@@ -538,7 +541,60 @@ def test_t10_af_live_gate() -> None:
             for b in (last or [])
         ), last
 
-    print("ok: t10 AF live score (rewrite DQD) / skip unconfirmed / skip AF FT")
+    t10.reset_scheduler_for_tests()
+    ref.reset_ft_referee_for_tests()
+
+    # Later goal (Arsenal 0-1 → 1-1 while T+10 was scheduled on 0-1) must not buy.
+    mismatch_src = "score_change|m_t10_mm|0-0->0-1|2026-09-06T23:33:12+08:00"
+    mismatch_ev = _goal_ev(
+        match_id="m_t10_mm",
+        home_score=0,
+        away_score=1,
+        prev={"home": 0, "away": 0},
+        curr={"home": 0, "away": 1},
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = _t10_root(td)
+        lib.write_json(
+            root / "data" / "bridge" / "prev_scores.json",
+            {"m_t10_mm": {"home": 1, "away": 1}},
+        )
+        sched = t10.get_scheduler(root)
+        assert sched.schedule(mismatch_ev, event_key=mismatch_src)
+
+        def events_fn_later(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 1, "away": 1},
+                "finished": False,
+                "status_short": "1H",
+                "af_fixture_id": 9,
+            }
+
+        referee = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=1.0,
+            events_fn=events_fn_later,
+            poll_schedule=False,
+        )
+        quoted = []
+
+        def fake_quote_mm(
+            root_arg: Path, ev_arg: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            quoted.append(dict(ev_arg))
+            return {"quoted_at": lib.now_cn_iso(), "count": 0, "opportunity_count": 0}
+
+        with patch.object(lib, "quote_bridge_event", side_effect=fake_quote_mm):
+            last = _pump_t10(root, referee, quoted)
+        assert quoted == [], quoted
+        assert any(
+            isinstance(b, dict) and str(b.get("mode") or "") == "t10_skip_score_mismatch"
+            for b in last
+        ), last
+
+    print("ok: t10 AF live score (match trigger) / skip unconfirmed / skip AF FT / skip later goal")
 
 
 if __name__ == "__main__":

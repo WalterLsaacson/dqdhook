@@ -68,6 +68,68 @@ def test_af_score_satisfies() -> None:
     check("behind rejected", not ok)
 
 
+def test_t10_live_score_relation() -> None:
+    print("test_t10_live_score_relation")
+    check("match", ref.t10_live_score_relation((0, 1), (0, 1)) == "match")
+    check("behind", ref.t10_live_score_relation((0, 0), (0, 1)) == "behind")
+    check("later goal", ref.t10_live_score_relation((1, 1), (0, 1)) == "mismatch")
+    check("wrong side", ref.t10_live_score_relation((1, 0), (0, 1)) == "mismatch")
+
+
+def test_await_t10_live_exact() -> None:
+    print("test_await_t10_live_exact")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def events_match(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "af_fixture_id": 1,
+                "goals": {"home": 0, "away": 1},
+                "finished": False,
+                "status_short": "1H",
+            }
+
+        referee = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=1.0,
+            events_fn=events_match,
+            poll_schedule=False,
+        )
+        out = referee.await_score(
+            "m_t10", (0, 1), for_t10_live=True, baseline=None
+        )
+        check("exact confirm", out.get("confirmed") is True, str(out))
+        check("exact goals", (out.get("goals") or {}) == {"home": 0, "away": 1})
+
+        def events_later(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "af_fixture_id": 1,
+                "goals": {"home": 1, "away": 1},
+                "finished": False,
+                "status_short": "1H",
+            }
+
+        referee2 = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=0.2,
+            events_fn=events_later,
+            poll_schedule=False,
+        )
+        out2 = referee2.await_score(
+            "m_t10", (0, 1), for_t10_live=True, baseline=None
+        )
+        check("later skip", out2.get("confirmed") is not True, str(out2))
+        check(
+            "mismatch err",
+            out2.get("error") == "t10_score_mismatch",
+            str(out2.get("error")),
+        )
+
+
 def test_await_via_bridge_fn() -> None:
     print("test_await_via_bridge_fn")
     with tempfile.TemporaryDirectory() as td:
@@ -480,6 +542,8 @@ def test_apply_score() -> None:
 def main() -> int:
     test_classifiers()
     test_af_score_satisfies()
+    test_t10_live_score_relation()
+    test_await_t10_live_exact()
     test_await_via_bridge_fn()
     test_await_af_ahead()
     test_async_submit_drain()

@@ -20,6 +20,7 @@ from dom_page_pool import (  # noqa: E402
     DomPagePool,
     MemoryDomBackend,
     _find_animation_frame,
+    chromium_launch_kwargs,
 )
 
 
@@ -45,6 +46,12 @@ def _url(mid: str) -> str:
 
 
 def main() -> int:
+    kw = chromium_launch_kwargs()
+    args = kw.get("args") or []
+    assert "--disable-webgl" in args, args
+    assert not any(a.startswith("--renderer-process-limit=") for a in args), args
+    assert "--disable-site-isolation-trials" not in args, args
+
     be = MemoryDomBackend()
     pool = DomPagePool(backend=be, max_pages=2)
     pool.start()

@@ -57,6 +57,13 @@ _PRIO_OPEN = 2
 _PRIO_SHUTDOWN = 3
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
@@ -86,8 +93,24 @@ def warm_open_timeout_s() -> float:
 
 
 def chromium_launch_kwargs() -> dict[str, Any]:
-    """Headless Chromium args that work on a root Linux server."""
+    """Headless Chromium args that work on a root Linux server.
+
+    Pitch-gate only ``evaluate``s overlay text (``.pop-box`` / ``.center-box``).
+    Chromium still needs a renderer per tab to run the tracker's JavaScript.
+    The 3D WebGL pitch is unused, so it is off unless ``QUOTE_DOM_WEBGL=1``.
+    Site isolation and renderer-process caps are left at Chromium defaults —
+    they are not required to read DOM text.
+    """
     args = ["--disable-dev-shm-usage", "--disable-gpu"]
+    if not _env_bool("QUOTE_DOM_WEBGL", False):
+        args.extend(
+            [
+                "--disable-webgl",
+                "--disable-webgl2",
+                "--disable-3d-apis",
+                "--disable-accelerated-2d-canvas",
+            ]
+        )
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         args.extend(["--no-sandbox", "--disable-setuid-sandbox"])
     extra = (os.getenv("QUOTE_CHROMIUM_ARGS") or "").strip()

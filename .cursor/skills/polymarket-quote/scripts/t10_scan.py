@@ -1,8 +1,11 @@
 """Post-goal +10min book rescan.
 
-After a paired DQD goal-up, wait ``QUOTE_T10_DELAY_S`` (default 600s) and quote
-from the **API-Football live score** at fire time. Dongqiudi ``prev_scores`` is
-only a skeleton (sides / halves); no T+10 order without an AF score.
+After a paired DQD goal-up, wait ``QUOTE_T10_DELAY_S`` (default 600s) and poll
+API-Football **live** goals. Quote only when that live tally **exactly matches
+the triggering score-change** (the goal that scheduled this job). A later goal
+or other disagreement skips; AF still behind the trigger keeps polling.
+Dongqiudi ``prev_scores`` is only a skeleton (sides / halves); no T+10 order
+without an AF score that matches the trigger.
 """
 
 from __future__ import annotations
@@ -157,10 +160,11 @@ def current_score_for_match(
     match_id: str,
     fallback_ev: dict[str, Any] | None = None,
 ) -> tuple[int, int] | None:
-    """Live score in Polymarket home/away (same frame as the scheduled event).
+    """Live DQD score in Polymarket home/away (metadata only).
 
     ``prev_scores`` and the DQD snapshot are venue/DQD order; re-orient before
-    overlaying onto the PM-labeled T+10 work event.
+    attaching as ``dqd_live_*`` on the T+10 work event. Never used as the
+    traded score — that stays the triggering goal.
     """
     mid = str(match_id or "").strip()
     row: dict[str, Any] | None = None
@@ -229,6 +233,20 @@ def match_is_played(root: Path, match_id: str) -> bool:
     return st in {"played", "finished"} or disp in {"played", "ft", "full time"}
 
 
+def trigger_score_from_job(job: dict[str, Any]) -> tuple[int, int] | None:
+    """Score **after** the goal that scheduled this T+10 — not the live overlay."""
+    ev = job.get("ev") if isinstance(job.get("ev"), dict) else {}
+    try:
+        from score_events import target_score_from_event
+
+        got = target_score_from_event(ev)
+        if got is not None:
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return _score_pair(ev)
+
+
 def build_t10_work_event(
     root: Path,
     job: dict[str, Any],
@@ -238,12 +256,9 @@ def build_t10_work_event(
     src = str(job.get("source_event_key") or "").strip()
     if not mid or not src:
         return None
-    score = current_score_for_match(root, mid, ev)
+    score = trigger_score_from_job(job)
     if score is None:
-        score = _score_pair(ev)
-    if score is None:
-        # Placeholder until AF live confirm overwrites home/away_score.
-        score = (0, 0)
+        return None
     hs, aws = score
     work = dict(ev)
     work["type"] = "score_change"
@@ -251,8 +266,11 @@ def build_t10_work_event(
     work["home_score"] = hs
     work["away_score"] = aws
     work["curr"] = {"home": hs, "away": aws}
-    work.pop("prev", None)
     work.pop("is_reversal", None)
+    live = current_score_for_match(root, mid, ev)
+    if live is not None:
+        work["dqd_live_home"] = live[0]
+        work["dqd_live_away"] = live[1]
     try:
         import quote_lib as lib
 

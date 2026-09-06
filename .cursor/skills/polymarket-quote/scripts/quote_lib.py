@@ -2596,9 +2596,11 @@ def process_bridge_events(
     cancel rest and open gates; if lots are open they start an AF confirm
     trail from t0 (no shot gate); flatten on first AF score_match then stop
     the trail.     Each paired goal also schedules a T+10 book rescan. At fire, T+10
-    quotes the API-Football **live** score while the match is still in
-    play (not Dongqiudi overlay). If AF is already FT/ET/PEN or an FT
-    confirm is pending, T+10 skips and the FT path owns the match.
+    polls API-Football **live** goals and quotes only when that tally
+    **exactly matches the triggering goal**. A later AF score skips
+    (``t10_skip_score_mismatch``); it does not rewrite-and-buy. If AF is
+    already FT/ET/PEN or an FT confirm is pending, T+10 skips and the FT
+    path owns the match.
 
     ``match_finished`` is not FT until API-Football ``regulation_ready``.
     DQD period=FT is a hint. Quote uses the AF regulation score. T+10 /
@@ -2933,11 +2935,39 @@ def process_bridge_events(
         except (TypeError, ValueError):
             gh, ga = None, None
         if confirmed and gh is not None and ga is not None:
+            trigger = target_score_from_event(ev)
+            if trigger is not None and (gh, ga) != trigger:
+                seen.add(orig_key)
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "t10_skip_score_mismatch",
+                        "event_key": orig_key,
+                        "match_id": mid,
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "af_error": "t10_score_mismatch",
+                        "af_score": f"{gh}-{ga}",
+                        "trigger_score": f"{trigger[0]}-{trigger[1]}",
+                    }
+                )
+                print(
+                    f"t10 → SKIP t10_skip_score_mismatch match_id={mid} "
+                    f"af={gh}-{ga} trigger={trigger[0]}-{trigger[1]} "
+                    f"key={orig_key}",
+                    flush=True,
+                )
+                return
             work = apply_af_score_to_event(ev, home=gh, away=ga)
-            dqd_s = f"{ev.get('home_score')}-{ev.get('away_score')}"
+            trig_s = (
+                f"{trigger[0]}-{trigger[1]}"
+                if trigger is not None
+                else f"{ev.get('home_score')}-{ev.get('away_score')}"
+            )
             print(
                 f"t10 → AF confirmed match_id={mid} af={gh}-{ga} "
-                f"dqd={dqd_s} key={orig_key}",
+                f"trigger={trig_s} key={orig_key}",
                 flush=True,
             )
             _quote_t10_work(work, orig_key)
@@ -2946,6 +2976,8 @@ def process_bridge_events(
         reason = str(gate_row.get("reason") or "")
         if err == "t10_af_ft_skip":
             mode = "t10_skip_af_finished"
+        elif err == "t10_score_mismatch":
+            mode = "t10_skip_score_mismatch"
         elif err == "aborted" and reason in {"ft_pending", "match_finished"}:
             mode = "t10_skip_ft_pending"
         else:
@@ -3172,12 +3204,20 @@ def process_bridge_events(
                         flush=True,
                     )
                     continue
+                trigger = target_score_from_event(work_ev)
+                if trigger is None:
+                    seen.add(t10_key)
+                    print(
+                        f"t10 → SKIP no trigger score match_id={mid} key={t10_key}",
+                        flush=True,
+                    )
+                    continue
                 try:
                     ok = bool(
                         referee.submit(
                             t10_key,
                             work_ev,
-                            (0, 0),
+                            trigger,
                             wait_cache=False,
                             kind="live",
                             timeout_s=t10_af_timeout_s(),
@@ -3189,7 +3229,7 @@ def process_bridge_events(
                 if ok:
                     print(
                         f"t10 → WAIT AF match_id={mid} key={t10_key} "
-                        f"dqd={work_ev.get('home_score')}-{work_ev.get('away_score')}",
+                        f"trigger={trigger[0]}-{trigger[1]}",
                         flush=True,
                     )
                     continue
