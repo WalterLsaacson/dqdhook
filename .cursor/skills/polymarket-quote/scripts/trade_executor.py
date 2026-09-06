@@ -509,6 +509,11 @@ def _trade_context_postft(match_meta: dict[str, Any] | None) -> bool:
     return isinstance(tc, dict) and bool(tc.get("postft_sweep"))
 
 
+def _trade_context_reconfirm(match_meta: dict[str, Any] | None) -> bool:
+    tc = (match_meta or {}).get("trade_context")
+    return isinstance(tc, dict) and bool(tc.get("reconfirm"))
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -554,8 +559,14 @@ class TradeExecutor:
                 )
         self._rebuild_open_from_trades()
 
-    def _live_for_signal(self, event_type: str) -> bool:
+    def _live_for_signal(
+        self,
+        event_type: str,
+        match_meta: dict[str, Any] | None = None,
+    ) -> bool:
         """Whether this bridge signal posts real CLOB orders."""
+        if _trade_context_reconfirm(match_meta):
+            return True
         typ = (event_type or "").strip()
         if typ == "score_change":
             return bool(self.settings.live_goals)
@@ -839,6 +850,8 @@ class TradeExecutor:
         """Pitch-gate buy_win that stays WIN even if this goal is voided."""
         if _trade_context_t10(match_meta):
             return False
+        if _trade_context_reconfirm(match_meta):
+            return False
         if _trade_context_postft(match_meta):
             if trade != "buy_win":
                 return False
@@ -959,7 +972,8 @@ class TradeExecutor:
             if not str(q.get("tick_size") or "").strip():
                 q["tick_size"] = "0.001"
         # Rest: pitch-gate when QUOTE_REST_ENABLED=1; T+10 always (own size).
-        rest_ok = (not postft) and (
+        # Reconfirm is a live FAK only — no GTC leftover.
+        rest_ok = (not postft) and (not _trade_context_reconfirm(match_meta)) and (
             _trade_context_t10(match_meta)
             or (rest_enabled() and _trade_context_pitch_gate(match_meta))
         )
@@ -973,7 +987,7 @@ class TradeExecutor:
         typ = self._resolve_event_type(
             event_type=event_type, event_key=event_key, match_meta=match_meta
         )
-        channel_live = self._live_for_signal(typ)
+        channel_live = self._live_for_signal(typ, match_meta)
         if mis and token_id and mid:
             n = self._cancel_live_rest_for_token(
                 mid,
@@ -1113,6 +1127,8 @@ class TradeExecutor:
             # after FAK. Not clipped by QUOTE_MAX_OPEN_USDC.
             target = float(getattr(self.settings, "t10_usdc", 0.0) or 0)
             return max(0.0, target), base
+        if _trade_context_reconfirm(match_meta):
+            return 0.0, ""
         if _trade_context_pitch_gate(match_meta):
             # Per-order size is QUOTE_REST_USDC. Do not clip by QUOTE_MAX_OPEN_USDC —
             # rest stays until reversal / FT / manual cancel.
@@ -1187,6 +1203,8 @@ class TradeExecutor:
         ignore_ask_zone: bool = False,
     ) -> dict[str, Any] | None:
         """Post/adjust GTC (or GTD) bids for A/B remainder after FAK."""
+        if _trade_context_reconfirm(match_meta):
+            return None
         t10 = _trade_context_t10(match_meta)
         if not rest_enabled() and not t10:
             return None
@@ -1213,7 +1231,7 @@ class TradeExecutor:
             working = self.ledger.rest_reserved_usdc(
                 token_id=token_id, match_id=mid, base_event_key=base
             )
-            channel_live = self._live_for_signal(typ)
+            channel_live = self._live_for_signal(typ, match_meta)
             tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
             share_floor = rest_min_shares(quote)
             cap = (
@@ -1814,7 +1832,7 @@ class TradeExecutor:
             event_key=event_key,
             match_meta=match_meta,
         )
-        channel_live = self._live_for_signal(typ)
+        channel_live = self._live_for_signal(typ, match_meta)
 
         key = trade_idempotency_key(event_key or "", token_id, trade)
         if key in self._in_flight:
@@ -1928,6 +1946,7 @@ class TradeExecutor:
 
         pitch_relaxed = _trade_context_pitch_gate(match_meta)
         t10 = _trade_context_t10(match_meta)
+        reconfirm = _trade_context_reconfirm(match_meta)
         sweep = trade == "buy_win" and self._locked_sweep_eligible(
             quote,
             trade=trade,
@@ -1952,6 +1971,7 @@ class TradeExecutor:
             event_type=typ,
             pitch_gate=pitch_relaxed,
             t10=t10,
+            reconfirm=reconfirm,
         )
         max_usdc = float(chan_usdc)
         max_shares = float(chan_shares)
@@ -2023,7 +2043,9 @@ class TradeExecutor:
                     floor_usdc=floor_usdc,
                 )
                 size_meta = caps.to_dict()
-                if t10:
+                if reconfirm:
+                    size_meta["channel"] = "reconfirm"
+                elif t10:
                     size_meta["channel"] = "t10"
                 else:
                     size_meta["channel"] = (

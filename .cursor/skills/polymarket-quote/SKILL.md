@@ -15,18 +15,19 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 **当前会动 CLOB 的策略（只买 `buy_win`）：**
 
-> 本分支 `feat/goal-reconfirm-20260906`：进球第一刀 **dry-run**；T+10 / 终场扫盘 / locked-sweep / 小时扫盘在代码常量硬停（不读 `.env`）。懂球帝回撤 flatten **仍在**。
+> 本分支 `feat/goal-reconfirm-20260906`：进球第一刀 **dry-run**；T+10 / 终场扫盘 / locked-sweep / 小时扫盘在代码常量硬停（不读 `.env`）。懂球帝回撤 flatten **仍在**。二次确认通过后 **live $1**。
 
 | 策略 | 触发 | 门控 | 金额 | Rest |
 |---|---|---|---|---|
 | Pitch-gate | 已配对进球，同帧 DOM `in_play` ∧ AF `score_match` | 是 | `QUOTE_GOAL_MAX_USDC`（本分支 **dry**） | 仅 `QUOTE_REST_ENABLED=1` |
+| Goal reconfirm | 第一刀 `posted`/`dry_run` 且仍有「回撤会改结算」的 WIN | 60s 后 DOM 6×3s 全 `in_play` + 一次 AF `score_match`；最多 3 次 | `QUOTE_RECONFIRM_USDC`（默认 $1，**live**） | 不挂 |
 | Locked sweep | ~~门控买时 token 在上一分已是 live WIN~~ | **硬停** | — | — |
 | T+10 | ~~进球后 600s~~ | **硬停** | — | — |
 | 终场 | ~~`match_finished` 且 AF `regulation_ready`~~ | **硬停** | — | — |
 | 终场灰尘盘 | 随终场 | **硬停** | — | — |
 | 完赛扫盘 | ~~每 1h~~ | **硬停** | — | — |
 
-**Pitch-gate 细节**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。**本拍 DOM `in_play` 才同帧打 AF**（庆祝/`unclear` 不打）。买入只有一条：**同帧 DOM `in_play` ∧ AF `ok && score_match`**（或本球更早一次 `in_play` 已认分的锁存；本拍硬不一致会清掉）。**射门不再卡买入**。Odds Grade A **只观察、不下单**。VAR 买入前仍永久否决。买入后立刻停 AF+DOM。本分支第一刀 **dry-run**（`goals_mode=dry`）。回撤确认轨仍是 5s AF+DOM 观察，**仅 AF `score_match` 才 flatten**（DOM 比分条不单独卖出）。**Locked-sweep 硬停**：不再对「这球不算也锁死」的 token 加买。终场 / T+10 / 小时扫盘硬停，见 `experiment_flags.py`。
+**Pitch-gate 细节**：DQD `score_change` 进球且已配对 → 进球后 **+0s** 起每 **5s 先采 DOM**。**本拍 DOM `in_play` 才同帧打 AF**（庆祝/`unclear` 不打）。买入只有一条：**同帧 DOM `in_play` ∧ AF `ok && score_match`**（或本球更早一次 `in_play` 已认分的锁存；本拍硬不一致会清掉）。**射门不再卡买入**。Odds Grade A **只观察、不下单**。VAR 买入前仍永久否决。买入后立刻停 AF+DOM。本分支第一刀 **dry-run**（`goals_mode=dry`）。若该刀至少一笔 `buy_win` `posted`/`dry_run`，且仍有 WIN 且 **不是** `win_if_goal_void` 的盘（回撤仍会改结算），则排队 **二次确认**：默认等 **60s**（`QUOTE_RECONFIRM_DELAY_S`），DOM **6 帧×3s** 每一帧 `in_play`，再 AF **一次** live `ok && score_match`。通过 → **live $1**（`QUOTE_RECONFIRM_USDC`）。失败再等 60s，最多 3 次。第一刀入队时把 `sides_swapped` / `dqd_home` / `dqd_away` 打在 `reconfirm_ev` 上，CLOB worker drain 后仍按原事件认分，不会主客对调。FT / 回撤 **拉黑该场**；新进球只挡住更早 ts 的二次确认（新球自己的第一刀之后仍可排）。取消会丢掉已经 `pass` 的 `_done`，retry 不能复活。回撤确认轨仍是 5s AF+DOM 观察，**仅 AF `score_match` 才 flatten**（DOM 比分条不单独卖出）。**Locked-sweep 硬停**：不再对「这球不算也锁死」的 token 加买。终场 / T+10 / 小时扫盘硬停，见 `experiment_flags.py`。
 
 > 询价、挂 rest、flatten、rest 对账在 **CLOB worker 线程**；watch tick 只 `start_gate` / 取消门控 / 把事件载荷入队。别场的 `/books` 和 GTC 不再堵住新球开 DOM。**`start_gate` 后并行预热** Gamma catalog + 周期 `POST /books`（`QUOTE_GATE_PREWARM`，默认开）；BUY 询价优先吃新鲜预热盘口，省掉热路径上约 0.5–1s 的 books RTT（**不缩短** DOM/AF 等待）。
 
@@ -48,7 +49,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 ## Quick start
 
-**主入口（推荐）** — System Main 拉起 boards + `pm_quote watch`（本分支默认 goals=dry，T+10 / FT / locked-sweep / 小时扫盘硬停）：
+**主入口（推荐）** — System Main 拉起 boards + `pm_quote watch`（本分支默认 goals=dry、ft 通道硬停；二次确认 live $1）：
 
 ```bash
 python3 frontend/run_main.py
@@ -80,19 +81,19 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 
 1. Prefer System Main (`frontend/run_main.py`): boards (UI) + `pm_quote watch` owns **in-process** match-bridge (memory `event_queue` → quote). `MAIN_BRIDGE_INPROC=0` falls back to bridge-board file wake.
 2. Bridge events in `data/bridge/events.jsonl`:
-  - `score_change` goal-up (paired) → **start pitch-gate** (DOM @+0s every 5s; AF on each `in_play` tick; dry-run quote on AND; stop AF+DOM after AND buy). T+10 **硬停**.
-  - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate; if lots are open, 5s AF trail → flatten on first AF `score_match` vs post-reverse score **only lots that are no longer WIN** (e.g. 1-1→1-0 keeps home O/U 0.5), then stop the trail.
-  - `match_finished` → **硬停**（取消 rest / gate；不询价、不下单）。
+  - `score_change` goal-up (paired) → **start pitch-gate** (DOM @+0s every 5s; AF on each `in_play` tick; dry-run quote on AND; stop AF+DOM after AND buy). If posted+remaining edge, **schedule reconfirm** (60s × up to 3). T+10 **硬停**.
+  - `score_change` reversal → first cancel/block the undone goal, then cancel rest + pitch-gate + reconfirm job; if lots are open, 5s AF trail → flatten on first AF `score_match` vs post-reverse score **only lots that are no longer WIN**.
+  - `match_finished` → **硬停**（取消 reconfirm / rest / gate；不询价、不下单）。
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: CLOB worker thread (not the watch tick) runs one `/books` POST; totals/BTTS before exact.
 5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` on this branch). Pitch-gate skips `min_buy_price` and size/$1 floors. **Locked-sweep 硬停**（`win_if_goal_void` 不再 FAK 加买）。
-6. **Pitch-gate: one `quote_bridge_event` per aligned buy.** T+10 / FT / post-FT leftover sweep are hard-stopped (`experiment_flags.py`).
+6. **Pitch-gate: one `quote_bridge_event` per aligned buy.** Remaining-edge + posted → **reconfirm** (`QUOTE_RECONFIRM_USDC`, default $1 live). T+10 / FT / post-FT leftover sweep are hard-stopped (`experiment_flags.py`).
 
 ## Trading flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| (default) | goals **dry** / ft live-flag（FT 硬停） | 第一刀 dry；T+10 / FT / locked-sweep 硬停 |
+| (default) | goals **dry** / ft live-flag（FT 硬停） | 第一刀 dry；二次确认 live $1 |
 | `--live` | off | Both channels live (FT still hard-stopped on this branch) |
 | `--goals-mode` / `--ft-mode` | dry / live | Per-channel override |
 | `--no-trade` | off | Quote only (no executor) |

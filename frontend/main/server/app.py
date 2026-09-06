@@ -962,7 +962,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "System Main — hub + boards + quote "
-            "(this branch: pitch-gate goals dry by default; T+10/FT/locked-sweep hard-stopped; "
+            "(this branch: pitch-gate goals dry by default + reconfirm live $1; "
             "do not start pm_quote / boards separately)"
         )
     )

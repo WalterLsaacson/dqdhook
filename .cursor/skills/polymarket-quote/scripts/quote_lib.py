@@ -2550,6 +2550,14 @@ def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
             worker.submit_rest_cancel(mid, reason="dqd_reversal")
     except Exception as e:  # noqa: BLE001
         print(f"ALERT clob-worker rest-cancel enqueue failed match={mid}: {e}", flush=True)
+    try:
+        from goal_reconfirm import get_scheduler as get_reconfirm_scheduler
+
+        get_reconfirm_scheduler(root).cancel_match(
+            mid, reason="dqd_reversal", event_ts=str(ev.get("ts") or "") or None
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def install_reversal_fast_cancel(root: Path) -> None:
@@ -2620,6 +2628,12 @@ def process_bridge_events(
         t10_af_timeout_s,
         t10_enabled,
     )
+    from goal_reconfirm import (
+        build_reconfirm_work_event,
+        get_scheduler as get_reconfirm_scheduler,
+        reconfirm_enabled,
+        slim_event,
+    )
     from experiment_flags import HARD_STOP_FT_SCAN
 
     cursor = load_cursor(root)
@@ -2651,6 +2665,38 @@ def process_bridge_events(
         if mid:
             processed_ft_ids.add(mid)
 
+    def _maybe_schedule_reconfirm(
+        bundle: dict[str, Any],
+        *,
+        ev: dict[str, Any] | None = None,
+    ) -> None:
+        if not reconfirm_enabled():
+            return
+        try:
+            get_reconfirm_scheduler(root).maybe_schedule_from_bundle(bundle, ev=ev)
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT reconfirm schedule failed: {e}", flush=True)
+
+    def _cancel_reconfirm(
+        match_id: str,
+        *,
+        reason: str,
+        ev: dict[str, Any] | None = None,
+        event_ts: str | None = None,
+    ) -> None:
+        mid = str(match_id or "").strip()
+        if not mid:
+            return
+        ts = event_ts
+        if ts is None and isinstance(ev, dict):
+            ts = ev.get("ts")
+        try:
+            get_reconfirm_scheduler(root).cancel_match(
+                mid, reason=reason, event_ts=str(ts or "") or None
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT reconfirm cancel failed match={mid}: {e}", flush=True)
+
     if clob is not None:
         for res in clob.drain_results():
             bundles.extend(res.bundles)
@@ -2659,6 +2705,9 @@ def process_bridge_events(
                     seen.add(k)
             for mid in res.ft_match_ids:
                 _mark_ft_done(mid)
+            for b in res.bundles:
+                if isinstance(b, dict):
+                    _maybe_schedule_reconfirm(b)
 
     # Pull events and cancel reversed gates BEFORE any CLOB flatten/rest work.
     # Havre 1-1 kept AF/DOM for ~90s because this tick sat in rest-buy first.
@@ -2734,7 +2783,7 @@ def process_bridge_events(
             if isinstance(work_ev.get("_trade_context"), dict)
             else {}
         )
-        skip_flatten = bool(tc.get("t10"))
+        skip_flatten = bool(tc.get("t10") or tc.get("reconfirm"))
         if trade_executor is not None and not skip_flatten:
             try:
                 flatten_rows = list(
@@ -2830,6 +2879,7 @@ def process_bridge_events(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"ALERT t10 cancel on FT failed match={mid}: {e}", flush=True)
+        _cancel_reconfirm(mid, reason="match_finished")
         if clob is not None:
             clob.submit_rest_cancel(mid, reason="match_finished")
         elif trade_executor is not None:
@@ -2908,6 +2958,84 @@ def process_bridge_events(
         if len(bundles) > n_before and isinstance(bundles[-1], dict):
             bundles[-1]["mode"] = "t10_scan"
             bundles[-1]["t10"] = extra["t10"]
+
+    def _quote_reconfirm_work(work_ev: dict[str, Any], rec_key: str) -> None:
+        extra = {
+            "mode": "reconfirm",
+            "skip_flatten": True,
+            "reconfirm": {
+                "source_event_key": (
+                    (work_ev.get("_trade_context") or {}).get("source_event_key")
+                    if isinstance(work_ev.get("_trade_context"), dict)
+                    else None
+                ),
+                "attempt": (
+                    (work_ev.get("_trade_context") or {}).get("attempt")
+                    if isinstance(work_ev.get("_trade_context"), dict)
+                    else None
+                ),
+            },
+        }
+        print(
+            f"reconfirm → BUY match_id={work_ev.get('match_id')} key={rec_key} "
+            f"score={work_ev.get('home_score')}-{work_ev.get('away_score')} "
+            f"usdc live",
+            flush=True,
+        )
+        if clob is not None:
+            clob.submit_quote(work_ev, event_key=rec_key, extra=extra)
+            seen.add(rec_key)
+            return
+        n_before = len(bundles)
+        _quote_one(work_ev, rec_key)
+        if rec_key not in seen:
+            seen.add(rec_key)
+        if len(bundles) > n_before and isinstance(bundles[-1], dict):
+            bundles[-1]["mode"] = "reconfirm"
+            bundles[-1]["reconfirm"] = extra["reconfirm"]
+
+    def _drain_reconfirm() -> None:
+        nonlocal bundles, seen
+        if not reconfirm_enabled():
+            return
+        try:
+            sched = get_reconfirm_scheduler(root)
+            sched.kick_due()
+            done = sched.drain_done()
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT reconfirm drain failed: {e}", flush=True)
+            return
+        for item in done:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status") or "") != "pass":
+                continue
+            job = item.get("job") if isinstance(item.get("job"), dict) else {}
+            rec_key = str(job.get("reconfirm_event_key") or "")
+            mid = str(job.get("match_id") or "")
+            if not rec_key:
+                continue
+            if rec_key in seen:
+                continue
+            if not sched.accept_job(job):
+                seen.add(rec_key)
+                print(
+                    f"reconfirm → SKIP suppressed match_id={mid} key={rec_key}",
+                    flush=True,
+                )
+                continue
+            if mid and mid in processed_ft_ids:
+                seen.add(rec_key)
+                print(
+                    f"reconfirm → SKIP finished match_id={mid} key={rec_key}",
+                    flush=True,
+                )
+                continue
+            work_ev = build_reconfirm_work_event(job)
+            if work_ev is None:
+                seen.add(rec_key)
+                continue
+            _quote_reconfirm_work(work_ev, rec_key)
 
     def _handle_t10_af_done(item: dict[str, Any]) -> None:
         from af_referee import apply_af_score_to_event
@@ -3345,6 +3473,7 @@ def process_bridge_events(
                         "sample_i": item.get("sample_i"),
                         "judge": item.get("judge"),
                     },
+                    "reconfirm_ev": slim_event(ev),
                 }
                 if clob is not None:
                     clob.submit_quote(work_ev, event_key=key, extra=pitch_extra)
@@ -3359,6 +3488,8 @@ def process_bridge_events(
                 if len(bundles) > n_before and isinstance(bundles[-1], dict):
                     bundles[-1]["mode"] = "pitch_gate_confirmed"
                     bundles[-1]["pitch_gate"] = pitch_extra["pitch_gate"]
+                    bundles[-1]["reconfirm_ev"] = pitch_extra.get("reconfirm_ev")
+                    _maybe_schedule_reconfirm(bundles[-1], ev=ev)
                 continue
             if status == "buy_revoked":
                 # Queued buy invalidated by cancel/reversal before drain.
@@ -3576,6 +3707,7 @@ def process_bridge_events(
 
             if event_is_goal_up(ev):
                 mid_up = str(ev.get("match_id") or "")
+                _cancel_reconfirm(mid_up, reason="new_goal", ev=ev)
                 if mid_up and trade_executor is not None:
                     try:
                         trade_executor.clear_rest_block(mid_up)
@@ -3684,6 +3816,7 @@ def process_bridge_events(
 
         if typ == "match_finished":
             mid = str(ev.get("match_id") or "")
+            _cancel_reconfirm(mid, reason="match_finished", ev=ev)
             if HARD_STOP_FT_SCAN:
                 _release_live_on_confirmed_ft(mid)
                 seen.add(key)
@@ -3753,6 +3886,7 @@ def process_bridge_events(
     _drain_pitch_gate()
     _drain_t10()
     _drain_ft_af()
+    _drain_reconfirm()
 
     cursor["processed_keys"] = sorted(seen)[-1000:]
     cursor["processed_ft_match_ids"] = sorted(processed_ft_ids)[-1000:]

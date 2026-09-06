@@ -110,6 +110,8 @@ class TradeSettings:
     locked_sweep_usdc: float = 1000.0
     # Goal +10min rescan: FAK + rest share this notional. 0 = off.
     t10_usdc: float = 0.0
+    # Goal reconfirm live FAK. 0 = off; load_trade_settings defaults to $1.
+    reconfirm_usdc: float = 0.0
     # Periodic post-FT leftover WIN ask sweep (pm-locked-scan).
     postft_sweep: bool = True
     postft_sweep_usdc: float = 1000.0
@@ -125,8 +127,13 @@ class TradeSettings:
         event_type: str = "",
         pitch_gate: bool = False,
         t10: bool = False,
+        reconfirm: bool = False,
     ) -> tuple[float, float, tuple[tuple[float, float], ...]]:
         """Return (max_usdc, max_shares, size_tiers) for this buy channel."""
+        if reconfirm:
+            usdc = float(getattr(self, "reconfirm_usdc", 0.0) or 0.0)
+            shares = usdc / 0.01 if usdc > 0 else 0.0
+            return usdc, shares, ((0.98, usdc),) if usdc > 0 else ((0.98, 0.0),)
         if t10:
             usdc = float(self.t10_usdc or 0.0)
             shares = usdc / 0.01 if usdc > 0 else 0.0
@@ -253,6 +260,14 @@ def load_trade_settings(
     except ImportError:  # noqa: BLE001
         _t10_usdc_env = lambda: 0.0  # noqa: E731
 
+    def _reconfirm_usdc() -> float:
+        try:
+            from goal_reconfirm import reconfirm_usdc as _rec
+
+            return float(_rec())
+        except ImportError:  # noqa: BLE001
+            return 1.0
+
     funder = os.getenv("FUNDER", "").strip() or None
     return TradeSettings(
         private_key=private_key,
@@ -291,6 +306,7 @@ def load_trade_settings(
             float(sweep_usdc) if sweep_usdc is not None else 1000.0
         ),
         t10_usdc=float(_t10_usdc_env()),
+        reconfirm_usdc=_reconfirm_usdc(),
         postft_sweep=_env_bool("QUOTE_POSTFT_SWEEP", True),
         postft_sweep_usdc=(
             float(os.getenv("QUOTE_POSTFT_SWEEP_USDC"))
@@ -312,6 +328,7 @@ def size_channels_label(settings: TradeSettings) -> str:
     sweep_u = float(getattr(settings, "locked_sweep_usdc", 1000.0) or 0)
     sweep = f"on:{sweep_u:g}" if sweep_on and sweep_u > 0 else "off"
     t10_u = float(getattr(settings, "t10_usdc", 0.0) or 0)
+    rec_u = float(getattr(settings, "reconfirm_usdc", 0.0) or 0)
     postft_on = bool(getattr(settings, "postft_sweep", True))
     postft_u = float(getattr(settings, "postft_sweep_usdc", 1000.0) or 0)
     postft = f"on:{postft_u:g}" if postft_on and postft_u > 0 else "off"
@@ -319,5 +336,5 @@ def size_channels_label(settings: TradeSettings) -> str:
         f"goals_usdc={g_u:g} tiers={format_size_tiers(g_t)} "
         f"ft_usdc={f_u:g} tiers={format_size_tiers(f_t)} "
         f"ft_dust_usdc={dust:g} locked_sweep={sweep} "
-        f"t10_usdc={t10_u:g} postft_sweep={postft}"
+        f"t10_usdc={t10_u:g} reconfirm_usdc={rec_u:g} postft_sweep={postft}"
     )

@@ -43,6 +43,15 @@ TRADE_SETUP_BACKOFF_S = 5.0
 TRADE_SETUP_BACKOFF_MAX_S = 30.0
 
 
+def _reconfirm_needs_key() -> bool:
+    try:
+        from goal_reconfirm import reconfirm_enabled
+
+        return bool(reconfirm_enabled())
+    except ImportError:
+        return False
+
+
 def root() -> Path:
     return lib.repo_root_from(Path(__file__))
 
@@ -52,7 +61,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
 
     Defaults: goals=dry (this experiment branch) and ft=live. Override with
     --goals-mode / --ft-mode / env. Goals still require pitch-gate ``in_play``
-    before buy.
+    before the first (dry) quote; reconfirm live $1 is separate.
     """
     if getattr(args, "no_trade", False):
         return None
@@ -80,14 +89,14 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         min_buy_price=float(getattr(args, "min_buy_price", 0.6)),
         enabled=True,
         env_file=getattr(args, "trade_env_file", None),
-        require_key=bool(live_goals or live_ft),
+        require_key=bool(live_goals or live_ft or _reconfirm_needs_key()),
     )
     executor = TradeExecutor(rt, settings)
     if settings.private_key:
         try:
             executor.ensure_trader()
         except Exception as e:  # noqa: BLE001
-            if settings.live:
+            if settings.live or float(getattr(settings, "reconfirm_usdc", 0) or 0) > 0:
                 raise
             print(
                 f"trade → CLOB init failed (sell position checks disabled): {e}",

@@ -619,6 +619,10 @@ class QuoteWorker:
                 bundle["pitch_gate"] = extra["pitch_gate"]
             if extra.get("t10"):
                 bundle["t10"] = extra["t10"]
+            if extra.get("reconfirm"):
+                bundle["reconfirm"] = extra["reconfirm"]
+            if extra.get("reconfirm_ev") is not None:
+                bundle["reconfirm_ev"] = extra["reconfirm_ev"]
             bundles.append(bundle)
             retry_needed = _quote_retry_needed(bundle)
             if str(ev.get("type") or "") == "match_finished" and not retry_needed:
