@@ -69,7 +69,11 @@ def _dom_shows_shot(
     dom: dict[str, Any] | None,
     judged: dict[str, Any] | None = None,
 ) -> bool:
-    """True when this frame shows a shot overlay (pop 射门 or ball/net mark)."""
+    """True when this frame shows a shot overlay (pop 射门 or ball/net mark).
+
+    Missed/saved penalty pop text wins over tracker ``ball``/``net`` marks —
+    namitiyu keeps those classes on a 点球不进 animation.
+    """
     pop = ""
     marks: list[Any] = []
     if isinstance(judged, dict):
@@ -80,6 +84,11 @@ def _dom_shows_shot(
             pop = str(dom.get("pop_box") or "")
         if not marks:
             marks = list(dom.get("marks") or [])
+    try:
+        if _animation_rules().pop_denies_shot(pop):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     if "射门" in pop:
         return True
     return any(str(m) in SHOT_MARKS for m in marks)

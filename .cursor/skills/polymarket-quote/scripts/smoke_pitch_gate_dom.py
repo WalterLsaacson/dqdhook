@@ -172,6 +172,12 @@ def check_judge_dom() -> None:
     assert pg._dom_shows_shot(_dom("阿森纳 进攻", "35:12 1 : 0", ["net"]))
     assert not pg._dom_shows_shot(_dom("阿森纳 进攻", "35:12 1 : 0", ["attack-move"]))
 
+    miss = _dom("马拉加 8'点球不进", "09:01 1 : 0", ["ball", "net", "penalty-box"])
+    j = rules.judge_dom(miss, **exp)
+    assert j["play_state"] == "stopped" and j["stopped_reason"] == "overlay_pause", j
+    assert rules.pop_denies_shot(miss["pop_box"])
+    assert not pg._dom_shows_shot(miss)
+
 
 def check_gate_source_env() -> None:
     old = os.environ.get("QUOTE_GATE_SOURCE")

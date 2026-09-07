@@ -234,14 +234,38 @@ def _frame_dom_in_play(frame: dict[str, Any]) -> bool:
     return isinstance(judge, dict) and str(judge.get("play_state") or "") == "in_play"
 
 
+def _frame_pop_box(frame: dict[str, Any]) -> str:
+    pop = str(frame.get("dom_pop_box") or "")
+    if pop:
+        return pop
+    judge = frame.get("judge") if isinstance(frame.get("judge"), dict) else {}
+    if judge.get("dom_pop_box"):
+        return str(judge.get("dom_pop_box") or "")
+    dom = frame.get("dom_state") if isinstance(frame.get("dom_state"), dict) else {}
+    return str(dom.get("pop_box") or "")
+
+
+def _frame_denies_shot(frame: dict[str, Any]) -> bool:
+    try:
+        scripts = ROOT / ".cursor" / "skills" / "pitch-state" / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        import animation_rules  # noqa: WPS433
+
+        return bool(animation_rules.pop_denies_shot(_frame_pop_box(frame)))
+    except Exception:  # noqa: BLE001
+        pop = _frame_pop_box(frame)
+        return "点球不进" in pop.replace(" ", "")
+
+
 def _frame_shows_shot(frame: dict[str, Any]) -> bool:
     """True when this frame's overlay is a 射门 (pop text or ball/net marks)."""
+    if _frame_denies_shot(frame):
+        return False
     if frame.get("shot_this_frame") is True:
         return True
-    pop = str(frame.get("dom_pop_box") or "")
+    pop = _frame_pop_box(frame)
     judge = frame.get("judge") if isinstance(frame.get("judge"), dict) else {}
-    if not pop:
-        pop = str(judge.get("dom_pop_box") or "")
     if "射门" in pop:
         return True
     marks = frame.get("dom_marks") or judge.get("dom_marks") or []
@@ -921,8 +945,11 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
                     }
             # Runtime shot flags win. Do not OR overlay ball/net onto an
             # explicit shot_this_frame=False / shot_seen=False (进攻 often
-            # carries a ball mark without the 射门 latch).
-            if f.get("shot_this_frame") is None:
+            # carries a ball mark without the 射门 latch). Missed-penalty
+            # pop text (点球不进) also clears a persisted ball/net latch.
+            if _frame_denies_shot(f):
+                f["shot_this_frame"] = False
+            elif f.get("shot_this_frame") is None:
                 if f.get("shot_seen") is False:
                     f["shot_this_frame"] = False
                 else:
@@ -930,8 +957,11 @@ def _build_goals_payload_uncached(*, limit: int = _MAX_GOALS) -> dict[str, Any]:
             else:
                 f["shot_this_frame"] = bool(f.get("shot_this_frame"))
             # Runtime ``shot_seen`` is authoritative per tick. Only synthesize a
-            # forward latch when older rows omitted the field.
-            if f.get("shot_seen") is not None:
+            # forward latch when older rows omitted the field. Missed-penalty
+            # frames must not start or keep a 射门 latch from persisted flags.
+            if _frame_denies_shot(f):
+                frame_latched = latched
+            elif f.get("shot_seen") is not None:
                 frame_latched = bool(f.get("shot_seen"))
                 if frame_latched:
                     latched = True

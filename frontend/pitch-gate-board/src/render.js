@@ -33,6 +33,13 @@ const MARK_LABELS = {
   "penalty-box": "禁区",
 };
 
+function popDeniesShot(pop) {
+  const compact = String(pop || "").replace(/\s+/g, "").toLowerCase();
+  return ["点球不进", "射失", "罚失", "扑出", "击中门柱", "击中横梁", "missedpenalty", "penaltymissed", "penaltysaved"].some(
+    (tok) => compact.includes(tok),
+  );
+}
+
 function gradeChip(grade) {
   const level = String(grade?.level || "").toUpperCase();
   if (!level) return "";
@@ -53,7 +60,17 @@ function renderDomCard(f) {
     : String(f.dom_pop_class || "").includes("home")
       ? "home"
       : "";
-  const marks = [...new Set((f.dom_marks || []).map((m) => MARK_LABELS[m]).filter(Boolean))];
+  const denyShot = popDeniesShot(pop);
+  const marks = [
+    ...new Set(
+      (f.dom_marks || [])
+        .map((m) => {
+          if (denyShot && (m === "ball" || m === "net")) return null;
+          return MARK_LABELS[m];
+        })
+        .filter(Boolean),
+    ),
+  ];
   return `
     <div class="frame__dom">
       <div class="frame__dom-state ${side ? `is-${side}` : ""}">${escapeHtml(pop || "—")}</div>

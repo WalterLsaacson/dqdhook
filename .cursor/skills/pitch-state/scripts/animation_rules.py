@@ -28,7 +28,36 @@ STOPPED_TOKEN_MAP = {
     # Avoid matching the substring inside 「伤停补时」.
     "伤停补时": None,  # ignore / not a pause token
     "伤停": "overlay_pause",
+    # Saved / missed PK overlay — not in_play, and not a 射门 latch.
+    "点球不进": "overlay_pause",
 }
+
+# Pop text that is not a shot even if the tracker keeps ball/net CSS marks
+# (namitiyu missed-penalty animation still tags those classes).
+NOT_SHOT_POP_TOKENS = (
+    "点球不进",
+    "射失",
+    "罚失",
+    "扑出",
+    "击中门柱",
+    "击中横梁",
+    "missed penalty",
+    "penalty missed",
+    "penalty saved",
+)
+
+
+def pop_denies_shot(pop: str | None) -> bool:
+    """True when overlay text is a miss/save, not a shot on target."""
+    raw = str(pop or "").strip()
+    if not raw:
+        return False
+    compact = raw.replace(" ", "").replace("'", "").lower()
+    for tok in NOT_SHOT_POP_TOKENS:
+        needle = tok.replace(" ", "").lower()
+        if needle and needle in compact:
+            return True
+    return False
 
 # Hard stops that often precede a disallowed goal — enable score veto after these.
 SCORE_GATE_STOP_REASONS = frozenset({"var", "celebration"})

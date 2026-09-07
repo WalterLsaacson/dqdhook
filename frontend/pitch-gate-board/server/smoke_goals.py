@@ -608,6 +608,40 @@ def main() -> int:
     latched = next(g for g in snap9["goals"] if g["event_key"] == latch_key)
     assert latched["verdict"] == "aligned_buy", latched["verdict"]
 
+    miss_key = "score_change|m_pk|0-0->1-0|t_pk"
+    _write_jsonl(
+        observe,
+        [
+            {
+                "event_key": miss_key,
+                "match_id": "m_pk",
+                "home": "Málaga CF",
+                "away": "Levante UD",
+                "home_score": 1,
+                "away_score": 0,
+                "sample_i": 1,
+                "elapsed_s": 5.008,
+                "ok": True,
+                "gate": True,
+                "judge": {
+                    "play_state": "unclear",
+                    "dom_pop_box": "马拉加 8'点球不进",
+                    "dom_marks": ["ball", "net", "penalty-box"],
+                },
+                "dom_state": {
+                    "pop_box": "马拉加 8'点球不进",
+                    "marks": ["ball", "net", "penalty-box"],
+                },
+                "shot_seen": True,
+                "shot_this_frame": True,
+            },
+        ],
+    )
+    snap_pk = board.build_goals_payload(limit=50)
+    missed = next(g for g in snap_pk["goals"] if g["event_key"] == miss_key)
+    assert missed["frames"][0]["shot_this_frame"] is False, missed["frames"][0]
+    assert missed["shot_seen"] is False, missed
+
     print("ok: pitch-gate board verdicts match DOM∧AF / AF flatten")
     return 0
 
