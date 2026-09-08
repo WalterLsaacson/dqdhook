@@ -58,7 +58,7 @@
 3. **配对**：英队名 + 北京开球时间模糊匹配（`min_score` / `min_side` / 联赛别名等，见 `match-bridge`）。未配对场次**不会**进门控下单。
 4. Bridge 产出事件：
    - `score_change` + 进球（比分上升）→ 启动 **pitch-gate**，并排队 **T+10** 再扫盘
-   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten（T+10 排队不取消，到点 AF 必须仍等于触发那球的比分才买）
+   - `score_change` + 回撤（任一侧比分下降）→ 取消该场门控与 rest，并**取消被撤销那球的 T+10**（同场更早仍成立的进球 T+10 保留）；**已有仓**才开 5s 观察，**AF 认回撤比分**再 flatten
    - `match_finished`（`period` 切入 `FT`）→ 取消未到期 T+10 + rest；**立刻询价下单**（不过门控）
 5. 加时中（DQD 仍在踢、`minute>90` 且 `injury_time==0`）的比分抖动**不发事件**，避免误触发。
 
@@ -135,7 +135,7 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 - 有 misprice → 同一套 `buy_win` FAK（fee / `min_net` / ask≤0.995；跳过 `min_buy_price`；**不做** locked sweep）
 - **每个已锁定 WIN 的 token** 再挂一笔 **@0.99 GTC**（不依赖 `QUOTE_REST_ENABLED`）
 - FAK 和限价**各**用 `QUOTE_T10_USDC`（叠，不是「一共这么多」）；rest **不受** `QUOTE_MAX_OPEN_USDC` 卡住
-- 终场取消未到期任务并撤 rest；回撤不取消排队
+- 终场取消未到期任务并撤 rest；回撤取消**被撤销那球**的排队 / 进行中 T+10（同场更早仍成立的进球保留）
 - `QUOTE_T10_USDC` 未设或 `0`、或 `QUOTE_T10=0` → 关闭。到期超过 `QUOTE_T10_MAX_LATE_S`（默认 900s）的任务丢掉（进程挂太久会漏扫）
 
 ### 4. 终场通道（FT）

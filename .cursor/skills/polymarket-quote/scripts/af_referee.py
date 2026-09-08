@@ -1173,6 +1173,12 @@ class AfReferee:
                                 (int(gh), int(ga)), (th, ta), baseline=base
                             )
                         if ok:
+                            if abort.is_set():
+                                return _aborted(
+                                    polls,
+                                    elapsed_ms,
+                                    last_goals,
+                                )
                             fid = last.get("af_fixture_id")
                             # Hot path: memory only — no second AF fetch, no sync disk.
                             set_confirmed_score_async(
@@ -1748,6 +1754,12 @@ def get_ft_referee(root: Path | None = None) -> AfReferee:
                 raise RuntimeError("FT AF referee requires root on first use")
             age = max(90.0, ft_max_age_s())
             _ft_referee = AfReferee(root, timeout_s=age, poll_schedule=True)
+        return _ft_referee
+
+
+def active_ft_referee() -> AfReferee | None:
+    """Return the process referee if watch already created one; do not start it."""
+    with _ft_ref_lock:
         return _ft_referee
 
 

@@ -4,8 +4,11 @@ After a paired DQD goal-up, wait ``QUOTE_T10_DELAY_S`` (default 600s) and poll
 API-Football **live** goals. Quote only when that live tally **exactly matches
 the triggering score-change** (the goal that scheduled this job). A later goal
 or other disagreement skips; AF still behind the trigger keeps polling.
-Dongqiudi ``prev_scores`` is only a skeleton (sides / halves); no T+10 order
-without an AF score that matches the trigger.
+A DQD reversal cancels the **undone** goal's pending / in-flight T+10 (stem
+match, ``ts`` ≤ reverse ``ts``) and records that stem so a job already
+``pop_due``'d cannot submit. Earlier standing goals on the same match keep
+theirs. Dongqiudi ``prev_scores`` is only a skeleton (sides / halves); no T+10
+order without an AF score that matches the trigger.
 """
 
 from __future__ import annotations
@@ -75,6 +78,31 @@ def t10_event_key(source_event_key: str) -> str:
     if src.startswith("t10|"):
         return src
     return f"t10|{src}"
+
+
+def t10_source_key(event_key: str) -> str:
+    """Strip the ``t10|`` prefix so stem/ts helpers see the goal key."""
+    src = str(event_key or "").strip()
+    if src.startswith("t10|"):
+        return src[4:]
+    return src
+
+
+def source_matches_undone_goal(source_event_key: str, reversal_event_key: str) -> bool:
+    """True when ``source`` is the inverted goal of this reverse (any ts ≤ reverse)."""
+    from pitch_gate import event_key_stem, event_key_ts, invert_score_change_key
+
+    src = t10_source_key(source_event_key)
+    inv = invert_score_change_key(reversal_event_key)
+    if not src or not inv:
+        return False
+    if event_key_stem(src) != event_key_stem(inv):
+        return False
+    until = event_key_ts(reversal_event_key) or event_key_ts(inv)
+    ts = event_key_ts(src)
+    if until and ts and ts > until:
+        return False
+    return True
 
 
 def _pending_path(root: Path) -> Path:
@@ -313,6 +341,7 @@ class T10Scheduler:
         self.root = Path(root)
         self._lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
+        self._blocked_until: dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -333,6 +362,15 @@ class T10Scheduler:
             if src:
                 out[src] = row
         self._jobs = out
+        blocked: dict[str, str] = {}
+        raw_block = raw.get("blocked_until") if isinstance(raw, dict) else None
+        if isinstance(raw_block, dict):
+            for stem, until in raw_block.items():
+                s = str(stem or "").strip()
+                u = str(until or "").strip()
+                if s and u:
+                    blocked[s] = u
+        self._blocked_until = blocked
 
     def _save_locked(self) -> None:
         try:
@@ -341,6 +379,7 @@ class T10Scheduler:
             payload = {
                 "updated_at": lib.now_cn_iso(),
                 "jobs": list(self._jobs.values()),
+                "blocked_until": dict(self._blocked_until),
             }
             lib.write_json(_pending_path(self.root), payload)
         except Exception:  # noqa: BLE001
@@ -384,6 +423,75 @@ class T10Scheduler:
             if drop:
                 self._save_locked()
             return len(drop)
+
+    def _block_undone_goal_locked(self, reversal_event_key: str) -> bool:
+        """Record inverted stem → reverse ts. Caller holds ``_lock``."""
+        from pitch_gate import event_key_stem, event_key_ts, invert_score_change_key
+
+        inv = invert_score_change_key(reversal_event_key)
+        if not inv:
+            return False
+        stem = event_key_stem(inv)
+        ts = event_key_ts(reversal_event_key) or event_key_ts(inv)
+        if not stem or not ts:
+            return False
+        prev = str(self._blocked_until.get(stem) or "")
+        if ts >= prev:
+            self._blocked_until[stem] = ts
+            return True
+        return False
+
+    def block_undone_goal(self, reversal_event_key: str) -> bool:
+        """Remember this reverse so an already-popped T+10 still skips submit."""
+        rev = str(reversal_event_key or "").strip()
+        if not rev:
+            return False
+        with self._lock:
+            changed = self._block_undone_goal_locked(rev)
+            if changed:
+                self._save_locked()
+            return changed
+
+    def is_source_blocked(self, source_event_key: str) -> bool:
+        """True when this goal stem is blocked and ``ts`` ≤ the reverse ts."""
+        from pitch_gate import event_key_stem, event_key_ts
+
+        src = t10_source_key(source_event_key)
+        stem = event_key_stem(src)
+        if not stem:
+            return False
+        ts = event_key_ts(src)
+        with self._lock:
+            until = str(self._blocked_until.get(stem) or "")
+            if not until:
+                return False
+            if not ts:
+                return True
+            return ts <= until
+
+    def cancel_undone_goal(self, reversal_event_key: str) -> list[str]:
+        """Drop pending T+10 for the inverted goal and block the stem.
+
+        Matches the goal stem (``score_change|mid|from->to``), any ``ts`` ≤ the
+        reverse. A later re-award of the same transition keeps its own job.
+        The stem block covers a job already ``pop_due``'d on the watch thread.
+        Returns cancelled ``t10_event_key`` values.
+        """
+        rev = str(reversal_event_key or "").strip()
+        if not rev:
+            return []
+        cancelled: list[str] = []
+        with self._lock:
+            blocked = self._block_undone_goal_locked(rev)
+            drop = [src for src in list(self._jobs) if source_matches_undone_goal(src, rev)]
+            for src in drop:
+                job = self._jobs.pop(src, None)
+                if job is None:
+                    continue
+                cancelled.append(str(job.get("t10_event_key") or t10_event_key(src)))
+            if drop or blocked:
+                self._save_locked()
+        return cancelled
 
     def pending_keys_for_match(self, match_id: str) -> list[str]:
         mid = str(match_id or "").strip()
@@ -439,6 +547,75 @@ def get_scheduler(root: Path) -> T10Scheduler:
         if _active is None or _active.root != rt:
             _active = T10Scheduler(rt)
         return _active
+
+
+def abort_t10_for_reversal(
+    root: Path,
+    reversal_event_key: str,
+    *,
+    match_id: str = "",
+    referee: Any | None = None,
+    worker: Any | None = None,
+) -> list[str]:
+    """Cancel queued T+10 for the undone goal and abort in-flight AF live polls.
+
+    Always records the inverted stem (even if the job already left the queue)
+    so ``_drain_t10`` can skip a just-popped due row.
+    """
+    rev = str(reversal_event_key or "").strip()
+    cancelled: list[str] = []
+    if not rev:
+        return cancelled
+    cancelled.extend(get_scheduler(root).cancel_undone_goal(rev))
+
+    if referee is None:
+        try:
+            import af_referee as _af
+
+            referee = _af.active_ft_referee()
+        except Exception:  # noqa: BLE001
+            referee = None
+    if worker is None:
+        try:
+            from quote_worker import get_quote_worker
+
+            worker = get_quote_worker()
+        except Exception:  # noqa: BLE001
+            worker = None
+
+    extra: list[str] = []
+    if referee is not None:
+        try:
+            pending = list(referee.pending_event_keys() or [])
+        except Exception:  # noqa: BLE001
+            pending = []
+        for key in pending:
+            k = str(key)
+            if source_matches_undone_goal(k, rev):
+                extra.append(k)
+        for k in extra:
+            try:
+                referee.cancel_key(k, reason="dqd_reversal")
+            except Exception:  # noqa: BLE001
+                pass
+            if k not in cancelled:
+                cancelled.append(k)
+
+    if worker is not None:
+        for k in cancelled:
+            try:
+                worker.revoke_event(k)
+            except Exception:  # noqa: BLE001
+                pass
+
+    if cancelled:
+        mid = str(match_id or "").strip()
+        print(
+            f"t10 → CANCEL reversal n={len(cancelled)} match_id={mid} "
+            f"keys={','.join(cancelled)}",
+            flush=True,
+        )
+    return cancelled
 
 
 def reset_scheduler_for_tests() -> None:

@@ -2494,26 +2494,46 @@ def quote_finished_event(
     )
 
 
-def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
+def apply_dqd_reversal_cancel(
+    root: Path,
+    ev: dict[str, Any],
+    *,
+    referee: Any | None = None,
+    worker: Any | None = None,
+) -> list[str]:
     """Stop AF/DOM for this match immediately. Safe on the bridge emit thread.
 
-    Does **not** call CLOB from this thread. Rest cancel is queued onto the
-    quote worker (watch tick no longer sits in rest-buy).
+    Cancels the **undone** goal's pending / in-flight T+10 (not every T+10 on
+    the match). Does **not** call CLOB from this thread. Rest cancel is queued
+    onto the quote worker (watch tick no longer sits in rest-buy).
     """
     from score_events import event_is_reversal
     from pitch_gate import get_coordinator
 
+    cancelled_t10: list[str] = []
     if str(ev.get("type") or "") != "score_change":
-        return
+        return cancelled_t10
     if not event_is_reversal(ev):
-        return
+        return cancelled_t10
     mid = str(ev.get("match_id") or "").strip()
     if not mid:
-        return
+        return cancelled_t10
+    try:
+        from t10_scan import abort_t10_for_reversal
+
+        cancelled_t10 = abort_t10_for_reversal(
+            root,
+            event_key(ev),
+            match_id=mid,
+            referee=referee,
+            worker=worker,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"ALERT t10 reversal cancel failed match={mid}: {e}", flush=True)
     try:
         gate = get_coordinator(root)
     except RuntimeError:
-        return
+        return cancelled_t10
     try:
         gate.cancel_match(mid, reason="dqd_reversal")
     except Exception as e:  # noqa: BLE001
@@ -2537,21 +2557,24 @@ def apply_dqd_reversal_cancel(root: Path, ev: dict[str, Any]) -> None:
     try:
         from quote_worker import get_quote_worker
 
-        worker = get_quote_worker()
-        if worker is not None:
+        clob = worker if worker is not None else get_quote_worker()
+        if clob is not None:
             from pitch_gate import invert_score_change_key
 
             inv = invert_score_change_key(event_key(ev))
             if inv:
-                worker.revoke_event(inv)
+                clob.revoke_event(inv)
             try:
                 for k in gate.consumed_event_keys(mid):
-                    worker.revoke_event(k)
+                    clob.revoke_event(k)
             except Exception:  # noqa: BLE001
                 pass
-            worker.submit_rest_cancel(mid, reason="dqd_reversal")
+            for k in cancelled_t10:
+                clob.revoke_event(k)
+            clob.submit_rest_cancel(mid, reason="dqd_reversal")
     except Exception as e:  # noqa: BLE001
         print(f"ALERT clob-worker rest-cancel enqueue failed match={mid}: {e}", flush=True)
+    return cancelled_t10
 
 
 def install_reversal_fast_cancel(root: Path) -> None:
@@ -2592,12 +2615,12 @@ def process_bridge_events(
     latch from an earlier ``in_play`` poll of this goal). AF starts on the
     first ``in_play`` tick and keeps polling later ``in_play`` ticks until
     AND buy. 射门 is not a buy gate. Odds Grade A is observe-only.
-    Aligned buy stops AF and DOM. DQD reversals
-    cancel rest and open gates; if lots are open they start an AF confirm
-    trail from t0 (no shot gate); flatten on first AF score_match then stop
-    the trail.     Each paired goal also schedules a T+10 book rescan. At fire, T+10
-    polls API-Football **live** goals and quotes only when that tally
-    **exactly matches the triggering goal**. A later AF score skips
+    DQD reversals cancel rest and open gates, and cancel the undone goal's
+    T+10 (queued or in-flight AF live). If lots are open they start an AF
+    confirm trail from t0 (no shot gate); flatten on first AF score_match then
+    stop the trail. Each paired goal also schedules a T+10 book rescan. At
+    fire, T+10 polls API-Football **live** goals and quotes only when that
+    tally **exactly matches the triggering goal**. A later AF score skips
     (``t10_skip_score_mismatch``); it does not rewrite-and-buy. If AF is
     already FT/ET/PEN or an FT confirm is pending, T+10 skips and the FT
     path owns the match.
@@ -2690,8 +2713,24 @@ def process_bridge_events(
         rkey = event_key(ev)
         if not force and rkey in seen:
             continue
-        apply_dqd_reversal_cancel(root, ev)
+        cancelled_t10 = apply_dqd_reversal_cancel(
+            root, ev, referee=referee, worker=clob
+        )
         seen.update(gate.consumed_event_keys(str(ev.get("match_id") or "")))
+        seen.update(cancelled_t10)
+        for k in cancelled_t10:
+            bundles.append(
+                {
+                    "quoted_at": now_cn_iso(),
+                    "trigger": "score_change",
+                    "mode": "t10_skip_reversal",
+                    "event_key": k,
+                    "match_id": str(ev.get("match_id") or ""),
+                    "count": 0,
+                    "opportunity_count": 0,
+                    "af_error": "dqd_reversal",
+                }
+            )
 
     # Retry any live flatten that failed / partial-filled on a prior tick.
     # Off-thread when the CLOB worker is running (idle sweep).
@@ -2980,6 +3019,8 @@ def process_bridge_events(
             mode = "t10_skip_score_mismatch"
         elif err == "aborted" and reason in {"ft_pending", "match_finished"}:
             mode = "t10_skip_ft_pending"
+        elif err == "aborted" and reason == "dqd_reversal":
+            mode = "t10_skip_reversal"
         else:
             mode = "t10_af_unconfirmed"
         seen.add(orig_key)
@@ -3165,9 +3206,29 @@ def process_bridge_events(
                 continue
             t10_key = str(job.get("t10_event_key") or "")
             mid = str(job.get("match_id") or "")
+            src = str(job.get("source_event_key") or "")
             if not t10_key:
                 continue
             if t10_key in seen:
+                continue
+            if src and sched.is_source_blocked(src):
+                seen.add(t10_key)
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "score_change",
+                        "mode": "t10_skip_reversal",
+                        "event_key": t10_key,
+                        "match_id": mid,
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "af_error": "dqd_reversal",
+                    }
+                )
+                print(
+                    f"t10 → SKIP t10_skip_reversal match_id={mid} key={t10_key}",
+                    flush=True,
+                )
                 continue
             if mid and mid in processed_ft_ids:
                 print(
