@@ -85,7 +85,9 @@ def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
 
 
 def pool_max_pages() -> int:
-    return max(1, _env_int("QUOTE_DOM_POOL_MAX", 24))
+    # 4GiB hosts: each tracker tab still costs ~200–400MB RSS. 8+ tabs OOMs the box
+    # even with site isolation off; un-warmed goals open a tab and evict LRU.
+    return max(1, _env_int("QUOTE_DOM_POOL_MAX", 4))
 
 
 def warm_open_timeout_s() -> float:
@@ -96,10 +98,10 @@ def chromium_launch_kwargs() -> dict[str, Any]:
     """Headless Chromium args that work on a root Linux server.
 
     Pitch-gate only ``evaluate``s overlay text (``.pop-box`` / ``.center-box``).
-    Chromium still needs a renderer per tab to run the tracker's JavaScript.
+    Chromium still needs a renderer to run the tracker's JavaScript.
     The 3D WebGL pitch is unused, so it is off unless ``QUOTE_DOM_WEBGL=1``.
-    Site isolation and renderer-process caps are left at Chromium defaults —
-    they are not required to read DOM text.
+    Site isolation is off so one tab does not become several renderer processes
+    (iframes on the 纳米 tracker). ``--renderer-process-limit`` tracks the tab cap.
     """
     args = ["--disable-dev-shm-usage", "--disable-gpu"]
     if not _env_bool("QUOTE_DOM_WEBGL", False):
@@ -111,6 +113,14 @@ def chromium_launch_kwargs() -> dict[str, Any]:
                 "--disable-accelerated-2d-canvas",
             ]
         )
+    limit = max(2, pool_max_pages())
+    args.extend(
+        [
+            "--disable-site-isolation-trials",
+            "--disable-features=IsolateOrigins,site-per-process",
+            f"--renderer-process-limit={limit}",
+        ]
+    )
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         args.extend(["--no-sandbox", "--disable-setuid-sandbox"])
     extra = (os.getenv("QUOTE_CHROMIUM_ARGS") or "").strip()

@@ -248,7 +248,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | 变量 | 默认 / 说明 |
 |---|---|
 | `QUOTE_DQD_STREAM_OBSERVE` | 须为 `1`，否则进球门控不可用 |
-| `QUOTE_DOM_POOL_MAX` | 共用 Chromium 标签上限，默认 24；满则踢最久未用的空闲页 |
+| `QUOTE_DOM_POOL_MAX` | 共用 Chromium 标签上限，默认 **4**；满则踢最久未用的空闲页 |
 | `QUOTE_DOM_WEBGL` | 默认关：不跑纳米 3D/WebGL（只读 overlay 文本）；`1` 才恢复 |
 | `QUOTE_DOM_WARM` | 默认开：进行中已配对场预开 tracker 页 |
 | `QUOTE_DOM_WARM_INTERVAL_S` | 预热扫描间隔，默认 10s |
