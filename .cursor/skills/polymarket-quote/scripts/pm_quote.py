@@ -324,9 +324,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     dqd_stream_obs = try_create_dqd_stream_observer(rt)
     if dqd_stream_obs is not None:
         dqd_stream_obs.start()
+        from pitch_gate import gate_source
+
+        src = gate_source()
+        extra = " · no Chromium" if src == "mqtt" else " · Chromium DOM"
         print(
             f"dqd-stream observe → {lib.data_dir(rt) / 'dqd_stream_observe.jsonl'} "
-            f"(DOM play_state · no screenshots)",
+            f"(gate-source={src}{extra} · no screenshots)",
             file=sys.stderr,
             flush=True,
         )

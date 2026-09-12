@@ -116,7 +116,10 @@ def _animation_rules() -> Any:
 
 
 def gate_source() -> str:
-    """Live gate is DOM-only. ``ocr`` is rejected."""
+    """``mqtt`` or ``dom``. ``ocr`` and anything else fall back to DOM."""
+    raw = str(os.getenv("QUOTE_GATE_SOURCE") or "dom").strip().lower()
+    if raw == "mqtt":
+        return "mqtt"
     return "dom"
 
 
@@ -848,11 +851,24 @@ class PitchGateCoordinator:
         )
 
     def _open_dom_reader(self, session: _GateSession, observer: Any) -> Any:
-        """Reuse the pooled tracker tab when the observer has one."""
+        """Reuse the pooled tracker tab, or the MQTT snapshot, for this match."""
         from dqd_stream_observe import DomReader
 
         info = observer._resolve_surface(session.match_id)
-        page_url = str((info or {}).get("page_url") or "")
+        if not isinstance(info, dict):
+            info = {}
+        else:
+            info = dict(info)
+        page_url = str(info.get("page_url") or "")
+        if gate_source() == "mqtt":
+            if session.ev.get("home"):
+                info["home"] = str(session.ev.get("home") or "")
+            if session.ev.get("away"):
+                info["away"] = str(session.ev.get("away") or "")
+            acquire = getattr(observer, "acquire_dom_reader", None)
+            if callable(acquire):
+                return acquire(session.match_id, page_url, info)
+            return self._open_mqtt_reader(session, info, page_url)
         acquire = getattr(observer, "acquire_dom_reader", None)
         if callable(acquire):
             return acquire(session.match_id, page_url, info)
@@ -863,6 +879,30 @@ class PitchGateCoordinator:
         if not ok:
             reader.close()
             return None, err or "dom_open_failed", info
+        return reader, None, info
+
+    @staticmethod
+    def _open_mqtt_reader(
+        session: "_GateSession", info: dict[str, Any], page_url: str
+    ) -> tuple[Any, str | None, dict[str, Any]]:
+        from nami_mqtt import MqttReader, get_hub, nami_id_from_url
+
+        nami = str(info.get("nami_id") or "").strip() or nami_id_from_url(page_url)
+        if nami:
+            info["nami_id"] = nami
+        if not nami:
+            return None, "no_nami_id", info
+        reader = MqttReader(
+            nami,
+            match_id=str(session.match_id or ""),
+            home=str(session.ev.get("home") or ""),
+            away=str(session.ev.get("away") or ""),
+            hub=get_hub(),
+        )
+        ok, err = reader.open()
+        if not ok:
+            reader.close()
+            return None, err or "mqtt_unavailable", info
         return reader, None, info
 
     @staticmethod
@@ -904,8 +944,8 @@ class PitchGateCoordinator:
             "page_url": (info or {}).get("page_url"),
             "stream_url": None,
             "nami_id": (info or {}).get("nami_id"),
-            "capture_method": "dom",
-            "frame_kind": "dom",
+            "capture_method": str(getattr(reader, "source", None) or gate_source() or "dom"),
+            "frame_kind": str(getattr(reader, "source", None) or gate_source() or "dom"),
             "frame_path": None,
             "ok": False,
             "error": "no_dom_reader",

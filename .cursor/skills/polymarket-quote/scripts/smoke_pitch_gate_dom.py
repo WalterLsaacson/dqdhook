@@ -185,6 +185,10 @@ def check_gate_source_env() -> None:
         for raw in ("", "dom", "OCR", "bogus"):
             os.environ["QUOTE_GATE_SOURCE"] = raw
             assert pg.gate_source() == "dom", (raw, pg.gate_source())
+        os.environ["QUOTE_GATE_SOURCE"] = "mqtt"
+        assert pg.gate_source() == "mqtt", pg.gate_source()
+        os.environ["QUOTE_GATE_SOURCE"] = "MQTT"
+        assert pg.gate_source() == "mqtt", pg.gate_source()
         os.environ["QUOTE_PITCH_STATE"] = "0"
         os.environ["QUOTE_DQD_STREAM_OBSERVE"] = "1"
         assert pg.gate_ready()[0] is True, pg.gate_ready()

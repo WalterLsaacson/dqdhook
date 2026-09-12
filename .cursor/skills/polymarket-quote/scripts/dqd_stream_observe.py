@@ -137,6 +137,7 @@ class DqdStreamObserver:
         self._capture_page_fn = capture_page_fn or self._capture_page_playwright
         self.page_pool = page_pool if page_pool is not None else DomPagePool()
         self._warm_thread: threading.Thread | None = None
+        self._mqtt_hub: Any = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -146,10 +147,20 @@ class DqdStreamObserver:
         self._thread.start()
         set_active_observer(self)
         logger.info("DQD stream observe on → %s", observe_path(self.root))
-        try:
-            self.page_pool.start()
-        except Exception as e:  # noqa: BLE001
-            print(f"dom-pool → chromium start failed: {e}", flush=True)
+        from pitch_gate import gate_source
+
+        if gate_source() == "mqtt":
+            from nami_mqtt import get_hub
+
+            self._mqtt_hub = get_hub()
+            ok, err = self._mqtt_hub.start()
+            if not ok:
+                print(f"nami-mqtt → start failed: {err}", flush=True)
+        else:
+            try:
+                self.page_pool.start()
+            except Exception as e:  # noqa: BLE001
+                print(f"dom-pool → chromium start failed: {e}", flush=True)
         self._warm_thread = threading.Thread(
             target=self._warm_loop, name="dom-page-warm", daemon=True
         )
@@ -174,6 +185,12 @@ class DqdStreamObserver:
         if self._warm_thread is not None:
             self._warm_thread.join(timeout=8.0)
             self._warm_thread = None
+        if self._mqtt_hub is not None:
+            try:
+                self._mqtt_hub.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.debug("nami mqtt shutdown failed", exc_info=True)
+            self._mqtt_hub = None
         try:
             self.page_pool.shutdown()
         except Exception:  # noqa: BLE001
@@ -181,10 +198,18 @@ class DqdStreamObserver:
         if get_active_observer() is self:
             set_active_observer(None)
 
+    @staticmethod
+    def _gate_is_mqtt() -> bool:
+        from pitch_gate import gate_source
+
+        return gate_source() == "mqtt"
+
     def acquire_dom_reader(
         self, match_id: str, page_url: str, info: dict[str, Any]
     ) -> tuple[Any, str | None, dict[str, Any]]:
-        """Open or reuse the pooled tracker tab for this match."""
+        """Open or reuse the pooled tracker tab / MQTT snapshot for this match."""
+        if self._gate_is_mqtt():
+            return self._acquire_mqtt_reader(match_id, page_url, info)
         mid = str(match_id or "").strip()
         url = str(page_url or "").strip()
         if not url:
@@ -201,7 +226,39 @@ class DqdStreamObserver:
         )
         return reader, None, info
 
+    def _acquire_mqtt_reader(
+        self, match_id: str, page_url: str, info: dict[str, Any]
+    ) -> tuple[Any, str | None, dict[str, Any]]:
+        from nami_mqtt import MqttReader, get_hub, nami_id_from_url
+
+        payload = dict(info or {})
+        nami = str(payload.get("nami_id") or "").strip() or nami_id_from_url(page_url)
+        if nami:
+            payload["nami_id"] = nami
+        if not nami:
+            return None, "no_nami_id", payload
+        hub = self._mqtt_hub or get_hub()
+        reader = MqttReader(
+            nami,
+            match_id=str(match_id or ""),
+            home=str(payload.get("home") or ""),
+            away=str(payload.get("away") or ""),
+            hub=hub,
+        )
+        ok, err = reader.open()
+        if not ok:
+            reader.close()
+            return None, err or "mqtt_unavailable", payload
+        kind = "REUSE" if reader.reused else "OPEN"
+        print(
+            f"nami-mqtt → {kind} match_id={match_id} nami_id={nami}",
+            flush=True,
+        )
+        return reader, None, payload
+
     def release_match(self, match_id: str, *, reason: str = "done") -> None:
+        if self._gate_is_mqtt():
+            return
         mid = str(match_id or "").strip()
         if not mid:
             return
@@ -210,7 +267,9 @@ class DqdStreamObserver:
         print(f"dom-pool → {kind} match_id={mid} reason={reason}", flush=True)
 
     def sync_playing_pages(self) -> dict[str, int]:
-        """Pre-open tracker tabs for in-play paired matches; close the rest."""
+        """Warm in-play paired matches: Chromium tabs, or MQTT subscribe."""
+        if self._gate_is_mqtt():
+            return self._sync_mqtt()
         want = _playing_paired_ids(self.root)
         closed = self.page_pool.close_absent(want)
         warmed = 0
@@ -244,15 +303,47 @@ class DqdStreamObserver:
                 print(f"dom-pool → CLOSE match_id={mid} reason=not_playing", flush=True)
         return {"warmed": warmed, "closed": len(closed), "kept": skipped}
 
+    def _sync_mqtt(self) -> dict[str, int]:
+        from nami_mqtt import get_hub, nami_id_from_url
+
+        hub = self._mqtt_hub or get_hub()
+        self._mqtt_hub = hub
+        ok, err = hub.start()
+        if not ok:
+            return {"warmed": 0, "closed": 0, "kept": 0}
+        want = _playing_paired_ids(self.root)
+        nami_ids: set[str] = set()
+        for mid in want:
+            info = self._resolve_surface(mid)
+            payload = info if isinstance(info, dict) else {}
+            nid = str(payload.get("nami_id") or "").strip() or nami_id_from_url(
+                payload.get("page_url")
+            )
+            if nid:
+                nami_ids.add(nid)
+        stats = hub.sync(nami_ids)
+        if stats.get("sub") or stats.get("unsub"):
+            print(
+                f"nami-mqtt → sync sub={stats.get('sub', 0)} unsub={stats.get('unsub', 0)} "
+                f"kept={stats.get('kept', 0)}",
+                flush=True,
+            )
+        return {
+            "warmed": int(stats.get("sub") or 0),
+            "closed": int(stats.get("unsub") or 0),
+            "kept": int(stats.get("kept") or 0),
+        }
+
     def _warm_loop(self) -> None:
-        if not _env_bool("QUOTE_DOM_WARM", True):
+        mqtt = self._gate_is_mqtt()
+        if not mqtt and not _env_bool("QUOTE_DOM_WARM", True):
             return
         interval = _warm_interval_s()
         while not self._stop.is_set():
             try:
                 self.sync_playing_pages()
             except Exception:  # noqa: BLE001
-                logger.exception("dom page warm failed")
+                logger.exception("page warm failed")
             self._stop.wait(interval)
 
     def enqueue_event(self, ev: dict[str, Any], *, event_key: str) -> bool:
@@ -480,9 +571,9 @@ class DqdStreamObserver:
         from pitch_gate import gate_source
 
         if gate_source() != "ocr":
-            # DOM mode never runs the model; loading it would cost seconds of
+            # DOM/MQTT never run the model; loading it would cost seconds of
             # startup and hundreds of MB for nothing.
-            print("pitch-state OCR skipped (gate reads DOM)", flush=True)
+            print(f"pitch-state OCR skipped (gate-source={gate_source()})", flush=True)
             return
         try:
             pitch_state_scripts = Path(__file__).resolve().parents[2] / "pitch-state" / "scripts"

@@ -101,7 +101,7 @@
 | 状态 class | `possession-rect` / `dangerous-attack-move` | 看板展示；文案闪事件时的补充信息 |
 
 - 共用 **一台 Chromium**：进行中已配对场预开 tracker 页，进球后第一拍只读 DOM；同场下一记进球复用标签。冷开页仍约 0.5–2s（仅未预热的场）。之后每次读数 **2–8ms**。
-- 页面来源仍是 `match_list` 每行自带的 `animation_live` 直链（`tracker.namitiyu.com/...&id=<nami_id>`），用来读 DOM，**不做 MQTT 球位观察**。读不到时会回退去找懂球帝页面里的 `iframe.md-anim-iframe`。
+- 页面来源仍是 `match_list` 每行自带的 `animation_live` 直链（`tracker.namitiyu.com/...&id=<nami_id>`）。默认 **Chromium 读 DOM**；`QUOTE_GATE_SOURCE=mqtt` 时改为纳米 MQTT 合成同一套 overlay，**不启动 Chromium**、**不做球位观察**。MQTT 挂了不会回退 DOM。读不到动画 URL 时 DOM 路径会回退去找懂球帝页面里的 `iframe.md-anim-iframe`。
 - 15s（`QUOTE_DOM_OPEN_TIMEOUT_S`）内找不到动画 → `unavailable`，不下单。
 - 不截图、不写 JPEG、不跑 OCR。
 
@@ -248,6 +248,10 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | 变量 | 默认 / 说明 |
 |---|---|
 | `QUOTE_DQD_STREAM_OBSERVE` | 须为 `1`，否则进球门控不可用 |
+| `QUOTE_GATE_SOURCE` | `dom` 或 `mqtt`。`dqdhook-run.sh` 默认 **mqtt**（不启动 Chromium）；未设时 Python 仍按 `dom`。`ocr` 已废弃。mqtt 挂了**不**回退 DOM |
+| `QUOTE_MQTT_STALE_S` | mqtt 进行中无 `10101` 后冻结时钟的秒数，默认 **8** |
+| `QUOTE_MQTT_HTTP_TIMEOUT_S` | 纳米 `variable_detail` 超时，默认 **2**；只在订阅/预热里打，不挡门控采样 |
+| `QUOTE_MQTT_HTTP_INTERVAL_S` | 预热校正 HTTP 最短间隔，默认 **15** |
 | `QUOTE_DOM_POOL_MAX` | 共用 Chromium 标签上限，默认 **4**；满则踢最久未用的空闲页 |
 | `QUOTE_DOM_WEBGL` | 默认关：不跑纳米 3D/WebGL（只读 overlay 文本）；`1` 才恢复 |
 | `QUOTE_DOM_WARM` | 默认开：进行中已配对场预开 tracker 页 |
@@ -349,6 +353,7 @@ python3 .cursor/skills/match-bridge/scripts/smoke_match_hardening.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_trade_modes.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_pitch_gate_dom.py
+python3 .cursor/skills/polymarket-quote/scripts/smoke_nami_mqtt.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_dom_page_pool.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_book_context_observe.py
 python3 .cursor/skills/polymarket-quote/scripts/smoke_prematch_odds.py
@@ -379,4 +384,4 @@ data/               # 运行时快照 / jsonl（勿提交密钥与隐私）
 
 - 默认 goals+ft 均为 **live**；进球仍须过 pitch-gate。请用小额 `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` 起步。  
 - 切勿提交 `.env`、私钥、`.idea` 等。  
-- 门控依赖 `QUOTE_DQD_STREAM_OBSERVE=1`（`QUOTE_GATE_SOURCE=ocr` 时另需 `QUOTE_PITCH_STATE=1`）。  
+- 门控依赖 `QUOTE_DQD_STREAM_OBSERVE=1`。`QUOTE_GATE_SOURCE=mqtt` 时不启动 Chromium；MQTT 挂了门控不可用，不会回退 DOM。  

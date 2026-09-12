@@ -21,8 +21,9 @@ fi
 export PM_PROXY=none
 unset ALL_PROXY all_proxy HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
 
-# Pitch-gate DOM reader; .env can still set this to 0.
+# Pitch-gate overlay: mqtt = Nami MQTT (no Chromium). .env can set dom.
 export QUOTE_DQD_STREAM_OBSERVE="${QUOTE_DQD_STREAM_OBSERVE:-1}"
+export QUOTE_GATE_SOURCE="${QUOTE_GATE_SOURCE:-mqtt}"
 
 if [[ -z "${DQD_PUBLIC_HOST:-}" ]]; then
   DQD_PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"

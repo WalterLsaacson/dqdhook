@@ -4,3 +4,5 @@ py-clob-client-v2>=1.0
 python-dotenv>=1.0
 eth-account>=0.10
 playwright>=1.40
+paho-mqtt>=1.6
+websocket-client>=1.6

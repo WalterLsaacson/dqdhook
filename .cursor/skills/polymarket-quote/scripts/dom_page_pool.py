@@ -798,6 +798,8 @@ class DomPagePool:
 class DomReader:
     """Handle to a pooled tracker tab. ``close()`` drops this handle's token."""
 
+    source = "dom"
+
     def __init__(
         self,
         page_url: str,
