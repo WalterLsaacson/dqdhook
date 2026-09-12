@@ -261,6 +261,11 @@ TEAM_ALIASES: dict[str, str] = {
     "rionegro": "rionegro",
     "ad cali": "deportivo cali",
     "deportivo cali": "deportivo cali",
+    # Valledupar FC rebranded to Real Cundinamarca (DQD still lists Valledupar)
+    "valledupar": "real cundinamarca",
+    "valledupar fc": "real cundinamarca",
+    "real cundinamarca": "real cundinamarca",
+    "real cundinamarca fc": "real cundinamarca",
     "clube de regatas vasco da gama": "vasco",
     "clube regatas vasco da gama": "vasco",
     "cr vasco da gama": "vasco",

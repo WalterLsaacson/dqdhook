@@ -474,4 +474,10 @@ LEAGUE_ALIASES: dict[str, str] = {
     "aze2": "aze2",
     "azerbaijan first division": "aze2",
     "azerbaijan first league": "aze2",
+    # --- 2026-09-13 unmatched PM (293/349): ACLE vs 亚冠精英 ---
+    "亚冠精英": "acle",
+    "acle": "acle",
+    "afc champions league elite": "acle",
+    "acl elite": "acle",
+    "afc champions elite": "acle",
 }

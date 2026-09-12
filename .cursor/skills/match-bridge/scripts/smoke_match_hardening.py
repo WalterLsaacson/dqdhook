@@ -733,6 +733,59 @@ def main() -> int:
         "足协杯 must alias to chfa",
     )
 
+    # 2026-09-13: ACLE league gate + Valledupar rebrand
+    _assert(bl.normalize_league("亚冠精英") == "acle", "亚冠精英→acle")
+    _assert(bl.normalize_league("ACLE", "acle") == "acle", "ACLE→acle")
+    _assert(
+        bl.league_similarity(
+            {"league": "亚冠精英"},
+            {"league_id": "acle", "league": "ACLE"},
+        )
+        == 1.0,
+        "亚冠精英↔acle",
+    )
+    _assert(
+        bl.team_similarity("Valledupar", "Real Cundinamarca") >= 0.99,
+        "Valledupar rebrand",
+    )
+    acle_pair = bl.score_pair(
+        {
+            "home": "Al Shamal",
+            "away": "Al-Ittihad Club",
+            "league": "亚冠精英",
+            "local_date": "2026-09-15",
+            "time": "00:00",
+        },
+        {
+            "home": "Al-Shamal",
+            "away": "Al-Ittihad Club",
+            "league": "ACLE",
+            "league_id": "acle",
+            "kickoff_beijing": "2026-09-15 00:00",
+        },
+    )
+    _assert(acle_pair >= bl.DEFAULT_MIN_SCORE, f"ACLE Shamal should match, got {acle_pair}")
+    col2_pair = bl.score_pair(
+        {
+            "home": "Valledupar",
+            "away": "Unión Magdalena",
+            "league": "哥伦乙",
+            "local_date": "2026-09-13",
+            "time": "07:00",
+        },
+        {
+            "home": "Real Cundinamarca",
+            "away": "Union Magdalena",
+            "league": "COL2",
+            "league_id": "col2",
+            "kickoff_beijing": "2026-09-13 07:00",
+        },
+    )
+    _assert(
+        col2_pair >= bl.DEFAULT_MIN_SCORE,
+        f"Valledupar/Cundinamarca should match, got {col2_pair}",
+    )
+
     print("smoke_match_hardening: ok")
     return 0
 
