@@ -87,7 +87,11 @@ def orient_af_goals_to_event(
     event_home: str,
     event_away: str,
 ) -> tuple[Any, Any]:
-    """Map AF fixture-frame goals onto event (usually Polymarket) home/away."""
+    """Map AF fixture-frame goals onto event (usually Polymarket) home/away.
+
+    Missing names return the raw pair unchanged. FT rewrite must use
+    ``orient_poll_goals`` and refuse to apply when ``mapped`` is False.
+    """
     if goals_home is None or goals_away is None:
         return goals_home, goals_away
     if not af_home or not event_home:
@@ -100,6 +104,118 @@ def orient_af_goals_to_event(
         event_home,
         event_away,
     )
+
+
+def scores_are_pure_swap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """True when scores differ only by home/away being crossed (not a draw)."""
+    ah, aa = int(a[0]), int(a[1])
+    bh, ba = int(b[0]), int(b[1])
+    return (ah, aa) != (bh, ba) and ah == ba and aa == bh
+
+
+def af_score_is_ahead(af: tuple[int, int], other: tuple[int, int]) -> bool:
+    """True when AF has at least as many goals on both sides and is not equal."""
+    ah, aa = int(af[0]), int(af[1])
+    oh, oa = int(other[0]), int(other[1])
+    return ah >= oh and aa >= oa and (ah, aa) != (oh, oa)
+
+
+def poll_fixture_names(
+    last: dict[str, Any],
+    *,
+    cache: dict[str, Any],
+    match_id: str,
+) -> tuple[str, str]:
+    """AF home/away from this poll's ``cache_entry``, then fixture_cache.json.
+
+    Never falls back to DQD names: those match PM/event order and hide a
+    swapped AF fixture (Benin vs Poland).
+    """
+    ent = last.get("cache_entry") if isinstance(last.get("cache_entry"), dict) else {}
+    af_home = str(ent.get("af_home") or "").strip()
+    af_away = str(ent.get("af_away") or "").strip()
+    if af_home and af_away:
+        return af_home, af_away
+    cached = aflib.cached_fixture_entry(cache, match_id) or {}
+    if not af_home:
+        af_home = str(cached.get("af_home") or "").strip()
+    if not af_away:
+        af_away = str(cached.get("af_away") or "").strip()
+    return af_home, af_away
+
+
+def orient_poll_goals(
+    last: dict[str, Any],
+    *,
+    cache: dict[str, Any],
+    match_id: str,
+    event_home: str,
+    event_away: str,
+) -> tuple[Any, Any, bool]:
+    """Map poll goals onto event sides.
+
+    ``mapped`` is False when AF or event names are missing — raw AF home/away
+    is returned and must not be used as a FT rewrite.
+    """
+    goals = last.get("goals") if isinstance(last.get("goals"), dict) else {}
+    gh, ga = goals.get("home"), goals.get("away")
+    if gh is None or ga is None:
+        return gh, ga, False
+    af_home, af_away = poll_fixture_names(last, cache=cache, match_id=match_id)
+    eh = str(event_home or "").strip()
+    ea = str(event_away or "").strip()
+    if not af_home or not eh:
+        return gh, ga, False
+    oh, oa = bridge.orient_scores(af_home, af_away, gh, ga, eh, ea)
+    return oh, oa, True
+
+
+FT_ORIENT_SKIP_ERRORS = frozenset(
+    {
+        "af_ft_orient_swap",
+        "af_ft_orient_missing",
+        "af_ft_observe_mismatch",
+    }
+)
+
+
+def ft_orient_skip_reason(
+    truth: tuple[int, int],
+    target: tuple[int, int],
+    *,
+    mapped: bool,
+    observe: tuple[int, int] | None = None,
+) -> str | None:
+    """Whether an AF FT score is unsafe to apply (swap / unmapped / observe).
+
+    A pure home/away swap vs DQD or vs the last pitch-gate AF score is an
+    orientation failure, not a VAR rewrite. Missing names plus any mismatch
+    must not rewrite-and-buy. Extra goals (AF ahead of observe) still rewrite.
+    """
+    if scores_are_pure_swap(truth, target):
+        return "af_ft_orient_swap"
+    if not mapped and not af_ft_score_matches(truth, target):
+        return "af_ft_orient_missing"
+    if observe is not None and truth != observe:
+        if scores_are_pure_swap(truth, observe):
+            return "af_ft_orient_swap"
+        if not af_ft_score_matches(truth, target) and not af_score_is_ahead(
+            truth, observe
+        ):
+            return "af_ft_observe_mismatch"
+    return None
+
+
+def _last_gate_observe_score(root: Path, match_id: str) -> tuple[int, int] | None:
+    """Last pitch-gate AF sample that matched DQD (PM-oriented). None if absent."""
+    try:
+        from af_observe import last_matched_gate_af_score
+    except ImportError:
+        return None
+    try:
+        return last_matched_gate_af_score(root, match_id)
+    except Exception:  # noqa: BLE001
+        return None
 
 def af_min_interval_s() -> float:
     import os
@@ -1100,13 +1216,10 @@ class AfReferee:
             retry_hits = 0  # reset after a clean (non-transient) attempt
 
             if last.get("ok"):
-                goals = last.get("goals") or {}
-                ent = aflib.cached_fixture_entry(self._fixture_cache(), mid) or {}
-                gh_o, ga_o = orient_af_goals_to_event(
-                    goals.get("home"),
-                    goals.get("away"),
-                    af_home=str(ent.get("af_home") or ""),
-                    af_away=str(ent.get("af_away") or ""),
+                gh_o, ga_o, _mapped = orient_poll_goals(
+                    last,
+                    cache=self._fixture_cache(),
+                    match_id=mid,
                     event_home=event_home,
                     event_away=event_away,
                 )
@@ -1261,7 +1374,10 @@ class AfReferee:
         confirm when AF ``regulation_ready`` and use that fulltime score even if
         it differs from the DQD target (stoppage VAR / false FT). Keep polling
         while AF is still in play. Remaps AF fixture-frame goals into
-        ``event_home``/``event_away`` before apply.
+        ``event_home``/``event_away`` before apply using the poll's
+        ``cache_entry``. A pure home/away swap vs DQD or vs the last pitch-gate
+        AF score is an orientation failure (no rewrite-and-buy). Missing AF
+        team names plus any mismatch also refuse to rewrite.
         """
         poll = self.poll_s if poll_s is None else max(0.05, float(poll_s))
         timeout = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
@@ -1439,13 +1555,10 @@ class AfReferee:
 
             retry_hits = 0
             if last.get("ok"):
-                goals = last.get("goals") or {}
-                ent = aflib.cached_fixture_entry(self._fixture_cache(), mid) or {}
-                gh_o, ga_o = orient_af_goals_to_event(
-                    goals.get("home"),
-                    goals.get("away"),
-                    af_home=str(ent.get("af_home") or ""),
-                    af_away=str(ent.get("af_away") or ""),
+                gh_o, ga_o, mapped = orient_poll_goals(
+                    last,
+                    cache=self._fixture_cache(),
+                    match_id=mid,
                     event_home=event_home,
                     event_away=event_away,
                 )
@@ -1465,6 +1578,39 @@ class AfReferee:
                     if gh is not None and ga is not None and last_ready:
                         fid = last.get("af_fixture_id")
                         truth = (int(gh), int(ga))
+                        observe = _last_gate_observe_score(self.root, mid)
+                        skip_err = ft_orient_skip_reason(
+                            truth,
+                            (th, ta),
+                            mapped=mapped,
+                            observe=observe,
+                        )
+                        if skip_err == "af_ft_orient_missing":
+                            # Names may show up on a later cache reload.
+                            last_error = skip_err
+                            continue
+                        if skip_err:
+                            return {
+                                "ok": False,
+                                "confirmed": False,
+                                "kind": "ft",
+                                "match_id": mid,
+                                "target": {"home": th, "away": ta},
+                                "goals": {"home": truth[0], "away": truth[1]},
+                                "finished": last_finished,
+                                "regulation_ready": True,
+                                "status_short": last_status,
+                                "af_fixture_id": fid,
+                                "polls": polls,
+                                "elapsed_ms": elapsed_ms,
+                                "timeout_s": timeout,
+                                "schedule": self._schedule_desc(),
+                                "error": skip_err,
+                                "via": "apifootball-bridge",
+                                "score_source": "score.fulltime",
+                                "cache_only": True,
+                                "orient_mapped": mapped,
+                            }
                         rewritten = not af_ft_score_matches(truth, (th, ta))
                         set_confirmed_score_async(
                             self.root,
@@ -1493,6 +1639,7 @@ class AfReferee:
                             "score_source": "score.fulltime",
                             "cache_only": True,
                             "score_rewritten": rewritten,
+                            "orient_mapped": mapped,
                         }
                 except (TypeError, ValueError):
                     pass

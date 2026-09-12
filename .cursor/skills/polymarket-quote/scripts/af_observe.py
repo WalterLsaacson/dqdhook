@@ -13,6 +13,7 @@ Fixture mapping is cache-only (owned by apifootball-bridge sync/watch).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -49,6 +50,56 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def observe_path(root: Path) -> Path:
     return lib.data_dir(root) / "af_observe.jsonl"
+
+
+def last_matched_gate_af_score(
+    root: Path,
+    match_id: str,
+    *,
+    max_bytes: int = 2_000_000,
+) -> tuple[int, int] | None:
+    """Most recent pitch-gate AF sample for ``match_id`` with ``score_match``.
+
+    Scores are already remapped onto event/PM sides. Used by FT confirm to
+    refuse a pure home/away swap against the in-play trail.
+    """
+    path = observe_path(root)
+    mid = str(match_id or "").strip()
+    if not mid or not path.is_file():
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    start = max(0, size - max(0, int(max_bytes)))
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            if start:
+                fh.seek(start)
+                fh.readline()
+            lines = fh.readlines()
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("match_id") or "") != mid:
+            continue
+        if row.get("is_reversal") or row.get("observe_only"):
+            continue
+        if row.get("ok") is True and row.get("score_match") is True:
+            try:
+                return int(row["af_home_score"]), int(row["af_away_score"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    return None
 
 
 def set_active_observer(observer: "AfScoreObserver | None") -> None:

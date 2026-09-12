@@ -28,7 +28,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 
 > 询价、挂 rest、flatten、rest 对账在 **CLOB worker 线程**；watch tick 只 `start_gate` / 取消门控 / 把事件载荷入队。别场的 `/books` 和 GTC 不再堵住新球开 DOM。**`start_gate` 后并行预热** Gamma catalog + 周期 `POST /books`（`QUOTE_GATE_PREWARM`，默认开）；BUY 询价优先吃新鲜预热盘口，省掉热路径上约 0.5–1s 的 books RTT（**不缩短** DOM/AF 等待）。
 
-> 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s 轨，**等 AF 认回撤后比分**。**AF 认分 flatten 后立刻停 AF+DOM**（买入后同样立刻停 AF+DOM，不再拖到 120s）。终场必须等 API-Football `regulation_ready`（`score.fulltime`）才询价；懂球帝 `period=FT` 只是提示。确认后用 AF 常规时间比分，即使和 DQD 不一致（伤停补时 VAR / 假全场）。T+10、rest、pitch-gate 也要等这次确认才撤。AF 仍在进行中则继续轮询，超时上限 `QUOTE_FT_MAX_AGE_S`（默认 900s）。
+> 动画已改比分、随后 DQD 才回撤的**延迟回撤**在买入时刻无法预知；出口靠懂球帝回撤后再开 5s 轨，**等 AF 认回撤后比分**。**AF 认分 flatten 后立刻停 AF+DOM**（买入后同样立刻停 AF+DOM，不再拖到 120s）。终场必须等 API-Football `regulation_ready`（`score.fulltime`）才询价；懂球帝 `period=FT` 只是提示。确认后用 AF 常规时间比分（先按 poll `cache_entry` 把 AF 主客映射到 PM），即使和 DQD 不一致（伤停补时 VAR / 假全场）。**纯主客对折**（AF 4-1 vs DQD 1-4）或**缺 AF 队名还改分**不当真相，跳过不下单；并和当场 pitch-gate 已确认的 AF 分核对。T+10、rest、pitch-gate 也要等这次确认才撤。AF 仍在进行中则继续轮询，超时上限 `QUOTE_FT_MAX_AGE_S`（默认 900s）。
 
 **完赛扫盘（post-FT leftover）**：`pm_quote watch` 启动约 60s 后跑第一轮，之后每 **1 小时**。扫盘是**独立子进程**（`pm_locked_scan.py --require-af`），不占 watch tick、也不占 CLOB worker。只按 API-Football 常规时间比分结算，**不用懂球帝回退**。扫完后只把短 FAK 丢进 worker；若队列里已有进球询价 / flatten / 撤 rest，扫盘单会让路。只吃 ask≤**0.995**；token 按最低卖价排序。`tick` / `neg_risk` 用盘口（CLOB `/neg-risk`），不要写死 `False`。不 `--refresh-af`。跟 `--ft-mode`。`QUOTE_POSTFT_SWEEP=0` 关闭。手跑：`python3 .cursor/skills/polymarket-quote/scripts/pm_quote.py postft-sweep`。
 

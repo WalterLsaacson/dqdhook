@@ -2626,9 +2626,13 @@ def process_bridge_events(
     path owns the match.
 
     ``match_finished`` is not FT until API-Football ``regulation_ready``.
-    DQD period=FT is a hint. Quote uses the AF regulation score. T+10 /
-    rest / pitch-gate cancel only after that confirm. ``af_mode="off"``
-    skips the gate (tests). Default is gate.
+    DQD period=FT is a hint. Quote uses the AF regulation score after
+    remapping AF home/away onto the event (poll ``cache_entry``). A pure
+    home/away swap vs DQD or vs the last pitch-gate AF score skips
+    (``ft_skip_orient_swap``) — it does not rewrite-and-buy. Missing AF
+    team names plus a mismatch also skip (``ft_skip_orient_missing``).
+    T+10 / rest / pitch-gate cancel only after that confirm.
+    ``af_mode="off"`` skips the gate (tests). Default is gate.
 
     When the CLOB quote worker is running, this tick only starts/cancels
     gates and enqueues quote/rest/flatten jobs — it does not call CLOB.
@@ -3089,6 +3093,42 @@ def process_bridge_events(
                 continue
             stale, age = ft_event_is_stale(ev)
             err = str(gate_row.get("error") or "af_ft_unconfirmed")
+            from af_referee import FT_ORIENT_SKIP_ERRORS
+
+            if err in FT_ORIENT_SKIP_ERRORS:
+                mode = {
+                    "af_ft_orient_swap": "ft_skip_orient_swap",
+                    "af_ft_orient_missing": "ft_skip_orient_missing",
+                    "af_ft_observe_mismatch": "ft_skip_observe_mismatch",
+                }.get(err, "ft_skip_orient_swap")
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "match_finished",
+                        "mode": mode,
+                        "event_key": orig_key,
+                        "match_id": mid,
+                        "home": ev.get("home"),
+                        "away": ev.get("away"),
+                        "home_score": ev.get("home_score"),
+                        "away_score": ev.get("away_score"),
+                        "count": 0,
+                        "opportunity_count": 0,
+                        "af_error": err,
+                        "af_score": (
+                            f"{gh}-{ga}" if gh is not None and ga is not None else None
+                        ),
+                    }
+                )
+                seen.add(orig_key)
+                _mark_ft_done(mid)
+                print(
+                    f"ft → SKIP {mode} match_id={mid} err={err} "
+                    f"af={gh}-{ga} dqd={ev.get('home_score')}-{ev.get('away_score')} "
+                    f"key={orig_key}",
+                    flush=True,
+                )
+                continue
             if stale:
                 bundles.append(
                     {

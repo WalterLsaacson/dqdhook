@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import time
@@ -88,6 +89,7 @@ def test_ft_mismatch_and_confirm() -> None:
                 "status_short": "FT",
                 "af_fixture_id": 1,
                 "score_source": "score.fulltime",
+                "cache_entry": {"af_home": "Home FC", "af_away": "Away FC"},
             }
 
         referee = ref.AfReferee(
@@ -257,6 +259,7 @@ def test_ft_not_ready_no_quote() -> None:
                 "status_short": "FT",
                 "af_fixture_id": 3,
                 "score_source": "score.fulltime",
+                "cache_entry": {"af_home": "Home FC", "af_away": "Away FC"},
             }
 
         referee = ref.AfReferee(
@@ -545,6 +548,232 @@ def test_ft_market_cache_survives_until_consumed() -> None:
         check("pruner drops consumed FT", cache.get("ft-cache") is None)
 
 
+def test_ft_orient_swap_skips_quote() -> None:
+    print("test_ft_orient_swap_skips_quote")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        (root / "data" / "bridge" / "matches.json").write_text('{"matches":[]}', encoding="utf-8")
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+
+        def events_fn(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 4, "away": 1},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 1637298,
+                "score_source": "score.fulltime",
+                "cache_entry": {
+                    "af_home": "Benin  U20 (W)",
+                    "af_away": "Poland Women U20",
+                },
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.01, timeout_s=1.0, events_fn=events_fn, poll_schedule=False
+        )
+        quoted: list[dict[str, Any]] = []
+
+        def fake_quote(root_arg: Path, ev: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            quoted.append(dict(ev))
+            return {
+                "quoted_at": lib.now_cn_iso(),
+                "trigger": "match_finished",
+                "count": 0,
+                "opportunity_count": 0,
+            }
+
+        ev = _ft_ev(match_id="ben-pol", home_score=1, away_score=4)
+        ev["home"] = "Benin"
+        ev["away"] = "Poland"
+        with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
+            first = lib.process_bridge_events(
+                root,
+                events_override=[ev],
+                af_referee=referee,
+                af_mode="gate",
+                trade_executor=None,
+            )
+            later: list[dict[str, Any]] = []
+            for _ in range(50):
+                later = lib.process_bridge_events(
+                    root,
+                    events_override=[],
+                    af_referee=referee,
+                    af_mode="gate",
+                    trade_executor=None,
+                )
+                if quoted or any(
+                    isinstance(b, dict)
+                    and str(b.get("mode") or "").startswith("ft_skip_orient")
+                    for b in later
+                ):
+                    break
+                time.sleep(0.02)
+        check("did not quote swapped FT", quoted == [], str(quoted))
+        modes = [b.get("mode") for b in later if isinstance(b, dict)]
+        if not modes:
+            modes = [b.get("mode") for b in first if isinstance(b, dict)]
+        check(
+            "orient swap skip mode",
+            "ft_skip_orient_swap" in modes,
+            str(modes),
+        )
+        cur = lib.load_cursor(root)
+        check(
+            "marks processed so it does not retry-buy",
+            "ben-pol" in (cur.get("processed_ft_match_ids") or []),
+            str(cur.get("processed_ft_match_ids")),
+        )
+
+
+def test_ft_swapped_fixture_orients_then_quotes() -> None:
+    print("test_ft_swapped_fixture_orients_then_quotes")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        (root / "data" / "pm-quote").mkdir(parents=True)
+        (root / "data" / "bridge" / "matches.json").write_text('{"matches":[]}', encoding="utf-8")
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+
+        def events_fn(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 4, "away": 1},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 1637298,
+                "score_source": "score.fulltime",
+                "cache_entry": {
+                    "af_home": "Poland U20 W",
+                    "af_away": "Benin U20 W",
+                },
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.01, timeout_s=1.0, events_fn=events_fn, poll_schedule=False
+        )
+        quoted: list[dict[str, Any]] = []
+
+        def fake_quote(root_arg: Path, ev: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            quoted.append(dict(ev))
+            return {
+                "quoted_at": lib.now_cn_iso(),
+                "trigger": "match_finished",
+                "home_score": ev.get("home_score"),
+                "away_score": ev.get("away_score"),
+                "count": 0,
+                "opportunity_count": 0,
+            }
+
+        ev = _ft_ev(match_id="ben-pol-ok", home_score=1, away_score=4)
+        ev["home"] = "Benin"
+        ev["away"] = "Poland"
+        with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
+            lib.process_bridge_events(
+                root,
+                events_override=[ev],
+                af_referee=referee,
+                af_mode="gate",
+                trade_executor=None,
+            )
+            for _ in range(50):
+                lib.process_bridge_events(
+                    root,
+                    events_override=[],
+                    af_referee=referee,
+                    af_mode="gate",
+                    trade_executor=None,
+                )
+                if quoted:
+                    break
+                time.sleep(0.02)
+        check("quotes after remap", len(quoted) == 1, str(quoted))
+        if quoted:
+            check(
+                "quotes 1-4 not 4-1",
+                quoted[0].get("home_score") == 1 and quoted[0].get("away_score") == 4,
+                str(quoted[0]),
+            )
+
+
+def test_ft_observe_mismatch_skips() -> None:
+    print("test_ft_observe_mismatch_skips")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data" / "bridge").mkdir(parents=True)
+        qdir = root / "data" / "pm-quote"
+        qdir.mkdir(parents=True)
+        (root / "data" / "bridge" / "matches.json").write_text('{"matches":[]}', encoding="utf-8")
+        (root / "data" / "bridge" / "events.jsonl").write_text("", encoding="utf-8")
+        (qdir / "af_observe.jsonl").write_text(
+            json.dumps(
+                {
+                    "match_id": "obs-ft",
+                    "ok": True,
+                    "score_match": True,
+                    "af_home_score": 1,
+                    "af_away_score": 4,
+                    "is_reversal": False,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def events_fn(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 0, "away": 3},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 1,
+                "cache_entry": {"af_home": "Home FC", "af_away": "Away FC"},
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.01, timeout_s=1.0, events_fn=events_fn, poll_schedule=False
+        )
+        quoted: list[dict[str, Any]] = []
+
+        def fake_quote(root_arg: Path, ev: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            quoted.append(dict(ev))
+            return {"quoted_at": lib.now_cn_iso(), "count": 0, "opportunity_count": 0}
+
+        ev = _ft_ev(match_id="obs-ft", home_score=1, away_score=4)
+        with patch.object(lib, "quote_bridge_event", side_effect=fake_quote):
+            lib.process_bridge_events(
+                root,
+                events_override=[ev],
+                af_referee=referee,
+                af_mode="gate",
+                trade_executor=None,
+            )
+            later: list[dict[str, Any]] = []
+            for _ in range(50):
+                later = lib.process_bridge_events(
+                    root,
+                    events_override=[],
+                    af_referee=referee,
+                    af_mode="gate",
+                    trade_executor=None,
+                )
+                if quoted or any(
+                    isinstance(b, dict) and b.get("mode") == "ft_skip_observe_mismatch"
+                    for b in later
+                ):
+                    break
+                time.sleep(0.02)
+        check("observe mismatch did not quote", quoted == [], str(quoted))
+        modes = [b.get("mode") for b in later if isinstance(b, dict)]
+        check("observe mismatch mode", "ft_skip_observe_mismatch" in modes, str(modes))
+
+
 def main() -> int:
     test_ft_stale_and_helpers()
     test_ft_mismatch_and_confirm()
@@ -555,6 +784,9 @@ def main() -> int:
     test_events_offset_clamps_on_shrink()
     test_cursor_writes_only_on_change()
     test_ft_market_cache_survives_until_consumed()
+    test_ft_orient_swap_skips_quote()
+    test_ft_swapped_fixture_orients_then_quotes()
+    test_ft_observe_mismatch_skips()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

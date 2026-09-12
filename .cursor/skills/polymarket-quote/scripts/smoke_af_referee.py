@@ -537,6 +537,169 @@ def test_apply_score() -> None:
         event_away="BG Pathum United",
     )
     check("same orientation passthrough", same == (2, 1), str(same))
+    check("pure swap 4-1 vs 1-4", ref.scores_are_pure_swap((4, 1), (1, 4)))
+    check("draw is not swap", not ref.scores_are_pure_swap((2, 2), (2, 2)))
+    check("2-2 vs 2-3 is not swap", not ref.scores_are_pure_swap((2, 2), (2, 3)))
+    check(
+        "swap skip vs DQD",
+        ref.ft_orient_skip_reason((4, 1), (1, 4), mapped=True) == "af_ft_orient_swap",
+    )
+    check(
+        "missing names skip rewrite",
+        ref.ft_orient_skip_reason((2, 2), (2, 3), mapped=False)
+        == "af_ft_orient_missing",
+    )
+    check(
+        "mapped extra goal ok",
+        ref.ft_orient_skip_reason((2, 2), (2, 3), mapped=True) is None,
+    )
+    check(
+        "observe extra goal ok",
+        ref.ft_orient_skip_reason(
+            (1, 5), (1, 4), mapped=True, observe=(1, 4)
+        )
+        is None,
+    )
+
+
+def test_t10_orients_from_poll_cache_entry() -> None:
+    print("test_t10_orients_from_poll_cache_entry")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def events_swapped(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "af_fixture_id": 1637298,
+                "goals": {"home": 2, "away": 0},
+                "finished": False,
+                "status_short": "1H",
+                "cache_entry": {
+                    "af_home": "Poland U20 W",
+                    "af_away": "Benin U20 W",
+                },
+            }
+
+        referee = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=1.0,
+            events_fn=events_swapped,
+            poll_schedule=False,
+        )
+        out = referee.await_score(
+            "54459497",
+            (0, 2),
+            for_t10_live=True,
+            baseline=None,
+            event_home="Benin",
+            event_away="Poland",
+        )
+        check("swapped live orients to trigger", out.get("confirmed") is True, str(out))
+        check(
+            "oriented 0-2",
+            (out.get("goals") or {}) == {"home": 0, "away": 2},
+            str(out.get("goals")),
+        )
+
+
+def test_ft_orients_and_refuses_swap() -> None:
+    print("test_ft_orients_and_refuses_swap")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def events_ok(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 4, "away": 1},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 1637298,
+                "cache_entry": {
+                    "af_home": "Poland U20 W",
+                    "af_away": "Benin U20 W",
+                },
+            }
+
+        referee = ref.AfReferee(
+            root, poll_s=0.01, timeout_s=1.0, events_fn=events_ok, poll_schedule=False
+        )
+        out = referee.await_ft_score(
+            "54459497",
+            (1, 4),
+            event_home="Benin",
+            event_away="Poland",
+        )
+        check("oriented FT confirms", out.get("confirmed") is True, str(out))
+        check(
+            "PM-frame 1-4 not 4-1",
+            (out.get("goals") or {}) == {"home": 1, "away": 4},
+            str(out.get("goals")),
+        )
+        check("not rewritten", out.get("score_rewritten") is False, str(out))
+
+        def events_dqd_names(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 4, "away": 1},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 1637298,
+                "cache_entry": {
+                    "af_home": "Benin  U20 (W)",
+                    "af_away": "Poland Women U20",
+                },
+            }
+
+        referee2 = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=1.0,
+            events_fn=events_dqd_names,
+            poll_schedule=False,
+        )
+        out2 = referee2.await_ft_score(
+            "54459497b",
+            (1, 4),
+            event_home="Benin",
+            event_away="Poland",
+        )
+        check("wrong names skip", out2.get("confirmed") is not True, str(out2))
+        check(
+            "swap error",
+            out2.get("error") == "af_ft_orient_swap",
+            str(out2.get("error")),
+        )
+        check("did not persist 4-1", ref.get_confirmed_score(root, "54459497b") is None)
+
+        def events_no_names(mid: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "goals": {"home": 2, "away": 2},
+                "finished": True,
+                "regulation_ready": True,
+                "status_short": "FT",
+                "af_fixture_id": 1,
+            }
+
+        referee3 = ref.AfReferee(
+            root,
+            poll_s=0.01,
+            timeout_s=0.3,
+            events_fn=events_no_names,
+            poll_schedule=False,
+        )
+        out3 = referee3.await_ft_score(
+            "m_miss", (2, 3), event_home="Home", event_away="Away"
+        )
+        check("missing names no confirm", out3.get("confirmed") is not True, str(out3))
+        check(
+            "missing error",
+            out3.get("error") == "af_ft_orient_missing",
+            str(out3.get("error")),
+        )
 
 
 def main() -> int:
@@ -554,6 +717,8 @@ def main() -> int:
     test_schedule_cadence_wall_times()
     test_transient_network_retry()
     test_apply_score()
+    test_t10_orients_from_poll_cache_entry()
+    test_ft_orients_and_refuses_swap()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
