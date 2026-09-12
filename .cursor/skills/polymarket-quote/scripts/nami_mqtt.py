@@ -20,6 +20,7 @@ logger = logging.getLogger("pm_quote.nami_mqtt")
 MQTT_HOST = "trackermq.namitiyu.com"
 MQTT_PATH = "/mqtt"
 MQTT_PORT = 443
+MQTT_ORIGIN = "https://tracker.namitiyu.com"
 API_ROOT = "https://tracker-api.namitiyu.com"
 PUSH_MLIVE = 10101
 PUSH_STATS = 10102
@@ -79,6 +80,22 @@ _SHOT_MARKS = {
     121: ["ball", "net"],
     122: ["ball"],
 }
+
+
+def _mqtt_rc(rc: Any) -> int:
+    """CONNACK/disconnect reason as int (paho v1 int or v2 ReasonCode)."""
+    if rc is None:
+        return 0
+    if isinstance(rc, int):
+        return rc
+    val = getattr(rc, "value", None)
+    if isinstance(val, int):
+        return val
+    try:
+        return int(rc)
+    except (TypeError, ValueError):
+        text = str(rc).strip().lower()
+        return 0 if text in {"0", "success"} else 1
 
 
 def _env_float(name: str, default: float) -> float:
@@ -513,11 +530,11 @@ class NamiMqttHub:
             if ver is not None:
                 client = mqtt.Client(
                     callback_api_version=ver.VERSION2,
-                    client_id="dqdhook-nami",
+                    client_id=f"dqdhook-nami-{os.getpid()}",
                     **kwargs,
                 )
             else:
-                client = mqtt.Client(client_id="dqdhook-nami", **kwargs)
+                client = mqtt.Client(client_id=f"dqdhook-nami-{os.getpid()}", **kwargs)
             if hasattr(client, "connect_timeout"):
                 try:
                     client.connect_timeout = CONNECT_WAIT_S
@@ -528,7 +545,13 @@ class NamiMqttHub:
                 tls()
             ws_opts = getattr(client, "ws_set_options", None)
             if callable(ws_opts):
-                ws_opts(path=MQTT_PATH)
+                ws_opts(
+                    path=MQTT_PATH,
+                    headers={
+                        "Origin": MQTT_ORIGIN,
+                        "User-Agent": "Mozilla/5.0",
+                    },
+                )
             client.on_connect = self._on_connect
             client.on_message = self._on_message
             client.on_disconnect = self._on_disconnect
@@ -545,8 +568,8 @@ class NamiMqttHub:
     def _on_connect(self, client: Any, _u: Any, _f: Any, rc: Any, _p: Any = None) -> None:
         if self._client is not None and client is not self._client:
             return
-        code = rc.reason_code if hasattr(rc, "reason_code") else rc
-        self._connected = int(code or 0) == 0
+        code = _mqtt_rc(rc)
+        self._connected = code == 0
         if not self._connected:
             self._start_err = f"mqtt_connack_{code}"
             return

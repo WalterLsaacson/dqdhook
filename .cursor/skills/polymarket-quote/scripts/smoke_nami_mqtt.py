@@ -170,6 +170,13 @@ def check_mqtt_reader() -> None:
 def check_truncated_protobuf() -> None:
     assert nm.decode_fields(b"") == []
     assert nm.decode_fields(b"\x12\xff\xff\xff\xff\x0f") == []
+    assert nm._mqtt_rc(0) == 0
+    assert nm._mqtt_rc(None) == 0
+
+    class _RC:
+        value = 0
+
+    assert nm._mqtt_rc(_RC()) == 0
 
 
 def check_vc_zero_clears_overlay() -> None:
