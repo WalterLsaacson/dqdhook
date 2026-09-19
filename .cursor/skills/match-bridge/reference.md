@@ -126,6 +126,7 @@ Matched rows get `finished: true` / `dongqiudi.is_finished: true` while `period`
 | `data/bridge/latest.json` | Same payload (alias) |
 | `data/bridge/prev_status.json` | Per-match status baseline |
 | `data/bridge/prev_period.json` | Per-match period baseline for FT detection |
+| `data/bridge/half_scores.json` | HT frozen while period is 1H/HT (2H must not copy live hts) |
 | `data/bridge/events.jsonl` | Append-only `match_finished` log |
 | `data/snapshot.json` | DQD upstream |
 | `data/polymarket/snapshot.json` | PM upstream |

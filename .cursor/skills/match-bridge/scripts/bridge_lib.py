@@ -655,6 +655,75 @@ def period_bucket(dqd: dict[str, Any] | None) -> str:
     return str(dqd.get("period") or "").strip().upper()
 
 
+def update_half_scores(
+    paired: list[dict[str, Any]],
+    half_scores: dict[str, dict[str, Any]],
+) -> None:
+    """Freeze HT from 1H/HT polls. 2H live ``hts`` must not overwrite this."""
+    for row in paired:
+        dqd = row.get("dongqiudi") or {}
+        pm = row.get("polymarket") or {}
+        mid = str(dqd.get("id") or "")
+        if not mid:
+            continue
+        period = period_bucket(dqd)
+        if period not in {"1H", "HT"}:
+            continue
+        hs, aws = dqd.get("home_score"), dqd.get("away_score")
+        try:
+            hs_i, aws_i = int(hs), int(aws)
+        except (TypeError, ValueError):
+            continue
+        pm_home = pm.get("home") or dqd.get("home") or ""
+        pm_away = pm.get("away") or dqd.get("away") or ""
+        cur_h, cur_a = orient_scores(
+            dqd.get("home") or "",
+            dqd.get("away") or "",
+            hs_i,
+            aws_i,
+            pm_home,
+            pm_away,
+        )
+        try:
+            half_scores[mid] = {"home": int(cur_h), "away": int(cur_a)}
+        except (TypeError, ValueError):
+            half_scores[mid] = {"home": hs_i, "away": aws_i}
+
+
+def _attach_period_and_halves(
+    ev: dict[str, Any],
+    dqd: dict[str, Any],
+    *,
+    mid: str,
+    home_score: int,
+    away_score: int,
+    half_scores: dict[str, dict[str, Any]] | None,
+) -> None:
+    """Stamp DQD period and a HT that cannot include 2H goals."""
+    period = period_bucket(dqd)
+    ev["period"] = period
+    if half_scores is None:
+        return
+    if period in {"1H", "HT"}:
+        half_scores[mid] = {"home": home_score, "away": away_score}
+        ev["home_half"] = home_score
+        ev["away_half"] = away_score
+        return
+    if period in {"2H", "FT", "AET", "ET", "PEN"}:
+        frozen = half_scores.get(mid)
+        if (
+            isinstance(frozen, dict)
+            and frozen.get("home") is not None
+            and frozen.get("away") is not None
+        ):
+            ev["home_half"] = frozen["home"]
+            ev["away_half"] = frozen["away"]
+        else:
+            # Started watching in 2H: skip half markets rather than copy live hts.
+            ev["home_half"] = ""
+            ev["away_half"] = ""
+
+
 def is_full_time(dqd: dict[str, Any] | None) -> bool:
     """True when Dongqiudi marks the match period as full time."""
     return period_bucket(dqd) == "FT"
@@ -728,6 +797,7 @@ def _extra_time_clock_fn() -> Any:
 def detect_score_changes(
     paired: list[dict[str, Any]],
     prev_scores: dict[str, dict[str, Any]],
+    half_scores: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Emit score_change on goals and on score reversals (disallowed / corrections).
 
@@ -828,6 +898,14 @@ def detect_score_changes(
                     **pm_side_fields(dqd, pm),
                 }
             )
+            _attach_period_and_halves(
+                events[-1],
+                dqd,
+                mid=mid,
+                home_score=cur_h_i,
+                away_score=cur_a_i,
+                half_scores=half_scores,
+            )
         # Disallowed / correction: either side's score drops (includes mixed up+down).
         elif hs_i < ph or aws_i < pa:
             mixed = (hs_i > ph or aws_i > pa) and (hs_i < ph or aws_i < pa)
@@ -881,6 +959,14 @@ def detect_score_changes(
                     "polymarket": _pm_event_handle(pm),
                     **pm_side_fields(dqd, pm),
                 }
+            )
+            _attach_period_and_halves(
+                events[-1],
+                dqd,
+                mid=mid,
+                home_score=cur_h_i,
+                away_score=cur_a_i,
+                half_scores=half_scores,
             )
     return events
 
@@ -1030,6 +1116,7 @@ class BridgeRuntime:
         self._prev_status: dict[str, str] = {}
         self._prev_period: dict[str, str] = {}
         self._prev_scores: dict[str, dict[str, Any]] = {}
+        self._half_scores: dict[str, dict[str, Any]] = {}
 
         self._persist_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._persist_thread: threading.Thread | None = None
@@ -1078,6 +1165,7 @@ class BridgeRuntime:
         write_json(self.bridge_data / "prev_status.json", job["prev_status"])
         write_json(self.bridge_data / "prev_period.json", job["prev_period"])
         write_json(self.bridge_data / "prev_scores.json", job["prev_scores"])
+        write_json(self.bridge_data / "half_scores.json", job.get("half_scores") or {})
         with self._persist_lock:
             if gen >= self._persist_written_gen:
                 self._persist_written_gen = gen
@@ -1098,6 +1186,12 @@ class BridgeRuntime:
         self._prev_period = {str(k): str(v) for k, v in prev_period.items()}
         self._prev_scores = {
             str(k): v for k, v in prev_scores.items() if isinstance(v, dict)
+        }
+        half_scores = load_json(self.bridge_data / "half_scores.json", {}) or {}
+        if not isinstance(half_scores, dict):
+            half_scores = {}
+        self._half_scores = {
+            str(k): v for k, v in half_scores.items() if isinstance(v, dict)
         }
         self._prev_loaded = True
 
@@ -1244,8 +1338,9 @@ class BridgeRuntime:
             prev_status = self._prev_status
             prev_period = self._prev_period
             prev_scores = self._prev_scores
-
-            score_events = detect_score_changes(paired, prev_scores)
+            half_scores = self._half_scores
+            update_half_scores(paired, half_scores)
+            score_events = detect_score_changes(paired, prev_scores, half_scores)
             ft_events = detect_match_finished(paired, prev_status, prev_period)
             events = score_events + ft_events
 
@@ -1284,6 +1379,7 @@ class BridgeRuntime:
                 "prev_status": dict(prev_status),
                 "prev_period": dict(prev_period),
                 "prev_scores": {k: dict(v) for k, v in prev_scores.items()},
+                "half_scores": {k: dict(v) for k, v in half_scores.items()},
                 "events": [dict(ev) for ev in events],
                 "payload": payload,
             }

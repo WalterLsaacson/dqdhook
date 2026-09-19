@@ -661,12 +661,64 @@ def infer_clock_period(
     return "1H" if minute <= 45 else "2H"
 
 
+def frozen_halves(root: Path, match_id: str) -> tuple[int, int] | None:
+    """HT frozen during 1H/HT polls (``data/bridge/half_scores.json``)."""
+    mid = str(match_id or "").strip()
+    if not mid:
+        return None
+    raw = load_json(bridge_dir(root) / "half_scores.json", {}) or {}
+    if not isinstance(raw, dict):
+        return None
+    row = raw.get(mid)
+    if not isinstance(row, dict):
+        return None
+    return _half_pair(row.get("home"), row.get("away"))
+
+
+def stated_match_period(*sources: dict[str, Any] | None) -> str:
+    """Event / Dongqiudi ``period`` stamp. Empty means clock-only inference."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        p = str(src.get("period") or "").strip().upper()
+        if p:
+            return p
+    return ""
+
+
+def promote_clock_period(
+    period: str,
+    *,
+    frozen: tuple[int, int] | None,
+    home_score: Any,
+    away_score: Any,
+    stated_period: str = "",
+) -> str:
+    """Clock said 1H but freeze already trails live → we are in 2H.
+
+    Only when no event/DQD period was stamped. Explicit 1H/HT stays 1H even
+    if ``half_scores.json`` has not caught up with this goal yet.
+    """
+    if str(stated_period or "").strip():
+        return period
+    if period != "1H" or frozen is None:
+        return period
+    h = _parse_int_score(home_score)
+    a = _parse_int_score(away_score)
+    if h is None or a is None:
+        return period
+    if frozen[0] < h or frozen[1] < a:
+        return "2H"
+    return period
+
+
 def resolve_regulation_halves(
     *,
     home_score: Any,
     away_score: Any,
     candidates: list[tuple[Any, Any]],
     period: str = "",
+    frozen: tuple[Any, Any] | None = None,
 ) -> tuple[Any, Any]:
     """Choose HT that cannot include second-half goals.
 
@@ -674,9 +726,17 @@ def resolve_regulation_halves(
     componentwise ≤ current, pick the smallest total. During 1H only, missing
     HT falls back to the current score. During 2H/FT, never fall back — that
     is what settled 1H O/U from the full-time score (Portuguesa 1-2).
+
+    A frozen HT that still equals the live score (no 2H goals yet) is real
+    half-time, not a 2H copy — keep it.
     """
     h = _parse_int_score(home_score)
     a = _parse_int_score(away_score)
+    period_u = str(period or "").upper()
+    # 1H/HT: the live score is the half-time score. A stale freeze from
+    # before this goal must not win as the "smallest" candidate.
+    if period_u in {"1H", "HT"} and h is not None and a is not None:
+        return h, a
     valid: list[tuple[int, int]] = []
     seen: set[tuple[int, int]] = set()
     if h is not None and a is not None:
@@ -691,10 +751,19 @@ def resolve_regulation_halves(
                 seen.add(pair)
                 valid.append(pair)
     if valid:
-        valid.sort(key=lambda p: (p[0] + p[1], p[0], p[1]))
-        return valid[0]
-    if str(period or "").upper() == "1H" and h is not None and a is not None:
-        return h, a
+        live_pair = (h, a) if h is not None and a is not None else None
+        keep = (
+            _half_pair(frozen[0], frozen[1])
+            if frozen is not None and len(frozen) >= 2
+            else None
+        )
+        # 2H/FT: hts equal to live is DQD copying 2H. Frozen HT equal to
+        # live means the second half has not scored yet — keep it.
+        if live_pair is not None and period_u in {"2H", "FT", "AET", "ET", "PEN"}:
+            valid = [p for p in valid if p != live_pair or p == keep]
+        if valid:
+            valid.sort(key=lambda p: (p[0] + p[1], p[0], p[1]))
+            return valid[0]
     return None, None
 
 
@@ -1760,6 +1829,8 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         dqd["home_score"] = ev.get("home_score")
     if ev.get("away_score") is not None:
         dqd["away_score"] = ev.get("away_score")
+    if ev.get("period"):
+        dqd["period"] = ev.get("period")
     ctx = {
         "event": ev,
         "match_row": row,
@@ -1771,19 +1842,29 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         "away": ev.get("away") or pm.get("away") or dqd.get("away") or "",
     }
     hh_dqd, ah_dqd = halves_in_pm_frame(ctx)
-    period = infer_clock_period(ev, dqd)
+    frozen = frozen_halves(root, mid)
+    period = promote_clock_period(
+        infer_clock_period(ev, dqd),
+        frozen=frozen,
+        home_score=ctx["home_score"],
+        away_score=ctx["away_score"],
+        stated_period=stated_match_period(ev, dqd),
+    )
     hh, ah = resolve_regulation_halves(
         home_score=ctx["home_score"],
         away_score=ctx["away_score"],
         candidates=[
+            frozen if frozen is not None else (None, None),
             (ev.get("home_half"), ev.get("away_half")),
             (hh_dqd, ah_dqd),
         ],
         period=period,
+        frozen=frozen,
     )
     ctx["home_half"] = hh
     ctx["away_half"] = ah
     ctx["clock_period"] = period
+    ctx["frozen_half"] = frozen
     return ctx
 
 
@@ -1986,12 +2067,14 @@ def collect_target_tokens(
                     home_score=hs,
                     away_score=aws,
                     candidates=[
+                        ctx.get("frozen_half") or (None, None),
                         (ev_row.get("home_half"), ev_row.get("away_half")),
                         (hh_dqd, ah_dqd),
                     ],
                     period=str(
                         ctx.get("clock_period") or infer_clock_period(ev_row, dqd_row)
                     ),
+                    frozen=ctx.get("frozen_half"),
                 )
             if mode == "ft":
                 tokens.extend(

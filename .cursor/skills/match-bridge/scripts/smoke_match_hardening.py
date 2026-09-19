@@ -786,6 +786,56 @@ def main() -> int:
         f"Valledupar/Cundinamarca should match, got {col2_pair}",
     )
 
+    # Lincoln: freeze HT at 1-0 in 1H; 2H must not copy live hts 1-1.
+    half_scores: dict = {}
+    lin_1h = {
+        "dongqiudi": {
+            "id": "lin_swa",
+            "home": "Lincoln City",
+            "away": "Swansea City",
+            "home_score": 1,
+            "away_score": 0,
+            "home_half": "",
+            "away_half": "",
+            "period": "1H",
+            "status": "Playing",
+            "status_raw": "Playing",
+            "official_clock": "40'",
+        },
+        "polymarket": {
+            "home": "Lincoln City FC",
+            "away": "Swansea City AFC",
+            "event_id": "1",
+            "slug": "x",
+        },
+    }
+    bl.update_half_scores([lin_1h], half_scores)
+    _assert(half_scores.get("lin_swa") == {"home": 1, "away": 0}, half_scores)
+    prev_lin: dict = {"lin_swa": {"home": 0, "away": 0}}
+    ev_1h = bl.detect_score_changes([lin_1h], prev_lin, half_scores)
+    _assert(len(ev_1h) == 1 and ev_1h[0].get("period") == "1H", ev_1h)
+    _assert((ev_1h[0].get("home_half"), ev_1h[0].get("away_half")) == (1, 0), ev_1h[0])
+    lin_2h = {
+        "dongqiudi": {
+            **lin_1h["dongqiudi"],
+            "home_score": 1,
+            "away_score": 2,
+            "home_half": 1,
+            "away_half": 1,
+            "period": "2H",
+            "official_clock": "45'",
+        },
+        "polymarket": lin_1h["polymarket"],
+    }
+    bl.update_half_scores([lin_2h], half_scores)
+    _assert(half_scores.get("lin_swa") == {"home": 1, "away": 0}, half_scores)
+    ev_2h = bl.detect_score_changes([lin_2h], prev_lin, half_scores)
+    _assert(len(ev_2h) == 1 and ev_2h[0].get("period") == "2H", ev_2h)
+    _assert(
+        (ev_2h[0].get("home_half"), ev_2h[0].get("away_half")) == (1, 0),
+        ev_2h[0],
+    )
+
     print("smoke_match_hardening: ok")
     return 0
 

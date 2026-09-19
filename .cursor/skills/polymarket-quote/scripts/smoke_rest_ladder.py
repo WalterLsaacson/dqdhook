@@ -48,6 +48,21 @@ def main() -> int:
     assert abs(rl.rest_target_usdc() - 7.0) < 1e-9
     os.environ.pop("QUOTE_REST_USDC", None)
 
+    assert abs(rl.clip_rest_to_balance(100.0, 40.0) - 40.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(100.0, 150.0) - 100.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(100.0, None) - 100.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(100.0, 0.0) - 0.0) < 1e-9
+    assert abs(rl.rest_place_usdc_for_wallet(100.0, available=40.0) - 40.0) < 1e-9
+    assert (
+        abs(
+            rl.rest_place_usdc_for_wallet(
+                100.0, available=10.0, working=40.0, replace=True
+            )
+            - 50.0
+        )
+        < 1e-9
+    )
+
     assert abs(rl.FAK_ZONE_MAX_ASK - 0.995) < 1e-12
     assert abs(rl.REST_CONCENTRATE_BID - 0.995) < 1e-12
 
@@ -110,7 +125,7 @@ def main() -> int:
 
     os.environ["QUOTE_REST_ENABLED"] = "1"
     try:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             (root / "data" / "pm-quote").mkdir(parents=True)
             ex = TradeExecutor(root, _settings())
@@ -165,6 +180,100 @@ def main() -> int:
                 q_stub, event_key=ek, match_meta=meta, event_type="score_change"
             )
             assert posted and posted.get("status") == "rest_dry_run", posted
+
+            # Dead 0.001 ask: do not rest @0.99 (Lincoln 1H).
+            q_dead = dict(q_no)
+            q_dead["token_id"] = "tok_dead"
+            q_dead["best_bid"] = None
+            q_dead["best_ask"] = 0.001
+            q_dead["asks_top"] = [{"price": "0.001", "size": "50"}]
+            dead = ex.maybe_trade(
+                q_dead, event_key=ek, match_meta=meta, event_type="score_change"
+            )
+            assert dead is None or dead.get("status") == "skipped", dead
+
+            # Ask 0.20 < gate floor 0.30: skip FAK and do not rest @0.99.
+            q_cheap = dict(q_no)
+            q_cheap["token_id"] = "tok_cheap20"
+            q_cheap["best_ask"] = 0.20
+            q_cheap["best_ask_size"] = 50.0
+            q_cheap["asks_top"] = [{"price": "0.20", "size": "50"}]
+            q_cheap["misprice"] = True
+            cheap = ex.maybe_trade(
+                q_cheap, event_key=ek, match_meta=meta, event_type="score_change"
+            )
+            assert cheap is not None and cheap.get("status") == "skipped", cheap
+            assert "buy_price_below_min" in str(cheap.get("skip_reason") or ""), cheap
+            assert cheap.get("rest") is None, cheap
+            assert ex._skip_rest_after_prepare(cheap)
+
+            q_floor = dict(q_cheap)
+            q_floor["token_id"] = "tok_floor30"
+            q_floor["best_ask"] = 0.30
+            q_floor["asks_top"] = [{"price": "0.30", "size": "50"}]
+            q_floor["misprice"] = False
+            at_floor = ex.maybe_trade(
+                q_floor, event_key=ek, match_meta=meta, event_type="score_change"
+            )
+            assert at_floor and at_floor.get("status") == "rest_dry_run", at_floor
+
+            orig_avail = ex._available_rest_usdc
+            os.environ["QUOTE_REST_USDC"] = "20"
+            try:
+                ex._available_rest_usdc = lambda *, live=False: 8.0
+                q_wallet = dict(q_no)
+                q_wallet["token_id"] = "tok_wallet8"
+                clipped = ex.maybe_trade(
+                    q_wallet, event_key=ek, match_meta=meta, event_type="score_change"
+                )
+                assert clipped and clipped.get("status") == "rest_dry_run", clipped
+                wlvls = (clipped.get("plan") or {}).get("levels") or []
+                assert wlvls and abs(float(wlvls[0]["usdc"]) - 8.0) < 0.05, wlvls
+                ex._available_rest_usdc = lambda *, live=False: 50.0
+                q_full = dict(q_no)
+                q_full["token_id"] = "tok_wallet50"
+                full = ex.maybe_trade(
+                    q_full, event_key=ek, match_meta=meta, event_type="score_change"
+                )
+                assert full and full.get("status") == "rest_dry_run", full
+                flvls = (full.get("plan") or {}).get("levels") or []
+                assert flvls and abs(float(flvls[0]["usdc"]) - 20.0) < 0.05, flvls
+                ex._available_rest_usdc = lambda *, live=False: 2.0
+                q_broke = dict(q_no)
+                q_broke["token_id"] = "tok_wallet2"
+                broke = ex.maybe_trade(
+                    q_broke, event_key=ek, match_meta=meta, event_type="score_change"
+                )
+                assert broke is None, broke
+            finally:
+                ex._available_rest_usdc = orig_avail
+                os.environ.pop("QUOTE_REST_USDC", None)
+
+            os.environ["QUOTE_T10"] = "1"
+            os.environ["QUOTE_T10_USDC"] = "15"
+            t10_meta = {
+                "match_id": "m1",
+                "home": "H",
+                "away": "A",
+                "home_score": 1,
+                "away_score": 2,
+                "trade_context": {"pitch_gate": True, "t10": True},
+            }
+            q_dead_t10 = dict(q_dead)
+            q_dead_t10["token_id"] = "tok_dead_t10"
+            q_dead_t10["misprice"] = True
+            dead_t10 = ex.maybe_trade(
+                q_dead_t10,
+                event_key="t10|" + ek,
+                match_meta=t10_meta,
+                event_type="score_change",
+            )
+            assert dead_t10 is None or str(dead_t10.get("skip_reason") or "").startswith(
+                "extreme_price"
+            ), dead_t10
+            os.environ.pop("QUOTE_T10_USDC", None)
+            os.environ.pop("QUOTE_T10", None)
+            del ex
     finally:
         os.environ.pop("QUOTE_REST_ENABLED", None)
 
@@ -184,7 +293,10 @@ def main() -> int:
         < 1e-9
     )
 
-    print("ok: rest ladder $5 / 0.01→0.99 / metadata 0.001 clamped to 0.01 / GTC default")
+    print(
+        "ok: rest ladder $5 / 0.01→0.99 / metadata 0.001 clamped to 0.01 / "
+        "GTC default / gate ask<0.30 skip / rest clips to wallet USDC"
+    )
     return 0
 
 

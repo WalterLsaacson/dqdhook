@@ -121,6 +121,16 @@ class ClobTrader:
         )
         return Decimal(str(result.get("balance", "0"))) / Decimal("1000000")
 
+    def get_collateral_usdc(self) -> Decimal:
+        """Spendable USDC (6 decimals) for new BUY rest / FAK."""
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+        result = self.client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        raw = result.get("balance", "0") if isinstance(result, dict) else 0
+        return Decimal(str(raw or 0)) / Decimal("1000000")
+
     def refresh_conditional_allowance(self, token_id: str) -> None:
         """Best-effort refresh of conditional-token allowance before sells."""
         from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams

@@ -24,6 +24,7 @@ from rest_ladder import (
     rest_expire_s,
     rest_limit_tick_size,
     rest_min_shares,
+    rest_place_usdc_for_wallet,
     rest_target_usdc,
 )
 from size_policy import compute_buy_size_caps
@@ -910,12 +911,12 @@ class TradeExecutor:
         event_key: str = "",
         event_type: str = "",
     ) -> str | None:
-        """buy_win ask floor (default 0.6; 0=off).
+        """buy_win ask floor.
 
-        Pitch-gate and FT both skip this floor (fee/min_net + 0.995 still apply).
+        Leftover path: ``QUOTE_MIN_BUY_PRICE`` (default 0.6).
+        Pitch-gate / T+10: ``QUOTE_GATE_MIN_BUY_PRICE`` (default 0.30).
+        FT / post-FT skip (dust path stays 0.01).
         """
-        if _trade_context_pitch_gate(match_meta):
-            return None
         if _trade_context_postft(match_meta):
             return None
         typ = self._resolve_event_type(
@@ -923,7 +924,10 @@ class TradeExecutor:
         )
         if typ == "match_finished":
             return None
-        floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
+        if _trade_context_pitch_gate(match_meta) or _trade_context_t10(match_meta):
+            floor = float(getattr(self.settings, "gate_min_buy_price", 0.30) or 0.0)
+        else:
+            floor = float(getattr(self.settings, "min_buy_price", 0.0) or 0.0)
         if floor <= 0 or price is None:
             return None
         if price < floor - 1e-12:
@@ -1114,6 +1118,19 @@ class TradeExecutor:
             return float(CUSHION_REST_USDC), base
         return 0.0, ""
 
+    def _available_rest_usdc(self, *, live: bool) -> float | None:
+        """Wallet USDC for rest sizing. None = do not clip (dry / lookup miss)."""
+        if not live:
+            return None
+        try:
+            trader = self.ensure_trader()
+            if trader is None:
+                return None
+            return max(0.0, float(trader.get_collateral_usdc()))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("rest wallet USDC lookup failed: %s", e)
+            return None
+
     def _skip_rest_after_prepare(self, row: dict[str, Any] | None) -> bool:
         if not isinstance(row, dict):
             return False
@@ -1125,6 +1142,10 @@ class TradeExecutor:
             "sell_lose_disabled",
             "already_done",
         ):
+            return True
+        if reason.startswith("extreme_price"):
+            return True
+        if reason.startswith("buy_price_below_min"):
             return True
         if str(row.get("status") or "") == "record_only":
             return True
@@ -1191,10 +1212,29 @@ class TradeExecutor:
         mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
         if not token_id or not mid:
             return None
-        cushion = quote_reversal_cushion(quote)
+        try:
+            ask_f = float(quote.get("best_ask")) if quote.get("best_ask") is not None else None
+        except (TypeError, ValueError):
+            ask_f = None
+        # Pitch/T+10 used to ignore the ask so a 0.001 dead token still got
+        # a 0.99 GTC (Lincoln 1H). Locked WIN with no ask still rests.
+        # Also skip when ask is below the gate floor (would fill by walking).
+        if ask_f is not None and ask_f <= 0.01 + 1e-12:
+            return None
         pitch = _trade_context_pitch_gate(match_meta)
+        gate_floor = float(getattr(self.settings, "gate_min_buy_price", 0.30) or 0.0)
+        if (
+            (pitch or t10)
+            and gate_floor > 0
+            and ask_f is not None
+            and ask_f < gate_floor - 1e-12
+        ):
+            return None
+        cushion = quote_reversal_cushion(quote)
         # Pitch-gate / T+10: single 0.995 bid; cushion also 0.995-only.
         rest_prices = CUSHION_REST_PRICES if (cushion or pitch or t10) else None
+        channel_live = self._live_for_signal(typ)
+        wallet_usdc = self._available_rest_usdc(live=channel_live)
         with self._lock:
             if self._match_buy_blocked_locked(mid) or mid in self._rest_blocked_matches:
                 return None
@@ -1205,7 +1245,6 @@ class TradeExecutor:
             working = self.ledger.rest_reserved_usdc(
                 token_id=token_id, match_id=mid, base_event_key=base
             )
-            channel_live = self._live_for_signal(typ)
             tick = rest_limit_tick_size(quote.get("tick_size") or "0.01")
             share_floor = rest_min_shares(quote)
             cap = (
@@ -1245,6 +1284,21 @@ class TradeExecutor:
                 if not replace and add_usdc + 1e-12 < floor:
                     return None
                 place_usdc = gap if replace else add_usdc
+                sized = rest_place_usdc_for_wallet(
+                    place_usdc,
+                    available=wallet_usdc,
+                    working=working,
+                    replace=replace,
+                )
+                if wallet_usdc is not None and sized + 1e-9 < place_usdc:
+                    print(
+                        f"rest-buy → clip usdc {place_usdc:.2f}→{sized:.2f} "
+                        f"wallet={float(wallet_usdc):.2f} token={token_id[:12]}…",
+                        flush=True,
+                    )
+                place_usdc = sized
+                if not replace and place_usdc + 1e-12 < floor:
+                    return None
                 # Pitch-gate ignores FAK-zone so a stub ask (0.999×5) or an
                 # empty ask side still rests @0.995 (wait for a dump).
                 ask_for_ladder = (
@@ -1277,7 +1331,12 @@ class TradeExecutor:
                 if ladder_changed:
                     cancel_ids = live_oids
                     replace = True
-                    place_usdc = gap
+                    place_usdc = rest_place_usdc_for_wallet(
+                        gap,
+                        available=wallet_usdc,
+                        working=working,
+                        replace=True,
+                    )
                     levels = allocate_rest_ladder(
                         place_usdc,
                         prices=rest_prices,

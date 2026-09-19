@@ -52,6 +52,45 @@ def rest_target_usdc() -> float:
         return float(DEFAULT_REST_USDC)
 
 
+def clip_rest_to_balance(target: float, available: float | None) -> float:
+    """Configured rest size, or wallet USDC when the wallet is smaller.
+
+    ``available is None`` (dry / lookup miss) keeps ``target``.
+    """
+    try:
+        want = max(0.0, float(target or 0))
+    except (TypeError, ValueError):
+        want = 0.0
+    if available is None:
+        return want
+    try:
+        have = max(0.0, float(available))
+    except (TypeError, ValueError):
+        return want
+    return min(want, have)
+
+
+def rest_place_usdc_for_wallet(
+    place_usdc: float,
+    *,
+    available: float | None,
+    working: float = 0.0,
+    replace: bool = False,
+) -> float:
+    """Clip a new rest bid to spendable USDC.
+
+    Replace cancels the working bid first, so that locked USDC is counted
+    as available again. Add-only uses current wallet cash.
+    """
+    room = available
+    if available is not None and replace:
+        try:
+            room = max(0.0, float(available)) + max(0.0, float(working or 0))
+        except (TypeError, ValueError):
+            room = available
+    return clip_rest_to_balance(place_usdc, room)
+
+
 def rest_min_shares(quote: dict[str, Any] | None) -> float:
     """CLOB share floor from the book; default ``MIN_REST_SHARES`` if unpublished."""
     raw = (quote or {}).get("min_order_size")

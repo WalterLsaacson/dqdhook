@@ -91,6 +91,7 @@ def main() -> int:
     )
     assert s.live_goals is False and s.live_ft is True and s.live is True
     assert s.min_buy_price == 0.6
+    assert abs(s.gate_min_buy_price - 0.30) < 1e-12
 
     s2 = load_trade_settings(
         live=False,
@@ -129,8 +130,10 @@ def main() -> int:
         ex = TradeExecutor(root, _settings(goals=False, ft=True))
         from dataclasses import replace
 
-        ex.settings = replace(ex.settings, min_buy_price=0.6)
-        # FT skips the ask floor (same as pitch-gate).
+        ex.settings = replace(
+            ex.settings, min_buy_price=0.6, gate_min_buy_price=0.30
+        )
+        # FT still skips (dust FAK). Pitch-gate / T+10 use 0.30.
         assert (
             ex._min_buy_price_blocked(0.05, event_key="match_finished|m1|1-0")
             is None
@@ -138,10 +141,36 @@ def main() -> int:
         assert (
             ex._min_buy_price_blocked(0.59, event_type="match_finished") is None
         )
-        # leftover non-FT / non-gate path still honors the floor
+        # leftover non-FT / non-gate path still honors 0.6
         assert ex._min_buy_price_blocked(0.59) is not None
         assert ex._min_buy_price_blocked(0.6) is None
         assert "buy_price_below_min" in (ex._min_buy_price_blocked(0.5) or "")
+        gate = {"trade_context": {"pitch_gate": True}}
+        t10m = {"trade_context": {"t10": True}}
+        assert (
+            ex._min_buy_price_blocked(
+                0.29, match_meta=gate, event_type="score_change"
+            )
+            is not None
+        )
+        assert (
+            ex._min_buy_price_blocked(
+                0.30, match_meta=gate, event_type="score_change"
+            )
+            is None
+        )
+        assert (
+            ex._min_buy_price_blocked(
+                0.29, match_meta=t10m, event_type="score_change"
+            )
+            is not None
+        )
+        assert (
+            ex._min_buy_price_blocked(
+                0.30, match_meta=t10m, event_type="score_change"
+            )
+            is None
+        )
 
         win = {"settlement": "WIN", "locked": True, "trade": "buy_win"}
         assert (

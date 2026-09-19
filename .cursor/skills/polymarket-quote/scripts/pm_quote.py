@@ -99,6 +99,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         f"trade → goals={g} ft={f} take_depth={settings.take_depth} "
         f"{size_channels_label(settings)} "
         f"min_buy_price={settings.min_buy_price} "
+        f"gate_min_buy_price={settings.gate_min_buy_price} "
         f"max_open_usdc={settings.max_open_usdc} "
         f"(pitch-gate: first @+0s, every 5s until 120s; DOM∧AF → enqueue CLOB worker; buy stops AF+DOM)",
         file=sys.stderr,

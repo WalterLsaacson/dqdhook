@@ -30,6 +30,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _gate_min_buy_price() -> float:
+    raw = os.getenv("QUOTE_GATE_MIN_BUY_PRICE")
+    if raw is None or str(raw).strip() == "":
+        return 0.30
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.30
+
+
 def _channel_size_tiers(
     env_name: str,
     *,
@@ -88,7 +98,7 @@ class TradeSettings:
     max_shares: float
     max_slippage: float
     allow_extreme_prices: bool
-    min_buy_price: float  # buy_win only: skip (but record) when best_ask < this; 0 = off
+    min_buy_price: float  # leftover buy_win: skip when best_ask < this; 0 = off
     min_order_shares: float
     enabled: bool
     # Price-tiered buy sizing (from .env); hard caps remain max_usdc/max_shares.
@@ -110,6 +120,8 @@ class TradeSettings:
     locked_sweep_usdc: float = 1000.0
     # Goal T+10 rescan (default delay 8min): FAK + rest share this notional. 0 = off.
     t10_usdc: float = 0.0
+    # Pitch-gate / T+10 ask floor (0.30). 0 = off. FT still skips.
+    gate_min_buy_price: float = 0.30
     # Periodic post-FT leftover WIN ask sweep (pm-locked-scan).
     postft_sweep: bool = True
     postft_sweep_usdc: float = 1000.0
@@ -291,6 +303,7 @@ def load_trade_settings(
             float(sweep_usdc) if sweep_usdc is not None else 1000.0
         ),
         t10_usdc=float(_t10_usdc_env()),
+        gate_min_buy_price=_gate_min_buy_price(),
         postft_sweep=_env_bool("QUOTE_POSTFT_SWEEP", True),
         postft_sweep_usdc=(
             float(os.getenv("QUOTE_POSTFT_SWEEP_USDC"))

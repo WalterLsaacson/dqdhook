@@ -123,6 +123,7 @@ def _slim_ev(ev: dict[str, Any]) -> dict[str, Any]:
         "league",
         "kickoff_beijing",
         "official_clock",
+        "period",
         "sides_swapped",
         "dqd_home",
         "dqd_away",
@@ -319,10 +320,19 @@ def build_t10_work_event(
                 work["dqd_home"] = fields.get("dqd_home")
             if fields.get("dqd_away"):
                 work["dqd_away"] = fields.get("dqd_away")
-            hh, ah = fields.get("home_half"), fields.get("away_half")
-            if hh not in (None, "") and ah not in (None, ""):
-                work["home_half"] = hh
-                work["away_half"] = ah
+            # Do not copy live DQD hts onto the work event — it tracks 2H.
+            if dqd.get("period") and not work.get("period"):
+                work["period"] = dqd.get("period")
+    try:
+        import quote_lib as lib
+
+        frozen = lib.load_json(lib.bridge_dir(root) / "half_scores.json", {}) or {}
+    except Exception:  # noqa: BLE001
+        frozen = {}
+    row_h = frozen.get(mid) if isinstance(frozen, dict) else None
+    if isinstance(row_h, dict) and row_h.get("home") is not None:
+        work["home_half"] = row_h.get("home")
+        work["away_half"] = row_h.get("away")
     t10_key = str(job.get("t10_event_key") or t10_event_key(src))
     work["_trade_event_key"] = t10_key
     work["_trade_context"] = {
