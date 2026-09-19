@@ -1,6 +1,6 @@
-"""Post-goal +10min book rescan.
+"""Post-goal T+10 book rescan (default delay 8 min).
 
-After a paired DQD goal-up, wait ``QUOTE_T10_DELAY_S`` (default 600s) and poll
+After a paired DQD goal-up, wait ``QUOTE_T10_DELAY_S`` (default 480s) and poll
 API-Football **live** goals. Quote only when that live tally **exactly matches
 the triggering score-change** (the goal that scheduled this job). A later goal
 or other disagreement skips; AF still behind the trigger keeps polling.
@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-DEFAULT_T10_DELAY_S = 600.0
+DEFAULT_T10_DELAY_S = 480.0
 DEFAULT_T10_MAX_LATE_S = 900.0
 DEFAULT_T10_ENABLED = True
 # AF live poll budget at fire (already waited delay_s). Cache miss skips immediately.

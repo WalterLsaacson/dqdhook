@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: goal +10min rescan scheduler, caps, rest without QUOTE_REST_ENABLED."""
+"""Smoke: goal T+10 rescan scheduler, caps, rest without QUOTE_REST_ENABLED."""
 
 from __future__ import annotations
 
@@ -100,10 +100,12 @@ def _run() -> int:
     t10.reset_scheduler_for_tests()
     os.environ["QUOTE_T10"] = "1"
     os.environ["QUOTE_T10_USDC"] = "15"
-    os.environ["QUOTE_T10_DELAY_S"] = "0"
     os.environ["QUOTE_T10_MAX_LATE_S"] = "900"
     os.environ.pop("QUOTE_REST_ENABLED", None)
     os.environ.pop("QUOTE_REST_USDC", None)
+    os.environ.pop("QUOTE_T10_DELAY_S", None)
+    assert abs(t10.t10_delay_s() - 480.0) < 1e-9, t10.t10_delay_s()
+    os.environ["QUOTE_T10_DELAY_S"] = "0"
 
     assert t10.t10_enabled()
     assert abs(t10.t10_usdc() - 15.0) < 1e-9

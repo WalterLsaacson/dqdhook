@@ -108,7 +108,7 @@ class TradeSettings:
     # Pitch-gate: FAK remaining asks when WIN even if this goal is voided.
     locked_sweep: bool = True
     locked_sweep_usdc: float = 1000.0
-    # Goal +10min rescan: FAK + rest share this notional. 0 = off.
+    # Goal T+10 rescan (default delay 8min): FAK + rest share this notional. 0 = off.
     t10_usdc: float = 0.0
     # Periodic post-FT leftover WIN ask sweep (pm-locked-scan).
     postft_sweep: bool = True

@@ -17,7 +17,7 @@
                      │
          ┌───────────┼───────────┬──────────────┐
          ▼           ▼           ▼              ▼
-   进球 pitch-gate   终场立刻询价  回撤 AF flatten  进球 +10min 再扫
+   进球 pitch-gate   终场立刻询价  回撤 AF flatten  进球 +8min 再扫
    （DOM∧AF 一刀）   （无门控）    （认分才卖）     （AF=触发比分）
 ```
 
@@ -68,7 +68,7 @@
 |---|---|---|---|---|
 | **Pitch-gate 进球** | 已配对进球，DOM `in_play` ∧ AF 认分 | 是 | `QUOTE_GOAL_MAX_USDC` | 仅当 `QUOTE_REST_ENABLED=1`（`QUOTE_REST_USDC`） |
 | **Locked sweep** | 门控买时，该 token 在**上一分**已是 live WIN | 是（同一刀） | `QUOTE_LOCKED_SWEEP_USDC` | 同门控 rest |
-| **T+10 再扫** | 进球后 10 分钟，AF live **等于触发那球的比分**才买 | 否 | `QUOTE_T10_USDC`（FAK 与 0.99 GTC 各用该金额） | **始终挂**（不看 `QUOTE_REST_ENABLED`） |
+| **T+10 再扫** | 进球后 8 分钟，AF live **等于触发那球的比分**才买 | 否 | `QUOTE_T10_USDC`（FAK 与 0.99 GTC 各用该金额） | **始终挂**（不看 `QUOTE_REST_ENABLED`） |
 | **终场** | `match_finished` | 否 | `QUOTE_FT_MAX_USDC` | 不挂 |
 | **终场灰尘盘** | 终场已锁定 WIN、ask≤0.01 | 否 | `QUOTE_FT_DUST_USDC` | 不挂 |
 
@@ -128,9 +128,9 @@ Odds Grade A 只写入观察 jsonl，**不触发买入**。回撤只认 AF 比�
 | 动画已改比分、随后 DQD 才长延迟回撤 | 买入时无法预知；出口靠回撤后再开 5s 轨 |
 | VAR 出现在**已经下单之后** | 拦不住该刀（除非随后 DQD 回撤且 AF/DOM 认分）
 
-### 3. 进球 +10 分钟再扫盘（T+10）
+### 3. 进球 +8 分钟再扫盘（T+10）
 
-已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **600s** 后拉 AF **live** 比分，**必须和触发这次 T+10 的那次进球后比分一致**才询价（后续又进球 / 回撤则 `t10_skip_score_mismatch`，不拿最新比分改写后买入）。叠到 Polymarket 主客上，主客对调要换边：
+已配对进球一出现就排队（`data/pm-quote/t10_pending.json`），**不管 pitch-gate 最终买没买**。默认 **480s** 后拉 AF **live** 比分，**必须和触发这次 T+10 的那次进球后比分一致**才询价（后续又进球 / 回撤则 `t10_skip_score_mismatch`，不拿最新比分改写后买入）。叠到 Polymarket 主客上，主客对调要换边：
 
 - 有 misprice → 同一套 `buy_win` FAK（fee / `min_net` / ask≤0.995；跳过 `min_buy_price`；**不做** locked sweep）
 - **每个已锁定 WIN 的 token** 再挂一笔 **@0.99 GTC**（不依赖 `QUOTE_REST_ENABLED`）
@@ -264,8 +264,8 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | `QUOTE_FT_DUST_USDC` | 终场已锁定 WIN、ask≤0.01 的 FAK 金额，默认 **100**；`0` 关闭该路径 |
 | `QUOTE_LOCKED_SWEEP` | 默认开：进球后若上一分已经 WIN，FAK 吃光 ask≤0.995；`0` 关闭 |
 | `QUOTE_LOCKED_SWEEP_USDC` | 扫盘单笔金额顶，默认 **1000**；`0` 关闭该路径 |
-| `QUOTE_T10_USDC` | 进球 +10 分钟再扫盘：FAK 与每 token 一笔 0.99 GTC **各**用该金额；未设或 `0` 关闭 |
-| `QUOTE_T10_DELAY_S` | T+10 延迟秒数，默认 **600** |
+| `QUOTE_T10_USDC` | 进球 +8 分钟再扫盘：FAK 与每 token 一笔 0.99 GTC **各**用该金额；未设或 `0` 关闭 |
+| `QUOTE_T10_DELAY_S` | T+10 延迟秒数，默认 **480**（8min） |
 | `QUOTE_T10_MAX_LATE_S` | 到期后最多晚多久仍扫，默认 **900**；超时丢任务 |
 | `QUOTE_T10` | `0` 关闭 T+10（即使金额已设） |
 | `QUOTE_GOAL_SIZE_TIERS` / `QUOTE_FT_SIZE_TIERS` | `ask:usdc`；终场不继承进球档，避免被 $50 卡住 |
@@ -294,7 +294,7 @@ python3 frontend/run_main.py --no-trade --no-browser                      # 只�
 | http://127.0.0.1:8792/ | API-Football Bridge：fixture 缓存 |
 | `data/pm-quote/watch.log` | 询价 / 门控 / 下单 stdout |
 | `data/pm-quote/trades.jsonl` | dry / live 尝试 |
-| `data/pm-quote/t10_pending.json` | 进球 +10 分钟待扫盘任务 |
+| `data/pm-quote/t10_pending.json` | 进球 +8 分钟待扫盘任务 |
 | `data/pm-quote/quotes.jsonl` | 完整询价包 |
 | `data/bridge/events.jsonl` | 持久化 bridge 事件 |
 | `data/bridge/matches.json` | 最近配对结果 |

@@ -19,7 +19,7 @@ Consumes **match-bridge** 进球/终场事件，按比分解读盘口，对 CLOB
 |---|---|---|---|---|
 | Pitch-gate | 已配对进球，同帧 DOM `in_play` ∧ AF `score_match` | 是 | `QUOTE_GOAL_MAX_USDC` | 仅 `QUOTE_REST_ENABLED=1` |
 | Locked sweep | 门控买时 token 在上一分已是 live WIN | 同一刀 | `QUOTE_LOCKED_SWEEP_USDC` | 同门控 |
-| T+10 | 进球后默认 600s；AF live **必须等于触发那球的比分**，否则 skip | **AF live = 触发比分**（FT/ET 交给终场） | `QUOTE_T10_USDC`（FAK 与 0.99 GTC **各**一份） | **始终挂**，每已锁 WIN token 一笔 |
+| T+10 | 进球后默认 480s（8min）；AF live **必须等于触发那球的比分**，否则 skip | **AF live = 触发比分**（FT/ET 交给终场） | `QUOTE_T10_USDC`（FAK 与 0.99 GTC **各**一份） | **始终挂**，每已锁 WIN token 一笔 |
 | 终场 | `match_finished` 且 AF `regulation_ready` | **AF 常规时间确认** | `QUOTE_FT_MAX_USDC` | 不挂 |
 | 终场灰尘盘 | 终场锁定 WIN、ask≤0.01 | 同上 | `QUOTE_FT_DUST_USDC` | 不挂 |
 | 完赛扫盘 | 主脚本运行中每 **1h** 扫过去 **24h** 未结算完赛盘 | **AF 常规时间** | `QUOTE_POSTFT_SWEEP_USDC`（默认 $1000） | 不挂；FAK 从最低卖价吃到 **0.995** |
@@ -85,7 +85,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 3. Join `data/bridge/matches.json` for full `market_refs` / `event_id`.
 4. **Latency path**: wake on events (poll ~50ms; `--interval` default **0.25s**). Market warmer fills `data/pm-quote/market_cache/{match_id}.json`. Live quote: CLOB worker thread (not the watch tick) runs one `/books` POST; totals/BTTS before exact.
 5. On misprice after pitch-gate, executor plans fills → `trades.jsonl` (`dry_run` or live `posted`). Pitch-gate and FT buys skip `min_buy_price`; pitch-gate also skips size/$1 floors (fee/`min_net` + per-channel `QUOTE_GOAL_MAX_USDC` / `QUOTE_FT_MAX_USDC` remain). Tokens that are WIN **even at the previous score** (`win_if_goal_void`) FAK remaining asks ≤0.995 up to `QUOTE_LOCKED_SWEEP_USDC` (default $1000) instead of the $50 goal cap.
-6. **Pitch-gate: one `quote_bridge_event` per aligned buy.** Separately, each paired goal schedules a **T+10** rescan (`QUOTE_T10_USDC`; delay `QUOTE_T10_DELAY_S` default 600s). A DQD reversal **cancels** that undone goal's queued / in-flight T+10 (`t10_skip_reversal`) and blocks the goal stem so a job already `pop_due`'d cannot submit; a later re-award of the same transition with a newer ts can schedule a new one. At fire, poll AF **live** goals (`QUOTE_T10_AF_TIMEOUT_S`, default 90s) only while the match is still in play. Buy only if that live tally **exactly matches the triggering goal's score**; a later goal skips (`t10_skip_score_mismatch`) instead of rewriting the work event. If AF is already FT/ET/PEN / `regulation_ready`, or an FT confirm is pending, T+10 **skips** (`t10_skip_af_finished` / `t10_skip_ft_pending`) and the FT path owns the score. Dongqiudi `prev_scores` is only a skeleton (sides / halves), never the traded score. Cache miss / timeout → skip (`t10_af_unconfirmed`), no DQD fallback. FAK uses the same fee/`min_net`/0.995 path; rest @0.99 uses the same USDC var (does not need `QUOTE_REST_ENABLED`). Locked sweep does **not** apply. Skip / cancel if AF has already confirmed FT.
+6. **Pitch-gate: one `quote_bridge_event` per aligned buy.** Separately, each paired goal schedules a **T+10** rescan (`QUOTE_T10_USDC`; delay `QUOTE_T10_DELAY_S` default 480s). A DQD reversal **cancels** that undone goal's queued / in-flight T+10 (`t10_skip_reversal`) and blocks the goal stem so a job already `pop_due`'d cannot submit; a later re-award of the same transition with a newer ts can schedule a new one. At fire, poll AF **live** goals (`QUOTE_T10_AF_TIMEOUT_S`, default 90s) only while the match is still in play. Buy only if that live tally **exactly matches the triggering goal's score**; a later goal skips (`t10_skip_score_mismatch`) instead of rewriting the work event. If AF is already FT/ET/PEN / `regulation_ready`, or an FT confirm is pending, T+10 **skips** (`t10_skip_af_finished` / `t10_skip_ft_pending`) and the FT path owns the score. Dongqiudi `prev_scores` is only a skeleton (sides / halves), never the traded score. Cache miss / timeout → skip (`t10_af_unconfirmed`), no DQD fallback. FAK uses the same fee/`min_net`/0.995 path; rest @0.99 uses the same USDC var (does not need `QUOTE_REST_ENABLED`). Locked sweep does **not** apply. Skip / cancel if AF has already confirmed FT.
 
 ## Trading flags
 
@@ -122,7 +122,7 @@ Env (same names as simple_str): `PRIVATE_KEY`, `FUNDER`, `SIGNATURE_TYPE`, `CHAI
 | AF Bridge board | http://127.0.0.1:8792/ | DQD→AF fixture cache / events |
 | Live Score observe | `data/pm-quote/livescore_observe.jsonl` | Optional LSA research |
 | Open lots | `data/pm-quote/open_positions.json` | buy_win lots |
-| T+10 pending | `data/pm-quote/t10_pending.json` | Goal +10min rescan jobs |
+| T+10 pending | `data/pm-quote/t10_pending.json` | Goal T+10 (8min) rescan jobs |
 | Cursor | `data/pm-quote/cursor.json` | Processed keys / FT ids / offset |
 
 ## Related skills
