@@ -114,7 +114,7 @@ Environment=DQD_BIND=0.0.0.0
 Environment=PM_PROXY=none
 Environment=DQD_PUBLIC_HOST=$(public_host)
 Environment=DQD_PYTHON=${ROOT}/.venv/bin/python
-Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${RUNNER}
 Restart=on-failure
 RestartSec=8

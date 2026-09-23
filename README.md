@@ -200,6 +200,8 @@ Pitch Gate 看板：普通回撤为**橙色**；若该球曾判定过 `in_play` 
 
 ## 快速开始
 
+新服务器从零部署、与当前生产对齐，见 **[DEPLOY.md](DEPLOY.md)**。
+
 ```bash
 pip install -r .cursor/skills/polymarket-quote/requirements-trade.txt
 
