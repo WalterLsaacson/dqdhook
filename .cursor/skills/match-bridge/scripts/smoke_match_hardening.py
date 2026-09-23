@@ -786,6 +786,93 @@ def main() -> int:
         f"Valledupar/Cundinamarca should match, got {col2_pair}",
     )
 
+    # 2026-09-23: FIF / UNL / CONL / MAR1 league gate + CN national names
+    _assert(bl.normalize_league("国际友谊") == "fif", "国际友谊→fif")
+    _assert(bl.normalize_league("欧国联") == "unl", "欧国联→unl")
+    _assert(bl.normalize_league("中北美国联") == "conl", "中北美国联→conl")
+    _assert(bl.normalize_league("摩洛超") == "mar1", "摩洛超→mar1")
+    _assert(
+        bl.league_similarity({"league": "国际友谊"}, {"league_id": "fif", "league": "FIF"})
+        == 1.0,
+        "国际友谊↔fif",
+    )
+    _assert(
+        bl.league_similarity({"league": "欧国联"}, {"league_id": "unl", "league": "UNL"})
+        == 1.0,
+        "欧国联↔unl",
+    )
+    _assert(
+        bl.league_similarity({"league": "中北美国联"}, {"league_id": "conl", "league": "CONL"})
+        == 1.0,
+        "中北美国联↔conl",
+    )
+    _assert(
+        bl.league_similarity({"league": "摩洛超"}, {"league_id": "mar1", "league": "MAR1"})
+        == 1.0,
+        "摩洛超↔mar1",
+    )
+    _assert(
+        bl.league_similarity({"league": "哥伦甲"}, {"league_id": "conl", "league": "CONL"})
+        == 0.0,
+        "col1 must not fuzzy-pass conl",
+    )
+    _assert(bl.team_similarity("葡萄牙", "Portugal") >= 0.99, "葡萄牙")
+    _assert(bl.team_similarity("爱尔兰", "Republic of Ireland") >= 0.99, "爱尔兰")
+    _assert(bl.team_similarity("Dominicaine", "Dominican Republic") >= 0.99, "Dominicaine")
+    _assert(bl.team_similarity("IR Tanger", "Ittihad Riadi Tanger") >= 0.99, "IR Tanger")
+    _assert(bl.team_similarity("阿迈勒提兹尼特", "US Amal Tiznit") >= 0.99, "Tiznit")
+    fif_pair = bl.score_pair(
+        {
+            "home": "Japan",
+            "away": "Uruguay",
+            "league": "国际友谊",
+            "local_date": "2026-09-24",
+            "time": "18:05",
+        },
+        {
+            "home": "Japan",
+            "away": "Uruguay",
+            "league": "FIF",
+            "league_id": "fif",
+            "kickoff_beijing": "2026-09-24 18:05",
+        },
+    )
+    _assert(fif_pair >= bl.DEFAULT_MIN_SCORE, f"FIF Japan should match, got {fif_pair}")
+    unl_pair = bl.score_pair(
+        {
+            "home": "葡萄牙",
+            "away": "Wales",
+            "league": "欧国联",
+            "local_date": "2026-09-25",
+            "time": "02:45",
+        },
+        {
+            "home": "Portugal",
+            "away": "Wales",
+            "league": "UNL",
+            "league_id": "unl",
+            "kickoff_beijing": "2026-09-25 02:45",
+        },
+    )
+    _assert(unl_pair >= bl.DEFAULT_MIN_SCORE, f"UNL Portugal should match, got {unl_pair}")
+    mar_pair = bl.score_pair(
+        {
+            "home": "阿迈勒提兹尼特",
+            "away": "Ittihad Riadi Tanger",
+            "league": "摩洛超",
+            "local_date": "2026-09-25",
+            "time": "03:00",
+        },
+        {
+            "home": "US Amal Tiznit",
+            "away": "IR Tanger",
+            "league": "MAR1",
+            "league_id": "mar1",
+            "kickoff_beijing": "2026-09-25 04:00",
+        },
+    )
+    _assert(mar_pair >= bl.DEFAULT_MIN_SCORE, f"MAR1 Tiznit should match, got {mar_pair}")
+
     # Lincoln: freeze HT at 1-0 in 1H; 2H must not copy live hts 1-1.
     half_scores: dict = {}
     lin_1h = {
