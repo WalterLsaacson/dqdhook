@@ -873,6 +873,44 @@ def main() -> int:
     )
     _assert(mar_pair >= bl.DEFAULT_MIN_SCORE, f"MAR1 Tiznit should match, got {mar_pair}")
 
+    # 2026-09-27: Copa del Rey / Indonesia Liga 2 / China invitational / Botola names
+    _assert(bl.normalize_league("国王杯") == "cdr", "国王杯→cdr")
+    _assert(bl.normalize_league("印尼甲") == "idn2", "印尼甲→idn2")
+    _assert(
+        bl.league_similarity({"league": "国王杯"}, {"league_id": "cdr", "league": "CDR"})
+        == 1.0,
+        "国王杯↔cdr",
+    )
+    _assert(
+        bl.league_similarity({"league": "印尼甲"}, {"league_id": "idn2", "league": "IDN2"})
+        == 1.0,
+        "印尼甲↔idn2",
+    )
+    _assert(
+        bl.league_similarity({"league": "中国之队邀请赛"}, {"league_id": "fif", "league": "FIF"})
+        == 1.0,
+        "中国之队邀请赛↔fif",
+    )
+    _assert(bl.team_similarity("RS Berkane", "Renaissance Sportive de Berkane") >= 0.99, "Berkane")
+    _assert(bl.team_similarity("HUS Agadir", "Hassania Agadir") >= 0.99, "Agadir")
+    cdr_pair = bl.score_pair(
+        {
+            "home": "Auriense",
+            "away": "San José Soria",
+            "league": "国王杯",
+            "local_date": "2026-09-27",
+            "time": "18:00",
+        },
+        {
+            "home": "Auriense CA",
+            "away": "CD San José de Soria",
+            "league": "CDR",
+            "league_id": "cdr",
+            "kickoff_beijing": "2026-09-27 18:00",
+        },
+    )
+    _assert(cdr_pair >= bl.DEFAULT_MIN_SCORE, f"CDR Auriense should match, got {cdr_pair}")
+
     # Lincoln: freeze HT at 1-0 in 1H; 2H must not copy live hts 1-1.
     half_scores: dict = {}
     lin_1h = {

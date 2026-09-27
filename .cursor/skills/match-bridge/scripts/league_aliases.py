@@ -501,4 +501,17 @@ LEAGUE_ALIASES: dict[str, str] = {
     "botola": "mar1",
     "botola pro": "mar1",
     "morocco botola": "mar1",
+    # --- 2026-09-27 unmatched PM: CDR / IDN2 / China invitational ---
+    "国王杯": "cdr",
+    "cdr": "cdr",
+    "copa del rey": "cdr",
+    "spanish cup": "cdr",
+    "spain cup": "cdr",
+    "印尼甲": "idn2",
+    "idn2": "idn2",
+    "liga 2 indonesia": "idn2",
+    "indonesia liga 2": "idn2",
+    "indonesia championship": "idn2",
+    "中国之队邀请赛": "fif",
+    "中国之队": "fif",
 }
