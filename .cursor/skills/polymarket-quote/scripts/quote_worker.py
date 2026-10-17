@@ -133,6 +133,7 @@ class QuoteWorker:
         self._busy_kind: str | None = None
         self._housekeep_queued = False
         self._urgent = 0
+        self._last_exit_offer = 0.0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -141,6 +142,7 @@ class QuoteWorker:
             target=self._loop, name="clob-quote-worker", daemon=True
         )
         self._thread.start()
+        self._schedule_housekeep()
         print("clob-worker → started (quote / rest / flatten off watch tick)", flush=True)
 
     def stop(self) -> None:
@@ -355,10 +357,35 @@ class QuoteWorker:
     def _run_housekeep(self) -> None:
         with self._lock:
             self._housekeep_queued = False
+        ex = self.trade_executor
+        now = time.time()
+        if ex is not None and now - self._last_exit_offer >= 20.0:
+            self._last_exit_offer = now
+            try:
+                exits = list(ex.offer_exit_sells() or [])
+                if exits:
+                    self._push_result(
+                        QuoteJobResult(
+                            bundles=[
+                                {
+                                    "quoted_at": _now(),
+                                    "trigger": "exit_sell",
+                                    "exit_sells": exits,
+                                    "exit_sell_count": len(exits),
+                                }
+                            ],
+                            seen_keys=[],
+                            ft_match_ids=[],
+                            event_key="",
+                            match_id="",
+                            kind="exit_sell",
+                        )
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(f"ALERT exit sell failed: {e}", flush=True)
         if self._queue_has_work():
             self._schedule_housekeep()
             return
-        ex = self.trade_executor
         if ex is None:
             return
         try:

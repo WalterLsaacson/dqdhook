@@ -15,6 +15,16 @@ from typing import Any
 
 import quote_lib as lib
 from clob_trader import ClobTrader
+from exit_sell import (
+    EXIT_MIN_ENTRY,
+    EXIT_MIN_SHARES,
+    EXIT_SELL_PRICE,
+    EXIT_SELL_TICK,
+    ensure_exit_eligible,
+    exit_unlisted_shares,
+    is_dongqiudi_match_id,
+    untracked_fill,
+)
 from fill_planner import FillPlan, plan_fill, plan_locked_sweep, MIN_MARKETABLE_BUY_USDC
 from rest_ladder import (
     MIN_REST_USDC,
@@ -534,6 +544,8 @@ class TradeExecutor:
         self._in_flight: set[str] = set()
         self._pending: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self._exit_wait_logged: set[str] = set()
+        self._exit_seeded = False
         self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
         self._load_recent_flattens()
@@ -1829,6 +1841,363 @@ class TradeExecutor:
                     )
         return out
 
+    def offer_exit_sells(self) -> list[dict[str, Any]]:
+        """Post GTC sells at 0.999 for 0.99 inventory that is not already listed.
+
+        Local ledger only. A lot with no new shares makes no HTTP call. A
+        balance reject sticks until more shares fill, so the same lot is not
+        reposted on the next pass.
+        """
+        if os.getenv("QUOTE_EXIT_SELL", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return []
+        self._seed_open_buy_exits()
+        now = time.time()
+        jobs: list[dict[str, Any]] = []
+        with self._lock:
+            for lot in self.ledger.all_open():
+                if not lot.get("live"):
+                    continue
+                if lot.get("pending_flatten"):
+                    continue
+                tid = str(lot.get("token_id") or "")
+                mid = str(lot.get("match_id") or "")
+                if not tid or not mid:
+                    continue
+                ensure_exit_eligible(lot)
+                if "invalid token id" in str(lot.get("exit_last_error") or "").lower():
+                    if lot.get("exit_block_eligible") is None:
+                        lot["exit_block_eligible"] = float(lot.get("exit_eligible_shares") or 0)
+                    continue
+                eligible = float(lot.get("exit_eligible_shares") or 0)
+                if eligible <= float(lot.get("exit_block_eligible") or 0) + 1e-9:
+                    continue
+                retry_at = float(lot.get("exit_retry_at") or 0)
+                if retry_at > now:
+                    continue
+                size = exit_unlisted_shares(lot, min_shares=EXIT_MIN_SHARES)
+                gap = eligible - float(lot.get("exit_listed_shares") or 0)
+                if size <= 0:
+                    if gap >= 0.01 and tid not in self._exit_wait_logged:
+                        self._exit_wait_logged.add(tid)
+                        print(
+                            f"exit-sell → wait token={tid[:12]}… "
+                            f"unlisted={gap:.2f} < min {EXIT_MIN_SHARES:.0f}",
+                            flush=True,
+                        )
+                    continue
+                self._exit_wait_logged.discard(tid)
+                jobs.append(
+                    {
+                        "match_id": mid,
+                        "token_id": tid,
+                        "shares": size,
+                        "neg_risk": lot.get("neg_risk"),
+                        "eligible": eligible,
+                    }
+                )
+        if not jobs:
+            return []
+        try:
+            trader = self.ensure_trader()
+        except Exception:  # noqa: BLE001
+            trader = None
+        if trader is None:
+            return []
+        posted: list[dict[str, Any]] = []
+        for job in jobs:
+            tid = str(job["token_id"])
+            try:
+                resp = trader.post_limit_sell(
+                    tid,
+                    Decimal(str(job["shares"])),
+                    Decimal(str(EXIT_SELL_PRICE)),
+                    EXIT_SELL_TICK,
+                    order_type="GTC",
+                    neg_risk=(
+                        bool(job["neg_risk"]) if job.get("neg_risk") is not None else None
+                    ),
+                )
+                oid = flatten_order_id(resp if isinstance(resp, dict) else None)
+                ok = trader.is_order_success(
+                    resp if isinstance(resp, dict) else None, market=False
+                )
+                if not ok or not oid:
+                    raise RuntimeError(f"exit sell rejected: {resp}")
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                balance_stuck = (
+                    "not enough balance" in err.lower()
+                    or "invalid amount" in err.lower()
+                    or "invalid token id" in err.lower()
+                )
+                with self._lock:
+                    lot = self._open_lot_locked(str(job["match_id"]), tid)
+                    if lot is not None:
+                        if balance_stuck:
+                            lot["exit_block_eligible"] = float(job["eligible"])
+                        else:
+                            lot["exit_retry_at"] = now + 60.0
+                        lot["exit_last_error"] = err[:300]
+                    self.ledger._save()
+                print(
+                    f"exit-sell → fail token={tid[:12]}… shares={float(job['shares']):.2f} "
+                    f"{err[:180]}",
+                    flush=True,
+                )
+                continue
+            order = {
+                "order_id": oid,
+                "price": EXIT_SELL_PRICE,
+                "shares": float(job["shares"]),
+                "status": "LIVE",
+                "order_type": "GTC",
+                "filled_shares": 0.0,
+                "posted_at": iso_now(),
+            }
+            with self._lock:
+                lot = self._open_lot_locked(str(job["match_id"]), tid)
+                if lot is None:
+                    continue
+                orders = list(lot.get("exit_orders") or [])
+                orders.append(order)
+                lot["exit_orders"] = orders
+                lot["exit_listed_shares"] = round(
+                    float(lot.get("exit_listed_shares") or 0) + float(job["shares"]),
+                    6,
+                )
+                lot.pop("exit_block_eligible", None)
+                lot.pop("exit_last_error", None)
+                lot.pop("exit_retry_at", None)
+                self.ledger._save()
+            posted.append(
+                {
+                    "match_id": job["match_id"],
+                    "token_id": tid,
+                    "order_id": oid,
+                    "shares": float(job["shares"]),
+                    "price": EXIT_SELL_PRICE,
+                }
+            )
+            print(
+                f"exit-sell → posted token={tid[:12]}… shares={float(job['shares']):.2f} "
+                f"px={EXIT_SELL_PRICE} GTC",
+                flush=True,
+            )
+        return posted
+
+    def _seed_open_buy_exits(self) -> None:
+        """Once: adopt live 0.99 bids the ledger no longer tracks.
+
+        Uses the open-order list, not a position scan. Later fills stay on the
+        rest reconcile path, which only posts the new shares.
+        """
+        if self._exit_seeded:
+            return
+        try:
+            trader = self.ensure_trader()
+        except Exception:  # noqa: BLE001
+            trader = None
+        if trader is None:
+            return
+        try:
+            opens = trader.client.get_open_orders() or []
+        except Exception as e:  # noqa: BLE001
+            print(f"exit-sell → seed open orders failed: {e}", flush=True)
+            return
+        self._exit_seeded = True
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for order in opens:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("side") or "").upper() != "BUY":
+                continue
+            try:
+                px = float(order.get("price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if px + 1e-9 < EXIT_MIN_ENTRY:
+                continue
+            tid = str(order.get("asset_id") or "")
+            if not tid:
+                continue
+            grouped.setdefault(tid, []).append(order)
+        identities = self._exit_identities(set(grouped))
+        adopted = 0
+        repaired = 0
+        booked = 0
+        with self._lock:
+            for tid, orders in grouped.items():
+                lot = next(
+                    (
+                        row
+                        for row in self.ledger.all_open()
+                        if str(row.get("token_id") or "") == tid
+                    ),
+                    None,
+                )
+                ident = identities.get(tid) or {}
+                fresh = False
+                if lot is None:
+                    mid = str(ident.get("match_id") or "")
+                    if not is_dongqiudi_match_id(mid):
+                        continue
+                    self.ledger.add_rest_order(
+                        match_id=mid,
+                        token_id=tid,
+                        order=self._exit_seed_rest_order(orders[0]),
+                        market_key=str(ident.get("market_key") or ""),
+                        family=str(ident.get("family") or ""),
+                        event_key=str(ident.get("event_key") or ""),
+                        home=str(ident.get("home") or ""),
+                        away=str(ident.get("away") or ""),
+                        live=True,
+                        tick_size=str(ident.get("tick_size") or "0.01"),
+                        neg_risk=ident.get("neg_risk"),
+                    )
+                    lot = next(
+                        (
+                            row
+                            for row in self.ledger.all_open()
+                            if str(row.get("token_id") or "") == tid
+                        ),
+                        None,
+                    )
+                    if lot is None:
+                        continue
+                    fresh = True
+                    matched, usdc = 0.0, 0.0
+                    for order in orders:
+                        filled, cost = untracked_fill(order, set())
+                        matched += filled
+                        usdc += cost
+                    if matched > 1e-9:
+                        lot["shares"] = round(matched, 6)
+                        lot["usdc"] = round(usdc, 6)
+                        lot["exit_eligible_shares"] = round(matched, 6)
+                        adopted += 1
+                elif ident and is_dongqiudi_match_id(ident.get("match_id")) and not is_dongqiudi_match_id(
+                    lot.get("match_id")
+                ):
+                    lot["match_id"] = str(ident["match_id"])
+                    for field in ("home", "away", "market_key", "family", "event_key"):
+                        if ident.get(field) and not lot.get(field):
+                            lot[field] = ident[field]
+                    repaired += 1
+                known = {
+                    str(item.get("order_id") or "")
+                    for item in (lot.get("rest_orders") or [])
+                    if isinstance(item, dict)
+                }
+                added_sh, added_usdc = 0.0, 0.0
+                for order in orders:
+                    oid = str(order.get("id") or "")
+                    if not oid or oid in known:
+                        continue
+                    filled, cost = untracked_fill(order, known)
+                    self.ledger.add_rest_order(
+                        match_id=str(lot.get("match_id") or ""),
+                        token_id=tid,
+                        order=self._exit_seed_rest_order(order),
+                        live=True,
+                    )
+                    known.add(oid)
+                    if fresh:
+                        continue
+                    added_sh += filled
+                    added_usdc += cost
+                if added_sh > 1e-9:
+                    ensure_exit_eligible(lot)
+                    lot["shares"] = round(float(lot.get("shares") or 0) + added_sh, 6)
+                    lot["usdc"] = round(float(lot.get("usdc") or 0) + added_usdc, 6)
+                    lot["exit_eligible_shares"] = round(
+                        float(lot.get("exit_eligible_shares") or 0) + added_sh, 6
+                    )
+                    booked += 1
+            if adopted or repaired or booked:
+                self.ledger._save()
+        if adopted or repaired or booked:
+            print(
+                f"exit-sell → seeded {adopted} filled bids, "
+                f"repaired {repaired} match ids",
+                flush=True,
+            )
+
+    def _exit_identities(self, token_ids: set[str]) -> dict[str, dict[str, Any]]:
+        """Dongqiudi match id for a token, from the ledger or the trade log.
+
+        Condition ids (0x…) are ignored so a seeded lot can still be cancelled
+        and flattened by match id.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        if not token_ids:
+            return out
+        for row in self.ledger._rows:
+            tid = str(row.get("token_id") or "")
+            if tid not in token_ids or not is_dongqiudi_match_id(row.get("match_id")):
+                continue
+            out[tid] = {
+                "match_id": str(row.get("match_id") or ""),
+                "home": str(row.get("home") or ""),
+                "away": str(row.get("away") or ""),
+                "market_key": str(row.get("market_key") or ""),
+                "family": str(row.get("family") or ""),
+                "event_key": str(row.get("event_key") or ""),
+                "tick_size": str(row.get("tick_size") or "0.01"),
+                "neg_risk": row.get("neg_risk"),
+            }
+        missing = token_ids - set(out)
+        path = lib.data_dir(self.root) / "trades.jsonl"
+        if not missing or not path.is_file():
+            return out
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tid = str(row.get("token_id") or "")
+                if tid not in missing or not is_dongqiudi_match_id(row.get("match_id")):
+                    continue
+                out[tid] = {
+                    "match_id": str(row.get("match_id") or ""),
+                    "home": str(row.get("home") or ""),
+                    "away": str(row.get("away") or ""),
+                    "market_key": str(row.get("market_key") or ""),
+                    "family": str(row.get("family") or ""),
+                    "event_key": str(row.get("event_key") or ""),
+                    "tick_size": "0.01",
+                    "neg_risk": None,
+                }
+                missing.discard(tid)
+                if not missing:
+                    break
+        return out
+
+    @staticmethod
+    def _exit_seed_rest_order(order: dict[str, Any]) -> dict[str, Any]:
+        px = float(order.get("price") or 0)
+        orig = float(order.get("original_size") or 0)
+        filled = float(order.get("size_matched") or 0)
+        return {
+            "order_id": str(order.get("id") or ""),
+            "price": px,
+            "shares": orig,
+            "usdc": round(orig * px, 6),
+            "status": str(order.get("status") or "LIVE"),
+            "order_type": str(order.get("order_type") or "GTC"),
+            "filled_shares": filled,
+            "filled_usdc": round(filled * px, 6),
+            "posted_at": iso_now(),
+        }
+
+    def _open_lot_locked(self, match_id: str, token_id: str) -> dict[str, Any] | None:
+        for lot in self.ledger.all_open():
+            if str(lot.get("match_id") or "") == match_id and str(lot.get("token_id") or "") == token_id:
+                return lot
+        return None
+
     def _pending_usdc_total_locked(self) -> float:
         return sum(float(p.get("usdc") or 0) for p in self._pending.values())
 
@@ -2455,6 +2824,7 @@ class TradeExecutor:
             settle=lib.settle_row_from_lot(quote),
             home_half=meta.get("home_half"),
             away_half=meta.get("away_half"),
+            entry_price=float(plan.worst_price or 0),
         )
 
     def maybe_flatten_for_event(

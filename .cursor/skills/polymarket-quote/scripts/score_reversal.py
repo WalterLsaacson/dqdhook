@@ -247,9 +247,11 @@ class OpenPositionLedger:
         settle: dict[str, Any] | None = None,
         home_half: Any = None,
         away_half: Any = None,
+        entry_price: float | None = None,
     ) -> None:
         if not match_id or not token_id or shares <= 0:
             return
+        added_shares = float(shares)
         sc = score_pair(home_score, away_score)
         fill = str(fill_status or FILL_STATUS_OPEN)
         if fill not in (FILL_STATUS_OPEN, FILL_STATUS_PENDING):
@@ -320,6 +322,18 @@ class OpenPositionLedger:
             row["pending_reason"] = existing.get("pending_reason")
         if existing is not None and existing.get("rest_orders"):
             row["rest_orders"] = list(existing.get("rest_orders") or [])
+        if existing is not None and "exit_eligible_shares" in existing:
+            row["exit_eligible_shares"] = existing.get("exit_eligible_shares")
+        if existing is not None and existing.get("exit_listed_shares"):
+            row["exit_listed_shares"] = existing.get("exit_listed_shares")
+        if existing is not None and existing.get("exit_orders"):
+            row["exit_orders"] = list(existing.get("exit_orders") or [])
+        if existing is not None and existing.get("exit_block_eligible") is not None:
+            row["exit_block_eligible"] = existing.get("exit_block_eligible")
+        if entry_price is not None:
+            from exit_sell import note_exit_fill
+
+            note_exit_fill(row, added_shares, float(entry_price))
         self._rows.append(row)
         self._save()
         logger.info(

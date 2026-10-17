@@ -2848,6 +2848,19 @@ def process_bridge_events(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"ALERT rest reconcile failed: {e}", flush=True)
+        try:
+            exits = list(trade_executor.offer_exit_sells() or [])
+            if exits:
+                bundles.append(
+                    {
+                        "quoted_at": now_cn_iso(),
+                        "trigger": "exit_sell",
+                        "exit_sells": exits,
+                        "exit_sell_count": len(exits),
+                    }
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"ALERT exit sell failed: {e}", flush=True)
 
     def _quote_one(work_ev: dict[str, Any], key: str) -> bool:
         nonlocal bundles, seen

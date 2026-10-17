@@ -323,6 +323,63 @@ class ClobTrader:
         )
         return out
 
+    def post_limit_sell(
+        self,
+        token_id: str,
+        shares: Decimal,
+        price: Decimal,
+        tick_size: str,
+        *,
+        order_type: str = "GTC",
+        expiration: int = 0,
+        neg_risk: bool | None = None,
+    ) -> dict:
+        """Resting SELL (GTC/GTD). Size is shares. Caller refreshes allowance."""
+        from py_clob_client_v2 import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+
+        ot_raw = str(order_type or "GTC").upper()
+        if ot_raw == "GTC":
+            ot = OrderType.GTC
+            exp = 0
+        else:
+            ot = OrderType.GTD
+            exp = int(expiration or 0)
+            if exp <= 0:
+                raise ValueError("GTD limit sell requires expiration > 0")
+        options = PartialCreateOrderOptions(tick_size=tick_size)
+        if neg_risk is not None:
+            options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
+        size = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if size <= 0:
+            raise ValueError(f"limit sell shares floor to 0 from {shares}")
+        px = Decimal(str(price))
+        if px <= 0 or px >= 1:
+            raise ValueError(f"limit sell price out of range: {price}")
+        self.refresh_conditional_allowance(token_id)
+        args = OrderArgs(
+            token_id=token_id,
+            price=float(px),
+            size=float(size),
+            side="SELL",
+            expiration=exp,
+        )
+        result = self.client.create_and_post_order(
+            args, options=options, order_type=ot
+        )
+        out = result if isinstance(result, dict) else {"result": result}
+        ot_label = getattr(ot, "name", None) or str(ot)
+        logger.info(
+            "limit SELL %s token=%s shares=%s price=%s exp=%s ok=%s",
+            ot_label,
+            token_id[:12],
+            size,
+            px,
+            exp,
+            self.is_order_success(out, market=False),
+        )
+        return out
+
     def post_market_buy(
         self,
         token_id: str,
