@@ -20,7 +20,9 @@ from rest_ladder import (
     MIN_REST_USDC,
     allocate_rest_ladder,
     ask_in_fak_zone,
+    clip_rest_to_balance,
     rest_enabled,
+    WALLET_ORDER_HAIRCUT_USDC,
     rest_expire_s,
     rest_limit_tick_size,
     rest_min_shares,
@@ -1004,6 +1006,23 @@ class TradeExecutor:
                     tick = str(ctx.get("tick") or "0.01") or "0.01"
                     neg_risk = ctx.get("neg_risk")
                     if plan.side == "BUY":
+                        wallet = self._available_rest_usdc(live=channel_live)
+                        sized = clip_rest_to_balance(float(plan.usdc or 0), wallet)
+                        if sized + 1e-9 < float(plan.usdc or 0):
+                            print(
+                                f"buy → clip usdc {float(plan.usdc):.2f}→{sized:.2f} "
+                                f"wallet={float(wallet):.2f} token={token_id[:12]}…",
+                                flush=True,
+                            )
+                            base = float(plan.usdc or 0)
+                            if base > 1e-12:
+                                plan.shares = float(plan.shares or 0) * (sized / base)
+                            plan.usdc = sized
+                        if float(plan.usdc or 0) + 1e-12 < MIN_MARKETABLE_BUY_USDC:
+                            raise RuntimeError(
+                                f"wallet {wallet} after ${WALLET_ORDER_HAIRCUT_USDC:.0f} "
+                                f"haircut leaves {plan.usdc:.2f} < min buy"
+                            )
                         response = trader.post_market_buy(
                             token_id,
                             Decimal(str(plan.usdc)),

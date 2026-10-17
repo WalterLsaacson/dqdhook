@@ -48,17 +48,20 @@ def main() -> int:
     assert abs(rl.rest_target_usdc() - 7.0) < 1e-9
     os.environ.pop("QUOTE_REST_USDC", None)
 
-    assert abs(rl.clip_rest_to_balance(100.0, 40.0) - 40.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(300.0, 55.0) - 53.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(100.0, 40.0) - 38.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(10.0, 55.0) - 10.0) < 1e-9
     assert abs(rl.clip_rest_to_balance(100.0, 150.0) - 100.0) < 1e-9
     assert abs(rl.clip_rest_to_balance(100.0, None) - 100.0) < 1e-9
     assert abs(rl.clip_rest_to_balance(100.0, 0.0) - 0.0) < 1e-9
-    assert abs(rl.rest_place_usdc_for_wallet(100.0, available=40.0) - 40.0) < 1e-9
+    assert abs(rl.clip_rest_to_balance(100.0, 1.5) - 0.0) < 1e-9
+    assert abs(rl.rest_place_usdc_for_wallet(100.0, available=40.0) - 38.0) < 1e-9
     assert (
         abs(
             rl.rest_place_usdc_for_wallet(
                 100.0, available=10.0, working=40.0, replace=True
             )
-            - 50.0
+            - 48.0
         )
         < 1e-9
     )
@@ -228,7 +231,7 @@ def main() -> int:
                 )
                 assert clipped and clipped.get("status") == "rest_dry_run", clipped
                 wlvls = (clipped.get("plan") or {}).get("levels") or []
-                assert wlvls and abs(float(wlvls[0]["usdc"]) - 8.0) < 0.05, wlvls
+                assert wlvls and abs(float(wlvls[0]["usdc"]) - 6.0) < 0.05, wlvls
                 ex._available_rest_usdc = lambda *, live=False: 50.0
                 q_full = dict(q_no)
                 q_full["token_id"] = "tok_wallet50"
@@ -295,7 +298,7 @@ def main() -> int:
 
     print(
         "ok: rest ladder $5 / 0.01→0.99 / metadata 0.001 clamped to 0.01 / "
-        "GTC default / gate ask<0.30 skip / rest clips to wallet USDC"
+        "GTC default / gate ask<0.30 skip / rest clips to wallet USDC minus $2"
     )
     return 0
 

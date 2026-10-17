@@ -19,6 +19,10 @@ MIN_REST_USDC = 1.0
 # rest therefore spends ``QUOTE_REST_USDC`` (default $5), not ``QUOTE_MAX_USDC``.
 DEFAULT_REST_USDC = 5.0
 MIN_REST_SHARES = 5.0
+# Leave this much collateral unused when the target does not fit. CLOB
+# checks notional plus fee, so a bid sized to the full balance is rejected
+# by about two cents. $2 covers that buffer (55 → 53).
+WALLET_ORDER_HAIRCUT_USDC = 2.0
 _SHARE_Q = Decimal("0.01")
 # CLOB limit orders reject tick_size below 0.01 on soccer tokens even when
 # Gamma/book metadata reports 0.001. Rest never posts finer than 0.01;
@@ -53,9 +57,11 @@ def rest_target_usdc() -> float:
 
 
 def clip_rest_to_balance(target: float, available: float | None) -> float:
-    """Configured rest size, or wallet USDC when the wallet is smaller.
+    """Configured size, or wallet USDC minus $2 when the wallet is smaller.
 
-    ``available is None`` (dry / lookup miss) keeps ``target``.
+    ``available is None`` (dry / lookup miss) keeps ``target``. A target that
+    already fits under ``available - 2`` is unchanged. Example: target 300
+    and wallet 55 places 53, so the fee-inclusive order still clears.
     """
     try:
         want = max(0.0, float(target or 0))
@@ -67,7 +73,8 @@ def clip_rest_to_balance(target: float, available: float | None) -> float:
         have = max(0.0, float(available))
     except (TypeError, ValueError):
         return want
-    return min(want, have)
+    room = max(0.0, have - WALLET_ORDER_HAIRCUT_USDC)
+    return min(want, room)
 
 
 def rest_place_usdc_for_wallet(
