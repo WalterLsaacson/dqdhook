@@ -911,6 +911,38 @@ def main() -> int:
     )
     _assert(cdr_pair >= bl.DEFAULT_MIN_SCORE, f"CDR Auriense should match, got {cdr_pair}")
 
+    # 2026-10-16: second-tier league codes that were blocking exact team pairs
+    _assert(bl.normalize_league("西协甲") == "es3", "西协甲→es3")
+    _assert(bl.normalize_league("德丙") == "bl3", "德丙→bl3")
+    _assert(bl.normalize_league("阿超") == "arg", "阿超→arg")
+    _assert(bl.normalize_league("墨甲") == "mex2", "墨甲→mex2")
+    _assert(bl.team_similarity("2 de Mayo PJC", "CS 2 de Mayo") >= 0.99, "2 de Mayo")
+    _assert(
+        bl.league_similarity({"league": "西甲"}, {"league_id": "es3", "league": "ES3"}) == 0.0,
+        "西甲 must not pass es3",
+    )
+    _assert(
+        bl.league_similarity({"league": "墨超"}, {"league_id": "mex2", "league": "MEX2"}) == 0.0,
+        "墨超 must not pass mex2",
+    )
+    es3_pair = bl.score_pair(
+        {
+            "home": "FC Cartagena",
+            "away": "CE Europa",
+            "league": "西协甲",
+            "local_date": "2026-10-17",
+            "time": "01:00",
+        },
+        {
+            "home": "FC Cartagena",
+            "away": "CE Europa",
+            "league": "ES3",
+            "league_id": "es3",
+            "kickoff_beijing": "2026-10-17 01:00",
+        },
+    )
+    _assert(es3_pair >= bl.DEFAULT_MIN_SCORE, f"ES3 Cartagena should match, got {es3_pair}")
+
     # Lincoln: freeze HT at 1-0 in 1H; 2H must not copy live hts 1-1.
     half_scores: dict = {}
     lin_1h = {
