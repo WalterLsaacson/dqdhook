@@ -60,23 +60,35 @@ def main() -> int:
     )
     assert (live_h, live_a) == (1, 0), (live_h, live_a)
 
-    # FT: event 1-2 vs snapshot 1-1 → keep true HT.
+    # FT: event 1-2 vs snapshot 1-1, neither is the live score. Do not guess.
     ft_h, ft_a = resolve_regulation_halves(
         home_score=2,
         away_score=2,
         candidates=[(1, 2), (1, 1)],
         period="FT",
     )
-    assert (ft_h, ft_a) == (1, 1), (ft_h, ft_a)
+    assert ft_h is None and ft_a is None, (ft_h, ft_a)
 
-    # Lincoln: frozen 1-0 beats DQD hts that copied 2H (1-1 / live 1-2).
+    # Lincoln: frozen 1-0 vs hts 1-1, after dropping the live 1-2 copy.
+    # Smaller is not a tie-break (Esenler froze 0-0 under a real 0-1).
     lin_h, lin_a = resolve_regulation_halves(
         home_score=1,
         away_score=2,
         candidates=[(1, 0), (1, 1), (1, 2)],
         period="2H",
+        frozen=(1, 0),
     )
-    assert (lin_h, lin_a) == (1, 0), (lin_h, lin_a)
+    assert lin_h is None and lin_a is None, (lin_h, lin_a)
+
+    # Esenler: stale freeze 0-0 vs DQD half 0-1 at FT 3-2. Skip 1H markets.
+    esen_h, esen_a = resolve_regulation_halves(
+        home_score=3,
+        away_score=2,
+        candidates=[(0, 0), (0, 1)],
+        period="FT",
+        frozen=(0, 0),
+    )
+    assert esen_h is None and esen_a is None, (esen_h, esen_a)
 
     # 2H with only the live score as "HT": drop it, do not settle 1H from 2H.
     live_only_h, live_only_a = resolve_regulation_halves(

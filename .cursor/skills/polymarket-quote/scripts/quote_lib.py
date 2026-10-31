@@ -722,13 +722,17 @@ def resolve_regulation_halves(
 ) -> tuple[Any, Any]:
     """Choose HT that cannot include second-half goals.
 
-    Dongqiudi ``hts`` sometimes copies the live 2H score. Among pairs that are
-    componentwise ≤ current, pick the smallest total. During 1H only, missing
-    HT falls back to the current score. During 2H/FT, never fall back — that
-    is what settled 1H O/U from the full-time score (Portuguesa 1-2).
+    Dongqiudi ``hts`` sometimes copies the live 2H score. Drop any candidate
+    equal to the current score in 2H/FT. A frozen HT that still equals the
+    live score (no 2H goals yet) is real half-time, not a copy — keep it.
 
-    A frozen HT that still equals the live score (no 2H goals yet) is real
-    half-time, not a 2H copy — keep it.
+    If more than one distinct pair remains, abstain. A stale 1H freeze can be
+    too low (missed goal, Esenler 0-0 vs true 0-1) and a larger ``hts`` can
+    include 2H goals (Lincoln 1-1 vs frozen 1-0). Those two errors have the
+    same shape, so the smaller total is not a tie-break. 1H/2H markets skip
+    when this returns ``(None, None)``. During 1H only, missing HT falls back
+    to the current score. During 2H/FT, never fall back to the live score —
+    that settled 1H O/U from the full-time score (Portuguesa 1-2).
     """
     h = _parse_int_score(home_score)
     a = _parse_int_score(away_score)
@@ -761,9 +765,10 @@ def resolve_regulation_halves(
         # live means the second half has not scored yet — keep it.
         if live_pair is not None and period_u in {"2H", "FT", "AET", "ET", "PEN"}:
             valid = [p for p in valid if p != live_pair or p == keep]
-        if valid:
-            valid.sort(key=lambda p: (p[0] + p[1], p[0], p[1]))
+        if len(valid) == 1:
             return valid[0]
+        # Disagreeing halves: do not guess. Callers skip 1H/2H markets.
+        return None, None
     return None, None
 
 
